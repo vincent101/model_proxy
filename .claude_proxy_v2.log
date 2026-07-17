@@ -1,0 +1,16 @@
+2026-07-17 16:29:17,768 WARNING cooldown+failover: supply=claude-badkey status=401 key_tail4=_401
+2026-07-17 16:31:13,184 WARNING no route matched: token_tail4=NOWN tier=default source=responses
+2026-07-17 16:31:13,192 WARNING no route matched: token_tail4=NOWN tier=sonnet source=anthropic
+2026-07-17 16:33:05,115 WARNING cooldown+failover: supply=claude-badkey status=401 key_tail4=_401
+2026-07-17 17:00:09,948 WARNING cooldown+failover: supply=claude-badkey status=401 key_tail4=_401
+2026-07-17 17:17:31,955 WARNING cooldown+failover: supply=claude-badkey status=401 key_tail4=_401
+2026-07-17 17:17:32,889 WARNING thinking_cache: model='claude-sonnet-5' → format='adaptive' (cached 48h)
+2026-07-17 17:19:25,875 WARNING thinking_cache: model='claude-sonnet-5' → format='enabled' (cached 48h)
+2026-07-17 17:19:25,875 WARNING thinking_cache: model='claude-sonnet-5' → format='adaptive' (cached 48h)
+2026-07-17 17:19:25,875 WARNING thinking_cache: model='claude-sonnet-5' → format='adaptive' (cached 48h)
+2026-07-17 17:38:16,859 WARNING cooldown+failover: supply=claude-badkey status=401 key_tail4=_401
+2026-07-17 17:39:34,490 WARNING FORWARD stream interrupted: simulated upstream connection drop
+2026-07-17 17:39:34,490 WARNING REVERSE stream interrupted: ProxyV2Handler._parse_anthropic_sse_block() takes 1 positional argument but 2 were given
+2026-07-17 17:40:05,645 WARNING cooldown+failover: supply=claude-badkey status=401 key_tail4=_401
+2026-07-17 17:41:53,184 WARNING cooldown+failover: supply=claude-badkey status=401 key_tail4=_401
+proxy_v2 listening on 127.0.0.1:18889

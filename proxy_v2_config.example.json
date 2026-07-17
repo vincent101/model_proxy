@@ -1,0 +1,44 @@
+{
+  "admin_token": "<ADMIN_TOKEN_PLACEHOLDER>",
+  "default_cooldown_seconds": 300,
+  "supplies": [
+    {
+      "id": "gw-claude",
+      "url": "https://aigc.sankuai.com/v1/anthropic",
+      "protocol": "anthropic",
+      "appkey": "<APPKEY_PLACEHOLDER>",
+      "target_model": "claude-sonnet-4",
+      "reasoning": true,
+      "cooldown_seconds": 300
+    },
+    {
+      "id": "gw-gpt-native",
+      "url": "https://aigc.sankuai.com/v1/openai/native",
+      "protocol": "chat",
+      "appkey": "<APPKEY_PLACEHOLDER>",
+      "target_model": "gpt-4o",
+      "reasoning": true
+    },
+    {
+      "id": "gw-codex-responses",
+      "url": "https://aigc.sankuai.com/v1/openai/responses",
+      "protocol": "responses",
+      "appkey": "<APPKEY_PLACEHOLDER>",
+      "target_model": "gpt-4o",
+      "reasoning": false,
+      "cooldown_seconds": 180
+    }
+  ],
+  "routes": [
+    {
+      "match": {"client_token": "cc-token-1", "model_tier": "sonnet"},
+      "supplies": ["gw-claude", "gw-gpt-native"],
+      "failover": "on"
+    },
+    {
+      "match": {"client_token": "codex-token-1"},
+      "supplies": ["gw-codex-responses"],
+      "failover": "off"
+    }
+  ]
+}

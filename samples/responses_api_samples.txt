@@ -1,0 +1,57 @@
+###### 美团网关 /v1/responses 端点实测样本 (2026-07-17) ######
+端点: https://aigc.sankuai.com/v1/responses  鉴权: Authorization: Bearer <appkey>
+
+===== 样本1: 非流式基础响应 =====
+{"id":"resp_1621465b45f7433c8b774b8a8230a215","object":"response","created_at":1784272493,"status":"completed","background":false,"completed_at":1784272495,"model":"gpt-5.6-sol","output":[{"type":"message","id":"msg_bd9fd384b3284232af347eca909c2eea","status":"completed","role":"assistant","content":[{"type":"output_text","text":"1+1等于2。","annotations":[],"logprobs":[]}]}],"parallel_tool_calls":true,"conversation":{"id":"conv_8e79c5e3420e44ac9dcfdd5b5647a20a"},"reasoning":{"effort":"low","summary":null},"service_tier":"default","store":true,"text":{"format":{"type":"text"},"verbosity":"medium"},"tool_choice":"auto","tools":[],"truncation":"disabled","usage":{"input_tokens":12,"input_tokens_details":{"cached_tokens":0},"output_tokens":11,"output_tokens_details":{"reasoning_tokens":0},"total_tokens":23},"metadata":{}}
+
+===== 样本3: 工具调用非流式 =====
+{"id":"resp_b86601cdd95a47499b43387c50c90369","object":"response","created_at":1784272495,"status":"completed","background":false,"completed_at":1784272497,"model":"gpt-5.6-sol","output":[{"type":"function_call","id":"item_48b4803b0d584e12bf5ccd53fb79ad19","status":"completed","call_id":"call_TVkbQvX6tgzd8kd7yJ5G0iy2","name":"get_weather","arguments":"{\"city\":\"北京\"}"}],"parallel_tool_calls":true,"conversation":{"id":"conv_e7988532a7e549ffb680ac0bb62f37f2"},"reasoning":{"effort":null,"summary":null},"service_tier":"default","store":true,"text":{"format":{"type":"text"},"verbosity":"medium"},"tool_choice":"auto","tools":[{"type":"function","name":"get_weather","description":"查天气","parameters":{"type":"object","properties":{"city":{"type":"string"}},"required":["city"]},"strict":true}],"truncation":"disabled","usage":{"input_tokens":124,"input_tokens_details":{"cached_tokens":0},"output_tokens":18,"output_tokens_details":{"reasoning_tokens":0},"total_tokens":142},"metadata":{}}
+
+===== 样本2: 流式完整事件序列(文本) =====
+data: {"type":"response.created","response":{"id":"resp_c3229d39e23b4b4d980052b0d33448df","object":"response","created_at":1784272497,"status":"in_progress","background":false,"model":"gpt-5.6-sol","output":[],"parallel_tool_calls":true,"conversation":{"id":"conv_5983bd9dd02543c69b291eafad45505f"},"reasoning":{"effort":null,"summary":null},"service_tier":"auto","store":true,"text":{"format":{"type":"text"},"verbosity":"medium"},"tool_choice":"auto","tools":[],"truncation":"disabled","metadata":{}},"sequence_number":0}
+
+data: {"type":"response.in_progress","response":{"id":"resp_c3229d39e23b4b4d980052b0d33448df","object":"response","created_at":1784272497,"status":"in_progress","background":false,"model":"gpt-5.6-sol","output":[],"parallel_tool_calls":true,"conversation":{"id":"conv_5983bd9dd02543c69b291eafad45505f"},"reasoning":{"effort":null,"summary":null},"service_tier":"auto","store":true,"text":{"format":{"type":"text"},"verbosity":"medium"},"tool_choice":"auto","tools":[],"truncation":"disabled","metadata":{}},"sequence_number":1}
+
+data: {"type":"response.output_item.added","output_index":0,"item":{"id":"msg_355bef4a06ec4d4eb295113fb1514dc8","type":"message","status":"in_progress","role":"assistant","content":[]},"sequence_number":2}
+
+data: {"type":"response.content_part.added","item_id":"msg_355bef4a06ec4d4eb295113fb1514dc8","output_index":0,"content_index":0,"part":{"type":"output_text","text":"","annotations":[],"logprobs":[]},"sequence_number":3}
+
+data: {"type":"response.output_text.delta","item_id":"msg_355bef4a06ec4d4eb295113fb1514dc8","output_index":0,"content_index":0,"delta":"Hi","logprobs":[],"obfuscation":"obf_278dde6c4","sequence_number":4}
+
+data: {"type":"response.output_text.delta","item_id":"msg_355bef4a06ec4d4eb295113fb1514dc8","output_index":0,"content_index":0,"delta":"!","logprobs":[],"obfuscation":"obf_317156075","sequence_number":5}
+
+data: {"type":"response.output_text.delta","item_id":"msg_355bef4a06ec4d4eb295113fb1514dc8","output_index":0,"content_index":0,"delta":" 👋","logprobs":[],"obfuscation":"obf_3b54cda26","sequence_number":6}
+
+data: {"type":"response.output_text.done","item_id":"msg_355bef4a06ec4d4eb295113fb1514dc8","output_index":0,"content_index":0,"text":"Hi! 👋","logprobs":[],"sequence_number":7}
+
+data: {"type":"response.content_part.done","item_id":"msg_355bef4a06ec4d4eb295113fb1514dc8","output_index":0,"content_index":0,"part":{"type":"output_text","text":"Hi! 👋","annotations":[],"logprobs":[]},"sequence_number":8}
+
+data: {"type":"response.output_item.done","output_index":0,"item":{"id":"msg_355bef4a06ec4d4eb295113fb1514dc8","type":"message","status":"completed","role":"assistant","content":[{"type":"output_text","text":"Hi! 👋","annotations":[],"logprobs":[]}]},"sequence_number":9}
+
+data: {"type":"response.completed","response":{"id":"resp_c3229d39e23b4b4d980052b0d33448df","object":"response","created_at":1784272497,"status":"completed","background":false,"completed_at":1784272499,"model":"gpt-5.6-sol","output":[{"type":"message","id":"msg_355bef4a06ec4d4eb295113fb1514dc8","status":"completed","role":"assistant","content":[{"type":"output_text","text":"Hi! 👋","annotations":[],"logprobs":[]}]}],"parallel_tool_calls":true,"conversation":{"id":"conv_5983bd9dd02543c69b291eafad45505f"},"reasoning":{"effort":null,"summary":null},"service_tier":"default","store":true,"text":{"format":{"type":"text"},"verbosity":"medium"},"tool_choice":"auto","tools":[],"truncation":"disabled","usage":{"input_tokens":8,"input_tokens_details":{"cached_tokens":0},"output_tokens":8,"output_tokens_details":{"reasoning_tokens":0},"total_tokens":16},"metadata":{}},"sequence_number":10}
+
+
+
+===== 样本4: 流式工具调用事件序列 =====
+data: {"type":"response.created","response":{"id":"resp_c5e52dab85fc4958b4252e6456748cad","object":"response","created_at":1784272499,"status":"in_progress","background":false,"model":"gpt-5.6-sol","output":[],"parallel_tool_calls":true,"conversation":{"id":"conv_06b1559c275041cd9f49639029915941"},"reasoning":{"effort":null,"summary":null},"service_tier":"auto","store":true,"text":{"format":{"type":"text"},"verbosity":"medium"},"tool_choice":"auto","tools":[{"type":"function","name":"get_weather","description":"查天气","parameters":{"type":"object","properties":{"city":{"type":"string"}},"required":["city"]},"strict":true}],"truncation":"disabled","metadata":{}},"sequence_number":0}
+
+data: {"type":"response.in_progress","response":{"id":"resp_c5e52dab85fc4958b4252e6456748cad","object":"response","created_at":1784272499,"status":"in_progress","background":false,"model":"gpt-5.6-sol","output":[],"parallel_tool_calls":true,"conversation":{"id":"conv_06b1559c275041cd9f49639029915941"},"reasoning":{"effort":null,"summary":null},"service_tier":"auto","store":true,"text":{"format":{"type":"text"},"verbosity":"medium"},"tool_choice":"auto","tools":[{"type":"function","name":"get_weather","description":"查天气","parameters":{"type":"object","properties":{"city":{"type":"string"}},"required":["city"]},"strict":true}],"truncation":"disabled","metadata":{}},"sequence_number":1}
+
+data: {"type":"response.output_item.added","output_index":0,"item":{"id":"item_d3f90dfd3f664ea8a2fe7e270f2afca7","type":"function_call","status":"in_progress","call_id":"call_a18hmNopzFqkgyNuVOueuSdz","name":"get_weather","arguments":""},"sequence_number":2}
+
+data: {"type":"response.function_call_arguments.delta","item_id":"item_d3f90dfd3f664ea8a2fe7e270f2afca7","output_index":0,"delta":"{\"","sequence_number":3}
+
+data: {"type":"response.function_call_arguments.delta","item_id":"item_d3f90dfd3f664ea8a2fe7e270f2afca7","output_index":0,"delta":"city","sequence_number":4}
+
+data: {"type":"response.function_call_arguments.delta","item_id":"item_d3f90dfd3f664ea8a2fe7e270f2afca7","output_index":0,"delta":"\":\"","sequence_number":5}
+
+data: {"type":"response.function_call_arguments.delta","item_id":"item_d3f90dfd3f664ea8a2fe7e270f2afca7","output_index":0,"delta":"北京","sequence_number":6}
+
+data: {"type":"response.function_call_arguments.delta","item_id":"item_d3f90dfd3f664ea8a2fe7e270f2afca7","output_index":0,"delta":"\"}","sequence_number":7}
+
+data: {"type":"response.function_call_arguments.done","item_id":"item_d3f90dfd3f664ea8a2fe7e270f2afca7","name":"get_weather","output_index":0,"arguments":"{\"city\":\"北京\"}","sequence_number":8}
+
+data: {"type":"response.output_item.done","output_index":0,"item":{"id":"item_d3f90dfd3f664ea8a2fe7e270f2afca7","type":"function_call","status":"completed","call_id":"call_a18hmNopzFqkgyNuVOueuSdz","name":"get_weather","arguments":"{\"city\":\"北京\"}"},"sequence_number":9}
+
+data: {"type":"response.completed","response":{"id":"resp_c5e52dab85fc4958b4252e6456748cad","object":"response","created_at":1784272499,"status":"completed","background":false,"completed_at":1784272501,"model":"gpt-5.6-sol","output":[{"type":"function_call","id":"item_d3f90dfd3f664ea8a2fe7e270f2afca7","status":"completed","call_id":"call_a18hmNopzFqkgyNuVOueuSdz","name":"get_weather","arguments":"{\"city\":\"北京\"}"}],"parallel_tool_calls":true,"conversation":{"id":"conv_06b1559c275041cd9f49639029915941"},"reasoning":{"effort":null,"summary":null},"service_tier":"default","store":true,"text":{"format":{"type":"text"},"verbosity":"medium"},"tool_choice":"auto","tools":[{"type":"function","name":"get_weather","description":"查天气","parameters":{"type":"object","properties":{"city":{"type":"string"}},"required":["city"]},"strict":true}],"truncation":"disabled","usage":{"input_tokens":123,"input_tokens_details":{"cached_tokens":0},"output_tokens":18,"output_tokens_details":{"reasoning_tokens":0},"total_tokens":141},"metadata":{}},"sequence_number":10}
+
