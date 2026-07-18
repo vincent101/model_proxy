@@ -83,6 +83,28 @@ tools/model_proxy/
 - `failover`：`on` 时上游返回 401/403/429/5xx 会把当前 supply 打入冷却并换同档下一个再试；
   `off` 时失败直接返回给客户端，不重试。failover 是 route（家族）级开关，不细分到 tier。
 
+**多档共享同一组真实上游**：不是每个家族都天然有三种不同能力的模型——比如某家族只有
+「强/快」两种真实模型，硬套三档反而要在 `supplies` 里复制冗余条目。这种情况下**多个 tier
+可以直接填同一组 supply id 列表**，不需要引入额外抽象层，`select_supply_list` 按 tier 名取
+列表的逻辑天然支持这种共享，代码不用改。例如 deepseek 家族只有 `pro`/`flash` 两种真实模型，
+`opus` 和 `sonnet` 都打 `pro`，`haiku` 单独打 `flash`：
+
+```json
+{
+  "id": "deepseek",
+  "tiers": {
+    "opus":   ["ds-pro-k1", "ds-pro-k0"],
+    "sonnet": ["ds-pro-k1", "ds-pro-k0"],
+    "haiku":  ["ds-flash-k1", "ds-flash-k0"]
+  },
+  "failover": "on"
+}
+```
+
+供给单元命名建议按**真实能力**取名（如 `ds-pro-k0`/`ds-flash-k0`），不要用 `opus`/`sonnet`
+这类档位词——档位是请求侧的分类，不代表上游真的有对应数量的独立模型，用档位词命名 supply
+容易让人误以为每档必然对应一个独立真实模型。
+
 ### strategies：client_token → route_id 绑定（运行时可切换）
 
 ```json
