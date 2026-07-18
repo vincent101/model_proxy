@@ -247,15 +247,15 @@ cfg = json.load(open(sys.argv[1]))
 for i, r in enumerate(cfg.get('routes', [])):
     match = r.get('match', {})
     token = match.get('client_token', '?')
-    tier = match.get('model_tier') or '(任意)'
+    model = match.get('client_model') or '(任意)'
     supplies = ', '.join(r.get('supplies', []))
     failover = r.get('failover', '?')
-    print(f'  [{i}] client_token={token:16} tier={tier:10} supplies=[{supplies}]  failover={failover}')
+    print(f'  [{i}] client_token={token:16} model={model:10} supplies=[{supplies}]  failover={failover}')
 " "$CONFIG_FILE"
       ;;
     add)
       echo -n "Client token (客户端 Authorization Bearer): "; read -r rtoken
-      echo -n "Model tier [opus/sonnet/haiku/default, 留空=任意]: "; read -r rtier
+      echo -n "匹配 model 字符串 (精确匹配请求的 model 字段, 如 claude-sonnet; 留空=匹配任意 model): "; read -r rtier
       echo -n "Supplies (空格分隔, 按优先级排序, 需为已存在 supply id): "; read -r rsupplies_raw
       echo -n "Failover [on/off]: "; read -r rfailover
       python3 -c "
@@ -266,8 +266,6 @@ rtoken = rtoken.strip()
 if not rtoken:
     print('Error: client_token 不能为空', file=sys.stderr); sys.exit(1)
 rtier = rtier.strip()
-if rtier and rtier not in ('opus', 'sonnet', 'haiku', 'default'):
-    print(f'Error: model_tier 非法: {rtier!r}（须为 opus/sonnet/haiku/default 或留空）', file=sys.stderr); sys.exit(1)
 if rfailover not in ('on', 'off'):
     print(f'Error: failover 非法: {rfailover!r}（须为 on/off）', file=sys.stderr); sys.exit(1)
 supplies = rsupplies_raw.split()
@@ -280,7 +278,7 @@ if bad:
     print(f'Error: 以下 supply id 不存在: {bad}', file=sys.stderr); sys.exit(1)
 match = {'client_token': rtoken}
 if rtier:
-    match['model_tier'] = rtier
+    match['client_model'] = rtier
 cfg.setdefault('routes', []).append({
     'match': match,
     'supplies': supplies,
@@ -296,6 +294,7 @@ except Exception:
     os.unlink(tmp); raise
 print(f'Added route: client_token={rtoken} supplies={supplies}')
 " "$rtoken" "$rtier" "$rsupplies_raw" "$rfailover" "$CONFIG_FILE" || return 1
+      echo "提示: 若此 token 已有留空(通配)的 route，精确 route 需要排在它前面，否则会被通配抢先命中，请检查 route list 顺序或手动调整 config.json 中 routes 数组顺序"
       reload_proxy
       ;;
     *)
@@ -328,9 +327,9 @@ print('可用的 client_token（来自 routes）:', file=sys.stderr)
 for i, r in enumerate(routes):
     m = r.get('match', {})
     tok = m.get('client_token', '?')
-    tier = m.get('model_tier') or '任意'
+    model = m.get('client_model') or '任意'
     supplies = ', '.join(r.get('supplies', []))
-    print(f'  [{i}] {tok:16} (tier={tier}, supplies=[{supplies}])', file=sys.stderr)
+    print(f'  [{i}] {tok:16} (model={model}, supplies=[{supplies}])', file=sys.stderr)
     print(tok)
 " "$CONFIG_FILE")
   local rc=$?

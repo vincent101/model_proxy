@@ -58,11 +58,11 @@ tools/model_proxy/
 - `cooldown_seconds`（可选）：该 supply 触发失败后的冷却时长，不填则用顶层
   `default_cooldown_seconds`。
 
-### routes：客户端 token + 模型档位 → 一组按优先级排列的 supplies
+### routes：客户端 token + 请求 model → 一组按优先级排列的 supplies
 
 ```json
 {
-  "match": {"client_token": "cc-token-1", "model_tier": "sonnet"},
+  "match": {"client_token": "cc-token-1", "client_model": "claude-sonnet"},
   "supplies": ["gw-claude", "gw-gpt-native"],
   "failover": "on"
 }
@@ -70,8 +70,10 @@ tools/model_proxy/
 
 - `match.client_token`：客户端请求 `Authorization: Bearer <token>` 里的 token，model_proxy
   据此识别是哪个客户端/哪套路由规则。
-- `match.model_tier`（可选）：按请求 model 名粗粒度分档（`opus`/`sonnet`/`haiku`/`default`），
-  省略则该 route 匹配任意档位。
+- `match.client_model`（可选）：精确匹配（`==`）请求体的 model 字段（客户端原始发送值，
+  非子串/非分档）。省略该字段表示该 route 匹配该 token 下的任意 model（通配兜底）。
+  由于 route 按数组顺序遍历、返回首个命中，通配 route 必须排在同一 token 下的精确
+  route 之后，否则通配会抢先命中导致精确 route 永远匹配不到。
 - `supplies`：按顺序尝试的 supply id 列表，取第一个「未冷却」的。
 - `failover`：`on` 时上游返回 401/403/429/5xx 会把当前 supply 打入冷却并换下一个再试；
   `off` 时失败直接返回给客户端，不重试。

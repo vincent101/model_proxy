@@ -355,25 +355,8 @@ def detect_source(path: str, body: dict | None) -> str:
     return "unknown"
 
 
-def resolve_model_tier(model: str | None) -> str:
-    """model → tier（粗粒度，能区分 route 即可）。
-
-    含 opus → opus，含 sonnet → sonnet，含 haiku → haiku，其余 → default。
-    """
-    if not model:
-        return "default"
-    m = model.lower()
-    if "opus" in m:
-        return "opus"
-    if "sonnet" in m:
-        return "sonnet"
-    if "haiku" in m:
-        return "haiku"
-    return "default"
-
-
-def match_route(routes: list, client_token: str, model_tier: str) -> dict | None:
-    """匹配 route：client_token 相等 且 (match 无 model_tier 或 tier 命中)。
+def match_route(routes: list, client_token: str, model: str | None) -> dict | None:
+    """匹配 route：client_token 相等 且 (match 无 client_model 或 model 精确命中)。
 
     有序遍历 routes，返回第一个命中的 route。
     """
@@ -381,8 +364,8 @@ def match_route(routes: list, client_token: str, model_tier: str) -> dict | None
         match = route.get("match", {})
         if match.get("client_token", "") != client_token:
             continue
-        want_tier = match.get("model_tier")
-        if want_tier is None or want_tier == model_tier:
+        want_model = match.get("client_model")
+        if want_model is None or want_model == model:
             return route
     return None
 
@@ -571,12 +554,11 @@ class ModelProxyHandler(BaseHTTPRequestHandler):
         source = detect_source(self.path, body_json)
 
         # 5. 匹配 route
-        model_tier = resolve_model_tier(request_model)
         routes = cs.get_routes()
-        route = match_route(routes, token, model_tier)
+        route = match_route(routes, token, request_model)
         if route is None:
-            log.warning("no route matched: token_tail4=%s tier=%s source=%s",
-                        token[-4:] if token else "", model_tier, source)
+            log.warning("no route matched: token_tail4=%s model=%s source=%s",
+                        token[-4:] if token else "", request_model, source)
             self._write_buffered_response(
                 401, [], error_body_for_source(source, 401, "no route matched"))
             return

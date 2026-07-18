@@ -79,6 +79,9 @@ class ConfigStore:
     def get_default_cooldown(self) -> int: ...       # config.get("default_cooldown_seconds", 300)
 ```
 
+> ⚠️ 已于本次重构废弃 tier 分档设计，改为 client_model 精确匹配，详见 README.md。
+> 以下 `model_tier` 相关描述为历史设计原文，保留不改，实际字段名与语义以 README.md 为准。
+
 **新配置 schema**（一次性新写，无旧配置降解兼容）：
 
 ```json
