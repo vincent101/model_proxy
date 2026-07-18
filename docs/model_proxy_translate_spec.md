@@ -208,39 +208,46 @@ else:
 
 ### 1.4 thinking + output_config.effort → reasoning_effort
 
-**网关事实** `[网关实测]`：`reasoning_effort` 仅 `low`/`medium`/`high` 三档，**无 `max`/`xhigh`**。
+**网关事实** `[网关实测 2026-07-18]`：`reasoning_effort` 实际支持 `none`/`low`/`medium`/`high`/`xhigh` **五档**，`minimal` 不支持（返回 400）。证据来源：curl 实测网关报错消息直接列出支持列表 `none / low / medium / high / xhigh`，且 `xhigh`、`none` 均实测 200 正常。另实测 `none` 与不发字段有实质差异——不发字段 `reasoning_tokens:21`（网关默认档仍思考），发 `none` 则 `reasoning_tokens:0`（彻底关闭）。
 
-Anthropic 侧 Claude Code 发出的两种形态：
-- 形态1：`thinking:{type:"adaptive"}` + `output_config:{effort: "low"|"medium"|"high"|"max"|"xhigh"}`
+Anthropic 侧 Claude Code 发出的形态：
+- 形态1：`thinking:{type:"adaptive"}` + `output_config:{effort: "low"|"medium"|"high"|"xhigh"|"max"}`
 - 形态2：`thinking:{type:"enabled", budget_tokens: N}`
+- 形态3：`thinking:{type:"disabled"}`（显式关闭思考）
 
-**映射规则（设计推断，参考 LiteLLM 的 budget→effort 分档）**：
+**触发条件**：只有 `thinking.type ∈ {enabled, adaptive, disabled}` 才产出非 None 值。裸 `output_config.effort`（无 `thinking.type`）视为未生效意图，返回 None（不塞字段）。
+
+**映射规则**：
 
 | Anthropic 输入 | reasoning_effort | 说明 |
 |---|---|---|
-| `output_config.effort = "low"` | `low` | |
-| `output_config.effort = "medium"` | `medium` | |
-| `output_config.effort = "high"` | `high` | |
-| `output_config.effort = "max"` | `high` | **降级**：网关无 max，取最高档 high |
-| `output_config.effort = "xhigh"` | `high` | **降级**：同上 |
-| `thinking.type = "enabled"`, `budget_tokens < 2000` | `low` | LiteLLM 分档：`<2000→low` |
-| `thinking.type = "enabled"`, `2000 ≤ budget < 32000` | `medium` | `[LiteLLM]` 分档 |
-| `thinking.type = "enabled"`, `budget ≥ 32000` | `high` | `[LiteLLM]` 分档 |
-| `thinking` 缺失/为 None 且无 `output_config.effort` | 不设 `reasoning_effort` | 非 reasoning 请求 |
+| `thinking.type = "disabled"` | `none` | 显式关闭思考，塞 `none` 才能让网关 `reasoning_tokens` 清零 |
+| `adaptive` + `effort ∈ {low,medium,high,xhigh}` | 同值 | 直传（`xhigh` 不再降级） |
+| `adaptive` + `effort = "max"` | `xhigh` | **降级**：Anthropic 最强档 max 映射到网关最强档 xhigh |
+| `adaptive` 无有效 effort | `medium` | 默认中档 |
+| `thinking.type = "enabled"`, `budget < 2000` | `low` | 4档3断点 |
+| `thinking.type = "enabled"`, `2000 ≤ budget < 8000` | `medium` | |
+| `thinking.type = "enabled"`, `8000 ≤ budget < 32000` | `high` | |
+| `thinking.type = "enabled"`, `budget ≥ 32000` | `xhigh` | |
+| 裸 `output_config.effort`（无 thinking.type）/ thinking 缺失 | 不设 `reasoning_effort` | 未生效意图 |
 
 ```
 def map_reasoning_effort(body) -> str | None:
+    thinking = body.get("thinking") or {}
+    ttype = thinking.get("type")
     oc = body.get("output_config") or {}
     effort = oc.get("effort")
-    if effort in ("low","medium","high"):  return effort
-    if effort in ("max","xhigh"):          return "high"   # 降级
-    thinking = body.get("thinking") or {}
-    if thinking.get("type") == "enabled":
-        b = thinking.get("budget_tokens", 10000)
-        return "low" if b < 2000 else ("high" if b >= 32000 else "medium")
-    if thinking.get("type") == "adaptive" and not effort:
-        return "medium"   # 设计推断：adaptive 无 effort 时给中档
-    return None
+    if ttype == "disabled":                 return "none"
+    if ttype not in ("enabled", "adaptive"): return None
+    if ttype == "adaptive":
+        if effort in ("low","medium","high","xhigh"): return effort
+        if effort == "max":                            return "xhigh"  # 降级
+        return "medium"
+    b = thinking.get("budget_tokens", 10000)   # ttype == "enabled"
+    if b < 2000:   return "low"
+    if b < 8000:   return "medium"
+    if b < 32000:  return "high"
+    return "xhigh"
 ```
 > 只有目标 model 是 reasoning 模型时才发 `reasoning_effort`（非 reasoning 模型带此参数可能 400）。是否 reasoning 由 proxy 配置/model 名判断 `[设计推断]`。
 
@@ -707,7 +714,7 @@ native 端点返回 4xx/5xx（OpenAI error 格式 `{error:{message,type,code}}`�
 | Anthropic 托管工具（web_search/computer 等） | 跳过或原样丢弃 | native 端点不支持 |
 | tool_result 含图片 | 降级为占位文本或数组序列化 | role:tool 图片支持未实测 |
 | `content_filter_results` | 丢弃 + 记 log | Anthropic 无对应字段 |
-| `max`/`xhigh` effort | 降级为 `high` | 网关只有 low/medium/high |
+| `max` effort | 降级为 `xhigh` | 网关支持 none/low/medium/high/xhigh 五档；`xhigh` 直传不降级，仅 Anthropic 独有的 `max` 降到 `xhigh` |
 | `stop_sequence`（响应里命中哪个序列） | 固定 null | 网关未返回 |
 | 多个 `choices`（n>1） | 只取 `choices[0]` | Anthropic 单响应模型 |
 
@@ -782,7 +789,7 @@ def sse_event_bytes(data: dict) -> bytes: ...
 - `[LiteLLM]` transformation.py：`translate_anthropic_to_openai`、`translate_anthropic_messages_to_openai`、`translate_anthropic_tools_to_openai`、`truncate_tool_name`（SHA256 前8位、`name[:55]+"_"+hash`）、`translate_anthropic_tool_choice_to_openai`（any→required）、`translate_openai_response_to_anthropic`、`_translate_openai_finish_reason_to_anthropic`、`_translate_openai_usage_to_anthropic_usage`、`_add_system_message_to_messages`、`_translate_anthropic_image_to_openai`。
 - `[LiteLLM]` streaming_iterator.py：`AnthropicStreamWrapper` 状态机（`sent_first_chunk`/`sent_content_block_start`/`sent_content_block_finish`/`current_content_block_index`/`current_content_block_type`/`holding_chunk`/`holding_stop_reason_chunk` 等 flag）、message_start 骨架与初始 usage 全 0、tool_use 块切换与 input_json_delta 原样透传、并发工具靠新 name 触发新块、`message_delta` 合并 usure、`message_stop` 收尾。
 - `[Anthropic]` Messages API 流式规范：事件序列 message_start→content_block_start→content_block_delta→content_block_stop→message_delta→message_stop（可穿插 ping）、各事件 JSON keys、wire format `event:\ndata:\n\n`。
-- `[网关实测]`（任务给定，直接采信）：native 非流式/流式返回结构、reasoning_effort 三档、Bearer appkey、content_filter_results。
+- `[网关实测]`（任务给定，直接采信）：native 非流式/流式返回结构、Bearer appkey、content_filter_results。reasoning_effort 五档（none/low/medium/high/xhigh，minimal 400）见 §1.4（2026-07-18 curl 实测报错消息列出支持列表）。
 - 现有 `tools/proxy.py`：`_forward`、`_write_streaming_response`（chunked）、`_apply_thinking_fmt`、model_map，作为接入点与代码风格参考。
 
 ---

@@ -121,7 +121,7 @@ def _apply_thinking_fmt(body: dict, fmt: str) -> dict:
         # enabled+budget → adaptive+effort
         if current == "enabled":
             budget = thinking.get("budget_tokens", 10000)
-            effort = "low" if budget < 2000 else "high" if budget >= 32000 else "medium"
+            effort = "low" if budget < 2000 else "medium" if budget < 8000 else "high" if budget < 32000 else "xhigh"
             body["thinking"] = {"type": "adaptive"}
             body.setdefault("output_config", {})["effort"] = effort
     elif fmt == "enabled":
@@ -129,7 +129,7 @@ def _apply_thinking_fmt(body: dict, fmt: str) -> dict:
         # （haiku 等模型不接受 output_config.effort，即使 thinking 为 None 也要清）
         if current == "adaptive":
             effort = body.get("output_config", {}).get("effort", "medium")
-            budget = {"low": 2000, "medium": 10000, "high": 40000}.get(effort, 10000)
+            budget = {"low": 2000, "medium": 8000, "high": 32000, "xhigh": 64000, "max": 128000}.get(effort, 10000)
             body["thinking"] = {"type": "enabled", "budget_tokens": budget}
         # 无论 thinking 形态如何，只要目标是 enabled 就移除 output_config
         # （游离的 output_config.effort 是 haiku 报错主因）

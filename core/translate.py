@@ -147,25 +147,37 @@ def truncate_tool_name(name: str) -> str:
 # ============================================================
 
 def map_reasoning_effort(body: dict):
-    """thinking + output_config.effort → reasoning_effort（low/medium/high 或 None）。"""
-    oc = body.get("output_config") or {}
-    effort = oc.get("effort")
-    if effort in ("low", "medium", "high"):
-        return effort
-    if effort in ("max", "xhigh"):
-        return "high"  # 网关无 max/xhigh，降级为 high
+    """thinking + output_config.effort → reasoning_effort（none/low/medium/high/xhigh 或 None）。
+
+    触发条件：只有 thinking.type ∈ {enabled, adaptive} 才产出非None值（含 disabled 显式关闭）。
+    裸 output_config.effort（无 thinking.type）视为未生效意图，返回 None（不塞字段）。
+    """
     thinking = body.get("thinking") or {}
     ttype = thinking.get("type")
-    if ttype == "enabled":
-        b = thinking.get("budget_tokens", 10000)
-        if b < 2000:
-            return "low"
-        if b >= 32000:
-            return "high"
+    oc = body.get("output_config") or {}
+    effort = oc.get("effort")
+
+    if ttype == "disabled":
+        return "none"  # 显式关闭思考，网关侧需要真的塞 reasoning_effort=none 才能让reasoning_tokens清零
+    if ttype not in ("enabled", "adaptive"):
+        return None  # thinking缺失/其他值 → 不产出（含裸output_config.effort场景）
+
+    if ttype == "adaptive":
+        if effort in ("low", "medium", "high", "xhigh"):
+            return effort
+        if effort == "max":
+            return "xhigh"  # Anthropic最强档降级到网关最强档
+        return "medium"  # adaptive无有效effort → 默认中档
+
+    # ttype == "enabled"：budget_tokens 分档（4档3断点，几何序，保留原2000/32000锚点）
+    b = thinking.get("budget_tokens", 10000)
+    if b < 2000:
+        return "low"
+    if b < 8000:
         return "medium"
-    if ttype == "adaptive" and not effort:
-        return "medium"  # adaptive 无 effort 时给中档
-    return None
+    if b < 32000:
+        return "high"
+    return "xhigh"
 
 
 # ============================================================
