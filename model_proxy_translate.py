@@ -1,4 +1,4 @@
-"""proxy_v2 正向协议转换器：Anthropic /v1/messages → OpenAI Chat Completions。
+"""model_proxy 正向协议转换器：Anthropic /v1/messages → OpenAI Chat Completions。
 
 严格照 tools/model_proxy/docs/proxy_translate_spec.md（正向规格）实现，字段映射不得自创。
 纯标准库（json / hashlib / secrets），无网络 IO，可脱离 HTTP 单测。
@@ -438,6 +438,11 @@ def openai_to_anthropic_response(resp: dict, ctx: dict = None) -> dict:
     stop_reason = map_finish_reason(choice.get("finish_reason"))
 
     # usage 映射
+    if not resp.get("usage"):
+        logger.warning(
+            "upstream chat completion response missing usage field, "
+            "anthropic usage will be all-zero"
+        )
     u = resp.get("usage") or {}
     anthropic_usage = {
         "input_tokens": u.get("prompt_tokens", 0),
@@ -560,18 +565,31 @@ class AnthropicStreamAdapter:
         return {"type": "content_block_stop", "index": index}
 
     def _message_delta_event(self) -> dict:
+        usage = {"output_tokens": self.output_tokens}
+        if self.input_tokens > 0:
+            usage["input_tokens"] = self.input_tokens
         return {
             "type": "message_delta",
             "delta": {
                 "stop_reason": self.final_stop_reason or "end_turn",
                 "stop_sequence": None,
             },
-            "usage": {"output_tokens": self.output_tokens},
+            "usage": usage,
         }
 
     @staticmethod
     def _message_stop_event() -> dict:
         return {"type": "message_stop"}
+
+    # ---- usage 吸收（统一入口） ----
+
+    def _absorb_usage(self, usage: dict) -> None:
+        if not usage:
+            return
+        if usage.get("prompt_tokens"):
+            self.input_tokens = usage.get("prompt_tokens", 0)
+        if usage.get("completion_tokens") is not None:
+            self.output_tokens = usage.get("completion_tokens", self.output_tokens)
 
     # ---- 核心：feed（§3.4） ----
 
@@ -583,8 +601,7 @@ class AnthropicStreamAdapter:
         if not self.sent_message_start:
             # 若首帧带 usage.prompt_tokens 可回填 input_tokens
             usage0 = openai_chunk.get("usage") or {}
-            if usage0.get("prompt_tokens"):
-                self.input_tokens = usage0.get("prompt_tokens", 0)
+            self._absorb_usage(usage0)
             events.append(self._message_start_event())
             self.sent_message_start = True
             events.append(self._ping_event())
@@ -594,9 +611,7 @@ class AnthropicStreamAdapter:
 
         # (A) 末尾只含 usage 的 chunk（choices 为空）
         if choice is None:
-            usage = openai_chunk.get("usage")
-            if usage:
-                self.output_tokens = usage.get("completion_tokens", self.output_tokens)
+            self._absorb_usage(openai_chunk.get("usage"))
             return events
 
         delta = choice.get("delta") or {}
@@ -622,9 +637,7 @@ class AnthropicStreamAdapter:
             self.final_stop_reason = map_finish_reason(finish)
 
         # (E) 本 chunk 内带 usage
-        usage = openai_chunk.get("usage")
-        if usage:
-            self.output_tokens = usage.get("completion_tokens", self.output_tokens)
+        self._absorb_usage(openai_chunk.get("usage"))
 
         return events
 

@@ -1,4 +1,4 @@
-# model_proxy（proxy_v2）
+# model_proxy
 
 ## 这是什么
 
@@ -7,7 +7,7 @@
 在 Claude Code 里实际调用 GPT，在 codex 里实际调用 Claude。
 
 与 v1（`tools/proxy.py`）的关系：v1 是纯 Anthropic 生态的 appkey/profile 轮转代理，服务
-Claude Code 单一协议，在端口 **18888** 生产运行。v2（本目录 `proxy_v2.py`）是新一代多协议
+Claude Code 单一协议，在端口 **18888** 生产运行。v2（本目录 `model_proxy.py`）是新一代多协议
 代理，支持协议互转，在端口 **18889**（默认，可配）**实验性**运行。两者当前完全独立并行，
 互不依赖、互不干扰，可同时保留。
 
@@ -15,15 +15,15 @@ Claude Code 单一协议，在端口 **18888** 生产运行。v2（本目录 `pr
 
 ```
 tools/model_proxy/
-├── proxy_v2.py                     # 主程序：HTTP server、路由决策、转发编排、控制 API
-├── proxy_v2_translate.py           # 正向转换器：Anthropic → OpenAI Chat Completions
-├── proxy_v2_translate_reverse.py   # 反向转换器：OpenAI Responses ↔ Anthropic
-├── test_proxy_v2_translate.py      # 正向转换器单测
-├── test_proxy_v2_translate_reverse.py  # 反向转换器单测
-├── proxy_v2_config.example.json    # 配置样例
-├── proxy_v2_status.sh              # 手动控制脚本
+├── model_proxy.py                     # 主程序：HTTP server、路由决策、转发编排、控制 API
+├── model_proxy_translate.py           # 正向转换器：Anthropic → OpenAI Chat Completions
+├── model_proxy_translate_reverse.py   # 反向转换器：OpenAI Responses ↔ Anthropic
+├── test_model_proxy_translate.py      # 正向转换器单测
+├── test_model_proxy_translate_reverse.py  # 反向转换器单测
+├── model_proxy_config.example.json    # 配置样例
+├── model_proxy_cli.sh              # 手动控制脚本
 ├── docs/                           # 规格/蓝图文档
-│   ├── proxy_v2_buildplan.md           # 施工蓝图（模块划分、实施顺序、风险点）
+│   ├── model_proxy_buildplan.md           # 施工蓝图（模块划分、实施顺序、风险点）
 │   ├── proxy_translate_spec.md         # 正向协议转换规格（Anthropic↔Chat）
 │   └── proxy_translate_spec_reverse.md # 反向协议转换规格（Responses↔Anthropic）
 └── samples/                        # 实测样本（网关真实响应，供规格核对字段用）
@@ -33,8 +33,8 @@ tools/model_proxy/
 
 ## 配置怎么写
 
-配置文件路径固定为 `~/.claude/proxy_v2_config.json`（不随代码迁移，本目录只提供
-`proxy_v2_config.example.json` 作为样例，不含真实凭证）。核心是两段式结构：**supplies**（供给单元）+ **routes**（客户端路由规则）。
+配置文件路径固定为 `~/.claude/model_proxy_config.json`（不随代码迁移，本目录只提供
+`model_proxy_config.example.json` 作为样例，不含真实凭证）。核心是两段式结构：**supplies**（供给单元）+ **routes**（客户端路由规则）。
 
 ### supplies：一个供给单元 = 一个上游端点
 
@@ -68,7 +68,7 @@ tools/model_proxy/
 }
 ```
 
-- `match.client_token`：客户端请求 `Authorization: Bearer <token>` 里的 token，proxy_v2
+- `match.client_token`：客户端请求 `Authorization: Bearer <token>` 里的 token，model_proxy
   据此识别是哪个客户端/哪套路由规则。
 - `match.model_tier`（可选）：按请求 model 名粗粒度分档（`opus`/`sonnet`/`haiku`/`default`），
   省略则该 route 匹配任意档位。
@@ -77,39 +77,48 @@ tools/model_proxy/
   `off` 时失败直接返回给客户端，不重试。
 
 顶层还有 `admin_token`（控制 API 鉴权）和 `default_cooldown_seconds`（默认冷却时长）。
-完整样例见 `proxy_v2_config.example.json`。
+完整样例见 `model_proxy_config.example.json`。
 
 ## 怎么启动
 
 手动启动（不随 Claude Code 会话自动拉起，这点和 v1 不同）：
 
 ```bash
-PROXY_V2_PORT=18889 python3 tools/model_proxy/proxy_v2.py &
+MODEL_PROXY_PORT=18889 python3 tools/model_proxy/model_proxy.py &
 ```
 
-端口默认 18889，可用 `PROXY_V2_PORT` 环境变量覆盖。日志写到本目录
-`.claude_proxy_v2.log`（启动时自动截断保留最后 1000 行），进程锁在
-`/tmp/claude_proxy_v2.lock`（防止同一时刻起多个实例）。
+端口默认 18889，可用 `MODEL_PROXY_PORT` 环境变量覆盖。日志写到本目录
+`.claude_model_proxy.log`（启动时自动截断保留最后 1000 行），进程锁在
+`/tmp/claude_model_proxy.lock`（防止同一时刻起多个实例）。
 
 **当前不接 SessionStart hook**：v2 还未经真实流量充分验证，不会像 v1 那样在每次
 Claude Code 会话启动时自动拉起，需要手动管理生命周期。
 
 ## 怎么控制
 
-用 `tools/model_proxy/proxy_v2_status.sh`（先 `chmod +x`，已在仓库里可直接执行）：
+用 `tools/model_proxy/model_proxy_cli.sh`（先 `chmod +x`，已在仓库里可直接执行）：
 
 ```bash
-tools/model_proxy/proxy_v2_status.sh status              # 查看运行状态 + supplies/routes/cooldown
-tools/model_proxy/proxy_v2_status.sh reload               # 触发配置热重载
-tools/model_proxy/proxy_v2_status.sh clear-cooldown <id>  # 手动清除某 supply 的冷却（幂等）
-tools/model_proxy/proxy_v2_status.sh on                   # 启动（已在监听则跳过）
-tools/model_proxy/proxy_v2_status.sh off                  # 停止
+tools/model_proxy/model_proxy_cli.sh status               # 查看运行状态 + supplies/routes/cooldown
+tools/model_proxy/model_proxy_cli.sh reload               # 触发配置热重载
+tools/model_proxy/model_proxy_cli.sh clear-cooldown <id>  # 手动清除某 supply 的冷却（幂等）
+tools/model_proxy/model_proxy_cli.sh supply list          # 列出所有 supply
+tools/model_proxy/model_proxy_cli.sh supply add           # 交互式新增 supply
+tools/model_proxy/model_proxy_cli.sh supply rotate-appkey <id> <key>  # 替换 appkey 并解冷
+tools/model_proxy/model_proxy_cli.sh route list           # 列出所有 route
+tools/model_proxy/model_proxy_cli.sh route add            # 交互式新增 route
+tools/model_proxy/model_proxy_cli.sh migrate              # 选一条 route 写入 settings.json
+tools/model_proxy/model_proxy_cli.sh on                   # 启动（已在监听则跳过）
+tools/model_proxy/model_proxy_cli.sh off                  # 停止
 ```
 
-- 端口默认 18889，同样支持 `PROXY_V2_PORT` 环境变量覆盖。
-- `admin_token` 从 `~/.claude/proxy_v2_config.json` 读取，用于控制 API 的
+- `supply`/`route` 子命令支持交互式增改配置（原子写盘后自动 reload），`migrate` 可从
+  已有 routes 里选一个 client_token 写入 `~/.claude/settings.json`。详细用法见 `--help`。
+
+- 端口默认 18889，同样支持 `MODEL_PROXY_PORT` 环境变量覆盖。
+- `admin_token` 从 `~/.claude/model_proxy_config.json` 读取，用于控制 API 的
   `X-Proxy-Admin-Token` 鉴权头。
-- `off` 只按本脚本同目录下 `proxy_v2.py` 的绝对路径精确匹配进程，不会影响 v1 的
+- `off` 只按本脚本同目录下 `model_proxy.py` 的绝对路径精确匹配进程，不会影响 v1 的
   `tools/proxy.py`（18888 生产进程）——两者进程 fingerprint 完全不同，已实测验证隔离。
 
 ## v1 ↔ v2 怎么切换/回退
@@ -132,8 +141,8 @@ tools/model_proxy/proxy_v2_status.sh off                  # 停止
 - 四种协议组合的转发/转换：
   1. anthropic → anthropic（PASSTHROUGH，字节透传 + thinking 方言适配）
   2. responses → responses（PASSTHROUGH，字节透传）
-  3. anthropic → chat（FORWARD，经 `proxy_v2_translate` 转换）
-  4. responses → anthropic（REVERSE，经 `proxy_v2_translate_reverse` 转换）
+  3. anthropic → chat（FORWARD，经 `model_proxy_translate` 转换）
+  4. responses → anthropic（REVERSE，经 `model_proxy_translate_reverse` 转换）
 - cross-supply failover：上游 401/403/429/5xx 触发对应 supply 冷却并按 route 顺序切换到下一个
   supply（不限协议，跨供给单元）。
 - thinking 方言适配（仅组合1）：识别网关对 `thinking.type` 的 400 拒绝，缓存并转换为对方接受
@@ -144,7 +153,7 @@ tools/model_proxy/proxy_v2_status.sh off                  # 停止
 已知限制：
 - 没有自动重启/自愈 hook，进程崩溃不会自动拉起，需要手动 `on`。
 - **配置支持热重载，不需要重启进程**：`ConfigStore` 用 mtime 比对（每次请求经过
-  `_forward` 都会 `maybe_reload()`），也可用 `proxy_v2_status.sh reload` 主动触发一次强制
+  `_forward` 都会 `maybe_reload()`），也可用 `model_proxy_cli.sh reload` 主动触发一次强制
   重载（`ConfigStore.reload()`）。若配置文件解析失败（JSON 非法等），会保留旧配置并记录
   warning 日志，不会导致进程崩溃或配置被清空。
 - 未接入自动化测试覆盖真实上游网络调用（转换器单测均为脱网络单测，`_forward` 转发编排本身

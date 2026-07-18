@@ -1,4 +1,4 @@
-"""proxy_v2_translate 正向转换器单测（脱网络，纯标准库 unittest）。
+"""model_proxy_translate 正向转换器单测（脱网络，纯标准库 unittest）。
 
 照正向规格 tools/model_proxy/docs/proxy_translate_spec.md §6.4 的用例：
     - 模块A 请求转换：string/array system、tool_use、tool_result、各 effort、工具名>64 截断
@@ -6,7 +6,7 @@
     - 模块C+D 流式：1 纯文本 / 2 单工具 / 3 双工具并发 / 4 arguments 断裂 / 5 缺 usage
       额外：text+tool 混合、SSE wire format、辅助函数
 
-运行：python3 tools/test_proxy_v2_translate.py
+运行：python3 tools/model_proxy/test_model_proxy_translate.py
 """
 
 import json
@@ -16,7 +16,7 @@ import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from proxy_v2_translate import (  # noqa: E402
+from model_proxy_translate import (  # noqa: E402
     AnthropicStreamAdapter,
     anthropic_image_to_data_url,
     anthropic_sse_bytes,
@@ -608,6 +608,34 @@ class TestStreamMixed(unittest.TestCase):
         ad = AnthropicStreamAdapter({}, "m")
         events = collect(ad, chunks)
         self.assertEqual(events[0]["message"]["usage"]["input_tokens"], 42)
+
+
+class TestStreamUsageFix(unittest.TestCase):
+    """usage 吸收统一逻辑修复回归测试。"""
+
+    def test_tail_chunk_backfills_input_tokens(self):
+        chunks = [
+            {"choices": [{"delta": {"content": "Hi"}, "finish_reason": None}]},
+            {"choices": [{"delta": {}, "finish_reason": "stop"}]},
+            {"choices": [], "usage": {"prompt_tokens": 100, "completion_tokens": 30}},
+        ]
+        ad = AnthropicStreamAdapter({}, "gpt-4o")
+        events = collect(ad, chunks)
+        # 首帧还未读到 usage，抢发时未知，这是预期行为不是 bug
+        self.assertEqual(events[0]["message"]["usage"]["input_tokens"], 0)
+        md = next(e for e in events if e["type"] == "message_delta")
+        self.assertEqual(md["usage"], {"output_tokens": 30, "input_tokens": 100})
+
+    def test_finish_chunk_with_usage_same_frame(self):
+        chunks = [
+            {"choices": [{"delta": {"content": "Hi"}, "finish_reason": "stop"}],
+             "usage": {"prompt_tokens": 50, "completion_tokens": 10}},
+        ]
+        ad = AnthropicStreamAdapter({}, "gpt-4o")
+        events = collect(ad, chunks)
+        md = next(e for e in events if e["type"] == "message_delta")
+        self.assertEqual(md["usage"]["input_tokens"], 50)
+        self.assertEqual(md["usage"]["output_tokens"], 10)
 
 
 if __name__ == "__main__":

@@ -1,4 +1,4 @@
-"""proxy_v2_translate_reverse 单测（脱网络，纯标准库）。
+"""model_proxy_translate_reverse 单测（脱网络，纯标准库）。
 
 覆盖反向规格 §6.4：
   模块 A' 请求转换：input 字符串 / items 混排 / effort 三档 / tools 扁平->input_schema /
@@ -14,7 +14,7 @@
 import json
 import sys
 
-import proxy_v2_translate_reverse as R
+import model_proxy_translate_reverse as R
 
 
 # ---------------------------------------------------------------------------

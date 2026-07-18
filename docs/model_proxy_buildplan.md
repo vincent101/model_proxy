@@ -1,6 +1,6 @@
-# proxy_v2 施工蓝图（总装图）
+# model_proxy 施工蓝图（总装图）
 
-> 用途：把 proxy_v2 "整体怎么搭起来、分几个文件、模块怎么调、先写哪块、每块怎么验证"讲清楚，交给 implementer 照着分模块实现。
+> 用途：把 model_proxy "整体怎么搭起来、分几个文件、模块怎么调、先写哪块、每块怎么验证"讲清楚，交给 implementer 照着分模块实现。
 >
 > **本文不重复协议字段映射细节**——那些查两份规格：
 > - 正向（Anthropic↔Chat Completions）：`tools/model_proxy/proxy_translate_spec.md`（下称"正向规格"）
@@ -12,8 +12,8 @@
 
 ## 0. 硬约束（施工前先钉死）
 
-1. **绝对不碰线上 `tools/proxy.py`**（端口 18888 生产运行中）。proxy_v2 全新独立文件，可**拷贝**其成熟机制到新文件，**不 import 旧文件**。
-2. **新端口 18889**（`PROXY_V2_PORT`，默认 18889）；**新配置** `~/.claude/proxy_v2_config.json`；**新进程锁** `/tmp/claude_proxy_v2.lock`；**新日志** `tools/model_proxy/.claude_proxy_v2.log`。与 18888 完全隔离并行跑。
+1. **绝对不碰线上 `tools/proxy.py`**（端口 18888 生产运行中）。model_proxy 全新独立文件，可**拷贝**其成熟机制到新文件，**不 import 旧文件**。
+2. **新端口 18889**（`MODEL_PROXY_PORT`，默认 18889）；**新配置** `~/.claude/model_proxy_config.json`；**新进程锁** `/tmp/claude_model_proxy.lock`；**新日志** `tools/model_proxy/.claude_model_proxy.log`。与 18888 完全隔离并行跑。
 3. **纯标准库**：`json / hashlib / secrets / urllib / http.server / threading / fcntl / time`。不引第三方。
 4. **验证隔离**：所有 curl 打 `127.0.0.1:18889`，绝不动 18888。切换由用户最后手动完成，本工程只到"18889 可用"为止。
 
@@ -25,26 +25,26 @@
 tools/
 ├── proxy.py                          # 【线上·只读·禁改】仅作参考来源
 └── model_proxy/
-    ├── proxy_v2.py                       # 主文件：基座+配置+cooldown+路由+转发+写回+控制API+main
-    ├── proxy_v2_translate.py             # 正向转换器（模块 A/B/C/D）+ 共享 SSE/工具辅助
-    ├── proxy_v2_translate_reverse.py     # 反向转换器（模块 A'/B'/C'/D'）+ Responses SSE 辅助
-    ├── proxy_v2_config.example.json      # 新 schema 配置样例（供用户填 appkey）
-    ├── test_proxy_v2_translate.py        # 正向转换器单测（脱网络）
-    └── test_proxy_v2_translate_reverse.py# 反向转换器单测（脱网络）
+    ├── model_proxy.py                       # 主文件：基座+配置+cooldown+路由+转发+写回+控制API+main
+    ├── model_proxy_translate.py             # 正向转换器（模块 A/B/C/D）+ 共享 SSE/工具辅助
+    ├── model_proxy_translate_reverse.py     # 反向转换器（模块 A'/B'/C'/D'）+ Responses SSE 辅助
+    ├── model_proxy_config.example.json      # 新 schema 配置样例（供用户填 appkey）
+    ├── test_model_proxy_translate.py        # 正向转换器单测（脱网络）
+    └── test_model_proxy_translate_reverse.py# 反向转换器单测（脱网络）
 ```
 
 **为什么这样切**：
 - 转换器**独立成文件**，纯 dict→dict / 状态机，可脱离 HTTP 单测（两份规格 §6.4 都要求）。正反向分两个文件，各自对齐一份规格，互不 import。
 - 分发/路由/cooldown 是小纯函数 + 内存状态，放主文件 L2 段落，不单独成文件。
-- 主文件只 `import proxy_v2_translate` 和 `proxy_v2_translate_reverse`，反向文件**不** import 正向文件（反向规格里"引用正向规格"是指文档引用，代码里 Anthropic 侧结构各自实现）。
+- 主文件只 `import model_proxy_translate` 和 `model_proxy_translate_reverse`，反向文件**不** import 正向文件（反向规格里"引用正向规格"是指文档引用，代码里 Anthropic 侧结构各自实现）。
 
 **拷贝 vs 新写标注**（详见第 2 节每模块）：
 
 | 来源 | 拷贝改造自 proxy.py | 全新写 |
 |---|---|---|
-| proxy_v2.py | 日志/_trim_log、ConfigStore(mtime热重载骨架)、进程锁、ThreadingHTTPServer骨架、appkey注入、`_write_streaming_response`/`_write_buffered_response`/`_send_json`、剥离query参数、thinking方言适配四函数 | CooldownStore、L2路由全部、`_forward`编排（重写不继承旧大泥球）、`_write_translated_stream`/`_write_responses_stream`、error_body_for_source、控制API内容 |
-| proxy_v2_translate.py | — | 全部 |
-| proxy_v2_translate_reverse.py | — | 全部 |
+| model_proxy.py | 日志/_trim_log、ConfigStore(mtime热重载骨架)、进程锁、ThreadingHTTPServer骨架、appkey注入、`_write_streaming_response`/`_write_buffered_response`/`_send_json`、剥离query参数、thinking方言适配四函数 | CooldownStore、L2路由全部、`_forward`编排（重写不继承旧大泥球）、`_write_translated_stream`/`_write_responses_stream`、error_body_for_source、控制API内容 |
+| model_proxy_translate.py | — | 全部 |
+| model_proxy_translate_reverse.py | — | 全部 |
 
 ---
 
@@ -52,14 +52,14 @@ tools/
 
 > 类型标注仅示意（都是 `dict`/`bytes`/`str`/`list`，标准库）。签名可微调，但**协议字段映射必须照两份规格，不得自创**。
 
-### L0 基座（proxy_v2.py 顶部）—— 拷贝 proxy.py
+### L0 基座（model_proxy.py 顶部）—— 拷贝 proxy.py
 
 ```python
-LOG_FILE = Path(__file__).parent / ".claude_proxy_v2.log"   # 改名
+LOG_FILE = Path(__file__).parent / ".claude_model_proxy.log"   # 改名
 def _trim_log(path, keep=1000) -> None: ...                  # 拷贝
 # logging.basicConfig(...) 拷贝
-_DEFAULT_CONFIG_PATH = Path.home()/".claude"/"proxy_v2_config.json"  # 改名
-_LOCK_FILE = Path("/tmp/claude_proxy_v2.lock")              # 改名
+_DEFAULT_CONFIG_PATH = Path.home()/".claude"/"model_proxy_config.json"  # 改名
+_LOCK_FILE = Path("/tmp/claude_model_proxy.lock")              # 改名
 ```
 
 ### L1 配置：ConfigStore —— 拷贝骨架 + 换 getter
@@ -172,13 +172,13 @@ def pick_translator(source: str, target: str) -> str: ...
 |---|---|---|---|---|
 | 1 | anthropic（claudecode /v1/messages） | anthropic | PASSTHROUGH | 无（字节透传）+ thinking 方言适配 |
 | 2 | responses（codex /v1/responses） | responses | PASSTHROUGH | 无（字节透传） |
-| 3 | anthropic | chat | FORWARD | proxy_v2_translate（A/B/C/D） |
-| 4 | responses | anthropic | REVERSE | proxy_v2_translate_reverse（A'/B'/C'/D'） |
+| 3 | anthropic | chat | FORWARD | model_proxy_translate（A/B/C/D） |
+| 4 | responses | anthropic | REVERSE | model_proxy_translate_reverse（A'/B'/C'/D'） |
 | 其余 | — | — | UNSUPPORTED | 返回 source 协议合法 error |
 
 ### L3 转换分发 —— 在 `_forward` 里按 mode 分支调对应转换器（见 L4）
 
-### L4 转发核心 + 写回（proxy_v2.py）
+### L4 转发核心 + 写回（model_proxy.py）
 
 `_forward` 编排（全新重写，不继承旧 `_forward` 大泥球）：
 
@@ -250,12 +250,12 @@ def error_body_for_source(source: str, http_status: int, message: str) -> bytes:
 ### 控制 API + 进程锁 + HTTP server 骨架 —— 拷贝骨架 + 换内容
 
 ```python
-_CONTROL_PATH_PREFIX = "/proxy_v2"     # 改前缀，避免与 18888 的 /proxy 混淆
+_CONTROL_PATH_PREFIX = "/model_proxy"     # 改前缀，避免与 18888 的 /proxy 混淆
 # 拷贝：do_GET/do_POST 分派、_dispatch_control 鉴权（X-Proxy-Admin-Token）、handle_error/log_message
 # 新内容：
-#   GET  /proxy_v2/status         → 回显 supplies/routes + cooldown 剩余秒（cooldown.snapshot()）
-#   POST /proxy_v2/reload         → cs.reload()
-#   POST /proxy_v2/supply/<id>/cooldown/clear → cooldown.clear(id)（手动解冷）
+#   GET  /model_proxy/status         → 回显 supplies/routes + cooldown 剩余秒（cooldown.snapshot()）
+#   POST /model_proxy/reload         → cs.reload()
+#   POST /model_proxy/supply/<id>/cooldown/clear → cooldown.clear(id)（手动解冷）
 # main(): 拷贝进程锁(改锁文件名) + ThreadingHTTPServer(改端口) + 挂 cooldown_store
 ```
 
@@ -266,14 +266,14 @@ _CONTROL_PATH_PREFIX = "/proxy_v2"     # 改前缀，避免与 18888 的 /proxy 
 依赖图：`阶段0 → 阶段1 → {阶段2, 阶段3 可并行} → 阶段4 → 阶段5`
 
 ### 阶段 0：骨架能启动能读配置
-- **做什么**：L0 基座 + ConfigStore（新 schema）+ 进程锁 + 日志 + ThreadingHTTPServer(18889) + 控制 API 骨架（先只实现 `/proxy_v2/status` 回显 supplies/routes）。写 `proxy_v2_config.example.json`。
+- **做什么**：L0 基座 + ConfigStore（新 schema）+ 进程锁 + 日志 + ThreadingHTTPServer(18889) + 控制 API 骨架（先只实现 `/model_proxy/status` 回显 supplies/routes）。写 `model_proxy_config.example.json`。
 - **依赖**：无。
-- **完成标志**：进程能起、能读新配置、`/proxy_v2/status` 返回配置回显。
+- **完成标志**：进程能起、能读新配置、`/model_proxy/status` 返回配置回显。
 - **验证**：
   ```bash
-  cp tools/model_proxy/proxy_v2_config.example.json ~/.claude/proxy_v2_config.json   # 填测试 appkey
-  PROXY_V2_PORT=18889 python3 tools/model_proxy/proxy_v2.py &
-  curl -s -H "X-Proxy-Admin-Token: xxx" http://127.0.0.1:18889/proxy_v2/status | python3 -m json.tool
+  cp tools/model_proxy/model_proxy_config.example.json ~/.claude/model_proxy_config.json   # 填测试 appkey
+  MODEL_PROXY_PORT=18889 python3 tools/model_proxy/model_proxy.py &
+  curl -s -H "X-Proxy-Admin-Token: xxx" http://127.0.0.1:18889/model_proxy/status | python3 -m json.tool
   # 确认 18888 仍在：curl -s http://127.0.0.1:18888/... 不受影响
   ```
 - **工作量**：小（大半拷贝）。**风险**：低。
@@ -296,38 +296,38 @@ _CONTROL_PATH_PREFIX = "/proxy_v2"     # 改前缀，避免与 18888 的 /proxy 
 - **工作量**：中。**风险**：中（failover 循环边界、cooldown 加锁、透传流式与旧一致）。
 
 ### 阶段 2：正向协议转换（组合 3：anthropic→chat）
-- **做什么**：写 `proxy_v2_translate.py`（模块 A/B/C/D + 辅助，**照正向规格 §1–§4、§6**）。写 `test_proxy_v2_translate.py`（正向规格 §6.4 用例）。接入 `_forward` 的 FORWARD 分支：非流式→模块B→buffered 写回；流式→`_write_translated_stream(AnthropicStreamAdapter)`。
+- **做什么**：写 `model_proxy_translate.py`（模块 A/B/C/D + 辅助，**照正向规格 §1–§4、§6**）。写 `test_model_proxy_translate.py`（正向规格 §6.4 用例）。接入 `_forward` 的 FORWARD 分支：非流式→模块B→buffered 写回；流式→`_write_translated_stream(AnthropicStreamAdapter)`。
 - **依赖**：阶段 1（复用路由/转发/写回框架）。
 - **完成标志**：单测全绿；claudecode 发 /v1/messages、命中 protocol=chat 的 supply，能转 Chat Completions 发 native 端点，响应转回 Anthropic；流式 SSE 正常；工具调用（含流式重组）正常。
 - **验证**：
   ```bash
-  python3 tools/model_proxy/test_proxy_v2_translate.py            # 先跑单测（脱网络）
+  python3 tools/model_proxy/test_model_proxy_translate.py            # 先跑单测（脱网络）
   # 非流式：curl /v1/messages（token 命中走 chat 的 route），确认返回合法 Anthropic JSON
   # 流式：加 stream:true + tools，确认 content_block_start/input_json_delta/content_block_stop 序列正确
   ```
 - **工作量**：大（流式状态机 C+D 是已知难点）。**风险**：高（SSE 状态机、工具分片重组）。
 
 ### 阶段 3：反向协议转换（组合 4：responses→anthropic）
-- **做什么**：写 `proxy_v2_translate_reverse.py`（模块 A'/B'/C'/D' + 辅助，**照反向规格 §1–§4、§6**）。写 `test_proxy_v2_translate_reverse.py`（反向规格 §6.4 用例）。接入 `_forward` 的 REVERSE 分支：非流式→B'→buffered 写回；流式→`_write_responses_stream(ResponsesStreamAdapter)`。
+- **做什么**：写 `model_proxy_translate_reverse.py`（模块 A'/B'/C'/D' + 辅助，**照反向规格 §1–§4、§6**）。写 `test_model_proxy_translate_reverse.py`（反向规格 §6.4 用例）。接入 `_forward` 的 REVERSE 分支：非流式→B'→buffered 写回；流式→`_write_responses_stream(ResponsesStreamAdapter)`。
 - **依赖**：阶段 1（与阶段 2 独立，可并行开发）。
 - **完成标志**：单测全绿；codex 发 /v1/responses、命中 protocol=anthropic 的 supply，转 Anthropic 发网关，响应转回 Responses；流式 `sequence_number` 从 0 连续递增、以 `response.completed` 收尾；工具调用正常。
 - **验证**：
   ```bash
-  python3 tools/model_proxy/test_proxy_v2_translate_reverse.py    # 先跑单测
+  python3 tools/model_proxy/test_model_proxy_translate_reverse.py    # 先跑单测
   # 非流式：curl /v1/responses（走 anthropic 上游的 route），确认返回照样本1/3 结构的 Responses JSON
   # 流式：确认 data: 单行、无 event: 行、无 [DONE]、seq 连续
   ```
 - **工作量**：大（input items 重分组 + Responses 流式事件多）。**风险**：高（同阶段2 + 反向 input 分组、reasoning 丢弃）。
 
 ### 阶段 4：加固（错误路径 + 边界降级 + thinking 接入）
-- **做什么**：UNSUPPORTED 组合返回对应 source 的合法 error；上游 4xx/5xx 按 source 包裹（正/反向 §5.2）；流式中途出错发对应 error 事件（正向 §5.1 `event: error` / 反向 §5.1 `response.failed`）；接入 thinking 方言适配到组合1透传路径；落实两份 §5 降级项（cache_control/thinking 块/托管工具/图片 tool_result/max·xhigh effort 等）；控制 API 补 `/proxy_v2/supply/<id>/cooldown/clear`。
+- **做什么**：UNSUPPORTED 组合返回对应 source 的合法 error；上游 4xx/5xx 按 source 包裹（正/反向 §5.2）；流式中途出错发对应 error 事件（正向 §5.1 `event: error` / 反向 §5.1 `response.failed`）；接入 thinking 方言适配到组合1透传路径；落实两份 §5 降级项（cache_control/thinking 块/托管工具/图片 tool_result/max·xhigh effort 等）；控制 API 补 `/model_proxy/supply/<id>/cooldown/clear`。
 - **依赖**：阶段 1/2/3。
 - **完成标志**：任何异常路径都返回合法 error（客户端不挂死）；组合1 thinking 请求走通。
 - **验证**：构造坏 body、UNSUPPORTED 组合（如 responses→chat 的 route）、上游 400、流式中途断——逐一确认返回结构合法。
 - **工作量**：中。**风险**：中。
 
 ### 阶段 5：切换准备与观测（收尾）
-- **做什么**：`/proxy_v2/status` 展示 cooldown 剩余秒；review 日志噪声；写一段"如何把客户端从 18888 切到 18889"的说明（改客户端 base_url，不改 18888）。
+- **做什么**：`/model_proxy/status` 展示 cooldown 剩余秒；review 日志噪声；写一段"如何把客户端从 18888 切到 18889"的说明（改客户端 base_url，不改 18888）。
 - **依赖**：阶段 4。
 - **完成标志**：用户可照说明手动切换，随时可切回 18888。
 - **工作量**：小。**风险**：低。
@@ -340,7 +340,7 @@ _CONTROL_PATH_PREFIX = "/proxy_v2"     # 改前缀，避免与 18888 的 /proxy 
 - **假 appkey supply** 是验证 failover/cooldown 的关键手段：配一个必然 401/403 的 supply 放在 route.supplies 首位，真 key 放次位，验证"首位冷却→failover 到次位成功"。
 - **转换器先脱网络单测再接线**：阶段 2/3 必须先 `python3 test_*.py` 全绿，再接 `_forward`。录制的 chunk/event 序列直接抄两份规格 §6.4 的重点用例编号（正向 5 类流式用例、反向 7 类）。
 - **流式核对**：用 `curl -N`（不缓冲）观察 SSE 逐事件到达；正向核对 Anthropic 事件序列（正向 §3.1），反向核对 `data:` 单行 + seq 连续 + `response.completed` 收尾（反向 §3.1）。
-- **进程互斥**：新锁文件 `/tmp/claude_proxy_v2.lock`，与 18888 的 `/tmp/claude_proxy.lock` 不同名，两进程可同时跑。
+- **进程互斥**：新锁文件 `/tmp/claude_model_proxy.lock`，与 18888 的 `/tmp/claude_proxy.lock` 不同名，两进程可同时跑。
 
 ---
 
@@ -367,8 +367,8 @@ _CONTROL_PATH_PREFIX = "/proxy_v2"     # 改前缀，避免与 18888 的 /proxy 
 
 ## 6. 给 implementer 的交接说明
 
-1. **严禁碰 `tools/proxy.py`**（18888 生产运行）。只读它做参考；所有代码写进 `proxy_v2*.py`。拷贝其机制时是**复制到新文件**，不 import。
-2. **端口/配置/锁/日志全用 v2 命名**（18889 / `proxy_v2_config.json` / `claude_proxy_v2.lock` / `.claude_proxy_v2.log`），确保与 18888 并行不冲突。
+1. **严禁碰 `tools/proxy.py`**（18888 生产运行）。只读它做参考；所有代码写进 `model_proxy*.py`。拷贝其机制时是**复制到新文件**，不 import。
+2. **端口/配置/锁/日志全用 v2 命名**（18889 / `model_proxy_config.json` / `claude_model_proxy.lock` / `.claude_model_proxy.log`），确保与 18888 并行不冲突。
 3. **协议字段映射一律查两份规格**（正向 `proxy_translate_spec.md`、反向 `proxy_translate_spec_reverse.md`），本蓝图第 2 节的签名只是骨架，字段级细节以规格为准。**遇到规格没覆盖的情况，停下问，不要自创映射。**
 4. **按阶段推进，每阶段先跑验证再进下一阶段**。阶段 2/3 的转换器**必须先脱网络单测全绿**（规格 §6.4 用例）再接 `_forward`。别写完一大坨再验证。
 5. **阶段 2 和阶段 3 相互独立**，可并行；但都依赖阶段 1 的路由/转发/写回框架先落地。

@@ -1,11 +1,11 @@
-"""proxy_v2 反向协议转换器：OpenAI Responses API ↔ Anthropic Messages API。
+"""model_proxy 反向协议转换器：OpenAI Responses API ↔ Anthropic Messages API。
 
 对应 tools/model_proxy/docs/proxy_translate_spec_reverse.md 的模块 A' / B' / C'+D'：
 - 模块 A' 请求转换：responses_to_anthropic_request  (Responses body -> Anthropic body)
 - 模块 B' 非流式响应：anthropic_to_responses_response (Anthropic resp -> Responses resp)
 - 模块 C'+D' 流式状态机：ResponsesStreamAdapter (Anthropic SSE 事件 -> Responses SSE 事件)
 
-纯标准库，脱网络，不 import proxy_v2.py 或正向转换器。
+纯标准库，脱网络，不 import model_proxy.py 或正向转换器。
 
 字段映射查反向规格；Responses 侧字段结构查 tools/model_proxy/samples/responses_api_samples.txt；
 Anthropic 流式格式查 tools/model_proxy/samples/anthropic_stream_samples.txt（含 3 处对规格 §3 假设的实测修正）：
@@ -20,8 +20,11 @@ Anthropic 流式格式查 tools/model_proxy/samples/anthropic_stream_samples.txt
 """
 
 import json
+import logging
 import secrets
 import time
+
+logger = logging.getLogger("model_proxy.translate_reverse")
 
 
 # ============================================================================
@@ -290,6 +293,10 @@ def _input_to_messages(input_items) -> list:
 
 def _anthropic_usage_to_responses(usage: dict) -> dict:
     """Anthropic usage -> Responses usage（反向规格 §2.3）。"""
+    if not usage:
+        logger.warning(
+            "anthropic response missing usage field, responses usage will be all-zero"
+        )
     u = usage or {}
     in_tok = u.get("input_tokens", 0) or 0
     out_tok = u.get("output_tokens", 0) or 0

@@ -1,17 +1,15 @@
 """
-tools/model_proxy/proxy_v2.py — 本地路由代理 v2，阶段0：骨架
+tools/model_proxy/model_proxy.py — 本地多协议路由代理
 
-能启动、能读新配置（supplies/routes schema）、控制 API status 能回显。
+多协议 AI 模型代理主程序：HTTP server、路由决策、转发编排、协议转换、控制 API。
 与线上 proxy.py（18888）完全隔离并行：新端口 18889、新配置
-~/.claude/proxy_v2_config.json、新进程锁 /tmp/claude_proxy_v2.lock、
-新日志 tools/model_proxy/.claude_proxy_v2.log。
-
-阶段0 不含转发逻辑（_forward/协议转换/路由决策后续阶段做），
-非控制路径请求返回 501 占位响应。
+~/.claude/model_proxy_config.json、新进程锁 /tmp/claude_model_proxy.lock、
+新日志 tools/model_proxy/.claude_model_proxy.log。
 
 仅使用 Python 标准库，不引入第三方依赖，也不 import proxy.py。
 """
 
+import hmac
 import json
 import logging
 import os
@@ -25,16 +23,16 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any, Callable
 
-# 同目录导入两个协议转换器（proxy_v2.py 与它们同在 tools/ 下）
+# 同目录导入两个协议转换器（model_proxy.py 与它们同在 tools/ 下）
 sys.path.insert(0, str(Path(__file__).parent))
-import proxy_v2_translate as fwd            # noqa: E402  正向：anthropic→chat
-import proxy_v2_translate_reverse as rev    # noqa: E402  反向：responses→anthropic
+import model_proxy_translate as fwd            # noqa: E402  正向：anthropic→chat
+import model_proxy_translate_reverse as rev    # noqa: E402  反向：responses→anthropic
 
 # ---------------------------------------------------------------------------
 # L0 基座
 # ---------------------------------------------------------------------------
 
-LOG_FILE = Path(__file__).parent / ".claude_proxy_v2.log"
+LOG_FILE = Path(__file__).parent / ".claude_model_proxy.log"
 
 
 def _trim_log(path: Path, keep: int = 1000) -> None:
@@ -58,11 +56,11 @@ logging.basicConfig(
 log = logging.getLogger(__name__)
 
 # 默认路径（全部 v2 命名）
-_DEFAULT_CONFIG_PATH = Path.home() / ".claude" / "proxy_v2_config.json"
-_LOCK_FILE = Path("/tmp/claude_proxy_v2.lock")
+_DEFAULT_CONFIG_PATH = Path.home() / ".claude" / "model_proxy_config.json"
+_LOCK_FILE = Path("/tmp/claude_model_proxy.lock")
 
 # 控制路径前缀（v2，避免与 18888 的 /proxy 混淆）
-_CONTROL_PATH_PREFIX = "/proxy_v2"
+_CONTROL_PATH_PREFIX = "/model_proxy"
 
 # 顶层默认冷却时长（秒）
 _DEFAULT_COOLDOWN_SECONDS = 300
@@ -166,7 +164,7 @@ def _maybe_precvt_thinking(carrier: dict | None, model: str | None) -> bool:
 # ---------------------------------------------------------------------------
 
 class ConfigStore:
-    """从 proxy_v2_config.json 加载并热重载配置。
+    """从 model_proxy_config.json 加载并热重载配置。
 
     热重载机制（mtime 比对、maybe_reload 双重检查、_reload_locked
     失败保留旧配置、reload 强制重载）拷贝自 proxy.py，getter 换成
@@ -474,7 +472,7 @@ def _responses_failed_event(adapter: "rev.ResponsesStreamAdapter", message: str)
     """构造反向流式中途出错的 response.failed 收尾事件（反向规格 §5.1）。
 
     只读取 adapter 的公开状态属性（response_id/model/...）拼装骨架，不调用、不修改
-    proxy_v2_translate_reverse.py 的内部逻辑。
+    model_proxy_translate_reverse.py 的内部逻辑。
     """
     return {
         "type": "response.failed",
@@ -502,10 +500,10 @@ def _responses_failed_event(adapter: "rev.ResponsesStreamAdapter", message: str)
 
 
 # ---------------------------------------------------------------------------
-# ProxyV2Handler（控制 API + 转发编排）
+# ModelProxyHandler（控制 API + 转发编排）
 # ---------------------------------------------------------------------------
 
-class ProxyV2Handler(BaseHTTPRequestHandler):
+class ModelProxyHandler(BaseHTTPRequestHandler):
     """HTTP 请求处理器。
 
     实例化时需要外部注入 config_store / cooldown_store，
@@ -847,25 +845,25 @@ class ProxyV2Handler(BaseHTTPRequestHandler):
             self._send_json(503, {"error": "admin_token not configured"})
             return
         request_token = self.headers.get("X-Proxy-Admin-Token", "")
-        if request_token != admin_token:
+        if not hmac.compare_digest(request_token, admin_token):
             self._send_json(401, {"error": "unauthorized"})
             return
 
         path = self.path.split("?", 1)[0]  # 去掉 query string
 
-        # GET /proxy_v2/status
-        if method == "GET" and path == "/proxy_v2/status":
+        # GET /model_proxy/status
+        if method == "GET" and path == "/model_proxy/status":
             self._handle_status(cs, cd)
             return
 
-        # POST /proxy_v2/reload
-        if method == "POST" and path == "/proxy_v2/reload":
+        # POST /model_proxy/reload
+        if method == "POST" and path == "/model_proxy/reload":
             self._handle_reload(cs, cd)
             return
 
-        # POST /proxy_v2/supply/<id>/cooldown/clear
-        if method == "POST" and path.startswith("/proxy_v2/supply/") and path.endswith("/cooldown/clear"):
-            supply_id = path[len("/proxy_v2/supply/"):-len("/cooldown/clear")]
+        # POST /model_proxy/supply/<id>/cooldown/clear
+        if method == "POST" and path.startswith("/model_proxy/supply/") and path.endswith("/cooldown/clear"):
+            supply_id = path[len("/model_proxy/supply/"):-len("/cooldown/clear")]
             self._handle_cooldown_clear(cd, supply_id)
             return
 
@@ -1133,16 +1131,16 @@ class ProxyV2Handler(BaseHTTPRequestHandler):
 
 def main():
     config_path = _DEFAULT_CONFIG_PATH
-    port = int(os.environ.get("PROXY_V2_PORT", "18889"))
+    port = int(os.environ.get("MODEL_PROXY_PORT", "18889"))
 
-    # 进程级互斥锁：同一时刻只允许一个 proxy_v2.py 实例运行
+    # 进程级互斥锁：同一时刻只允许一个 model_proxy.py 实例运行
     import fcntl
     lock_fd = open(_LOCK_FILE, "w")
     try:
         fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
     except OSError:
         existing_pid = _LOCK_FILE.read_text().strip() if _LOCK_FILE.exists() else "unknown"
-        print(f"ERROR: another proxy_v2.py is already running (pid {existing_pid}). Exiting.", flush=True)
+        print(f"ERROR: another model_proxy.py is already running (pid {existing_pid}). Exiting.", flush=True)
         lock_fd.close()
         raise SystemExit(1)
     lock_fd.write(str(os.getpid()))
@@ -1155,11 +1153,11 @@ def main():
     cooldown_store = CooldownStore()
 
     # 3. 启动 ThreadingHTTPServer
-    server = ThreadingHTTPServer(("127.0.0.1", port), ProxyV2Handler)
+    server = ThreadingHTTPServer(("127.0.0.1", port), ModelProxyHandler)
     server.config_store = config_store    # type: ignore[attr-defined]
     server.cooldown_store = cooldown_store  # type: ignore[attr-defined]
 
-    print(f"proxy_v2 listening on 127.0.0.1:{port}", flush=True)
+    print(f"model_proxy listening on 127.0.0.1:{port}", flush=True)
     try:
         server.serve_forever()
     except KeyboardInterrupt:
