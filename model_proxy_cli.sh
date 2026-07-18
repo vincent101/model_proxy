@@ -348,7 +348,10 @@ for i, r in enumerate(routes):
   fi
 
   local backup="${settings}.bak.$(date +%Y%m%d%H%M%S)"
-  cp "$settings" "$backup"
+  if ! cp "$settings" "$backup"; then
+    echo "Error: backup failed (cannot write $backup), abort without touching $settings"
+    return 1
+  fi
   echo "Backup: $backup"
 
   python3 -c "
