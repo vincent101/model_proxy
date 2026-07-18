@@ -3,42 +3,60 @@
   "default_cooldown_seconds": 300,
   "supplies": [
     {
-      "id": "gw-claude",
+      "id": "claude-opus-k0",
+      "url": "https://aigc.sankuai.com/v1/anthropic",
+      "protocol": "anthropic",
+      "appkey": "<APPKEY_PLACEHOLDER>",
+      "target_model": "claude-opus-4",
+      "reasoning": true
+    },
+    {
+      "id": "claude-sonnet-k0",
       "url": "https://aigc.sankuai.com/v1/anthropic",
       "protocol": "anthropic",
       "appkey": "<APPKEY_PLACEHOLDER>",
       "target_model": "claude-sonnet-4",
-      "reasoning": true,
-      "cooldown_seconds": 300
-    },
-    {
-      "id": "gw-gpt-native",
-      "url": "https://aigc.sankuai.com/v1/openai/native",
-      "protocol": "chat",
-      "appkey": "<APPKEY_PLACEHOLDER>",
-      "target_model": "gpt-4o",
       "reasoning": true
     },
     {
-      "id": "gw-codex-responses",
-      "url": "https://aigc.sankuai.com/v1/openai/responses",
-      "protocol": "responses",
+      "id": "claude-haiku-k0",
+      "url": "https://aigc.sankuai.com/v1/anthropic",
+      "protocol": "anthropic",
       "appkey": "<APPKEY_PLACEHOLDER>",
-      "target_model": "gpt-4o",
-      "reasoning": false,
-      "cooldown_seconds": 180
+      "target_model": "claude-haiku-3.5",
+      "reasoning": false
+    },
+    {
+      "id": "glm-sonnet-k0",
+      "url": "https://aigc.sankuai.com/v1/anthropic",
+      "protocol": "anthropic",
+      "appkey": "<APPKEY_PLACEHOLDER>",
+      "target_model": "glm-5.2",
+      "reasoning": false
     }
   ],
   "routes": [
     {
-      "match": {"client_token": "cc-token-1", "client_model": "claude-sonnet"},
-      "supplies": ["gw-claude", "gw-gpt-native"],
+      "id": "claude",
+      "tiers": {
+        "opus": ["claude-opus-k0"],
+        "sonnet": ["claude-sonnet-k0"],
+        "haiku": ["claude-haiku-k0"]
+      },
       "failover": "on"
     },
     {
-      "match": {"client_token": "codex-token-1"},
-      "supplies": ["gw-codex-responses"],
+      "id": "glm",
+      "tiers": {
+        "opus": ["glm-sonnet-k0"],
+        "sonnet": ["glm-sonnet-k0"],
+        "haiku": ["glm-sonnet-k0"]
+      },
       "failover": "off"
     }
+  ],
+  "strategies": [
+    { "client_token": "cc",     "route_id": "claude", "note": "默认 Claude 家族" },
+    { "client_token": "cc-glm", "route_id": "glm",    "note": "切到 GLM 家族" }
   ]
 }

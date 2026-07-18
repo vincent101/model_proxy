@@ -24,7 +24,7 @@ tools/model_proxy/
 │   └── translate.py                   # 双向协议转换器（正向 Anthropic↔Chat + 反向 Responses↔Anthropic）
 ├── tests/                             # 单测
 │   ├── __init__.py
-│   ├── test_route.py                  # match_route 路由匹配单测
+│   ├── test_route.py                  # 三阶段路由匹配单测（resolve_route/resolve_tier/select_supply_list/select_supply）
 │   └── test_translate.py              # 双向协议转换器合并单测
 ├── docs/                              # 规格/蓝图文档
 │   ├── model_proxy_buildplan.md       # 施工蓝图（模块划分、实施顺序、风险点）
@@ -37,7 +37,8 @@ tools/model_proxy/
 ## 配置怎么写
 
 配置文件路径固定为 `~/.claude/model_proxy_config.json`（不随代码迁移，本目录只提供
-`model_proxy_config.example.json` 作为样例，不含真实凭证）。核心是两段式结构：**supplies**（供给单元）+ **routes**（客户端路由规则）。
+`model_proxy_config.example.json` 作为样例，不含真实凭证）。核心是三段式结构：
+**supplies**（供给单元）+ **routes**（家族模板）+ **strategies**（token→家族绑定）。
 
 ### supplies：一个供给单元 = 一个上游端点
 
@@ -61,25 +62,49 @@ tools/model_proxy/
 - `cooldown_seconds`（可选）：该 supply 触发失败后的冷却时长，不填则用顶层
   `default_cooldown_seconds`。
 
-### routes：客户端 token + 请求 model → 一组按优先级排列的 supplies
+### routes：家族模板 = 一个 route id + 三档（opus/sonnet/haiku）各自的 supplies 列表
 
 ```json
 {
-  "match": {"client_token": "cc-token-1", "client_model": "claude-sonnet"},
-  "supplies": ["gw-claude", "gw-gpt-native"],
+  "id": "claude",
+  "tiers": {
+    "opus": ["claude-opus-k0"],
+    "sonnet": ["claude-sonnet-k0"],
+    "haiku": ["claude-haiku-k0"]
+  },
   "failover": "on"
 }
 ```
 
-- `match.client_token`：客户端请求 `Authorization: Bearer <token>` 里的 token，model_proxy
-  据此识别是哪个客户端/哪套路由规则。
-- `match.client_model`（可选）：精确匹配（`==`）请求体的 model 字段（客户端原始发送值，
-  非子串/非分档）。省略该字段表示该 route 匹配该 token 下的任意 model（通配兜底）。
-  由于 route 按数组顺序遍历、返回首个命中，通配 route 必须排在同一 token 下的精确
-  route 之后，否则通配会抢先命中导致精确 route 永远匹配不到。
-- `supplies`：按顺序尝试的 supply id 列表，取第一个「未冷却」的。
-- `failover`：`on` 时上游返回 401/403/429/5xx 会把当前 supply 打入冷却并换下一个再试；
-  `off` 时失败直接返回给客户端，不重试。
+- `id`：家族唯一标识，strategies 里按 id 引用。route 本身**不含 client_token**，只是一个
+  可复用的家族模板。
+- `tiers`：固定三档 `opus`/`sonnet`/`haiku`，每档一个按优先级排列的 supply id 列表，取第一个
+  「未冷却」的。
+- `failover`：`on` 时上游返回 401/403/429/5xx 会把当前 supply 打入冷却并换同档下一个再试；
+  `off` 时失败直接返回给客户端，不重试。failover 是 route（家族）级开关，不细分到 tier。
+
+### strategies：client_token → route_id 绑定（运行时可切换）
+
+```json
+{ "client_token": "cc", "route_id": "claude", "note": "默认 Claude 家族" }
+```
+
+- `client_token`：客户端请求 `Authorization: Bearer <token>` 里的 token，model_proxy 据此
+  找到对应 strategy。
+- `route_id`：该 token 绑定到哪个 route 家族，必须是 routes 里存在的 id。
+- `note`：可选备注。
+- 禁用一个 token 直接删除其 strategy 记录即可（无 enabled 开关）。
+
+**匹配流程（三阶段）**：请求进来后 ① 用 `client_token` 查 strategies 拿到 `route_id`，再用
+`route_id` 拿到 route 家族；② 把请求体 `model` 字段**精确查表**映射成 tier 名
+（`claude-opus`→opus / `claude-sonnet`→sonnet / `claude-haiku`→haiku，仅这三个精确值，
+非子串猜测）；③ 从 route 的 `tiers` 里按 tier 取出该档 supplies 列表交给 failover 选择。
+
+> **注意**：新架构下 `model` 字段不是上述三个预设值之一时，选路直接 **400 失败，不再有兜底降级**。
+> `settings.json` 里的 `ANTHROPIC_DEFAULT_OPUS_MODEL`/`ANTHROPIC_DEFAULT_SONNET_MODEL`/
+> `ANTHROPIC_DEFAULT_HAIKU_MODEL` 三个值现在是固定档位标签（分别填 `claude-opus`/`claude-sonnet`/
+> `claude-haiku`），**不需要改**；运行时切换家族用 `model_proxy_cli.sh switch <token> <route_id>`
+> 改 strategy 绑定，不动 model 标签。
 
 顶层还有 `admin_token`（控制 API 鉴权）和 `default_cooldown_seconds`（默认冷却时长）。
 完整样例见 `model_proxy_config.example.json`。
@@ -110,15 +135,19 @@ tools/model_proxy/model_proxy_cli.sh clear-cooldown <id>  # 手动清除某 supp
 tools/model_proxy/model_proxy_cli.sh supply list          # 列出所有 supply
 tools/model_proxy/model_proxy_cli.sh supply add           # 交互式新增 supply
 tools/model_proxy/model_proxy_cli.sh supply rotate-appkey <id> <key>  # 替换 appkey 并解冷
-tools/model_proxy/model_proxy_cli.sh route list           # 列出所有 route
-tools/model_proxy/model_proxy_cli.sh route add            # 交互式新增 route
-tools/model_proxy/model_proxy_cli.sh migrate              # 选一条 route 写入 settings.json
+tools/model_proxy/model_proxy_cli.sh route list           # 列出所有 route 家族模板
+tools/model_proxy/model_proxy_cli.sh route add            # 交互式新增 route 家族模板
+tools/model_proxy/model_proxy_cli.sh strategy list        # 列出所有 token→家族 绑定
+tools/model_proxy/model_proxy_cli.sh strategy add         # 交互式新增 strategy 绑定
+tools/model_proxy/model_proxy_cli.sh switch <token> <route_id>  # 切换某 token 绑定的家族
+tools/model_proxy/model_proxy_cli.sh migrate              # 选一个 strategy 的 token 写入 settings.json
 tools/model_proxy/model_proxy_cli.sh on                   # 启动（已在监听则跳过）
 tools/model_proxy/model_proxy_cli.sh off                  # 停止
 ```
 
-- `supply`/`route` 子命令支持交互式增改配置（原子写盘后自动 reload），`migrate` 可从
-  已有 routes 里选一个 client_token 写入 `~/.claude/settings.json`。详细用法见 `--help`。
+- `supply`/`route`/`strategy` 子命令支持交互式增改配置（原子写盘后自动 reload），
+  `switch <token> <route_id>` 用参数式改某 token 的 route 家族绑定，`migrate` 可从
+  已有 strategies 里选一个 client_token 写入 `~/.claude/settings.json`。详细用法见 `--help`。
 
 - 端口默认 18889，同样支持 `MODEL_PROXY_PORT` 环境变量覆盖。
 - `admin_token` 从 `~/.claude/model_proxy_config.json` 读取，用于控制 API 的
@@ -132,7 +161,7 @@ tools/model_proxy/model_proxy_cli.sh off                  # 停止
 
 - **Claude Code**：改 `~/.claude/settings.json` 里 `env.ANTHROPIC_BASE_URL`（v1 通常是
   `http://localhost:18888/`，切到 v2 改成 `http://localhost:18889/`）及对应
-  `ANTHROPIC_AUTH_TOKEN`（需匹配 v2 配置里某条 route 的 `client_token`）。
+  `ANTHROPIC_AUTH_TOKEN`（需匹配 v2 配置里某条 strategy 的 `client_token`）。
 - **codex-cli**：改其配置里 Responses API 的 base_url/token，同理指向 18889。
 
 切回 v1 只需把 base_url 改回 18888，两个 proxy 进程互不干扰，可以同时保留运行，随时切换

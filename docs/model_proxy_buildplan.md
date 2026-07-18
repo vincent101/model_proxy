@@ -83,6 +83,12 @@ class ConfigStore:
 > ⚠️ 已于本次重构废弃 tier 分档设计，改为 client_model 精确匹配，详见 README.md。
 > 以下 `model_tier` 相关描述为历史设计原文，保留不改，实际字段名与语义以 README.md 为准。
 
+> ⚠️ 【后续重构】route(含 client_token/client_model 的 match) + `match_route` 那套单层结构
+> 已再次废弃，改为 route(家族模板：id + opus/sonnet/haiku 三档 tiers + route 级 failover)
+> \+ strategies(client_token→route_id 绑定) 分层架构；选路由 `resolve_route`/`resolve_tier`
+> （model 精确查表，非子串猜测）/`select_supply_list` 三阶段替代。以下含 `match`/`client_token`/
+> `client_model`/`match_route` 的历史正文保留不改，实际字段名与语义以 README.md 为准。
+
 **新配置 schema**（一次性新写，无旧配置降解兼容）：
 
 ```json

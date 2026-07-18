@@ -203,6 +203,17 @@ class ConfigStore:
         with self._lock:
             return list(self._config.get("routes", []))
 
+    def get_routes_map(self) -> dict[str, dict]:
+        """{route["id"]: route} 映射。"""
+        with self._lock:
+            routes = self._config.get("routes", [])
+            return {r["id"]: r for r in routes if "id" in r}
+
+    def get_strategies(self) -> list[dict]:
+        """config["strategies"]（有序列表）的浅拷贝。"""
+        with self._lock:
+            return list(self._config.get("strategies", []))
+
     def get_admin_token(self) -> str:
         with self._lock:
             return str(self._config.get("admin_token", ""))
@@ -355,29 +366,41 @@ def detect_source(path: str, body: dict | None) -> str:
     return "unknown"
 
 
-def match_route(routes: list, client_token: str, model: str | None) -> dict | None:
-    """匹配 route：client_token 相等 且 (match 无 client_model 或 model 精确命中)。
+_MODEL_TIER_MAP = {
+    "claude-opus": "opus",
+    "claude-sonnet": "sonnet",
+    "claude-haiku": "haiku",
+}
 
-    有序遍历 routes，返回第一个命中的 route。
-    """
-    for route in routes:
-        match = route.get("match", {})
-        if match.get("client_token", "") != client_token:
-            continue
-        want_model = match.get("client_model")
-        if want_model is None or want_model == model:
-            return route
+
+def resolve_route(strategies: list, routes_map: dict, client_token: str) -> dict | None:
+    """阶段1：client_token → strategy → route_id → route。"""
+    for s in strategies:
+        if s.get("client_token") == client_token:
+            return routes_map.get(s.get("route_id"))
     return None
 
 
-def select_supply(route: dict, supply_map: dict, cooldown: "CooldownStore",
+def resolve_tier(model: str | None) -> str | None:
+    """阶段2：model字符串精确查表 → tier名。不做子串猜测。"""
+    if not model:
+        return None
+    return _MODEL_TIER_MAP.get(model)
+
+
+def select_supply_list(route: dict, tier: str) -> list | None:
+    """阶段3：route的tiers字典按tier名取出supplies列表。"""
+    return (route.get("tiers") or {}).get(tier)
+
+
+def select_supply(supplies: list, supply_map: dict, cooldown: "CooldownStore",
                   tried_set: set) -> dict | None:
-    """从 route.supplies 有序取第一个「未冷却且未试过」的 supply。
+    """从 supplies 列表有序取第一个「未冷却且未试过」的 supply。
 
     跳过 cooling 的、tried_set 里已试的、以及 supply_map 中不存在的 id。
     返回 supply dict（非 id），无可用则 None。
     """
-    for sid in route.get("supplies", []):
+    for sid in supplies:
         if sid in tried_set:
             continue
         if sid not in supply_map:
@@ -553,14 +576,29 @@ class ModelProxyHandler(BaseHTTPRequestHandler):
         # 4. source 协议识别
         source = detect_source(self.path, body_json)
 
-        # 5. 匹配 route
-        routes = cs.get_routes()
-        route = match_route(routes, token, request_model)
+        # 5. 三阶段匹配：strategy → route → tier → supplies 列表
+        strategies = cs.get_strategies()
+        routes_map = cs.get_routes_map()
+        route = resolve_route(strategies, routes_map, token)
         if route is None:
-            log.warning("no route matched: token_tail4=%s model=%s source=%s",
-                        token[-4:] if token else "", request_model, source)
+            log.warning("no strategy/route matched: token_tail4=%s source=%s",
+                        token[-4:] if token else "", source)
             self._write_buffered_response(
-                401, [], error_body_for_source(source, 401, "no route matched"))
+                401, [], error_body_for_source(source, 401, "no strategy/route matched"))
+            return
+
+        tier = resolve_tier(request_model)
+        if tier is None:
+            log.warning("unknown model tier: model=%s route=%s", request_model, route.get("id"))
+            self._write_buffered_response(
+                400, [], error_body_for_source(source, 400, f"unknown model tier: {request_model}"))
+            return
+
+        supplies_list = select_supply_list(route, tier)
+        if not supplies_list:
+            log.warning("route missing tier config: route=%s tier=%s", route.get("id"), tier)
+            self._write_buffered_response(
+                503, [], error_body_for_source(source, 503, f"route {route.get('id')} missing tier {tier}"))
             return
 
         supply_map = cs.get_supply_map()
@@ -571,10 +609,10 @@ class ModelProxyHandler(BaseHTTPRequestHandler):
         tried_set: set[str] = set()
         _thinking_retried = False   # thinking 格式重试只做一次，作用域覆盖整个请求周期
         while True:
-            supply = select_supply(route, supply_map, cd, tried_set)
+            supply = select_supply(supplies_list, supply_map, cd, tried_set)
             if supply is None:
-                log.warning("all supplies failed or cooling: route_token=%s",
-                            route.get("match", {}).get("client_token", ""))
+                log.warning("all supplies failed or cooling: route=%s tier=%s",
+                            route.get("id"), tier)
                 self._write_buffered_response(
                     503, [], error_body_for_source(
                         source, 503, "all upstream supplies failed or cooling"))
@@ -871,6 +909,7 @@ class ModelProxyHandler(BaseHTTPRequestHandler):
         self._send_json(200, {
             "supplies": safe_supplies,
             "routes": cs.get_routes(),
+            "strategies": cs.get_strategies(),
             "cooldown": cd.snapshot(),
             "default_cooldown_seconds": cs.get_default_cooldown(),
         })

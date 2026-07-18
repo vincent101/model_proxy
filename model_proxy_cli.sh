@@ -22,9 +22,12 @@ clear-cooldown <id>               清除某个 supply 的冷却（幂等，id �
 supply list                       列出所有 supply（appkey 脱敏尾4位、cooldown）
 supply add                        交互式新增 supply（写配置后 reload）
 supply rotate-appkey <id> <key>   替换某 supply 的 appkey，reload 并解冷
-route list                        列出所有 route
-route add                         交互式新增 route（写配置后 reload）
-migrate                           选一条 route 的 client_token 写入 ~/.claude/settings.json
+route list                        列出所有 route（家族模板：opus/sonnet/haiku 三档 + failover）
+route add                         交互式新增 route 家族模板（写配置后 reload）
+strategy list                     列出所有 strategy（client_token -> route_id 绑定）
+strategy add                      交互式新增 strategy 绑定（写配置后 reload）
+switch <client_token> <route_id>  切换某 token 绑定的 route 家族（改 strategy.route_id 后 reload）
+migrate                           选一个 strategy 的 client_token 写入 ~/.claude/settings.json
 on                                启动 model_proxy.py（已在监听则跳过）
 off                               停止 model_proxy.py（严格按脚本绝对路径匹配，绝不影响 v1 的 proxy.py）
 --help / -h                       显示此帮助
@@ -90,10 +93,21 @@ for s in data.get('supplies', []):
     tail4 = s.get('appkey_tail4', '????')
     model = s.get('target_model', '?')
     print(f'  {sid:20} protocol={proto:10} model={model:20} appkey=...{tail4}')
-print('routes:')
+print('routes (家族模板):')
 for r in data.get('routes', []):
-    match = r.get('match', {})
-    print(f\"  match={match}  supplies={r.get('supplies', [])}  failover={r.get('failover', '?')}\")
+    rid = r.get('id', '?')
+    tiers = r.get('tiers', {})
+    opus = ','.join(tiers.get('opus', []))
+    sonnet = ','.join(tiers.get('sonnet', []))
+    haiku = ','.join(tiers.get('haiku', []))
+    failover = r.get('failover', '?')
+    print(f'  {rid:12} opus=[{opus}] sonnet=[{sonnet}] haiku=[{haiku}] failover={failover}')
+print('strategies (token 绑定):')
+for st in data.get('strategies', []):
+    tok = st.get('client_token', '?')
+    rid = st.get('route_id', '?')
+    note = st.get('note', '') or ''
+    print(f'  {tok:16} -> {rid:12} ({note})')
 cooldown = data.get('cooldown', {})
 if cooldown:
     print('cooldown (剩余秒):')
@@ -244,44 +258,42 @@ cmd_route() {
       python3 -c "
 import json, sys
 cfg = json.load(open(sys.argv[1]))
-for i, r in enumerate(cfg.get('routes', [])):
-    match = r.get('match', {})
-    token = match.get('client_token', '?')
-    model = match.get('client_model') or '(任意)'
-    supplies = ', '.join(r.get('supplies', []))
+for r in cfg.get('routes', []):
+    rid = r.get('id', '?')
+    tiers = r.get('tiers', {})
+    opus = ','.join(tiers.get('opus', []))
+    sonnet = ','.join(tiers.get('sonnet', []))
+    haiku = ','.join(tiers.get('haiku', []))
     failover = r.get('failover', '?')
-    print(f'  [{i}] client_token={token:16} model={model:10} supplies=[{supplies}]  failover={failover}')
+    print(f'  {rid:12} opus=[{opus}] sonnet=[{sonnet}] haiku=[{haiku}] failover={failover}')
 " "$CONFIG_FILE"
       ;;
     add)
-      echo -n "Client token (客户端 Authorization Bearer): "; read -r rtoken
-      echo -n "匹配 model 字符串 (精确匹配请求的 model 字段, 如 claude-sonnet; 留空=匹配任意 model): "; read -r rtier
-      echo -n "Supplies (空格分隔, 按优先级排序, 需为已存在 supply id): "; read -r rsupplies_raw
+      echo -n "Route ID: "; read -r rid
+      echo -n "Opus 档 supplies (空格分隔, 按优先级排序): "; read -r ropus
+      echo -n "Sonnet 档 supplies (空格分隔, 按优先级排序): "; read -r rsonnet
+      echo -n "Haiku 档 supplies (空格分隔, 按优先级排序): "; read -r rhaiku
       echo -n "Failover [on/off]: "; read -r rfailover
       python3 -c "
 import json, os, tempfile, sys
-rtoken, rtier, rsupplies_raw, rfailover = sys.argv[1:5]
-FILE = sys.argv[5]
-rtoken = rtoken.strip()
-if not rtoken:
-    print('Error: client_token 不能为空', file=sys.stderr); sys.exit(1)
-rtier = rtier.strip()
+rid, ropus, rsonnet, rhaiku, rfailover = sys.argv[1:6]
+FILE = sys.argv[6]
+rid = rid.strip()
+if not rid:
+    print('Error: Route ID 不能为空', file=sys.stderr); sys.exit(1)
 if rfailover not in ('on', 'off'):
     print(f'Error: failover 非法: {rfailover!r}（须为 on/off）', file=sys.stderr); sys.exit(1)
-supplies = rsupplies_raw.split()
-if not supplies:
-    print('Error: supplies 不能为空', file=sys.stderr); sys.exit(1)
+opus = ropus.split(); sonnet = rsonnet.split(); haiku = rhaiku.split()
 cfg = json.load(open(FILE))
+if any(r.get('id') == rid for r in cfg.get('routes', [])):
+    print(f'Error: route id 已存在: {rid}', file=sys.stderr); sys.exit(1)
 known = {s.get('id') for s in cfg.get('supplies', [])}
-bad = [x for x in supplies if x not in known]
+bad = [x for x in (opus + sonnet + haiku) if x not in known]
 if bad:
-    print(f'Error: 以下 supply id 不存在: {bad}', file=sys.stderr); sys.exit(1)
-match = {'client_token': rtoken}
-if rtier:
-    match['client_model'] = rtier
+    print(f'Error: 以下 supply id 不存在: {sorted(set(bad))}', file=sys.stderr); sys.exit(1)
 cfg.setdefault('routes', []).append({
-    'match': match,
-    'supplies': supplies,
+    'id': rid,
+    'tiers': {'opus': opus, 'sonnet': sonnet, 'haiku': haiku},
     'failover': rfailover,
 })
 _dir = os.path.dirname(FILE)
@@ -292,15 +304,113 @@ try:
     os.replace(tmp, FILE)
 except Exception:
     os.unlink(tmp); raise
-print(f'Added route: client_token={rtoken} supplies={supplies}')
-" "$rtoken" "$rtier" "$rsupplies_raw" "$rfailover" "$CONFIG_FILE" || return 1
-      echo "提示: 若此 token 已有留空(通配)的 route，精确 route 需要排在它前面，否则会被通配抢先命中，请检查 route list 顺序或手动调整 config.json 中 routes 数组顺序"
+print(f'Added route: id={rid} opus={opus} sonnet={sonnet} haiku={haiku} failover={rfailover}')
+" "$rid" "$ropus" "$rsonnet" "$rhaiku" "$rfailover" "$CONFIG_FILE" || return 1
       reload_proxy
       ;;
     *)
       echo "用法: route list | route add"
       ;;
   esac
+}
+
+# ---- strategy ----
+cmd_strategy() {
+  local subcmd="${1:-}"
+
+  case "$subcmd" in
+    list)
+      if [[ ! -f "$CONFIG_FILE" ]]; then
+        echo "Error: config not found: $CONFIG_FILE"
+        return 1
+      fi
+      python3 -c "
+import json, sys
+cfg = json.load(open(sys.argv[1]))
+for st in cfg.get('strategies', []):
+    tok = st.get('client_token', '?')
+    rid = st.get('route_id', '?')
+    note = st.get('note', '') or ''
+    print(f'  {tok:16} -> {rid:12} ({note})')
+" "$CONFIG_FILE"
+      ;;
+    add)
+      echo -n "Client token: "; read -r stoken
+      echo -n "Route ID (需为已存在的 route id): "; read -r srid
+      echo -n "Note (可选备注): "; read -r snote
+      python3 -c "
+import json, os, tempfile, sys
+stoken, srid, snote = sys.argv[1:4]
+FILE = sys.argv[4]
+stoken = stoken.strip(); srid = srid.strip()
+if not stoken:
+    print('Error: client_token 不能为空', file=sys.stderr); sys.exit(1)
+if not srid:
+    print('Error: route_id 不能为空', file=sys.stderr); sys.exit(1)
+cfg = json.load(open(FILE))
+if any(s.get('client_token') == stoken for s in cfg.get('strategies', [])):
+    print(f'Error: client_token 已存在 strategy 绑定: {stoken}', file=sys.stderr); sys.exit(1)
+if not any(r.get('id') == srid for r in cfg.get('routes', [])):
+    print(f'Error: route id 不存在: {srid}', file=sys.stderr); sys.exit(1)
+cfg.setdefault('strategies', []).append({
+    'client_token': stoken,
+    'route_id': srid,
+    'note': snote,
+})
+_dir = os.path.dirname(FILE)
+fd, tmp = tempfile.mkstemp(dir=_dir, suffix='.tmp')
+try:
+    with os.fdopen(fd, 'w', encoding='utf-8') as f:
+        json.dump(cfg, f, indent=2, ensure_ascii=False)
+    os.replace(tmp, FILE)
+except Exception:
+    os.unlink(tmp); raise
+print(f'Added strategy: {stoken} -> {srid}')
+" "$stoken" "$srid" "$snote" "$CONFIG_FILE" || return 1
+      reload_proxy
+      ;;
+    *)
+      echo "用法: strategy list | strategy add"
+      ;;
+  esac
+}
+
+# ---- switch ----
+cmd_switch() {
+  local stoken="$1" srid="$2"
+  if [[ -z "$stoken" || -z "$srid" ]]; then
+    echo "用法: switch <client_token> <route_id>"
+    return 1
+  fi
+  if [[ ! -f "$CONFIG_FILE" ]]; then
+    echo "Error: config not found: $CONFIG_FILE"
+    return 1
+  fi
+  python3 -c "
+import json, os, tempfile, sys
+stoken, srid, FILE = sys.argv[1:4]
+cfg = json.load(open(FILE))
+target = None
+for s in cfg.get('strategies', []):
+    if s.get('client_token') == stoken:
+        target = s; break
+if target is None:
+    print(f'Error: 未找到该 token 的 strategy 绑定: {stoken}，请先用 strategy add 新增', file=sys.stderr); sys.exit(1)
+if not any(r.get('id') == srid for r in cfg.get('routes', [])):
+    print(f'Error: route id 不存在: {srid}', file=sys.stderr); sys.exit(1)
+old = target.get('route_id')
+target['route_id'] = srid
+_dir = os.path.dirname(FILE)
+fd, tmp = tempfile.mkstemp(dir=_dir, suffix='.tmp')
+try:
+    with os.fdopen(fd, 'w', encoding='utf-8') as f:
+        json.dump(cfg, f, indent=2, ensure_ascii=False)
+    os.replace(tmp, FILE)
+except Exception:
+    os.unlink(tmp); raise
+print(f'已切换: {stoken} -> route_id={srid}（原 route_id={old}）')
+" "$stoken" "$srid" "$CONFIG_FILE" || return 1
+  reload_proxy
 }
 
 # ---- migrate ----
@@ -315,26 +425,25 @@ cmd_migrate() {
     return 1
   fi
 
-  # 列出 routes 里所有 client_token 供选择（清单打到 stderr，token 列表打到 stdout）
+  # 列出 strategies 里所有 client_token 供选择（清单打到 stderr，token 列表打到 stdout）
   local tokens
   tokens=$(python3 -c "
 import json, sys
 cfg = json.load(open(sys.argv[1]))
-routes = cfg.get('routes', [])
-if not routes:
+strategies = cfg.get('strategies', [])
+if not strategies:
     sys.exit(2)
-print('可用的 client_token（来自 routes）:', file=sys.stderr)
-for i, r in enumerate(routes):
-    m = r.get('match', {})
-    tok = m.get('client_token', '?')
-    model = m.get('client_model') or '任意'
-    supplies = ', '.join(r.get('supplies', []))
-    print(f'  [{i}] {tok:16} (model={model}, supplies=[{supplies}])', file=sys.stderr)
+print('可用的 client_token（来自 strategies）:', file=sys.stderr)
+for i, s in enumerate(strategies):
+    tok = s.get('client_token', '?')
+    rid = s.get('route_id', '?')
+    note = s.get('note', '') or ''
+    print(f'  [{i}] {tok:16} (route_id={rid}, note={note})', file=sys.stderr)
     print(tok)
 " "$CONFIG_FILE")
   local rc=$?
   if [[ $rc -eq 2 ]]; then
-    echo "Error: routes 为空，请先 route add"
+    echo "Error: strategies 为空，请先 strategy add"
     return 1
   fi
 
@@ -444,6 +553,12 @@ case "${1:-}" in
     ;;
   route)
     cmd_route "${2:-}"
+    ;;
+  strategy)
+    cmd_strategy "${2:-}"
+    ;;
+  switch)
+    cmd_switch "${2:-}" "${3:-}"
     ;;
   migrate)
     cmd_migrate
