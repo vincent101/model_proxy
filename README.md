@@ -49,7 +49,6 @@ tools/model_proxy/
   "protocol": "anthropic",
   "appkey": "<APPKEY_PLACEHOLDER>",
   "target_model": "claude-sonnet-4",
-  "reasoning": true,
   "cooldown_seconds": 300
 }
 ```
@@ -58,9 +57,44 @@ tools/model_proxy/
 - `url` + `protocol`：上游端点地址与协议（`anthropic` / `chat` / `responses`）。
 - `appkey`：鉴权用 Bearer token，注入到转发请求。
 - `target_model`：实际下发给上游的模型名（客户端请求里的 model 字段会被替换成这个）。
-- `reasoning`：该模型是否支持推理/thinking，影响是否走 thinking 方言适配或 effort 映射。
 - `cooldown_seconds`（可选）：该 supply 触发失败后的冷却时长，不填则用顶层
   `default_cooldown_seconds`。
+- `reasoning_map`（可选）：per-supply 的 effort 档位映射覆盖，见下。
+
+> 已移除旧的 `reasoning` 布尔字段。实测证明它试图防范的"非 reasoning 模型收到 thinking/reasoning
+> 字段就 400"从未真实发生；真正会 400 的是 thinking **格式**不对（如新版 claude-sonnet-5 拒绝
+> `thinking.type=enabled` 要求改用 `adaptive`），这已由 thinking 格式自适应重试机制
+> （`_apply_thinking_fmt`）独立处理。现在无条件走 thinking 格式自适应，不再有粗粒度门控开关。
+
+#### reasoning_map（可选）：覆盖 effort 映射
+
+不同供应商真实支持的 effort 档位不一样（例如 glm 支持 `minimal`，无 `xhigh`）。不配置时用代码默认
+5 档逻辑；配置后按 supply 覆盖 `map_reasoning_effort` 的档位/断点。
+
+```json
+{
+  "id": "glm-52-sankuai-3339",
+  "url": "https://aigc.sankuai.com/v1/anthropic",
+  "protocol": "anthropic",
+  "appkey": "<APPKEY_PLACEHOLDER>",
+  "target_model": "glm-5.2",
+  "reasoning_map": {
+    "effort_enum": ["none", "minimal", "low", "medium", "high"],
+    "budget_breakpoints": {"low": 2000, "medium": 8000, "high": 32000},
+    "max_alias": "high"
+  }
+}
+```
+
+- `effort_enum`：该 supply 真实支持的 effort 档位有序列表（低→高）。
+  缺省 `["none","low","medium","high","xhigh"]`。
+- `budget_breakpoints`：`thinking.type=enabled` 时 `budget_tokens` 的分档断点（可任意数量，
+  按值升序判断，`budget < 断点` 命中对应档；超过所有断点 → `effort_enum` 最高档，
+  故最高档不必在断点里显式写）。缺省 `{"low":2000,"medium":8000,"high":32000}`。
+- `max_alias`：Anthropic 的 `max` 档降级映射到的目标档；若不在 `effort_enum` 内自动兜底到最高档。
+  缺省 `"xhigh"`（例：glm 无 xhigh，故配 `"high"`，`max` 会正确映射到 `high`）。
+
+档位不确定时可用 `probe-effort` 子命令向上游探测（见下）。
 
 ### routes：家族模板 = 一个 route id + 三档（opus/sonnet/haiku）各自的 supplies 列表
 
@@ -157,6 +191,7 @@ tools/model_proxy/model_proxy_cli.sh clear-cooldown <id>  # 手动清除某 supp
 tools/model_proxy/model_proxy_cli.sh supply list          # 列出所有 supply
 tools/model_proxy/model_proxy_cli.sh supply add           # 交互式新增 supply
 tools/model_proxy/model_proxy_cli.sh supply rotate-appkey <id> <key>  # 替换 appkey 并解冷
+tools/model_proxy/model_proxy_cli.sh probe-effort <supply_id>  # 探测该 supply 真实支持的 effort 枚举
 tools/model_proxy/model_proxy_cli.sh route list           # 列出所有 route 家族模板
 tools/model_proxy/model_proxy_cli.sh route add            # 交互式新增 route 家族模板
 tools/model_proxy/model_proxy_cli.sh strategy list        # 列出所有 token→家族 绑定
@@ -170,6 +205,13 @@ tools/model_proxy/model_proxy_cli.sh off                  # 停止
 - `supply`/`route`/`strategy` 子命令支持交互式增改配置（原子写盘后自动 reload），
   `switch <token> <route_id>` 用参数式改某 token 的 route 家族绑定，`migrate` 可从
   已有 strategies 里选一个 client_token 写入 `~/.claude/settings.json`。详细用法见 `--help`。
+
+- `probe-effort <supply_id>`：向该 supply 上游直接发一个已知非法的 effort 值
+  （`__probe_invalid__`），按 protocol 构造对应探测请求（anthropic 走 `output_config.effort`、
+  chat 走 `reasoning_effort`、responses 走 `reasoning.effort`），从报错响应里用宽松正则
+  尝试提取"Supported values are: ..."之类枚举并打印。**仅辅助人工审阅，不自动写入 config**
+  （供应商报错格式差异大、glm 的 body 还会被截断、Responses 端点报错走 200-with-failed-status
+  而非 400），解析结果不保证准确，需人工判断后手动填 `reasoning_map`。
 
 - 端口默认 18889，同样支持 `MODEL_PROXY_PORT` 环境变量覆盖。
 - `admin_token` 从 `~/.claude/model_proxy_config.json` 读取，用于控制 API 的

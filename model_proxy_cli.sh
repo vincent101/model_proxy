@@ -28,6 +28,8 @@ strategy list                     列出所有 strategy（client_token -> route_
 strategy add                      交互式新增 strategy 绑定（写配置后 reload）
 switch <client_token> <route_id>  切换某 token 绑定的 route 家族（改 strategy.route_id 后 reload）
 migrate                           选一个 strategy 的 client_token 写入 ~/.claude/settings.json
+probe-effort <supply_id>          向该 supply 发一个非法 effort 值，探测其真实支持的 effort 枚举
+                                  （仅辅助人工审阅，不写入 config；解析不保证准确）
 on                                启动 model_proxy.py（已在监听则跳过）
 off                               停止 model_proxy.py（严格按脚本绝对路径匹配，绝不影响 v1 的 proxy.py）
 --help / -h                       显示此帮助
@@ -154,12 +156,12 @@ for s in cfg.get('supplies', []):
     proto = s.get('protocol', '?')
     model = s.get('target_model', '?')
     tail4 = str(s.get('appkey', ''))[-4:] or '????'
-    reasoning = 'Y' if s.get('reasoning') else 'N'
+    rmap = 'Y' if s.get('reasoning_map') else '-'
     if 'cooldown_seconds' in s:
         cd = f\"{s['cooldown_seconds']}s\"
     else:
         cd = '(默认)'
-    print(f'  {sid:20} protocol={proto:10} model={model:24} appkey=...{tail4}  reasoning={reasoning}  cooldown={cd}')
+    print(f'  {sid:20} protocol={proto:10} model={model:24} appkey=...{tail4}  reasoning_map={rmap}  cooldown={cd}')
 " "$CONFIG_FILE"
       ;;
     add)
@@ -168,12 +170,11 @@ for s in cfg.get('supplies', []):
       echo -n "协议 [anthropic/chat/responses]: "; read -r sproto
       echo -n "Appkey: "; read -r sappkey
       echo -n "目标模型 target_model: "; read -r smodel
-      echo -n "是否推理模型 reasoning [y/N]: "; read -r sreason
       echo -n "冷却时长 cooldown_seconds (回车用全局默认): "; read -r scooldown
       python3 -c "
 import json, os, tempfile, sys
-sid, surl, sproto, sappkey, smodel, sreason, scooldown = sys.argv[1:8]
-FILE = sys.argv[8]
+sid, surl, sproto, sappkey, smodel, scooldown = sys.argv[1:7]
+FILE = sys.argv[7]
 sid = sid.strip()
 if not sid:
     print('Error: Supply ID 不能为空', file=sys.stderr); sys.exit(1)
@@ -189,7 +190,6 @@ entry = {
     'protocol': sproto,
     'appkey': sappkey,
     'target_model': smodel,
-    'reasoning': sreason.strip().lower() == 'y',
 }
 scooldown = scooldown.strip()
 if scooldown:
@@ -205,8 +205,8 @@ try:
     os.replace(tmp, FILE)
 except Exception:
     os.unlink(tmp); raise
-print(f'Added supply: {sid}')
-" "$sid" "$surl" "$sproto" "$sappkey" "$smodel" "$sreason" "$scooldown" "$CONFIG_FILE" || return 1
+print(f'Added supply: {sid}（如需 effort 覆盖，可后续手动编辑该 supply 的 reasoning_map 字段，参考 probe-effort）')
+" "$sid" "$surl" "$sproto" "$sappkey" "$smodel" "$scooldown" "$CONFIG_FILE" || return 1
       reload_proxy
       ;;
     rotate-appkey)
@@ -480,6 +480,109 @@ print(f'  ANTHROPIC_AUTH_TOKEN -> {token}')
   echo "请重启 Claude Code 生效。"
 }
 
+# ---- probe-effort ----
+# 向指定 supply 的上游直接发一个已知非法的 effort 值，尝试从报错响应里解析真实支持的
+# effort 枚举。仅辅助人工审阅，不自动写入 config（供应商报错格式差异大、可能被截断）。
+cmd_probe_effort() {
+  local supply_id="$1"
+  if [[ -z "$supply_id" ]]; then
+    echo "用法: probe-effort <supply_id>"
+    return 1
+  fi
+  if [[ ! -f "$CONFIG_FILE" ]]; then
+    echo "Error: config not found: $CONFIG_FILE"
+    return 1
+  fi
+  python3 -c "
+import json, sys, re, urllib.request, urllib.error
+
+SUPPLY_ID, FILE = sys.argv[1:3]
+PROBE = '__probe_invalid__'
+
+cfg = json.load(open(FILE))
+supply = None
+for s in cfg.get('supplies', []):
+    if s.get('id') == SUPPLY_ID:
+        supply = s; break
+if supply is None:
+    print(f'Error: supply id 不存在: {SUPPLY_ID}', file=sys.stderr); sys.exit(1)
+
+url = (supply.get('url') or '').rstrip('/')
+proto = supply.get('protocol')
+appkey = supply.get('appkey', '')
+model = supply.get('target_model', '')
+
+if proto == 'anthropic':
+    target = url + '/v1/messages'
+    body = {'model': model, 'max_tokens': 16,
+            'thinking': {'type': 'adaptive'},
+            'output_config': {'effort': PROBE},
+            'messages': [{'role': 'user', 'content': 'probe'}]}
+elif proto == 'chat':
+    target = url + '/chat/completions'
+    body = {'model': model, 'max_tokens': 16,
+            'reasoning_effort': PROBE,
+            'messages': [{'role': 'user', 'content': 'probe'}]}
+elif proto == 'responses':
+    target = url  # url 已配到完整 /v1/responses 层级
+    body = {'model': model, 'max_output_tokens': 16,
+            'reasoning': {'effort': PROBE},
+            'input': 'probe'}
+else:
+    print(f'Error: 未知 protocol: {proto!r}', file=sys.stderr); sys.exit(1)
+
+data = json.dumps(body).encode('utf-8')
+headers = {'Content-Type': 'application/json',
+           'Authorization': f'Bearer {appkey}', 'x-api-key': appkey}
+req = urllib.request.Request(target, data=data, headers=headers, method='POST')
+
+status = None
+raw = ''
+try:
+    with urllib.request.urlopen(req, timeout=30) as resp:
+        status = resp.status
+        raw = resp.read().decode('utf-8', 'replace')
+except urllib.error.HTTPError as e:
+    status = e.code
+    raw = e.read().decode('utf-8', 'replace')
+except Exception as e:
+    print(f'Error: 请求失败: {e}', file=sys.stderr); sys.exit(1)
+
+print(f'supply={SUPPLY_ID} protocol={proto} model={model}')
+print(f'endpoint={target}')
+print(f'HTTP status={status}')
+print('-' * 60)
+
+# 宽松解析 'Supported values are: xxx, yyy, zzz' 之类措辞（引号包裹词组，英文逗号分隔）
+m = re.search(r'[Ss]upported values (?:are)?\s*[:：]?\s*(.+)', raw)
+enums = None
+if m:
+    tail = m.group(1)
+    # 提取引号包裹的词（单/双引号），退化到逗号分隔的裸词
+    quoted = re.findall(r\"['\\\"]([^'\\\"]+)['\\\"]\", tail)
+    cands = quoted if quoted else [
+        w.strip() for w in re.split(r'[,，]', re.split(r'[.。\n]', tail)[0]) if w.strip()]
+    # 只保留开头连续的合法 effort 标识符，遇到第一个非标识符（多为后续 JSON 噪音）即停
+    ident = re.compile(r'^[A-Za-z][A-Za-z0-9_-]*\$')
+    enums = []
+    for w in cands:
+        if ident.match(w):
+            enums.append(w)
+        else:
+            break
+    enums = enums or None
+
+if enums:
+    print(f'疑似支持的枚举: {enums}')
+else:
+    print('无法自动解析，请查看原始响应自行判断:')
+    print(raw[:500] + ('...(truncated)' if len(raw) > 500 else ''))
+
+print('-' * 60)
+print('提示: 这是探测辅助结果，不保证准确。如需生效请手动编辑 config 的 reasoning_map 字段。')
+" "$supply_id" "$CONFIG_FILE"
+}
+
 # ---- on ----
 cmd_on() {
   if lsof -i :"$MODEL_PROXY_PORT" -sTCP:LISTEN -t &>/dev/null; then
@@ -562,6 +665,9 @@ case "${1:-}" in
     ;;
   migrate)
     cmd_migrate
+    ;;
+  probe-effort)
+    cmd_probe_effort "${2:-}"
     ;;
   on)
     cmd_on

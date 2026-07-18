@@ -632,7 +632,7 @@ class ModelProxyHandler(BaseHTTPRequestHandler):
                 return
 
             target_model = supply.get("target_model")
-            supply_reasoning = bool(supply.get("reasoning", True))
+            reasoning_map = supply.get("reasoning_map")  # 可选 per-supply effort 映射覆盖
             base_url = supply.get("url", "").rstrip("/")
 
             # ---- 按 mode 计算 send_body / target_url / 转换上下文 ----
@@ -661,7 +661,8 @@ class ModelProxyHandler(BaseHTTPRequestHandler):
                 # 请求转换失败（异常）→ 合法 Anthropic error，400（正向规格 §5.1）
                 try:
                     openai_body, fwd_ctx = pt.anthropic_to_openai_request(
-                        body_json or {}, model_is_reasoning=supply_reasoning)
+                        body_json or {}, model_is_reasoning=True,
+                        reasoning_map=reasoning_map)
                 except Exception as e:
                     log.warning("ANTHROPIC_TO_CHAT request translate failed: %s", e)
                     self._write_buffered_response(
@@ -680,7 +681,8 @@ class ModelProxyHandler(BaseHTTPRequestHandler):
                 # 请求转换失败（异常）→ 合法 Anthropic error，400
                 try:
                     responses_body, fwd_ctx = pt.anthropic_to_responses_request(
-                        body_json or {}, model_is_reasoning=supply_reasoning)
+                        body_json or {}, model_is_reasoning=True,
+                        reasoning_map=reasoning_map)
                 except Exception as e:
                     log.warning("ANTHROPIC_TO_RESPONSES request translate failed: %s", e)
                     self._write_buffered_response(
@@ -690,9 +692,6 @@ class ModelProxyHandler(BaseHTTPRequestHandler):
                 if target_model:
                     responses_body["model"] = target_model
                     fwd_ctx["request_model"] = target_model  # 响应 model 字段回填 target_model
-                # reasoning 门控：目标非 reasoning 模型时剔除 reasoning 避免网关 400
-                if not supply_reasoning:
-                    responses_body.pop("reasoning", None)
                 send_body = json.dumps(responses_body, ensure_ascii=False).encode("utf-8")
                 # base_url 已配到完整 /v1/responses 层级，不拼子路径
                 target_url = base_url
@@ -713,12 +712,8 @@ class ModelProxyHandler(BaseHTTPRequestHandler):
                     return
                 if target_model:
                     anthropic_body["model"] = target_model
-                # reasoning 门控：目标非 reasoning 模型时剔除 thinking/output_config 避免网关 400
-                if not supply_reasoning:
-                    anthropic_body.pop("thinking", None)
-                    anthropic_body.pop("output_config", None)
-                # thinking 格式预转换：门控之后执行——若已被剔除，载体里无 thinking 相关字段，
-                # _maybe_precvt_thinking 的 has_thinking_related 判断自然跳过
+                # thinking 格式预转换：enabled↔adaptive 自适应由 _apply_thinking_fmt 重试机制处理，
+                # 无条件执行（不再按 supply.reasoning 门控）
                 _maybe_precvt_thinking(anthropic_body, target_model)
                 send_body = json.dumps(anthropic_body, ensure_ascii=False).encode("utf-8")
                 # anthropic 端点固定后缀 /v1/messages（客户端 /v1/responses 不透传）

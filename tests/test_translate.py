@@ -111,6 +111,74 @@ class TestHelpers(unittest.TestCase):
         self.assertIsNone(pt.map_reasoning_effort({}))
         self.assertIsNone(pt.map_reasoning_effort({"thinking": None}))
 
+    def test_map_reasoning_effort_default_unchanged_when_map_none(self):
+        # 显式传 reasoning_map=None 必须与不传时的默认 5 档行为完全一致（向后兼容回归）
+        self.assertEqual(pt.map_reasoning_effort({"thinking": {"type": "disabled"}}, None), "none")
+        self.assertEqual(
+            pt.map_reasoning_effort({"thinking": {"type": "adaptive"}, "output_config": {"effort": "max"}}, None),
+            "xhigh")
+        self.assertEqual(
+            pt.map_reasoning_effort({"thinking": {"type": "enabled", "budget_tokens": 40000}}, None),
+            "xhigh")
+        self.assertEqual(
+            pt.map_reasoning_effort({"thinking": {"type": "enabled", "budget_tokens": 1000}}, None),
+            "low")
+
+    def test_map_reasoning_effort_glm_map_max_alias(self):
+        # glm 示例：effort_enum 不含 xhigh，max_alias=high → max 映射到 high 而非默认 xhigh
+        rmap = {
+            "effort_enum": ["none", "minimal", "low", "medium", "high"],
+            "budget_breakpoints": {"low": 2000, "medium": 8000, "high": 32000},
+            "max_alias": "high",
+        }
+        self.assertEqual(
+            pt.map_reasoning_effort({"thinking": {"type": "adaptive"}, "output_config": {"effort": "max"}}, rmap),
+            "high")
+        # minimal 在枚举内 → 直传
+        self.assertEqual(
+            pt.map_reasoning_effort({"thinking": {"type": "adaptive"}, "output_config": {"effort": "minimal"}}, rmap),
+            "minimal")
+        # enabled 超过所有断点 → effort_enum 最高档 high（非默认 xhigh）
+        self.assertEqual(
+            pt.map_reasoning_effort({"thinking": {"type": "enabled", "budget_tokens": 100000}}, rmap),
+            "high")
+        # disabled → none（枚举含 none）
+        self.assertEqual(
+            pt.map_reasoning_effort({"thinking": {"type": "disabled"}}, rmap), "none")
+
+    def test_map_reasoning_effort_custom_breakpoints(self):
+        # 自定义断点：分档结果跟自定义断点一致而非默认断点
+        rmap = {
+            "effort_enum": ["none", "low", "high"],
+            "budget_breakpoints": {"low": 5000, "high": 50000},
+            "max_alias": "high",
+        }
+        bud = lambda b: pt.map_reasoning_effort({"thinking": {"type": "enabled", "budget_tokens": b}}, rmap)
+        self.assertEqual(bud(4999), "low")      # <5000 → low
+        self.assertEqual(bud(5000), "high")     # >=5000 且 <50000 → high（下一档）
+        self.assertEqual(bud(49999), "high")
+        self.assertEqual(bud(50000), "high")    # 超过所有断点 → 最高档 high
+
+    def test_map_reasoning_effort_map_edge_cases(self):
+        # 异常配置兜底：effort_enum 为空列表 → 退回默认 5 档
+        self.assertEqual(
+            pt.map_reasoning_effort({"thinking": {"type": "enabled", "budget_tokens": 40000}}, {"effort_enum": []}),
+            "xhigh")
+        # 空 dict 等价于默认
+        self.assertEqual(
+            pt.map_reasoning_effort({"thinking": {"type": "adaptive"}, "output_config": {"effort": "max"}}, {}),
+            "xhigh")
+        # max_alias 不在 effort_enum → 兜底到最高档
+        rmap = {"effort_enum": ["none", "low", "high"], "max_alias": "bogus"}
+        self.assertEqual(
+            pt.map_reasoning_effort({"thinking": {"type": "adaptive"}, "output_config": {"effort": "max"}}, rmap),
+            "high")
+        # effort_enum 无 medium 且 adaptive 无有效 effort → 取枚举中位
+        rmap2 = {"effort_enum": ["a", "b", "c", "d"]}
+        self.assertEqual(
+            pt.map_reasoning_effort({"thinking": {"type": "adaptive"}}, rmap2),
+            "c")  # len=4, index 4//2=2 → "c"
+
     def test_image_to_data_url(self):
         self.assertEqual(
             pt.anthropic_image_to_data_url({"type": "base64", "media_type": "image/png", "data": "AAA"}),

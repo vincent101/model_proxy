@@ -146,38 +146,65 @@ def truncate_tool_name(name: str) -> str:
 # 辅助：reasoning_effort 映射（正向规格 §1.4）
 # ============================================================
 
-def map_reasoning_effort(body: dict):
+def map_reasoning_effort(body: dict, reasoning_map: dict | None = None):
     """thinking + output_config.effort → reasoning_effort（none/low/medium/high/xhigh 或 None）。
 
     触发条件：只有 thinking.type ∈ {enabled, adaptive} 才产出非None值（含 disabled 显式关闭）。
     裸 output_config.effort（无 thinking.type）视为未生效意图，返回 None（不塞字段）。
+
+    reasoning_map（可选，来自 supply.reasoning_map 配置，用于覆盖代码默认档位/断点）：
+    - effort_enum: 该 supply 真实支持的 effort 档位有序列表（低→高），
+      缺省用代码默认 5 档 ["none","low","medium","high","xhigh"]。
+    - budget_breakpoints: enabled 模式下 budget_tokens 分档断点 dict，
+      缺省用代码默认 {"low":2000,"medium":8000,"high":32000}。
+      语义：budget < 断点 → 对应档；超过所有断点 → effort_enum 最高档（不需显式写最高档断点）。
+    - max_alias: Anthropic max 档位映射到的目标档位，缺省 "xhigh"；
+      若不在 effort_enum 内，兜底到 effort_enum 最高档。
+
+    未传 reasoning_map（或 None）时行为与默认 5 档硬编码逻辑完全等价（向后兼容）。
     """
+    reasoning_map = reasoning_map or {}
+    effort_enum = reasoning_map.get("effort_enum") or ["none", "low", "medium", "high", "xhigh"]
+    # 异常配置兜底：空列表 → 退回默认 5 档
+    if not effort_enum:
+        effort_enum = ["none", "low", "medium", "high", "xhigh"]
+    breakpoints = reasoning_map.get("budget_breakpoints")
+    if not breakpoints:
+        breakpoints = {"low": 2000, "medium": 8000, "high": 32000}
+    max_alias = reasoning_map.get("max_alias", "xhigh")
+    # max_alias 必须在 effort_enum 内，否则兜底成最高档
+    if max_alias not in effort_enum:
+        max_alias = effort_enum[-1]
+
     thinking = body.get("thinking") or {}
     ttype = thinking.get("type")
     oc = body.get("output_config") or {}
     effort = oc.get("effort")
 
     if ttype == "disabled":
-        return "none"  # 显式关闭思考，网关侧需要真的塞 reasoning_effort=none 才能让reasoning_tokens清零
+        # 显式关闭思考，网关侧需要真的塞 reasoning_effort=none 才能让 reasoning_tokens 清零。
+        # 若该 supply 不支持 none 档，则不塞字段（返回 None）。
+        return "none" if "none" in effort_enum else None
     if ttype not in ("enabled", "adaptive"):
         return None  # thinking缺失/其他值 → 不产出（含裸output_config.effort场景）
 
     if ttype == "adaptive":
-        if effort in ("low", "medium", "high", "xhigh"):
+        if effort in effort_enum:
             return effort
         if effort == "max":
-            return "xhigh"  # Anthropic最强档降级到网关最强档
-        return "medium"  # adaptive无有效effort → 默认中档
+            return max_alias  # Anthropic 最强档降级到该 supply 的目标档
+        # 不在枚举内的值（含无 effort）→ 兜底到中档：优先 medium，否则取枚举中位
+        if "medium" in effort_enum:
+            return "medium"
+        return effort_enum[len(effort_enum) // 2]
 
-    # ttype == "enabled"：budget_tokens 分档（4档3断点，几何序，保留原2000/32000锚点）
+    # ttype == "enabled"：budget_tokens 按 breakpoints 从低到高分档（动态支持任意数量断点）
     b = thinking.get("budget_tokens", 10000)
-    if b < 2000:
-        return "low"
-    if b < 8000:
-        return "medium"
-    if b < 32000:
-        return "high"
-    return "xhigh"
+    for tier_name, threshold in sorted(breakpoints.items(), key=lambda kv: kv[1]):
+        if b < threshold:
+            return tier_name
+    # 超过所有断点 → 最高档（effort_enum 最后一项）
+    return effort_enum[-1]
 
 
 # ============================================================
@@ -405,7 +432,8 @@ def _translate_assistant_message(content):
 # 模块 A：请求转换 Anthropic → OpenAI（正向规格 §1）
 # ============================================================
 
-def anthropic_to_openai_request(body: dict, model_is_reasoning: bool = True):
+def anthropic_to_openai_request(body: dict, model_is_reasoning: bool = True,
+                                reasoning_map: dict | None = None):
     """Anthropic /v1/messages body → (openai_body, ctx)。
 
     ctx = {
@@ -437,7 +465,7 @@ def anthropic_to_openai_request(body: dict, model_is_reasoning: bool = True):
 
     # reasoning_effort（仅 reasoning 模型）
     if model_is_reasoning:
-        effort = map_reasoning_effort(body)
+        effort = map_reasoning_effort(body, reasoning_map)
         if effort is not None:
             openai_body["reasoning_effort"] = effort
 
@@ -1502,7 +1530,8 @@ def _a2r_translate_tool_choice(tc):
 # 模块 A''：请求转换 Anthropic → Responses（§3.1）
 # ============================================================================
 
-def anthropic_to_responses_request(body: dict, model_is_reasoning: bool = True):
+def anthropic_to_responses_request(body: dict, model_is_reasoning: bool = True,
+                                   reasoning_map: dict | None = None):
     """Anthropic /v1/messages body → (responses_body, ctx)。
 
     ctx = {"tool_name_mapping": dict[str,str], "request_model": str}
@@ -1537,7 +1566,7 @@ def anthropic_to_responses_request(body: dict, model_is_reasoning: bool = True):
 
     # thinking/output_config → reasoning.effort（仅 reasoning 模型）
     if model_is_reasoning:
-        effort = map_reasoning_effort(body)
+        effort = map_reasoning_effort(body, reasoning_map)
         if effort is not None:
             responses_body["reasoning"] = {"effort": effort}
 
