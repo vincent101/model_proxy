@@ -179,6 +179,43 @@ class TestHelpers(unittest.TestCase):
             pt.map_reasoning_effort({"thinking": {"type": "adaptive"}}, rmap2),
             "c")  # len=4, index 4//2=2 → "c"
 
+    def test_map_reasoning_effort_clamp_out_of_enum(self):
+        # 3档 supply（无 xhigh/none）：枚举外值按强度就近钳位，不再粗暴兜底到 medium
+        rmap = {"effort_enum": ["low", "medium", "high"], "max_alias": "high"}
+        adaptive = lambda eff: pt.map_reasoning_effort(
+            {"thinking": {"type": "adaptive"}, "output_config": {"effort": eff}}, rmap)
+        # 钳顶：xhigh(rank4) 超过枚举最高档 high(rank3) → high，而非 medium
+        self.assertEqual(adaptive("xhigh"), "high")
+        # 钳底：none(rank0) 低于枚举最低档 low(rank1) → low，而非 medium
+        self.assertEqual(adaptive("none"), "low")
+        # 精确命中不受影响
+        self.assertEqual(adaptive("high"), "high")
+        self.assertEqual(adaptive("low"), "low")
+        self.assertEqual(adaptive("medium"), "medium")
+        # max_alias 特例不受影响
+        self.assertEqual(
+            pt.map_reasoning_effort(
+                {"thinking": {"type": "adaptive"}, "output_config": {"effort": "max"}}, rmap),
+            "high")
+
+    def test_map_reasoning_effort_clamp_nearest_neighbor(self):
+        # 跳档场景（非并列）：effort_enum=["low","xhigh"]，客户端发 medium(rank2)
+        # 距 low(rank1) 距离 1，距 xhigh(rank4) 距离 2 → 取更近的 low
+        rmap = {"effort_enum": ["low", "xhigh"]}
+        self.assertEqual(
+            pt.map_reasoning_effort(
+                {"thinking": {"type": "adaptive"}, "output_config": {"effort": "medium"}}, rmap),
+            "low")
+
+    def test_map_reasoning_effort_clamp_tie_prefers_higher(self):
+        # 并列距离场景：effort_enum=["none","xhigh"]，客户端发 medium(rank2)
+        # 距 none(rank0) 距离 2，距 xhigh(rank4) 距离 2 → 并列取更高档 xhigh
+        rmap = {"effort_enum": ["none", "xhigh"], "max_alias": "xhigh"}
+        self.assertEqual(
+            pt.map_reasoning_effort(
+                {"thinking": {"type": "adaptive"}, "output_config": {"effort": "medium"}}, rmap),
+            "xhigh")
+
     def test_image_to_data_url(self):
         self.assertEqual(
             pt.anthropic_image_to_data_url({"type": "base64", "media_type": "image/png", "data": "AAA"}),

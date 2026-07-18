@@ -68,8 +68,12 @@ tools/model_proxy/
 
 #### reasoning_map（可选）：覆盖 effort 映射
 
-不同供应商真实支持的 effort 档位不一样（例如 glm 支持 `minimal`，无 `xhigh`）。不配置时用代码默认
-5 档逻辑；配置后按 supply 覆盖 `map_reasoning_effort` 的档位/断点。
+`reasoning_map` 是**每个 supply 自己的可选字段**，不配置时该 supply 用代码内置的默认 5 档逻辑
+（等价于 `effort_enum: ["none","low","medium","high","xhigh"]` + 默认断点 +
+`max_alias: "xhigh"`，与旧版本行为完全一致）。配置后按该 supply 覆盖
+`map_reasoning_effort` 的档位/断点，不影响其他 supply。
+
+不同供应商真实支持的 effort 档位不一样。以下是 glm 家族的实测示例（来自 `probe-effort` 探测）：
 
 ```json
 {
@@ -88,6 +92,11 @@ tools/model_proxy/
 
 - `effort_enum`：该 supply 真实支持的 effort 档位有序列表（低→高）。
   缺省 `["none","low","medium","high","xhigh"]`。
+  > `minimal` 是**疑似**支持，非精确确认：glm 上游对非法 effort 值的报错 body 会被截断成
+  > 不完整 JSON，`probe-effort` 无法按标准 JSON 解析，`minimal` 是从截断后的乱码报错文本片段里
+  > "看起来像"识别出来的枚举词。生效前建议用户自行向 glm 核实该档位真实存在，若核实后发现不支持，
+  > 从 `effort_enum` 里删掉即可（删掉后该词退化为"枚举外的值"，走下面的跨模型强度钳位逻辑）。
+  > 无 `xhigh` 是确认无疑的（glm 最高档就是 `high`）。
 - `budget_breakpoints`：`thinking.type=enabled` 时 `budget_tokens` 的分档断点（可任意数量，
   按值升序判断，`budget < 断点` 命中对应档；超过所有断点 → `effort_enum` 最高档，
   故最高档不必在断点里显式写）。缺省 `{"low":2000,"medium":8000,"high":32000}`。
@@ -95,6 +104,22 @@ tools/model_proxy/
   缺省 `"xhigh"`（例：glm 无 xhigh，故配 `"high"`，`max` 会正确映射到 `high`）。
 
 档位不确定时可用 `probe-effort` 子命令向上游探测（见下）。
+
+#### 跨模型 effort 映射机制：强度就近钳位，不会强度倒挂
+
+客户端发的 effort 意图（`none`/`low`/`medium`/`high`/`xhigh`，强度依次递增）未必落在目标 supply
+真实支持的 `effort_enum` 里。例如客户端按 Claude 的 5 档模型发起请求，但目标 supply 只支持 3 档
+`["low","medium","high"]`：
+
+- 客户端发 `xhigh`（不在枚举里，但强度上高于枚举最高档 `high`）→ 钳到枚举最高档 `high`
+  （尽量给到该 supply 能提供的最强档，而不是退到中间档）。
+- 客户端发 `none`（不在枚举里，强度低于枚举最低档 `low`）→ 钳到枚举最低档 `low`。
+- 客户端发 `high`（恰好在枚举里）→ 精确命中，直传 `high`。
+- 客户端发 `max`（Anthropic 特殊字面值）→ 走 `max_alias` 专用逻辑，不参与强度钳位。
+- 若枚举跳过了某档（如 `effort_enum=["low","xhigh"]`），客户端发 `medium` 会落在枚举强度范围内但
+  未精确命中 → 取强度序上最接近的一档；若两侧距离相等则取更高的一档（偏保守，保留更多思考质量）。
+
+按整体强度序就近钳位，不会出现"发更强意图反而映射到更弱档位"的强度倒挂。
 
 ### routes：家族模板 = 一个 route id + 三档（opus/sonnet/haiku）各自的 supplies 列表
 

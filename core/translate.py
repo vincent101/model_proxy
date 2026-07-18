@@ -146,6 +146,10 @@ def truncate_tool_name(name: str) -> str:
 # 辅助：reasoning_effort 映射（正向规格 §1.4）
 # ============================================================
 
+# 5 档标准 effort 强度序，用于 adaptive 分支里"枚举外的值"按强度就近钳位。
+_EFFORT_RANK = {"none": 0, "low": 1, "medium": 2, "high": 3, "xhigh": 4}
+
+
 def map_reasoning_effort(body: dict, reasoning_map: dict | None = None):
     """thinking + output_config.effort → reasoning_effort（none/low/medium/high/xhigh 或 None）。
 
@@ -193,7 +197,27 @@ def map_reasoning_effort(body: dict, reasoning_map: dict | None = None):
             return effort
         if effort == "max":
             return max_alias  # Anthropic 最强档降级到该 supply 的目标档
-        # 不在枚举内的值（含无 effort）→ 兜底到中档：优先 medium，否则取枚举中位
+        # 不在枚举内的值 → 按强度就近钳位：枚举里能查到标准强度序的档位参与比较，
+        # 客户端 effort 强度超出枚举范围则钳到对应端点，落在范围内但未精确命中则取最近邻
+        # （并列取更高档，偏保守保留更多思考质量）。
+        effort_rank = _EFFORT_RANK.get(effort)
+        ranked_enum = [(e, _EFFORT_RANK[e]) for e in effort_enum if e in _EFFORT_RANK]
+        if effort_rank is not None and ranked_enum:
+            min_item = min(ranked_enum, key=lambda kv: kv[1])
+            max_item = max(ranked_enum, key=lambda kv: kv[1])
+            if effort_rank > max_item[1]:
+                return max_item[0]
+            if effort_rank < min_item[1]:
+                return min_item[0]
+            best = None
+            best_dist = None
+            for name, rank in ranked_enum:
+                dist = abs(rank - effort_rank)
+                if best is None or dist < best_dist or (dist == best_dist and rank > best[1]):
+                    best = (name, rank)
+                    best_dist = dist
+            return best[0]
+        # effort 不是标准词，或 effort_enum 里没有任何能识别的标准档 → 沿用原兜底逻辑
         if "medium" in effort_enum:
             return "medium"
         return effort_enum[len(effort_enum) // 2]
