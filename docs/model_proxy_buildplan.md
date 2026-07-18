@@ -2,9 +2,10 @@
 
 > 用途：把 model_proxy "整体怎么搭起来、分几个文件、模块怎么调、先写哪块、每块怎么验证"讲清楚，交给 implementer 照着分模块实现。
 >
-> **本文不重复协议字段映射细节**——那些查两份规格：
-> - 正向（Anthropic↔Chat Completions）：`tools/model_proxy/proxy_translate_spec.md`（下称"正向规格"）
-> - 反向（Responses↔Anthropic）：`tools/model_proxy/proxy_translate_spec_reverse.md`（下称"反向规格"）
+> **本文不重复协议字段映射细节**——那些查合并后的双向规格
+> `tools/model_proxy/docs/model_proxy_translate_spec.md`：
+> - 正向（Anthropic↔Chat Completions）：见该规格 Part 1（下称"正向规格"）
+> - 反向（Responses↔Anthropic）：见该规格 Part 2（下称"反向规格"）
 >
 > 本文只讲：文件结构、模块划分与接口签名、实施顺序、每阶段验证、风险、交接说明。
 
@@ -372,7 +373,7 @@ _CONTROL_PATH_PREFIX = "/model_proxy"     # 改前缀，避免与 18888 的 /pro
 
 1. **严禁碰 `tools/proxy.py`**（18888 生产运行）。只读它做参考；所有代码写进 `model_proxy*.py`。拷贝其机制时是**复制到新文件**，不 import。
 2. **端口/配置/锁/日志全用 v2 命名**（18889 / `model_proxy_config.json` / `claude_model_proxy.lock` / `.claude_model_proxy.log`），确保与 18888 并行不冲突。
-3. **协议字段映射一律查两份规格**（正向 `proxy_translate_spec.md`、反向 `proxy_translate_spec_reverse.md`），本蓝图第 2 节的签名只是骨架，字段级细节以规格为准。**遇到规格没覆盖的情况，停下问，不要自创映射。**
+3. **协议字段映射一律查合并规格** `model_proxy_translate_spec.md`（正向见 Part 1、反向见 Part 2），本蓝图第 2 节的签名只是骨架，字段级细节以规格为准。**遇到规格没覆盖的情况，停下问，不要自创映射。**
 4. **按阶段推进，每阶段先跑验证再进下一阶段**。阶段 2/3 的转换器**必须先脱网络单测全绿**（规格 §6.4 用例）再接 `_forward`。别写完一大坨再验证。
 5. **阶段 2 和阶段 3 相互独立**，可并行；但都依赖阶段 1 的路由/转发/写回框架先落地。
 6. **流式路径**：透传（组合1/2）用字节 chunked；转换（组合3/4）用逐事件状态机写回——两套写回函数不要混用。

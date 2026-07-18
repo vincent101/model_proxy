@@ -3,16 +3,17 @@
 覆盖 client_model 精确匹配语义：精确命中/不命中、通配兜底、有序遍历
 （通配排在精确前会抢先命中）、client_token 不匹配、routes 为空。
 
-运行：python3 tools/model_proxy/test_model_proxy_route.py
+运行：cd tools/model_proxy && python3 -m unittest tests.test_route
 """
 
 import os
 import sys
 import unittest
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+# tests/ 与 core/ 同级，sys.path 指向 tools/model_proxy/ 以便 from core.server import
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from model_proxy import match_route  # noqa: E402
+from core.server import match_route  # noqa: E402
 
 
 class TestMatchRoute(unittest.TestCase):

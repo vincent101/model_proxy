@@ -15,18 +15,21 @@ Claude Code 单一协议，在端口 **18888** 生产运行。v2（本目录 `mo
 
 ```
 tools/model_proxy/
-├── model_proxy.py                     # 主程序：HTTP server、路由决策、转发编排、控制 API
-├── model_proxy_translate.py           # 正向转换器：Anthropic → OpenAI Chat Completions
-├── model_proxy_translate_reverse.py   # 反向转换器：OpenAI Responses ↔ Anthropic
-├── test_model_proxy_translate.py      # 正向转换器单测
-├── test_model_proxy_translate_reverse.py  # 反向转换器单测
+├── model_proxy.py                     # 入口（thin wrapper，转发到 core.server.main）
 ├── model_proxy_config.example.json    # 配置样例
-├── model_proxy_cli.sh              # 手动控制脚本
-├── docs/                           # 规格/蓝图文档
-│   ├── model_proxy_buildplan.md           # 施工蓝图（模块划分、实施顺序、风险点）
-│   ├── proxy_translate_spec.md         # 正向协议转换规格（Anthropic↔Chat）
-│   └── proxy_translate_spec_reverse.md # 反向协议转换规格（Responses↔Anthropic）
-└── samples/                        # 实测样本（网关真实响应，供规格核对字段用）
+├── model_proxy_cli.sh                 # 手动控制脚本
+├── core/                              # 核心实现包
+│   ├── __init__.py
+│   ├── server.py                      # 主体：HTTP server、路由决策、转发编排、控制 API
+│   └── translate.py                   # 双向协议转换器（正向 Anthropic↔Chat + 反向 Responses↔Anthropic）
+├── tests/                             # 单测
+│   ├── __init__.py
+│   ├── test_route.py                  # match_route 路由匹配单测
+│   └── test_translate.py              # 双向协议转换器合并单测
+├── docs/                              # 规格/蓝图文档
+│   ├── model_proxy_buildplan.md       # 施工蓝图（模块划分、实施顺序、风险点）
+│   └── model_proxy_translate_spec.md  # 双向协议转换规格（Part 1 正向 / Part 2 反向）
+└── samples/                           # 实测样本（网关真实响应，供规格核对字段用）
     ├── anthropic_stream_samples.txt
     └── responses_api_samples.txt
 ```
@@ -143,8 +146,8 @@ tools/model_proxy/model_proxy_cli.sh off                  # 停止
 - 四种协议组合的转发/转换：
   1. anthropic → anthropic（PASSTHROUGH，字节透传 + thinking 方言适配）
   2. responses → responses（PASSTHROUGH，字节透传）
-  3. anthropic → chat（FORWARD，经 `model_proxy_translate` 转换）
-  4. responses → anthropic（REVERSE，经 `model_proxy_translate_reverse` 转换）
+  3. anthropic → chat（FORWARD，经 `core/translate.py` 正向部分转换）
+  4. responses → anthropic（REVERSE，经 `core/translate.py` 反向部分转换）
 - cross-supply failover：上游 401/403/429/5xx 触发对应 supply 冷却并按 route 顺序切换到下一个
   supply（不限协议，跨供给单元）。
 - thinking 方言适配（仅组合1）：识别网关对 `thinking.type` 的 400 拒绝，缓存并转换为对方接受
