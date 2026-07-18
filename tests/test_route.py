@@ -20,6 +20,12 @@ from core.server import (  # noqa: E402
     resolve_tier,
     select_supply_list,
     select_supply,
+    pick_translator,
+    PASSTHROUGH,
+    ANTHROPIC_TO_CHAT,
+    RESPONSES_TO_ANTHROPIC,
+    ANTHROPIC_TO_RESPONSES,
+    UNSUPPORTED,
 )
 
 
@@ -126,6 +132,24 @@ class TestSelectSupply(unittest.TestCase):
         cd = _FakeCooldown(cooling={"k1"})
         supply = select_supply(["k1", "k0"], supply_map, cd, set())
         self.assertEqual(supply["id"], "k0")
+
+
+class TestPickTranslator(unittest.TestCase):
+
+    def test_combinations(self):
+        self.assertEqual(pick_translator("anthropic", "anthropic"), PASSTHROUGH)
+        self.assertEqual(pick_translator("responses", "responses"), PASSTHROUGH)
+        self.assertEqual(pick_translator("anthropic", "chat"), ANTHROPIC_TO_CHAT)
+        self.assertEqual(pick_translator("responses", "anthropic"), RESPONSES_TO_ANTHROPIC)
+        self.assertEqual(pick_translator("anthropic", "responses"), ANTHROPIC_TO_RESPONSES)
+
+    def test_anthropic_to_responses(self):
+        self.assertEqual(pick_translator("anthropic", "responses"), ANTHROPIC_TO_RESPONSES)
+        self.assertEqual(ANTHROPIC_TO_RESPONSES, "anthropic_to_responses")
+
+    def test_unsupported(self):
+        self.assertEqual(pick_translator("chat", "anthropic"), UNSUPPORTED)
+        self.assertEqual(pick_translator("responses", "chat"), UNSUPPORTED)
 
 
 class TestEndToEnd(unittest.TestCase):

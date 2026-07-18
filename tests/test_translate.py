@@ -1183,5 +1183,359 @@ def _bind_reverse_tests():
 _bind_reverse_tests()
 
 
+# ============================================================================
+# §3 Anthropic → Responses（新组合，标准 unittest）
+# 前缀 test_ar_ 区分现有 test_A/B/C（反向）与正向 TestXxx。
+# 用独立 TestCase 类（非 module-level test_* 函数），不会被 _bind_reverse_tests 抓取。
+# ============================================================================
+
+
+def _run_ar_stream(adapter, events):
+    """喂 (event_type, data) 序列给 ResponsesToAnthropicStreamAdapter，收集所有产出。"""
+    out = []
+    for et, d in events:
+        out.extend(adapter.feed(et, d))
+    out.extend(adapter.finalize())
+    return out
+
+
+class TestARRequest(unittest.TestCase):
+    """§3.1 请求转换 anthropic_to_responses_request。"""
+
+    def test_ar_system_string(self):
+        body = {"system": "你是助手", "messages": [{"role": "user", "content": "hi"}]}
+        rb, ctx = pt.anthropic_to_responses_request(body)
+        self.assertEqual(rb["instructions"], "你是助手")
+
+    def test_ar_system_block_array(self):
+        body = {"system": [{"type": "text", "text": "A"}, {"type": "text", "text": "B"}],
+                "messages": []}
+        rb, _ = pt.anthropic_to_responses_request(body)
+        self.assertEqual(rb["instructions"], "A\nB")
+
+    def test_ar_user_text_to_input_message(self):
+        body = {"messages": [{"role": "user", "content": "hello"}]}
+        rb, _ = pt.anthropic_to_responses_request(body)
+        self.assertEqual(rb["input"], [
+            {"type": "message", "role": "user",
+             "content": [{"type": "input_text", "text": "hello"}]}])
+
+    def test_ar_user_image_data_url(self):
+        body = {"messages": [{"role": "user", "content": [
+            {"type": "image", "source": {"type": "base64", "media_type": "image/png",
+                                         "data": "AAAA"}}]}]}
+        rb, _ = pt.anthropic_to_responses_request(body)
+        item = rb["input"][0]
+        self.assertEqual(item["content"][0]["type"], "input_image")
+        self.assertEqual(item["content"][0]["image_url"], "data:image/png;base64,AAAA")
+
+    def test_ar_assistant_tool_use_to_function_call(self):
+        body = {"messages": [{"role": "assistant", "content": [
+            {"type": "tool_use", "id": "toolu_1", "name": "get_weather",
+             "input": {"city": "北京"}}]}]}
+        rb, _ = pt.anthropic_to_responses_request(body)
+        fc = rb["input"][0]
+        self.assertEqual(fc["type"], "function_call")
+        self.assertEqual(fc["call_id"], "toolu_1")
+        self.assertEqual(fc["name"], "get_weather")
+        self.assertEqual(json.loads(fc["arguments"]), {"city": "北京"})
+
+    def test_ar_user_tool_result_to_output(self):
+        body = {"messages": [{"role": "user", "content": [
+            {"type": "tool_result", "tool_use_id": "toolu_1", "content": "晴"}]}]}
+        rb, _ = pt.anthropic_to_responses_request(body)
+        out = rb["input"][0]
+        self.assertEqual(out["type"], "function_call_output")
+        self.assertEqual(out["call_id"], "toolu_1")
+        self.assertEqual(out["output"], "晴")
+
+    def test_ar_consecutive_tool_use_multiple_items(self):
+        body = {"messages": [{"role": "assistant", "content": [
+            {"type": "tool_use", "id": "t1", "name": "f1", "input": {}},
+            {"type": "tool_use", "id": "t2", "name": "f2", "input": {}}]}]}
+        rb, _ = pt.anthropic_to_responses_request(body)
+        fcs = [i for i in rb["input"] if i["type"] == "function_call"]
+        self.assertEqual(len(fcs), 2)
+        self.assertEqual([f["name"] for f in fcs], ["f1", "f2"])
+
+    def test_ar_max_tokens(self):
+        body = {"max_tokens": 128, "messages": []}
+        rb, _ = pt.anthropic_to_responses_request(body)
+        self.assertEqual(rb["max_output_tokens"], 128)
+
+    def test_ar_reasoning_effort_tiers(self):
+        # thinking enabled budget 边界：<2000→low, [2000,32000)→medium, >=32000→high
+        for budget, expect in [(1000, "low"), (10000, "medium"), (40000, "high")]:
+            body = {"messages": [], "thinking": {"type": "enabled", "budget_tokens": budget}}
+            rb, _ = pt.anthropic_to_responses_request(body)
+            self.assertEqual(rb["reasoning"], {"effort": expect}, f"budget={budget}")
+
+    def test_ar_reasoning_not_injected_when_non_reasoning(self):
+        body = {"messages": [], "thinking": {"type": "enabled", "budget_tokens": 40000}}
+        rb, _ = pt.anthropic_to_responses_request(body, model_is_reasoning=False)
+        self.assertNotIn("reasoning", rb)
+
+    def test_ar_tools_flat_and_name_truncation(self):
+        long_name = "x" * 70
+        body = {"messages": [], "tools": [
+            {"name": "short", "description": "d", "input_schema": {"type": "object"}},
+            {"name": long_name, "input_schema": {"type": "object"}}]}
+        rb, ctx = pt.anthropic_to_responses_request(body)
+        self.assertEqual(rb["tools"][0]["type"], "function")
+        self.assertNotIn("function", rb["tools"][0])  # 扁平，非两层嵌套
+        self.assertEqual(rb["tools"][0]["name"], "short")
+        truncated = rb["tools"][1]["name"]
+        self.assertLessEqual(len(truncated), 64)
+        self.assertIn(truncated, ctx["tool_name_mapping"])
+        self.assertEqual(ctx["tool_name_mapping"][truncated], long_name)
+
+    def test_ar_tool_choice_four_states(self):
+        cases = [
+            ({"type": "auto"}, "auto"),
+            ({"type": "any"}, "required"),
+            ({"type": "none"}, "none"),
+            ({"type": "tool", "name": "f"}, {"type": "function", "name": "f"}),
+        ]
+        for tc_in, expect in cases:
+            rb, _ = pt.anthropic_to_responses_request({"messages": [], "tool_choice": tc_in})
+            self.assertEqual(rb["tool_choice"], expect, f"tc={tc_in}")
+
+    def test_ar_stop_sequences_dropped(self):
+        body = {"messages": [], "stop_sequences": ["STOP"]}
+        rb, _ = pt.anthropic_to_responses_request(body)
+        self.assertNotIn("stop_sequences", rb)
+        self.assertNotIn("stop", rb)
+
+
+class TestARResponse(unittest.TestCase):
+    """§3.1 非流式响应 responses_to_anthropic_response。"""
+
+    def test_ar_text_response(self):
+        resp = {"id": "resp_x", "output": [
+            {"type": "message", "content": [{"type": "output_text", "text": "答案"}]}],
+            "usage": {"input_tokens": 5, "output_tokens": 3}}
+        ar = pt.responses_to_anthropic_response(resp, {"request_model": "m"})
+        self.assertEqual(ar["content"], [{"type": "text", "text": "答案"}])
+        self.assertEqual(ar["stop_reason"], "end_turn")
+        self.assertEqual(ar["model"], "m")
+        self.assertEqual(ar["usage"]["input_tokens"], 5)
+        self.assertEqual(ar["usage"]["output_tokens"], 3)
+
+    def test_ar_function_call_response(self):
+        resp = {"id": "r", "output": [
+            {"type": "function_call", "call_id": "call_1", "name": "get_weather",
+             "arguments": "{\"city\":\"北京\"}"}]}
+        ar = pt.responses_to_anthropic_response(resp)
+        blk = ar["content"][0]
+        self.assertEqual(blk["type"], "tool_use")
+        self.assertEqual(blk["id"], "call_1")
+        self.assertEqual(blk["name"], "get_weather")
+        self.assertEqual(blk["input"], {"city": "北京"})
+        self.assertEqual(ar["stop_reason"], "tool_use")
+
+    def test_ar_text_and_tool_mixed(self):
+        resp = {"output": [
+            {"type": "message", "content": [{"type": "output_text", "text": "t"}]},
+            {"type": "function_call", "call_id": "c", "name": "f", "arguments": "{}"}]}
+        ar = pt.responses_to_anthropic_response(resp)
+        self.assertEqual([b["type"] for b in ar["content"]], ["text", "tool_use"])
+        self.assertEqual(ar["stop_reason"], "tool_use")
+
+    def test_ar_reasoning_item_dropped(self):
+        resp = {"output": [
+            {"type": "reasoning", "summary": "x"},
+            {"type": "message", "content": [{"type": "output_text", "text": "ok"}]}]}
+        ar = pt.responses_to_anthropic_response(resp)
+        self.assertEqual(ar["content"], [{"type": "text", "text": "ok"}])
+
+    def test_ar_tool_name_restored(self):
+        long_name = "y" * 70
+        truncated = pt.truncate_tool_name(long_name)
+        resp = {"output": [
+            {"type": "function_call", "call_id": "c", "name": truncated, "arguments": "{}"}]}
+        ar = pt.responses_to_anthropic_response(resp, {"tool_name_mapping": {truncated: long_name}})
+        self.assertEqual(ar["content"][0]["name"], long_name)
+
+    def test_ar_bad_arguments_downgrade(self):
+        resp = {"output": [
+            {"type": "function_call", "call_id": "c", "name": "f", "arguments": "not-json"}]}
+        ar = pt.responses_to_anthropic_response(resp)
+        self.assertEqual(ar["content"][0]["input"], {})
+
+    def test_ar_missing_usage_and_id_fallback(self):
+        resp = {"output": [
+            {"type": "message", "content": [{"type": "output_text", "text": "x"}]}]}
+        ar = pt.responses_to_anthropic_response(resp)
+        self.assertEqual(ar["usage"], {"input_tokens": 0, "output_tokens": 0})
+        self.assertTrue(ar["id"].startswith("msg_"))
+
+    def test_ar_cached_tokens_mapped(self):
+        resp = {"output": [], "usage": {"input_tokens": 10, "output_tokens": 2,
+                                        "input_tokens_details": {"cached_tokens": 4}}}
+        ar = pt.responses_to_anthropic_response(resp)
+        self.assertEqual(ar["usage"]["cache_read_input_tokens"], 4)
+
+    def test_ar_empty_output_end_turn(self):
+        ar = pt.responses_to_anthropic_response({"output": []})
+        self.assertEqual(ar["content"], [])
+        self.assertEqual(ar["stop_reason"], "end_turn")
+
+
+def _ar_text_stream_events():
+    """基于 samples/responses_api_samples.txt 样本2构造的文本流事件序列。"""
+    return [
+        ("response.created", {"response": {"id": "resp_c", "model": "gpt-5.6-sol"}}),
+        ("response.in_progress", {"response": {"id": "resp_c"}}),
+        ("response.output_item.added", {"output_index": 0, "item": {
+            "id": "msg_1", "type": "message", "status": "in_progress",
+            "role": "assistant", "content": []}}),
+        ("response.content_part.added", {"item_id": "msg_1", "output_index": 0,
+            "content_index": 0, "part": {"type": "output_text", "text": ""}}),
+        ("response.output_text.delta", {"item_id": "msg_1", "delta": "Hi"}),
+        ("response.output_text.delta", {"item_id": "msg_1", "delta": "!"}),
+        ("response.output_text.delta", {"item_id": "msg_1", "delta": " 👋"}),
+        ("response.output_text.done", {"item_id": "msg_1", "text": "Hi! 👋"}),
+        ("response.content_part.done", {"item_id": "msg_1", "part": {
+            "type": "output_text", "text": "Hi! 👋"}}),
+        ("response.output_item.done", {"output_index": 0, "item": {
+            "id": "msg_1", "type": "message", "status": "completed",
+            "role": "assistant", "content": [{"type": "output_text", "text": "Hi! 👋"}]}}),
+        ("response.completed", {"response": {
+            "id": "resp_c", "status": "completed",
+            "usage": {"input_tokens": 8, "output_tokens": 8}}}),
+    ]
+
+
+def _ar_tool_stream_events():
+    """基于样本4构造的工具调用流事件序列。"""
+    return [
+        ("response.created", {"response": {"id": "resp_t", "model": "gpt-5.6-sol"}}),
+        ("response.in_progress", {"response": {"id": "resp_t"}}),
+        ("response.output_item.added", {"output_index": 0, "item": {
+            "id": "item_1", "type": "function_call", "status": "in_progress",
+            "call_id": "call_a", "name": "get_weather", "arguments": ""}}),
+        ("response.function_call_arguments.delta", {"item_id": "item_1", "delta": "{\""}),
+        ("response.function_call_arguments.delta", {"item_id": "item_1", "delta": "city"}),
+        ("response.function_call_arguments.delta", {"item_id": "item_1", "delta": "\":\""}),
+        ("response.function_call_arguments.delta", {"item_id": "item_1", "delta": "北京"}),
+        ("response.function_call_arguments.delta", {"item_id": "item_1", "delta": "\"}"}),
+        ("response.function_call_arguments.done", {"item_id": "item_1",
+            "name": "get_weather", "arguments": "{\"city\":\"北京\"}"}),
+        ("response.output_item.done", {"output_index": 0, "item": {
+            "id": "item_1", "type": "function_call", "status": "completed",
+            "call_id": "call_a", "name": "get_weather", "arguments": "{\"city\":\"北京\"}"}}),
+        ("response.completed", {"response": {
+            "id": "resp_t", "status": "completed",
+            "usage": {"input_tokens": 123, "output_tokens": 18}}}),
+    ]
+
+
+class TestARStream(unittest.TestCase):
+    """§3.1 流式 ResponsesToAnthropicStreamAdapter。"""
+
+    def test_ar_text_stream_sequence(self):
+        adapter = pt.ResponsesToAnthropicStreamAdapter({}, "m")
+        evs = _run_ar_stream(adapter, _ar_text_stream_events())
+        types = [e["type"] for e in evs]
+        self.assertEqual(types[0], "message_start")
+        self.assertEqual(types[1], "ping")
+        self.assertIn("content_block_start", types)
+        self.assertIn("content_block_delta", types)
+        self.assertEqual(types[-1], "message_stop")
+        self.assertEqual(types[-2], "message_delta")
+        # message_stop 前一个是 content_block_stop
+        self.assertEqual(types[types.index("message_delta") - 1], "content_block_stop")
+        # 文本 delta 拼接
+        text = "".join(e["delta"]["text"] for e in evs
+                        if e["type"] == "content_block_delta"
+                        and e["delta"]["type"] == "text_delta")
+        self.assertEqual(text, "Hi! 👋")
+
+    def test_ar_text_stream_usage_to_message_delta(self):
+        adapter = pt.ResponsesToAnthropicStreamAdapter({}, "m")
+        evs = _run_ar_stream(adapter, _ar_text_stream_events())
+        md = [e for e in evs if e["type"] == "message_delta"][0]
+        self.assertEqual(md["usage"]["output_tokens"], 8)
+        self.assertEqual(md["usage"]["input_tokens"], 8)
+
+    def test_ar_tool_stream_sequence(self):
+        adapter = pt.ResponsesToAnthropicStreamAdapter({}, "m")
+        evs = _run_ar_stream(adapter, _ar_tool_stream_events())
+        starts = [e for e in evs if e["type"] == "content_block_start"]
+        self.assertEqual(starts[0]["content_block"]["type"], "tool_use")
+        self.assertEqual(starts[0]["content_block"]["name"], "get_weather")
+        self.assertEqual(starts[0]["content_block"]["id"], "call_a")
+        # input_json_delta 拼接为完整 arguments
+        args = "".join(e["delta"]["partial_json"] for e in evs
+                       if e["type"] == "content_block_delta"
+                       and e["delta"]["type"] == "input_json_delta")
+        self.assertEqual(json.loads(args), {"city": "北京"})
+        stop_reason = [e for e in evs if e["type"] == "message_delta"][0]["delta"]["stop_reason"]
+        self.assertEqual(stop_reason, "tool_use")
+
+    def test_ar_tool_name_restored_in_stream(self):
+        long_name = "z" * 70
+        truncated = pt.truncate_tool_name(long_name)
+        adapter = pt.ResponsesToAnthropicStreamAdapter(
+            {"tool_name_mapping": {truncated: long_name}}, "m")
+        evs = _run_ar_stream(adapter, [
+            ("response.created", {"response": {"id": "r"}}),
+            ("response.output_item.added", {"item": {
+                "type": "function_call", "call_id": "c", "name": truncated, "arguments": ""}}),
+            ("response.completed", {"response": {"usage": {"input_tokens": 1, "output_tokens": 1}}}),
+        ])
+        start = [e for e in evs if e["type"] == "content_block_start"][0]
+        self.assertEqual(start["content_block"]["name"], long_name)
+
+    def test_ar_text_and_tool_mixed_stream(self):
+        adapter = pt.ResponsesToAnthropicStreamAdapter({}, "m")
+        evs = _run_ar_stream(adapter, [
+            ("response.created", {"response": {"id": "r"}}),
+            ("response.output_item.added", {"item": {"type": "message", "content": []}}),
+            ("response.output_text.delta", {"delta": "hello"}),
+            ("response.output_item.done", {"item": {"type": "message"}}),
+            ("response.output_item.added", {"item": {
+                "type": "function_call", "call_id": "c", "name": "f", "arguments": ""}}),
+            ("response.function_call_arguments.delta", {"delta": "{}"}),
+            ("response.completed", {"response": {"usage": {"input_tokens": 1, "output_tokens": 1}}}),
+        ])
+        block_types = [e["content_block"]["type"] for e in evs
+                       if e["type"] == "content_block_start"]
+        self.assertEqual(block_types, ["text", "tool_use"])
+        # 两个 block 各配一个 stop
+        self.assertEqual(len([e for e in evs if e["type"] == "content_block_stop"]), 2)
+
+    def test_ar_finalize_idempotent(self):
+        adapter = pt.ResponsesToAnthropicStreamAdapter({}, "m")
+        evs = _run_ar_stream(adapter, _ar_text_stream_events())  # 已含 completed + finalize
+        self.assertEqual(len([e for e in evs if e["type"] == "message_stop"]), 1)
+        # 再次 finalize 不产事件
+        self.assertEqual(adapter.finalize(), [])
+
+    def test_ar_empty_stream_valid_finish(self):
+        adapter = pt.ResponsesToAnthropicStreamAdapter({}, "m")
+        # 只有 created，无内容，无 completed → finalize 补收尾
+        evs = _run_ar_stream(adapter, [
+            ("response.created", {"response": {"id": "r"}}),
+        ])
+        types = [e["type"] for e in evs]
+        self.assertIn("message_start", types)
+        self.assertEqual(types[-1], "message_stop")
+        self.assertIn("message_delta", types)
+
+    def test_ar_incomplete_stream_finalize(self):
+        adapter = pt.ResponsesToAnthropicStreamAdapter({}, "m")
+        # 文本进行到一半，无 completed
+        evs = _run_ar_stream(adapter, [
+            ("response.created", {"response": {"id": "r"}}),
+            ("response.output_item.added", {"item": {"type": "message", "content": []}}),
+            ("response.output_text.delta", {"delta": "半句"}),
+        ])
+        types = [e["type"] for e in evs]
+        self.assertEqual(types[-1], "message_stop")
+        # 开着的 text block 被 finalize 收掉
+        self.assertIn("content_block_stop", types)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

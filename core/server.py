@@ -334,11 +334,20 @@ class CooldownStore:
 # 测试场景坏 key 返回 401，必须包含 401 才能触发 cooldown + failover。
 _FAILOVER_STATUSES = frozenset([401, 403, 429]) | frozenset(range(500, 600))
 
-# 四组合分发模式
+# 组合分发模式（精确组合命名）
 PASSTHROUGH = "passthrough"
-FORWARD = "forward"
-REVERSE = "reverse"
+ANTHROPIC_TO_CHAT = "anthropic_to_chat"            # 原 FORWARD
+RESPONSES_TO_ANTHROPIC = "responses_to_anthropic"  # 原 REVERSE
+ANTHROPIC_TO_RESPONSES = "anthropic_to_responses"  # 新增
 UNSUPPORTED = "unsupported"
+
+_TRANSLATOR_TABLE = {
+    ("anthropic", "anthropic"): PASSTHROUGH,
+    ("responses", "responses"): PASSTHROUGH,
+    ("anthropic", "chat"): ANTHROPIC_TO_CHAT,
+    ("responses", "anthropic"): RESPONSES_TO_ANTHROPIC,
+    ("anthropic", "responses"): ANTHROPIC_TO_RESPONSES,
+}
 
 
 def detect_source(path: str, body: dict | None) -> str:
@@ -417,20 +426,13 @@ def detect_target(supply: dict) -> str:
 
 
 def pick_translator(source: str, target: str) -> str:
-    """四组合分发决策表。
+    """组合分发决策表。
 
     (anthropic,anthropic)|(responses,responses) → PASSTHROUGH
-    (anthropic,chat) → FORWARD；(responses,anthropic) → REVERSE；其余 → UNSUPPORTED
+    (anthropic,chat) → ANTHROPIC_TO_CHAT；(responses,anthropic) → RESPONSES_TO_ANTHROPIC；
+    (anthropic,responses) → ANTHROPIC_TO_RESPONSES；其余 → UNSUPPORTED
     """
-    if source == "anthropic" and target == "anthropic":
-        return PASSTHROUGH
-    if source == "responses" and target == "responses":
-        return PASSTHROUGH
-    if source == "anthropic" and target == "chat":
-        return FORWARD
-    if source == "responses" and target == "anthropic":
-        return REVERSE
-    return UNSUPPORTED
+    return _TRANSLATOR_TABLE.get((source, target), UNSUPPORTED)
 
 
 def error_body_for_source(source: str, http_status: int, message: str) -> bytes:
@@ -634,7 +636,8 @@ class ModelProxyHandler(BaseHTTPRequestHandler):
             base_url = supply.get("url", "").rstrip("/")
 
             # ---- 按 mode 计算 send_body / target_url / 转换上下文 ----
-            # fwd_ctx：正向请求转换上下文（tool_name_mapping/request_model），仅 FORWARD 用
+            # fwd_ctx：请求转换上下文（tool_name_mapping/request_model），
+            # ANTHROPIC_TO_CHAT 与 ANTHROPIC_TO_RESPONSES 用
             fwd_ctx: dict[str, Any] | None = None
             if mode == PASSTHROUGH:
                 # 改写 model → target_model；target_url = supply.url + 清洗后的客户端 path
@@ -653,14 +656,14 @@ class ModelProxyHandler(BaseHTTPRequestHandler):
                 _clean_path = _parsed.path + ("?" + urllib.parse.urlencode(_qs) if _qs else "")
                 target_url = base_url + _clean_path
 
-            elif mode == FORWARD:
+            elif mode == ANTHROPIC_TO_CHAT:
                 # 组合3：anthropic 请求 → chat 上游。转成 OpenAI body，打 native chat 端点。
                 # 请求转换失败（异常）→ 合法 Anthropic error，400（正向规格 §5.1）
                 try:
                     openai_body, fwd_ctx = pt.anthropic_to_openai_request(
                         body_json or {}, model_is_reasoning=supply_reasoning)
                 except Exception as e:
-                    log.warning("FORWARD request translate failed: %s", e)
+                    log.warning("ANTHROPIC_TO_CHAT request translate failed: %s", e)
                     self._write_buffered_response(
                         400, [], error_body_for_source(
                             source, 400, f"proxy translate failed: {e}"))
@@ -672,14 +675,38 @@ class ModelProxyHandler(BaseHTTPRequestHandler):
                 # chat 端点固定后缀 /chat/completions（客户端 /v1/messages 不透传）
                 target_url = base_url + "/chat/completions"
 
-            else:  # REVERSE
+            elif mode == ANTHROPIC_TO_RESPONSES:
+                # 新组合：anthropic 请求 → responses 上游。转成 Responses body，打完整 /v1/responses。
+                # 请求转换失败（异常）→ 合法 Anthropic error，400
+                try:
+                    responses_body, fwd_ctx = pt.anthropic_to_responses_request(
+                        body_json or {}, model_is_reasoning=supply_reasoning)
+                except Exception as e:
+                    log.warning("ANTHROPIC_TO_RESPONSES request translate failed: %s", e)
+                    self._write_buffered_response(
+                        400, [], error_body_for_source(
+                            source, 400, f"proxy translate failed: {e}"))
+                    return
+                if target_model:
+                    responses_body["model"] = target_model
+                    fwd_ctx["request_model"] = target_model  # 响应 model 字段回填 target_model
+                # reasoning 门控：目标非 reasoning 模型时剔除 reasoning 避免网关 400
+                if not supply_reasoning:
+                    responses_body.pop("reasoning", None)
+                send_body = json.dumps(responses_body, ensure_ascii=False).encode("utf-8")
+                # base_url 已配到完整 /v1/responses 层级，不拼子路径
+                target_url = base_url
+                # 不调用 _maybe_precvt_thinking：新组合走 Responses reasoning.effort 机制，
+                # 无 Anthropic thinking.type 400 拒绝问题，无需 thinking 格式自适应重试
+
+            else:  # RESPONSES_TO_ANTHROPIC
                 # 组合4：responses 请求 → anthropic 上游。转成 Anthropic body，打 /v1/messages。
                 # 请求转换失败（异常）→ 合法 Responses error，400（反向规格 §5.1）
                 try:
                     anthropic_body = pt.responses_to_anthropic_request(
                         body_json or {}, max_tokens_default=4096)
                 except Exception as e:
-                    log.warning("REVERSE request translate failed: %s", e)
+                    log.warning("RESPONSES_TO_ANTHROPIC request translate failed: %s", e)
                     self._write_buffered_response(
                         400, [], error_body_for_source(
                             source, 400, f"proxy translate failed: {e}"))
@@ -731,10 +758,12 @@ class ModelProxyHandler(BaseHTTPRequestHandler):
 
                 # thinking 格式错误自适应重试（仅一次，不 rotate/cooldown supply，
                 # 与 failover 重试的关键区别：不加入 tried_set、不调用 cd.cooldown）
+                # 注：ANTHROPIC_TO_RESPONSES 不进 thinking 重试分支——它走 Responses
+                # reasoning.effort 机制，无 Anthropic thinking.type 400 拒绝问题。
                 thinking_carrier: dict | None = None
                 if mode == PASSTHROUGH and source == "anthropic" and target == "anthropic":
                     thinking_carrier = body_json if isinstance(body_json, dict) else None
-                elif mode == REVERSE:
+                elif mode == RESPONSES_TO_ANTHROPIC:
                     thinking_carrier = anthropic_body
                 _carrier_has_thinking = thinking_carrier and (
                     thinking_carrier.get("thinking") or thinking_carrier.get("output_config"))
@@ -796,7 +825,7 @@ class ModelProxyHandler(BaseHTTPRequestHandler):
                     resp.close()
                 return
 
-            if mode == FORWARD:
+            if mode == ANTHROPIC_TO_CHAT:
                 # chat 响应 → Anthropic
                 if is_stream:
                     adapter = pt.OpenAIToAnthropicStreamAdapter(fwd_ctx, target_model or "")
@@ -811,7 +840,7 @@ class ModelProxyHandler(BaseHTTPRequestHandler):
                         openai_resp = json.loads(raw_resp_body)
                         anthropic_resp = pt.openai_to_anthropic_response(openai_resp, fwd_ctx)
                     except Exception as e:
-                        log.warning("FORWARD response translate failed: %s", e)
+                        log.warning("ANTHROPIC_TO_CHAT response translate failed: %s", e)
                         self._write_buffered_response(
                             500, [], error_body_for_source(
                                 source, 500, f"proxy translate failed: {e}"))
@@ -821,7 +850,33 @@ class ModelProxyHandler(BaseHTTPRequestHandler):
                         json.dumps(anthropic_resp, ensure_ascii=False).encode("utf-8"))
                 return
 
-            # REVERSE：anthropic 响应 → Responses
+            if mode == ANTHROPIC_TO_RESPONSES:
+                # responses 响应 → Anthropic
+                if is_stream:
+                    adapter = pt.ResponsesToAnthropicStreamAdapter(fwd_ctx, target_model or "")
+                    self._write_translated_stream_from_responses(resp, adapter)
+                else:
+                    try:
+                        raw_resp_body = resp.read()
+                    finally:
+                        resp.close()
+                    # 响应转换失败（JSON 非法/转换器异常）→ 合法 Anthropic error，500
+                    try:
+                        responses_resp = json.loads(raw_resp_body)
+                        anthropic_resp = pt.responses_to_anthropic_response(
+                            responses_resp, fwd_ctx)
+                    except Exception as e:
+                        log.warning("ANTHROPIC_TO_RESPONSES response translate failed: %s", e)
+                        self._write_buffered_response(
+                            500, [], error_body_for_source(
+                                source, 500, f"proxy translate failed: {e}"))
+                        return
+                    self._write_buffered_response(
+                        200, [("Content-Type", "application/json")],
+                        json.dumps(anthropic_resp, ensure_ascii=False).encode("utf-8"))
+                return
+
+            # RESPONSES_TO_ANTHROPIC：anthropic 响应 → Responses
             _r_effort = ((body_json or {}).get("reasoning") or {}).get("effort")
             _tools_echo = (body_json or {}).get("tools") or []
             if is_stream:
@@ -841,7 +896,7 @@ class ModelProxyHandler(BaseHTTPRequestHandler):
                         anthropic_resp, target_model or "",
                         reasoning_effort=_r_effort, tools_echo=_tools_echo)
                 except Exception as e:
-                    log.warning("REVERSE response translate failed: %s", e)
+                    log.warning("RESPONSES_TO_ANTHROPIC response translate failed: %s", e)
                     self._write_buffered_response(
                         500, [], error_body_for_source(
                             source, 500, f"proxy translate failed: {e}"))
@@ -1041,7 +1096,7 @@ class ModelProxyHandler(BaseHTTPRequestHandler):
             # 上游连接中断/读取异常/adapter.feed 抛异常：200+chunked 头已发出，无法降级为
             # 非流式 error body，只能按正向规格 §5.1 补发一个 `event: error` 再体面收尾
             # （不调用 adapter.finalize()，避免在失败态下伪造 message_delta/message_stop）
-            log.warning("FORWARD stream interrupted: %s", e)
+            log.warning("ANTHROPIC_TO_CHAT stream interrupted: %s", e)
             try:
                 err_event = {
                     "type": "error",
@@ -1095,10 +1150,62 @@ class ModelProxyHandler(BaseHTTPRequestHandler):
         except Exception as e:
             # 上游连接中断/读取异常/adapter.feed 抛异常：200+chunked 头已发出，无法降级为
             # 非流式 error body，按反向规格 §5.1 补发一个 response.failed 事件再体面收尾
-            log.warning("REVERSE stream interrupted: %s", e)
+            log.warning("RESPONSES_TO_ANTHROPIC stream interrupted: %s", e)
             try:
                 self._write_sse_chunk(pt.responses_sse_bytes(
                     _responses_failed_event(adapter, f"stream interrupted: {e}")))
+                self.wfile.write(b"0\r\n\r\n")
+                self.wfile.flush()
+            except (BrokenPipeError, ConnectionResetError, OSError):
+                pass
+        finally:
+            upstream_resp.close()
+
+    def _write_translated_stream_from_responses(self, upstream_resp, adapter) -> None:
+        """新组合流式：上游 Responses SSE → Anthropic SSE。
+
+        上游 Responses SSE 为单行 `data:{json}`（无 event: 行、无 [DONE] 哨兵），
+        event_type 从 data.type 取（_parse_anthropic_sse_block 的 event: 行缺失兜底逻辑
+        自然覆盖此场景）。按 \\n\\n 切块 → adapter.feed(event_type, data) →
+        pt.anthropic_sse_bytes 写出。断流则 finalize 补收尾。
+        中断时补 `event: error`（输出侧已是 Anthropic 格式，不用 response.failed）。
+        """
+        self._begin_sse_chunked()
+        buf = b""
+        try:
+            while True:
+                data = upstream_resp.read(4096)
+                if not data:
+                    break
+                buf += data
+                while b"\n\n" in buf:
+                    block, buf = buf.split(b"\n\n", 1)
+                    ev_type, ev_data = self._parse_anthropic_sse_block(block)
+                    if ev_type is None:
+                        continue
+                    for ev in adapter.feed(ev_type, ev_data):
+                        self._write_sse_chunk(pt.anthropic_sse_bytes(ev))
+            # 处理 buffer 残余块（末尾可能无空行）
+            if buf.strip():
+                ev_type, ev_data = self._parse_anthropic_sse_block(buf)
+                if ev_type is not None:
+                    for ev in adapter.feed(ev_type, ev_data):
+                        self._write_sse_chunk(pt.anthropic_sse_bytes(ev))
+            # 流意外结束（无 response.completed）时补收尾，幂等
+            for ev in adapter.finalize():
+                self._write_sse_chunk(pt.anthropic_sse_bytes(ev))
+            self.wfile.write(b"0\r\n\r\n")
+            self.wfile.flush()
+        except (BrokenPipeError, ConnectionResetError):
+            pass
+        except Exception as e:
+            log.warning("ANTHROPIC_TO_RESPONSES stream interrupted: %s", e)
+            try:
+                err_event = {
+                    "type": "error",
+                    "error": {"type": "api_error", "message": f"stream interrupted: {e}"},
+                }
+                self._write_sse_chunk(pt.anthropic_sse_bytes(err_event))
                 self.wfile.write(b"0\r\n\r\n")
                 self.wfile.flush()
             except (BrokenPipeError, ConnectionResetError, OSError):

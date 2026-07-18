@@ -1363,3 +1363,474 @@ class AnthropicToResponsesStreamAdapter:
                                        with_completed_at=True, with_usage=True),
         }))
         self.completed = True
+
+
+# ############################################################################
+# §3 Anthropic → Responses（新组合，anthropic 请求 → responses 上游）
+#
+# 复用 §1 的辅助（truncate_tool_name / map_reasoning_effort /
+# anthropic_image_to_data_url），产出 Responses 扁平结构。响应侧把 Responses
+# 响应/事件还原为 Anthropic 格式，工具名经 ctx["tool_name_mapping"] 还原。
+# ############################################################################
+
+# ============================================================================
+# 辅助：messages → Responses input items（§3，方向与 _input_to_messages 相反）
+# ============================================================================
+
+def _messages_to_input(messages, tool_name_mapping: dict) -> list:
+    """Anthropic messages → Responses input items 数组。
+
+    - user 文本/图片 → message(role=user, content=[input_text|input_image])
+    - assistant 文本 → message(role=assistant, content=[output_text])
+    - assistant tool_use → function_call item（name 经 tool_name_mapping 截断映射）
+    - user tool_result → function_call_output item
+    """
+    items: list = []
+    for msg in messages or []:
+        if not isinstance(msg, dict):
+            continue
+        role = msg.get("role")
+        content = msg.get("content")
+
+        if role == "user":
+            if isinstance(content, str):
+                if content:
+                    items.append({
+                        "type": "message", "role": "user",
+                        "content": [{"type": "input_text", "text": content}],
+                    })
+                continue
+            normal_parts = []          # 文本/图片 → 一条 user message
+            for block in content or []:
+                if not isinstance(block, dict):
+                    continue
+                bt = block.get("type")
+                if bt == "text":
+                    normal_parts.append({"type": "input_text", "text": block.get("text", "")})
+                elif bt == "image":
+                    url = anthropic_image_to_data_url(block.get("source"))
+                    if url is not None:
+                        normal_parts.append({"type": "input_image", "image_url": url})
+                    else:
+                        logger.warning("unsupported image source dropped (a2r)")
+                elif bt == "tool_result":
+                    inner = block.get("content")
+                    if isinstance(inner, str):
+                        out = inner
+                    elif isinstance(inner, list):
+                        texts = [b.get("text", "") for b in inner
+                                 if isinstance(b, dict) and b.get("type") == "text"]
+                        out = "\n".join(texts) if texts else json.dumps(inner, ensure_ascii=False)
+                    else:
+                        out = "" if inner is None else json.dumps(inner, ensure_ascii=False)
+                    items.append({
+                        "type": "function_call_output",
+                        "call_id": block.get("tool_use_id", ""),
+                        "output": out,
+                    })
+                else:
+                    logger.warning("unsupported user content block dropped (a2r): %r", bt)
+            if normal_parts:
+                items.append({"type": "message", "role": "user", "content": normal_parts})
+
+        elif role == "assistant":
+            if isinstance(content, str):
+                if content:
+                    items.append({
+                        "type": "message", "role": "assistant",
+                        "content": [{"type": "output_text", "text": content}],
+                    })
+                continue
+            text_parts = []
+            for block in content or []:
+                if not isinstance(block, dict):
+                    continue
+                bt = block.get("type")
+                if bt == "text":
+                    text_parts.append({"type": "output_text", "text": block.get("text", "")})
+                elif bt == "tool_use":
+                    original = block.get("name", "")
+                    truncated = truncate_tool_name(original)
+                    if truncated != original:
+                        tool_name_mapping[truncated] = original
+                    items.append({
+                        "type": "function_call",
+                        "call_id": block.get("id", ""),
+                        "name": truncated,
+                        "arguments": json.dumps(block.get("input", {}), ensure_ascii=False),
+                    })
+                elif bt in ("thinking", "redacted_thinking"):
+                    logger.debug("thinking block dropped in assistant message (a2r)")
+                else:
+                    logger.warning("unsupported assistant content block dropped (a2r): %r", bt)
+            if text_parts:
+                items.append({"type": "message", "role": "assistant", "content": text_parts})
+        else:
+            logger.warning("unknown message role dropped (a2r): %r", role)
+    return items
+
+
+def _a2r_translate_tool_choice(tc):
+    """Anthropic tool_choice → Responses tool_choice。未知形态保守 'auto'。"""
+    if not isinstance(tc, dict):
+        return "auto"
+    t = tc.get("type")
+    if t == "auto":
+        return "auto"
+    if t == "any":
+        return "required"
+    if t == "none":
+        return "none"
+    if t == "tool":
+        return {"type": "function", "name": truncate_tool_name(tc.get("name", ""))}
+    return "auto"
+
+
+# ============================================================================
+# 模块 A''：请求转换 Anthropic → Responses（§3.1）
+# ============================================================================
+
+def anthropic_to_responses_request(body: dict, model_is_reasoning: bool = True):
+    """Anthropic /v1/messages body → (responses_body, ctx)。
+
+    ctx = {"tool_name_mapping": dict[str,str], "request_model": str}
+    白名单：只转换列出字段，其余丢弃。model_is_reasoning=False 时不注入 reasoning。
+    """
+    responses_body: dict = {}
+    ctx = {"tool_name_mapping": {}, "request_model": ""}
+
+    # model 透传（会被主流程覆盖成 target_model）
+    if "model" in body:
+        responses_body["model"] = body["model"]
+        ctx["request_model"] = body["model"]
+
+    # system（字符串或 block 数组）→ instructions（纯字符串）
+    system = body.get("system")
+    if isinstance(system, str):
+        if system:
+            responses_body["instructions"] = system
+    elif isinstance(system, list):
+        text_parts = [b.get("text", "") for b in system
+                      if isinstance(b, dict) and b.get("type") == "text"]
+        if text_parts:
+            responses_body["instructions"] = "\n".join(text_parts)
+
+    # messages → input items（工具名映射在此收集）
+    tool_name_mapping: dict = {}
+    responses_body["input"] = _messages_to_input(body.get("messages"), tool_name_mapping)
+
+    # max_tokens → max_output_tokens
+    if "max_tokens" in body:
+        responses_body["max_output_tokens"] = body["max_tokens"]
+
+    # thinking/output_config → reasoning.effort（仅 reasoning 模型）
+    if model_is_reasoning:
+        effort = map_reasoning_effort(body)
+        if effort is not None:
+            responses_body["reasoning"] = {"effort": effort}
+
+    # tools → Responses 扁平 function（复用 §1 _translate_tools 拿 mapping，再摊平）
+    if body.get("tools"):
+        openai_tools, tmap = _translate_tools(body["tools"])
+        flat = []
+        for t in openai_tools:
+            fn = t.get("function") or {}
+            flat.append({
+                "type": "function",
+                "name": fn.get("name", ""),
+                "description": fn.get("description", ""),
+                "parameters": fn.get("parameters", {"type": "object", "properties": {}}),
+            })
+        responses_body["tools"] = flat
+        # 合并 tools 侧的截断映射（tool_use item 侧的已在 _messages_to_input 收集）
+        tool_name_mapping.update(tmap)
+
+    # tool_choice 四态
+    if "tool_choice" in body:
+        responses_body["tool_choice"] = _a2r_translate_tool_choice(body["tool_choice"])
+
+    # stop_sequences 丢弃（Responses 无对应字段）
+    if "stop_sequences" in body:
+        logger.debug("stop_sequences dropped (a2r): Responses 无对应字段")
+
+    # temperature / top_p / stream 同名透传
+    if "temperature" in body:
+        responses_body["temperature"] = body["temperature"]
+    if "top_p" in body:
+        responses_body["top_p"] = body["top_p"]
+    if "stream" in body:
+        responses_body["stream"] = body["stream"]
+
+    ctx["tool_name_mapping"] = tool_name_mapping
+    return responses_body, ctx
+
+
+# ============================================================================
+# 模块 B''：非流式响应转换 Responses → Anthropic（§3.1）
+# ============================================================================
+
+def responses_to_anthropic_response(resp: dict, ctx: dict = None) -> dict:
+    """Responses 非流式响应 → Anthropic 响应 dict（缺失字段容错）。"""
+    ctx = ctx or {}
+    tool_name_mapping = ctx.get("tool_name_mapping", {})
+    request_model = ctx.get("request_model", "")
+
+    content_blocks = []
+    has_tool_use = False
+    for item in resp.get("output", []) or []:
+        if not isinstance(item, dict):
+            continue
+        it = item.get("type")
+        if it == "message":
+            for part in item.get("content", []) or []:
+                if isinstance(part, dict) and part.get("type") in ("output_text", "text"):
+                    content_blocks.append({"type": "text", "text": part.get("text", "")})
+        elif it == "function_call":
+            has_tool_use = True
+            raw_args = item.get("arguments", "") or "{}"
+            try:
+                parsed = json.loads(raw_args)
+            except (ValueError, TypeError):
+                parsed = {}
+                logger.warning("function_call arguments not valid JSON, downgraded to {} (r2a)")
+            name = tool_name_mapping.get(item.get("name", ""), item.get("name", ""))  # 还原
+            content_blocks.append({
+                "type": "tool_use",
+                "id": item.get("call_id") or gen_toolu_id(),
+                "name": name,
+                "input": parsed if isinstance(parsed, dict) else {},
+            })
+        elif it == "reasoning":
+            pass                                     # 丢弃，对称反向丢 thinking
+        # 其他 type 忽略
+
+    stop_reason = "tool_use" if has_tool_use else "end_turn"
+
+    u = resp.get("usage") or {}
+    anthropic_usage = {
+        "input_tokens": u.get("input_tokens", 0) or 0,
+        "output_tokens": u.get("output_tokens", 0) or 0,
+    }
+    cached = (u.get("input_tokens_details") or {}).get("cached_tokens")
+    if cached:
+        anthropic_usage["cache_read_input_tokens"] = cached
+
+    return {
+        "id": resp.get("id") or gen_msg_id(),
+        "type": "message",
+        "role": "assistant",
+        "model": request_model,
+        "content": content_blocks,
+        "stop_reason": stop_reason,
+        "stop_sequence": None,
+        "usage": anthropic_usage,
+    }
+
+
+# ============================================================================
+# 模块 C''+D''：流式状态机 Responses 事件 → Anthropic 事件（§3.1）
+# ============================================================================
+
+class ResponsesToAnthropicStreamAdapter:
+    """喂 Responses SSE 事件，产出 Anthropic 流式事件序列。
+
+    用法：
+        adapter = ResponsesToAnthropicStreamAdapter(ctx, model)
+        for ev in adapter.feed(event_type, data):   # data 已 json.loads
+            write(anthropic_sse_bytes(ev))
+        for ev in adapter.finalize():                # 流意外结束补收尾
+            write(anthropic_sse_bytes(ev))
+
+    块索引管理（对齐 OpenAIToAnthropicStreamAdapter）：cur_index 从 -1 起，
+    每开一个 block +1，单调递增；content_block_start/stop 配对。
+    """
+
+    def __init__(self, ctx: dict = None, model: str = ""):
+        self.ctx = ctx or {}
+        self.tool_name_mapping = self.ctx.get("tool_name_mapping", {})
+        self.model = model or self.ctx.get("request_model", "")
+
+        self.sent_message_start = False
+        self.block_open = False
+        self.cur_index = -1
+        self.cur_type = None                          # "text" | "tool_use"
+        self.final_stop_reason = None
+        self.input_tokens = 0
+        self.output_tokens = 0
+        self.message_id = gen_msg_id()
+        self._finalized = False
+        self._completed = False
+
+    # ---- 事件构造 helper（复用 Anthropic 事件形态） ----
+
+    def _message_start_event(self) -> dict:
+        return {
+            "type": "message_start",
+            "message": {
+                "id": self.message_id,
+                "type": "message",
+                "role": "assistant",
+                "content": [],
+                "model": self.model,
+                "stop_reason": None,
+                "stop_sequence": None,
+                "usage": {},          # message_start.usage 为空占位，completed 时经 message_delta 更新
+            },
+        }
+
+    @staticmethod
+    def _ping_event() -> dict:
+        return {"type": "ping"}
+
+    @staticmethod
+    def _content_block_start_text(index: int) -> dict:
+        return {
+            "type": "content_block_start",
+            "index": index,
+            "content_block": {"type": "text", "text": ""},
+        }
+
+    @staticmethod
+    def _content_block_start_tool(index: int, tool_id: str, name: str) -> dict:
+        return {
+            "type": "content_block_start",
+            "index": index,
+            "content_block": {"type": "tool_use", "id": tool_id, "name": name, "input": {}},
+        }
+
+    @staticmethod
+    def _content_block_delta_text(index: int, text: str) -> dict:
+        return {
+            "type": "content_block_delta",
+            "index": index,
+            "delta": {"type": "text_delta", "text": text},
+        }
+
+    @staticmethod
+    def _content_block_delta_input_json(index: int, partial_json: str) -> dict:
+        return {
+            "type": "content_block_delta",
+            "index": index,
+            "delta": {"type": "input_json_delta", "partial_json": partial_json},
+        }
+
+    @staticmethod
+    def _content_block_stop(index: int) -> dict:
+        return {"type": "content_block_stop", "index": index}
+
+    def _message_delta_event(self) -> dict:
+        usage = {"output_tokens": self.output_tokens}
+        if self.input_tokens > 0:
+            usage["input_tokens"] = self.input_tokens
+        return {
+            "type": "message_delta",
+            "delta": {
+                "stop_reason": self.final_stop_reason or "end_turn",
+                "stop_sequence": None,
+            },
+            "usage": usage,
+        }
+
+    @staticmethod
+    def _message_stop_event() -> dict:
+        return {"type": "message_stop"}
+
+    def _ensure_message_start(self, events: list) -> None:
+        if not self.sent_message_start:
+            events.append(self._message_start_event())
+            self.sent_message_start = True
+            events.append(self._ping_event())
+
+    # ---- 核心：feed ----
+
+    def feed(self, event_type: str, data: dict) -> list:
+        events: list = []
+        data = data or {}
+
+        if event_type in ("response.created", "response.in_progress"):
+            self._ensure_message_start(events)
+
+        elif event_type == "response.output_item.added":
+            self._ensure_message_start(events)
+            item = data.get("item") or {}
+            it = item.get("type")
+            if it == "message":
+                # 开一个 text block（时机对齐正向：text 首个 delta 前开亦可，这里 added 时开）
+                if self.block_open:
+                    events.append(self._content_block_stop(self.cur_index))
+                self.cur_index += 1
+                self.cur_type = "text"
+                self.block_open = True
+                events.append(self._content_block_start_text(self.cur_index))
+            elif it == "function_call":
+                if self.block_open:
+                    events.append(self._content_block_stop(self.cur_index))
+                self.cur_index += 1
+                self.cur_type = "tool_use"
+                self.block_open = True
+                original = self.tool_name_mapping.get(item.get("name", ""), item.get("name", ""))
+                tool_id = item.get("call_id") or gen_toolu_id()
+                events.append(self._content_block_start_tool(self.cur_index, tool_id, original))
+
+        elif event_type == "response.output_text.delta":
+            self._ensure_message_start(events)
+            if self.cur_type != "text" or not self.block_open:
+                if self.block_open:
+                    events.append(self._content_block_stop(self.cur_index))
+                self.cur_index += 1
+                self.cur_type = "text"
+                self.block_open = True
+                events.append(self._content_block_start_text(self.cur_index))
+            txt = data.get("delta", "")
+            if txt:
+                events.append(self._content_block_delta_text(self.cur_index, txt))
+
+        elif event_type == "response.function_call_arguments.delta":
+            frag = data.get("delta", "")
+            if frag and self.cur_type == "tool_use" and self.block_open:
+                events.append(self._content_block_delta_input_json(self.cur_index, frag))
+
+        elif event_type in ("response.output_text.done",
+                             "response.content_part.done",
+                             "response.output_item.done",
+                             "response.function_call_arguments.done",
+                             "response.content_part.added"):
+            pass                                      # delta 已累积内容，忽略
+
+        elif event_type == "response.completed":
+            resp = data.get("response") or {}
+            u = resp.get("usage") or {}
+            if u.get("input_tokens") is not None:
+                self.input_tokens = u.get("input_tokens") or 0
+            if u.get("output_tokens") is not None:
+                self.output_tokens = u.get("output_tokens") or 0
+            if self.final_stop_reason is None:
+                self.final_stop_reason = "tool_use" if self.cur_type == "tool_use" else "end_turn"
+            events.extend(self._emit_finish())
+
+        elif event_type == "response.failed":
+            events.extend(self._emit_finish())
+
+        return events
+
+    def _emit_finish(self) -> list:
+        events: list = []
+        if self._completed:
+            return events
+        self._ensure_message_start(events)
+        if self.block_open:
+            events.append(self._content_block_stop(self.cur_index))
+            self.block_open = False
+        events.append(self._message_delta_event())
+        events.append(self._message_stop_event())
+        self._completed = True
+        return events
+
+    def finalize(self) -> list:
+        """流意外结束补收尾。幂等。"""
+        if self._finalized:
+            return []
+        self._finalized = True
+        if self._completed:
+            return []
+        return self._emit_finish()
