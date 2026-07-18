@@ -156,12 +156,12 @@ for s in cfg.get('supplies', []):
     proto = s.get('protocol', '?')
     model = s.get('target_model', '?')
     tail4 = str(s.get('appkey', ''))[-4:] or '????'
-    rmap = 'Y' if s.get('reasoning_map') else '-'
+    rcap = 'Y' if s.get('reasoning_capability') else '-'
     if 'cooldown_seconds' in s:
         cd = f\"{s['cooldown_seconds']}s\"
     else:
         cd = '(默认)'
-    print(f'  {sid:20} protocol={proto:10} model={model:24} appkey=...{tail4}  reasoning_map={rmap}  cooldown={cd}')
+    print(f'  {sid:20} protocol={proto:10} model={model:24} appkey=...{tail4}  reasoning_capability={rcap}  cooldown={cd}')
 " "$CONFIG_FILE"
       ;;
     add)
@@ -205,7 +205,7 @@ try:
     os.replace(tmp, FILE)
 except Exception:
     os.unlink(tmp); raise
-print(f'Added supply: {sid}（如需 effort 覆盖，可后续手动编辑该 supply 的 reasoning_map 字段，参考 probe-effort）')
+print(f'Added supply: {sid}（如需 effort 覆盖，可后续手动编辑该 supply 的 reasoning_capability 字段，参考 probe-effort）')
 " "$sid" "$surl" "$sproto" "$sappkey" "$smodel" "$scooldown" "$CONFIG_FILE" || return 1
       reload_proxy
       ;;
@@ -579,7 +579,7 @@ else:
     print(raw[:500] + ('...(truncated)' if len(raw) > 500 else ''))
 
 print('-' * 60)
-print('提示: 这是探测辅助结果，不保证准确。如需生效请手动编辑 config 的 reasoning_map 字段。')
+print('提示: 这是探测辅助结果，不保证准确。如需生效请手动编辑 config 的 reasoning_capability 字段。')
 " "$supply_id" "$CONFIG_FILE"
 }
 

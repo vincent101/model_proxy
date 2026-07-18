@@ -29,9 +29,8 @@
       "protocol": "anthropic",
       "appkey": "<APPKEY_PLACEHOLDER>",
       "target_model": "glm-5.2",
-      "reasoning_map": {
+      "reasoning_capability": {
         "effort_enum": ["none", "minimal", "low", "medium", "high"],
-        "budget_breakpoints": {"low": 2000, "medium": 8000, "high": 32000},
         "max_alias": "high"
       }
     }

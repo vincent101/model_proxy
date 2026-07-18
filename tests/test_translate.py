@@ -70,152 +70,6 @@ class TestHelpers(unittest.TestCase):
         self.assertEqual(pt.map_finish_reason(None), "end_turn")
         self.assertEqual(pt.map_finish_reason("weird"), "end_turn")
 
-    def test_map_reasoning_effort_effort_field(self):
-        # 裸 output_config.effort（无 thinking.type）视为未生效意图 → None（不塞字段）
-        self.assertIsNone(pt.map_reasoning_effort({"output_config": {"effort": "low"}}))
-        self.assertIsNone(pt.map_reasoning_effort({"output_config": {"effort": "medium"}}))
-        self.assertIsNone(pt.map_reasoning_effort({"output_config": {"effort": "high"}}))
-        self.assertIsNone(pt.map_reasoning_effort({"output_config": {"effort": "max"}}))
-        self.assertIsNone(pt.map_reasoning_effort({"output_config": {"effort": "xhigh"}}))
-
-    def test_map_reasoning_effort_adaptive_effort(self):
-        # thinking.type=adaptive + output_config.effort → 直传/降级
-        def adaptive(eff):
-            return pt.map_reasoning_effort({"thinking": {"type": "adaptive"}, "output_config": {"effort": eff}})
-        self.assertEqual(adaptive("low"), "low")
-        self.assertEqual(adaptive("medium"), "medium")
-        self.assertEqual(adaptive("high"), "high")
-        self.assertEqual(adaptive("xhigh"), "xhigh")  # xhigh 直传不降级
-        self.assertEqual(adaptive("max"), "xhigh")     # max 降级到网关最强档 xhigh
-
-    def test_map_reasoning_effort_budget(self):
-        # enabled budget 4档3断点：<2000→low, <8000→medium, <32000→high, 其余→xhigh
-        def bud(b):
-            return pt.map_reasoning_effort({"thinking": {"type": "enabled", "budget_tokens": b}})
-        self.assertEqual(bud(1000), "low")
-        self.assertEqual(bud(1999), "low")
-        self.assertEqual(bud(2000), "medium")
-        self.assertEqual(bud(5000), "medium")
-        self.assertEqual(bud(7999), "medium")
-        self.assertEqual(bud(8000), "high")
-        self.assertEqual(bud(31999), "high")
-        self.assertEqual(bud(32000), "xhigh")
-        self.assertEqual(bud(40000), "xhigh")
-
-    def test_map_reasoning_effort_disabled(self):
-        # thinking.type=disabled → 显式关闭思考，塞 none
-        self.assertEqual(pt.map_reasoning_effort({"thinking": {"type": "disabled"}}), "none")
-
-    def test_map_reasoning_effort_adaptive_and_none(self):
-        self.assertEqual(pt.map_reasoning_effort({"thinking": {"type": "adaptive"}}), "medium")
-        self.assertIsNone(pt.map_reasoning_effort({}))
-        self.assertIsNone(pt.map_reasoning_effort({"thinking": None}))
-
-    def test_map_reasoning_effort_default_unchanged_when_map_none(self):
-        # 显式传 reasoning_map=None 必须与不传时的默认 5 档行为完全一致（向后兼容回归）
-        self.assertEqual(pt.map_reasoning_effort({"thinking": {"type": "disabled"}}, None), "none")
-        self.assertEqual(
-            pt.map_reasoning_effort({"thinking": {"type": "adaptive"}, "output_config": {"effort": "max"}}, None),
-            "xhigh")
-        self.assertEqual(
-            pt.map_reasoning_effort({"thinking": {"type": "enabled", "budget_tokens": 40000}}, None),
-            "xhigh")
-        self.assertEqual(
-            pt.map_reasoning_effort({"thinking": {"type": "enabled", "budget_tokens": 1000}}, None),
-            "low")
-
-    def test_map_reasoning_effort_glm_map_max_alias(self):
-        # glm 示例：effort_enum 不含 xhigh，max_alias=high → max 映射到 high 而非默认 xhigh
-        rmap = {
-            "effort_enum": ["none", "minimal", "low", "medium", "high"],
-            "budget_breakpoints": {"low": 2000, "medium": 8000, "high": 32000},
-            "max_alias": "high",
-        }
-        self.assertEqual(
-            pt.map_reasoning_effort({"thinking": {"type": "adaptive"}, "output_config": {"effort": "max"}}, rmap),
-            "high")
-        # minimal 在枚举内 → 直传
-        self.assertEqual(
-            pt.map_reasoning_effort({"thinking": {"type": "adaptive"}, "output_config": {"effort": "minimal"}}, rmap),
-            "minimal")
-        # enabled 超过所有断点 → effort_enum 最高档 high（非默认 xhigh）
-        self.assertEqual(
-            pt.map_reasoning_effort({"thinking": {"type": "enabled", "budget_tokens": 100000}}, rmap),
-            "high")
-        # disabled → none（枚举含 none）
-        self.assertEqual(
-            pt.map_reasoning_effort({"thinking": {"type": "disabled"}}, rmap), "none")
-
-    def test_map_reasoning_effort_custom_breakpoints(self):
-        # 自定义断点：分档结果跟自定义断点一致而非默认断点
-        rmap = {
-            "effort_enum": ["none", "low", "high"],
-            "budget_breakpoints": {"low": 5000, "high": 50000},
-            "max_alias": "high",
-        }
-        bud = lambda b: pt.map_reasoning_effort({"thinking": {"type": "enabled", "budget_tokens": b}}, rmap)
-        self.assertEqual(bud(4999), "low")      # <5000 → low
-        self.assertEqual(bud(5000), "high")     # >=5000 且 <50000 → high（下一档）
-        self.assertEqual(bud(49999), "high")
-        self.assertEqual(bud(50000), "high")    # 超过所有断点 → 最高档 high
-
-    def test_map_reasoning_effort_map_edge_cases(self):
-        # 异常配置兜底：effort_enum 为空列表 → 退回默认 5 档
-        self.assertEqual(
-            pt.map_reasoning_effort({"thinking": {"type": "enabled", "budget_tokens": 40000}}, {"effort_enum": []}),
-            "xhigh")
-        # 空 dict 等价于默认
-        self.assertEqual(
-            pt.map_reasoning_effort({"thinking": {"type": "adaptive"}, "output_config": {"effort": "max"}}, {}),
-            "xhigh")
-        # max_alias 不在 effort_enum → 兜底到最高档
-        rmap = {"effort_enum": ["none", "low", "high"], "max_alias": "bogus"}
-        self.assertEqual(
-            pt.map_reasoning_effort({"thinking": {"type": "adaptive"}, "output_config": {"effort": "max"}}, rmap),
-            "high")
-        # effort_enum 无 medium 且 adaptive 无有效 effort → 取枚举中位
-        rmap2 = {"effort_enum": ["a", "b", "c", "d"]}
-        self.assertEqual(
-            pt.map_reasoning_effort({"thinking": {"type": "adaptive"}}, rmap2),
-            "c")  # len=4, index 4//2=2 → "c"
-
-    def test_map_reasoning_effort_clamp_out_of_enum(self):
-        # 3档 supply（无 xhigh/none）：枚举外值按强度就近钳位，不再粗暴兜底到 medium
-        rmap = {"effort_enum": ["low", "medium", "high"], "max_alias": "high"}
-        adaptive = lambda eff: pt.map_reasoning_effort(
-            {"thinking": {"type": "adaptive"}, "output_config": {"effort": eff}}, rmap)
-        # 钳顶：xhigh(rank4) 超过枚举最高档 high(rank3) → high，而非 medium
-        self.assertEqual(adaptive("xhigh"), "high")
-        # 钳底：none(rank0) 低于枚举最低档 low(rank1) → low，而非 medium
-        self.assertEqual(adaptive("none"), "low")
-        # 精确命中不受影响
-        self.assertEqual(adaptive("high"), "high")
-        self.assertEqual(adaptive("low"), "low")
-        self.assertEqual(adaptive("medium"), "medium")
-        # max_alias 特例不受影响
-        self.assertEqual(
-            pt.map_reasoning_effort(
-                {"thinking": {"type": "adaptive"}, "output_config": {"effort": "max"}}, rmap),
-            "high")
-
-    def test_map_reasoning_effort_clamp_nearest_neighbor(self):
-        # 跳档场景（非并列）：effort_enum=["low","xhigh"]，客户端发 medium(rank2)
-        # 距 low(rank1) 距离 1，距 xhigh(rank4) 距离 2 → 取更近的 low
-        rmap = {"effort_enum": ["low", "xhigh"]}
-        self.assertEqual(
-            pt.map_reasoning_effort(
-                {"thinking": {"type": "adaptive"}, "output_config": {"effort": "medium"}}, rmap),
-            "low")
-
-    def test_map_reasoning_effort_clamp_tie_prefers_higher(self):
-        # 并列距离场景：effort_enum=["none","xhigh"]，客户端发 medium(rank2)
-        # 距 none(rank0) 距离 2，距 xhigh(rank4) 距离 2 → 并列取更高档 xhigh
-        rmap = {"effort_enum": ["none", "xhigh"], "max_alias": "xhigh"}
-        self.assertEqual(
-            pt.map_reasoning_effort(
-                {"thinking": {"type": "adaptive"}, "output_config": {"effort": "medium"}}, rmap),
-            "xhigh")
-
     def test_image_to_data_url(self):
         self.assertEqual(
             pt.anthropic_image_to_data_url({"type": "base64", "media_type": "image/png", "data": "AAA"}),
@@ -252,7 +106,7 @@ class TestRequestTranslate(unittest.TestCase):
             "system": "you are helpful",
             "messages": [{"role": "user", "content": "hi"}],
         }
-        out, ctx = pt.anthropic_to_openai_request(body, model_is_reasoning=False)
+        out, ctx = pt.anthropic_to_openai_request(body, reasoning_fields=None)
         self.assertEqual(out["model"], "gpt-4o")
         self.assertEqual(out["max_completion_tokens"], 128)          # 改名
         self.assertNotIn("max_tokens", out)
@@ -260,7 +114,7 @@ class TestRequestTranslate(unittest.TestCase):
         self.assertEqual(out["messages"][1], {"role": "user", "content": "hi"})
         self.assertEqual(ctx["request_model"], "gpt-4o")
         self.assertFalse(ctx["stream"])
-        # 非 reasoning：不发 reasoning_effort
+        # reasoning_fields=None（调用方模拟非 reasoning 模型场景）：不发 reasoning_effort
         self.assertNotIn("reasoning_effort", out)
 
     def test_array_system(self):
@@ -400,14 +254,26 @@ class TestRequestTranslate(unittest.TestCase):
 
     def test_reasoning_effort_emitted_when_reasoning(self):
         # 带 thinking.type=adaptive 才触发；裸 output_config 不再触发
+        # reasoning_fields 由调用方（server.py）用 core.reasoning 链路算好后传入，
+        # 这里模拟该链路：AnthropicReasoningCodec.decode → align(默认 cap) → ChatReasoningCodec.encode
+        from core.reasoning.capability import ReasoningCapability, align
+        from core.reasoning.registry import get_codec
         body = {"messages": [], "thinking": {"type": "adaptive"}, "output_config": {"effort": "high"}}
-        out, _ = pt.anthropic_to_openai_request(body, model_is_reasoning=True)
+        intent = get_codec("anthropic").decode(body)
+        aligned = align(intent, ReasoningCapability.from_config(None))
+        fields = get_codec("chat").encode(aligned, ReasoningCapability.from_config(None), "chat_effort")
+        out, _ = pt.anthropic_to_openai_request(body, reasoning_fields=fields)
         self.assertEqual(out["reasoning_effort"], "high")
 
     def test_reasoning_effort_not_emitted_for_bare_output_config(self):
-        # 裸 output_config.effort（无 thinking）→ 不塞 reasoning_effort
+        # 裸 output_config.effort（无 thinking）→ decode 不产出意图 → 不塞 reasoning_effort
+        from core.reasoning.capability import ReasoningCapability, align
+        from core.reasoning.registry import get_codec
         body = {"messages": [], "output_config": {"effort": "high"}}
-        out, _ = pt.anthropic_to_openai_request(body, model_is_reasoning=True)
+        intent = get_codec("anthropic").decode(body)
+        aligned = align(intent, ReasoningCapability.from_config(None))
+        fields = get_codec("chat").encode(aligned, ReasoningCapability.from_config(None), "chat_effort")
+        out, _ = pt.anthropic_to_openai_request(body, reasoning_fields=fields)
         self.assertNotIn("reasoning_effort", out)
 
     def test_metadata_user_id(self):
@@ -817,15 +683,31 @@ def test_A_max_tokens_priority():
        512, "A max_tokens 兜底可配")
 
 
+def _responses_body_to_reasoning_fields(body, variant="anthropic_adaptive"):
+    """测试辅助：模拟 server.py 的 decode→align→encode 链路（responses→anthropic）。"""
+    from core.reasoning.capability import ReasoningCapability, align
+    from core.reasoning.registry import get_codec
+    cap = ReasoningCapability.from_config(None)
+    intent = get_codec("responses").decode(body)
+    aligned = align(intent, cap)
+    return get_codec("anthropic").encode(aligned, cap, variant)
+
+
 def test_A_reasoning_effort():
     for eff in ("low", "medium", "high"):
-        ab = pt.responses_to_anthropic_request({"input": "x", "reasoning": {"effort": eff}})
+        body = {"input": "x", "reasoning": {"effort": eff}}
+        fields = _responses_body_to_reasoning_fields(body)
+        ab = pt.responses_to_anthropic_request(body, reasoning_fields=fields)
         eq(ab.get("thinking"), {"type": "adaptive"}, "A effort=%s -> thinking adaptive" % eff)
         eq(ab.get("output_config"), {"effort": eff}, "A effort=%s -> output_config" % eff)
     # 缺失/null 不注入
-    ab = pt.responses_to_anthropic_request({"input": "x"})
+    body_missing = {"input": "x"}
+    ab = pt.responses_to_anthropic_request(
+        body_missing, reasoning_fields=_responses_body_to_reasoning_fields(body_missing))
     check("thinking" not in ab and "output_config" not in ab, "A 无 reasoning 不注入 thinking")
-    ab = pt.responses_to_anthropic_request({"input": "x", "reasoning": {"effort": None}})
+    body_null = {"input": "x", "reasoning": {"effort": None}}
+    ab = pt.responses_to_anthropic_request(
+        body_null, reasoning_fields=_responses_body_to_reasoning_fields(body_null))
     check("thinking" not in ab, "A effort=null 不注入 thinking")
 
 
@@ -1395,16 +1277,28 @@ class TestARRequest(unittest.TestCase):
         rb, _ = pt.anthropic_to_responses_request(body)
         self.assertEqual(rb["max_output_tokens"], 128)
 
+    def _anthropic_body_to_responses_reasoning_fields(self, body):
+        """测试辅助：模拟 server.py 的 decode→align→encode 链路（anthropic→responses）。"""
+        from core.reasoning.capability import ReasoningCapability, align
+        from core.reasoning.registry import get_codec
+        cap = ReasoningCapability.from_config(None)
+        intent = get_codec("anthropic").decode(body)
+        aligned = align(intent, cap)
+        return get_codec("responses").encode(aligned, cap, "resp_effort")
+
     def test_ar_reasoning_effort_tiers(self):
-        # thinking enabled budget 4档3断点：<2000→low, <8000→medium, <32000→high, >=32000→xhigh
+        # thinking enabled budget 分档：<2000→low, <8000→medium, <32000→high, <64000→xhigh
+        # （budget=40000 落在 [32000,64000) → XHIGH，与旧行为 >=32000→xhigh 一致）
         for budget, expect in [(1000, "low"), (5000, "medium"), (10000, "high"), (40000, "xhigh")]:
             body = {"messages": [], "thinking": {"type": "enabled", "budget_tokens": budget}}
-            rb, _ = pt.anthropic_to_responses_request(body)
+            fields = self._anthropic_body_to_responses_reasoning_fields(body)
+            rb, _ = pt.anthropic_to_responses_request(body, reasoning_fields=fields)
             self.assertEqual(rb["reasoning"], {"effort": expect}, f"budget={budget}")
 
     def test_ar_reasoning_not_injected_when_non_reasoning(self):
+        # 非 reasoning 模型场景：调用方直接传 None（不走 core.reasoning 链路）
         body = {"messages": [], "thinking": {"type": "enabled", "budget_tokens": 40000}}
-        rb, _ = pt.anthropic_to_responses_request(body, model_is_reasoning=False)
+        rb, _ = pt.anthropic_to_responses_request(body, reasoning_fields=None)
         self.assertNotIn("reasoning", rb)
 
     def test_ar_tools_flat_and_name_truncation(self):

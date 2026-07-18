@@ -59,19 +59,27 @@ tools/model_proxy/
 - `target_model`：实际下发给上游的模型名（客户端请求里的 model 字段会被替换成这个）。
 - `cooldown_seconds`（可选）：该 supply 触发失败后的冷却时长，不填则用顶层
   `default_cooldown_seconds`。
-- `reasoning_map`（可选）：per-supply 的 effort 档位映射覆盖，见下。
+- `reasoning_capability`（可选）：per-supply 的 effort 档位能力描述，见下。
 
 > 已移除旧的 `reasoning` 布尔字段。实测证明它试图防范的"非 reasoning 模型收到 thinking/reasoning
-> 字段就 400"从未真实发生；真正会 400 的是 thinking **格式**不对（如新版 claude-sonnet-5 拒绝
-> `thinking.type=enabled` 要求改用 `adaptive`），这已由 thinking 格式自适应重试机制
-> （`_apply_thinking_fmt`）独立处理。现在无条件走 thinking 格式自适应，不再有粗粒度门控开关。
+> 字段就 400"从未真实发生；真正会 400 的是 thinking **语法变体**不对（如新版 claude-sonnet-5
+> 拒绝 `thinking.type=enabled` 要求改用 `adaptive`），这已由 `core.reasoning` 领域层
+> （`AnthropicReasoningCodec.interpret_rejection` + `SyntaxPreferenceStore`）统一处理。
+> 现在无条件走 reasoning 语法自适应，不再有粗粒度门控开关。
 
-#### reasoning_map（可选）：覆盖 effort 映射
+#### reasoning_capability（可选）：覆盖该 supply 真实支持的 effort 档位
 
-`reasoning_map` 是**每个 supply 自己的可选字段**，不配置时该 supply 用代码内置的默认 5 档逻辑
-（等价于 `effort_enum: ["none","low","medium","high","xhigh"]` + 默认断点 +
-`max_alias: "xhigh"`，与旧版本行为完全一致）。配置后按该 supply 覆盖
-`map_reasoning_effort` 的档位/断点，不影响其他 supply。
+强度处理是三层正交架构（`core/reasoning/`）：
+- `ladder.py`：canonical 强度全序（跨协议统一序数）+ budget↔canonical 换算（全局常量锚点，
+  不再是 per-supply 可配置项）。
+- `capability.py`：`ReasoningCapability`（per-supply 能力）+ `align()`（唯一钳位点）。
+- `codecs.py` / `registry.py`：各协议（anthropic/chat/responses）decode/encode/选语法。
+
+`reasoning_capability` 是**每个 supply 自己的可选字段**，不配置时该 supply 用代码内置的默认
+5 档（等价于 `effort_enum: ["none","low","medium","high","xhigh"]` + `max_alias: "xhigh"` +
+`off_alias: "none"`，与旧版本行为完全一致）。配置后按该 supply 覆盖 `ReasoningCapability`，
+不影响其他 supply。**budget 分档断点已上收为全局常量（`ladder.py` 的 `_BUDGET_ANCHORS`），
+不再支持 per-supply 自定义**（Anthropic budget 语义本身是固定的，与上游厂商无关）。
 
 不同供应商真实支持的 effort 档位不一样。以下是 glm 家族的实测示例（来自 `probe-effort` 探测）：
 
@@ -82,9 +90,8 @@ tools/model_proxy/
   "protocol": "anthropic",
   "appkey": "<APPKEY_PLACEHOLDER>",
   "target_model": "glm-5.2",
-  "reasoning_map": {
+  "reasoning_capability": {
     "effort_enum": ["none", "minimal", "low", "medium", "high"],
-    "budget_breakpoints": {"low": 2000, "medium": 8000, "high": 32000},
     "max_alias": "high"
   }
 }
@@ -97,11 +104,10 @@ tools/model_proxy/
   > "看起来像"识别出来的枚举词。生效前建议用户自行向 glm 核实该档位真实存在，若核实后发现不支持，
   > 从 `effort_enum` 里删掉即可（删掉后该词退化为"枚举外的值"，走下面的跨模型强度钳位逻辑）。
   > 无 `xhigh` 是确认无疑的（glm 最高档就是 `high`）。
-- `budget_breakpoints`：`thinking.type=enabled` 时 `budget_tokens` 的分档断点（可任意数量，
-  按值升序判断，`budget < 断点` 命中对应档；超过所有断点 → `effort_enum` 最高档，
-  故最高档不必在断点里显式写）。缺省 `{"low":2000,"medium":8000,"high":32000}`。
-- `max_alias`：Anthropic 的 `max` 档降级映射到的目标档；若不在 `effort_enum` 内自动兜底到最高档。
-  缺省 `"xhigh"`（例：glm 无 xhigh，故配 `"high"`，`max` 会正确映射到 `high`）。
+- `max_alias`：canonical `MAX` 档降级映射到的目标档；若不在 `effort_enum` 内自动兜底到最高档。
+  缺省 = `effort_enum` 最高档（例：glm 无 xhigh，配 `"high"`，`max` 会正确映射到 `high`）。
+- `off_alias`（可选）：显式关闭思考（Anthropic `thinking.type=disabled`）落到的目标档；
+  缺省 = `effort_enum` 含 `none`/`off` 则落到该档，否则不塞字段。
 
 档位不确定时可用 `probe-effort` 子命令向上游探测（见下）。
 
@@ -236,7 +242,7 @@ tools/model_proxy/model_proxy_cli.sh off                  # 停止
   chat 走 `reasoning_effort`、responses 走 `reasoning.effort`），从报错响应里用宽松正则
   尝试提取"Supported values are: ..."之类枚举并打印。**仅辅助人工审阅，不自动写入 config**
   （供应商报错格式差异大、glm 的 body 还会被截断、Responses 端点报错走 200-with-failed-status
-  而非 400），解析结果不保证准确，需人工判断后手动填 `reasoning_map`。
+  而非 400），解析结果不保证准确，需人工判断后手动填 `reasoning_capability`。
 
 - 端口默认 18889，同样支持 `MODEL_PROXY_PORT` 环境变量覆盖。
 - `admin_token` 从 `~/.claude/model_proxy_config.json` 读取，用于控制 API 的

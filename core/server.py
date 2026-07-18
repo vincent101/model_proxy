@@ -26,6 +26,8 @@ from typing import Any, Callable
 
 # 合并后的双向协议转换器（core 包内相对导入）
 from . import translate as pt
+from .reasoning.capability import ReasoningCapability, align
+from .reasoning.registry import apply_fields, get_codec
 
 # ---------------------------------------------------------------------------
 # L0 基座
@@ -67,96 +69,33 @@ _DEFAULT_COOLDOWN_SECONDS = 300
 
 
 # ---------------------------------------------------------------------------
-# Thinking 格式自适应缓存（原样拷贝自 proxy.py，不改内部逻辑）
-# 组合1（PASSTHROUGH, anthropic→anthropic）与组合4（REVERSE, responses→anthropic
-# 转换后打真实 Claude 上游）共用：缓存 key 用 target_model，同进程内同一真实模型
-# 命中同一条缓存。这四个函数只认 thinking/output_config 两个 key，不关心 dict 来源。
+# reasoning 语法偏好存储（取代旧 _THINKING_FMT_CACHE / _get/_set_thinking_fmt）。
+# 记录"某 target_model 应该用哪种语法变体"的运行时学习结果（由 400 拒绝重试驱动）。
+# 四种协议组合统一走 core.reasoning 链路，snapshot/learn 与协议无关，key 用 target_model。
 # ---------------------------------------------------------------------------
 
-_THINKING_FMT_CACHE: dict[str, dict] = {}          # model → {format, at}
-_THINKING_CACHE_TTL = 48 * 3600                     # 48 小时
 
+class SyntaxPreferenceStore:
+    """model → {"variant": str, "at": float}，带 TTL（沿用现有 48h）。"""
 
-def _get_thinking_fmt(model: str) -> str | None:
-    entry = _THINKING_FMT_CACHE.get(model)
-    if entry and time.time() - entry["at"] < _THINKING_CACHE_TTL:
-        return entry["format"]
-    return None
+    _TTL = 48 * 3600
 
+    def __init__(self):
+        self._cache: dict[str, dict] = {}
+        self._lock = threading.Lock()
 
-def _set_thinking_fmt(model: str, fmt: str) -> None:
-    _THINKING_FMT_CACHE[model] = {"format": fmt, "at": time.time()}
-    log.warning("thinking_cache: model=%r → format=%r (cached 48h)", model, fmt)
+    def snapshot(self, model: str) -> dict:
+        """返回该 model 当前的偏好 dict（供 codec.select_variant 用），过期或未学到返回 {}。"""
+        with self._lock:
+            entry = self._cache.get(model)
+            if entry and time.time() - entry["at"] < self._TTL:
+                return {"variant": entry["variant"]}
+            return {}
 
-
-def _parse_thinking_error(body: bytes) -> str | None:
-    """从 400 响应体识别应换用的 thinking 格式；返回 'adaptive' 或 'enabled'，无法识别返回 None。"""
-    try:
-        text = body.decode("utf-8", errors="replace")
-    except Exception:
-        return None
-    t = text.lower()
-    if "thinking.type.enabled" in t and "not supported" in t:
-        return "adaptive"
-    if "budget_tokens" in t and "not supported" in t:
-        return "adaptive"
-    if "thinking.type.adaptive" in t and "not supported" in t:
-        return "enabled"
-    # GLM 等部分网关返回泛化错误（不含具体 thinking 关键词），
-    # 当请求带了 adaptive thinking 时，转回 enabled 尝试
-    # output_config 不被支持（如 haiku-4.5 不接受 adaptive 的 output_config.effort）
-    if "output_config" in t and ("not permitted" in t or "not allowed" in t):
-        return "enabled"
-    # GLM 等部分上游返回泛化中文错误（调用方带了 thinking 才走到此分支）
-    if "参数有误" in t or "invalid parameter" in t.lower():
-        return "enabled"
-    return None
-
-
-def _apply_thinking_fmt(body: dict, fmt: str) -> dict:
-    """将 body 里的 thinking/output_config 转换为目标格式，返回修改后的 body（原地修改）。"""
-    thinking = body.get("thinking")
-    current = thinking.get("type") if isinstance(thinking, dict) else None
-    if fmt == "adaptive":
-        # enabled+budget → adaptive+effort
-        if current == "enabled":
-            budget = thinking.get("budget_tokens", 10000)
-            effort = "low" if budget < 2000 else "medium" if budget < 8000 else "high" if budget < 32000 else "xhigh"
-            body["thinking"] = {"type": "adaptive"}
-            body.setdefault("output_config", {})["effort"] = effort
-    elif fmt == "enabled":
-        # adaptive → enabled+budget；并清除游离的 output_config.effort
-        # （haiku 等模型不接受 output_config.effort，即使 thinking 为 None 也要清）
-        if current == "adaptive":
-            effort = body.get("output_config", {}).get("effort", "medium")
-            budget = {"low": 2000, "medium": 8000, "high": 32000, "xhigh": 64000, "max": 128000}.get(effort, 10000)
-            body["thinking"] = {"type": "enabled", "budget_tokens": budget}
-        # 无论 thinking 形态如何，只要目标是 enabled 就移除 output_config
-        # （游离的 output_config.effort 是 haiku 报错主因）
-        if isinstance(body.get("output_config"), dict):
-            body["output_config"].pop("effort", None)
-            if not body["output_config"]:
-                body.pop("output_config", None)
-    return body
-
-
-def _maybe_precvt_thinking(carrier: dict | None, model: str | None) -> bool:
-    """查缓存，命中则对 carrier 原地应用 thinking 格式转换。
-
-    carrier 为 PASSTHROUGH(anthropic→anthropic) 的 body_json 或 REVERSE 的
-    anthropic_body；两处预转换逻辑复用同一份判断，避免重复代码。
-    返回是否发生了转换（供调用方决定要不要重新序列化 send_body）。
-    """
-    if not carrier or not model:
-        return False
-    has_thinking_related = carrier.get("thinking") or carrier.get("output_config")
-    if not has_thinking_related:
-        return False
-    cached_fmt = _get_thinking_fmt(model)
-    if not cached_fmt:
-        return False
-    _apply_thinking_fmt(carrier, cached_fmt)
-    return True
+    def learn(self, model: str, variant: str) -> None:
+        with self._lock:
+            self._cache[model] = {"variant": variant, "at": time.time()}
+        log.warning("reasoning_pref: model=%r → variant=%r (cached 48h)", model, variant)
 
 
 # ---------------------------------------------------------------------------
@@ -556,6 +495,7 @@ class ModelProxyHandler(BaseHTTPRequestHandler):
     def _forward(self, method: str):
         cs: ConfigStore = self.server.config_store
         cd: CooldownStore = self.server.cooldown_store
+        pref_store: SyntaxPreferenceStore = self.server.pref_store
 
         # 1. 热重载 + 读 body
         cs.maybe_reload()
@@ -609,7 +549,7 @@ class ModelProxyHandler(BaseHTTPRequestHandler):
 
         # 6. failover 循环（tried_set 为请求内局部集合，不改全局状态）
         tried_set: set[str] = set()
-        _thinking_retried = False   # thinking 格式重试只做一次，作用域覆盖整个请求周期
+        _reasoning_retried = False   # reasoning 语法重试只做一次，作用域覆盖整个请求周期
         while True:
             supply = select_supply(supplies_list, supply_map, cd, tried_set)
             if supply is None:
@@ -632,8 +572,20 @@ class ModelProxyHandler(BaseHTTPRequestHandler):
                 return
 
             target_model = supply.get("target_model")
-            reasoning_map = supply.get("reasoning_map")  # 可选 per-supply effort 映射覆盖
             base_url = supply.get("url", "").rstrip("/")
+
+            # ---- reasoning 统一链路：decode(source) → align(cap) → select_variant → encode(target) ----
+            # 四种协议组合（PASSTHROUGH anthropic→anthropic / PASSTHROUGH responses→responses /
+            # ANTHROPIC_TO_CHAT / ANTHROPIC_TO_RESPONSES / RESPONSES_TO_ANTHROPIC）全部走这同一条
+            # 链路，差异只在 get_codec 拿到哪个 codec。PASSTHROUGH anthropic→anthropic 现在也用
+            # 目标 Claude 模型的 capability 钳位（现状缺失的能力）。
+            src_codec = get_codec(source)
+            tgt_codec = get_codec(target)
+            reasoning_intent = src_codec.decode(body_json or {})
+            reasoning_cap = ReasoningCapability.from_config(supply)
+            aligned_effort = align(reasoning_intent, reasoning_cap)
+            reasoning_variant = tgt_codec.select_variant(pref_store.snapshot(target_model or ""))
+            reasoning_fields = tgt_codec.encode(aligned_effort, reasoning_cap, reasoning_variant)
 
             # ---- 按 mode 计算 send_body / target_url / 转换上下文 ----
             # fwd_ctx：请求转换上下文（tool_name_mapping/request_model），
@@ -645,11 +597,12 @@ class ModelProxyHandler(BaseHTTPRequestHandler):
                 if target_model and isinstance(body_json, dict) and "model" in body_json:
                     body_json["model"] = target_model
                     send_body = json.dumps(body_json, ensure_ascii=False).encode("utf-8")
-                # thinking 格式预转换：仅 anthropic→anthropic（显式排除组合2 responses→responses，
-                # 该组合理论上也无害，但意图要清晰——只在真正涉及 Anthropic thinking 语义时介入）
-                if source == "anthropic" and target == "anthropic" and isinstance(body_json, dict):
-                    if _maybe_precvt_thinking(body_json, target_model):
-                        send_body = json.dumps(body_json, ensure_ascii=False).encode("utf-8")
+                # reasoning 字段按目标 capability 钳位后原地 merge（含 anthropic→anthropic 与
+                # responses→responses：source==target 时 encode 的 variant 就是该协议唯一/学到的
+                # 语法，PASSTHROUGH 不代表"不处理 reasoning"，只代表 body 结构本身不用转换）
+                if isinstance(body_json, dict) and reasoning_fields:
+                    apply_fields(body_json, reasoning_fields)
+                    send_body = json.dumps(body_json, ensure_ascii=False).encode("utf-8")
                 _parsed = urllib.parse.urlparse(self.path)
                 _qs = {k: v for k, v in urllib.parse.parse_qsl(_parsed.query)
                        if k not in {"beta"}}
@@ -661,8 +614,7 @@ class ModelProxyHandler(BaseHTTPRequestHandler):
                 # 请求转换失败（异常）→ 合法 Anthropic error，400（正向规格 §5.1）
                 try:
                     openai_body, fwd_ctx = pt.anthropic_to_openai_request(
-                        body_json or {}, model_is_reasoning=True,
-                        reasoning_map=reasoning_map)
+                        body_json or {}, reasoning_fields=reasoning_fields)
                 except Exception as e:
                     log.warning("ANTHROPIC_TO_CHAT request translate failed: %s", e)
                     self._write_buffered_response(
@@ -681,8 +633,7 @@ class ModelProxyHandler(BaseHTTPRequestHandler):
                 # 请求转换失败（异常）→ 合法 Anthropic error，400
                 try:
                     responses_body, fwd_ctx = pt.anthropic_to_responses_request(
-                        body_json or {}, model_is_reasoning=True,
-                        reasoning_map=reasoning_map)
+                        body_json or {}, reasoning_fields=reasoning_fields)
                 except Exception as e:
                     log.warning("ANTHROPIC_TO_RESPONSES request translate failed: %s", e)
                     self._write_buffered_response(
@@ -695,15 +646,16 @@ class ModelProxyHandler(BaseHTTPRequestHandler):
                 send_body = json.dumps(responses_body, ensure_ascii=False).encode("utf-8")
                 # base_url 已配到完整 /v1/responses 层级，不拼子路径
                 target_url = base_url
-                # 不调用 _maybe_precvt_thinking：新组合走 Responses reasoning.effort 机制，
-                # 无 Anthropic thinking.type 400 拒绝问题，无需 thinking 格式自适应重试
+                # Responses reasoning.effort 机制无 Anthropic thinking.type 400 拒绝问题
+                # （ResponsesReasoningCodec 单变体，interpret_rejection 恒 None），无需重试。
 
             else:  # RESPONSES_TO_ANTHROPIC
                 # 组合4：responses 请求 → anthropic 上游。转成 Anthropic body，打 /v1/messages。
                 # 请求转换失败（异常）→ 合法 Responses error，400（反向规格 §5.1）
                 try:
                     anthropic_body = pt.responses_to_anthropic_request(
-                        body_json or {}, max_tokens_default=4096)
+                        body_json or {}, max_tokens_default=4096,
+                        reasoning_fields=reasoning_fields)
                 except Exception as e:
                     log.warning("RESPONSES_TO_ANTHROPIC request translate failed: %s", e)
                     self._write_buffered_response(
@@ -712,9 +664,6 @@ class ModelProxyHandler(BaseHTTPRequestHandler):
                     return
                 if target_model:
                     anthropic_body["model"] = target_model
-                # thinking 格式预转换：enabled↔adaptive 自适应由 _apply_thinking_fmt 重试机制处理，
-                # 无条件执行（不再按 supply.reasoning 门控）
-                _maybe_precvt_thinking(anthropic_body, target_model)
                 send_body = json.dumps(anthropic_body, ensure_ascii=False).encode("utf-8")
                 # anthropic 端点固定后缀 /v1/messages（客户端 /v1/responses 不透传）
                 target_url = base_url + "/v1/messages"
@@ -751,25 +700,19 @@ class ModelProxyHandler(BaseHTTPRequestHandler):
                 resp_headers = list(e.headers.items())
                 resp_body = e.read()
 
-                # thinking 格式错误自适应重试（仅一次，不 rotate/cooldown supply，
-                # 与 failover 重试的关键区别：不加入 tried_set、不调用 cd.cooldown）
-                # 注：ANTHROPIC_TO_RESPONSES 不进 thinking 重试分支——它走 Responses
-                # reasoning.effort 机制，无 Anthropic thinking.type 400 拒绝问题。
-                thinking_carrier: dict | None = None
-                if mode == PASSTHROUGH and source == "anthropic" and target == "anthropic":
-                    thinking_carrier = body_json if isinstance(body_json, dict) else None
-                elif mode == RESPONSES_TO_ANTHROPIC:
-                    thinking_carrier = anthropic_body
-                _carrier_has_thinking = thinking_carrier and (
-                    thinking_carrier.get("thinking") or thinking_carrier.get("output_config"))
-                if (resp_status == 400 and not _thinking_retried
-                        and target_model and _carrier_has_thinking):
-                    required_fmt = _parse_thinking_error(resp_body)
-                    if required_fmt:
-                        _set_thinking_fmt(target_model, required_fmt)
-                        _thinking_retried = True
+                # reasoning 语法自适应重试（仅一次，不 rotate/cooldown supply，
+                # 与 failover 重试的关键区别：不加入 tried_set、不调用 cd.cooldown）。
+                # 单变体 codec（Chat/Responses）interpret_rejection 恒 None，天然不触发重试；
+                # 只有 AnthropicReasoningCodec（双变体）在 tgt_codec 为它时才可能返回新变体。
+                if (resp_status == 400 and not _reasoning_retried and target_model
+                        and reasoning_fields):
+                    next_variant = tgt_codec.interpret_rejection(resp_body, reasoning_variant)
+                    if next_variant:
+                        pref_store.learn(target_model, next_variant)
+                        _reasoning_retried = True
                         continue  # 重新走 while 循环：select_supply 会再次选中同一 supply，
-                                  # 重新构造 body 时预转换命中刚写入的缓存，自动改对格式后重发
+                                  # 重新算 reasoning_fields 时 select_variant 命中刚学到的偏好，
+                                  # 自动改对语法后重发
 
                 if failover == "on" and resp_status in _FAILOVER_STATUSES:
                     log.warning("cooldown+failover: supply=%s status=%s key_tail4=%s",
@@ -1275,10 +1218,14 @@ def main():
     # 2. 实例化 CooldownStore
     cooldown_store = CooldownStore()
 
+    # 2.5 实例化 SyntaxPreferenceStore（reasoning 语法偏好，取代旧 _THINKING_FMT_CACHE）
+    pref_store = SyntaxPreferenceStore()
+
     # 3. 启动 ThreadingHTTPServer
     server = ThreadingHTTPServer(("127.0.0.1", port), ModelProxyHandler)
     server.config_store = config_store    # type: ignore[attr-defined]
     server.cooldown_store = cooldown_store  # type: ignore[attr-defined]
+    server.pref_store = pref_store        # type: ignore[attr-defined]
 
     print(f"model_proxy listening on 127.0.0.1:{port}", flush=True)
     try:

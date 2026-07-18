@@ -143,92 +143,10 @@ def truncate_tool_name(name: str) -> str:
 
 
 # ============================================================
-# 辅助：reasoning_effort 映射（正向规格 §1.4）
+# reasoning 强度处理已迁移到 core.reasoning.*（ladder/capability/codecs/registry）。
+# 本模块的 *_request 函数不再自己算强度/选语法，改为接收调用方（server.py）已算好的
+# reasoning_fields dict，只负责 merge 进 body（详见各 *_request 函数签名变更）。
 # ============================================================
-
-# 5 档标准 effort 强度序，用于 adaptive 分支里"枚举外的值"按强度就近钳位。
-_EFFORT_RANK = {"none": 0, "low": 1, "medium": 2, "high": 3, "xhigh": 4}
-
-
-def map_reasoning_effort(body: dict, reasoning_map: dict | None = None):
-    """thinking + output_config.effort → reasoning_effort（none/low/medium/high/xhigh 或 None）。
-
-    触发条件：只有 thinking.type ∈ {enabled, adaptive} 才产出非None值（含 disabled 显式关闭）。
-    裸 output_config.effort（无 thinking.type）视为未生效意图，返回 None（不塞字段）。
-
-    reasoning_map（可选，来自 supply.reasoning_map 配置，用于覆盖代码默认档位/断点）：
-    - effort_enum: 该 supply 真实支持的 effort 档位有序列表（低→高），
-      缺省用代码默认 5 档 ["none","low","medium","high","xhigh"]。
-    - budget_breakpoints: enabled 模式下 budget_tokens 分档断点 dict，
-      缺省用代码默认 {"low":2000,"medium":8000,"high":32000}。
-      语义：budget < 断点 → 对应档；超过所有断点 → effort_enum 最高档（不需显式写最高档断点）。
-    - max_alias: Anthropic max 档位映射到的目标档位，缺省 "xhigh"；
-      若不在 effort_enum 内，兜底到 effort_enum 最高档。
-
-    未传 reasoning_map（或 None）时行为与默认 5 档硬编码逻辑完全等价（向后兼容）。
-    """
-    reasoning_map = reasoning_map or {}
-    effort_enum = reasoning_map.get("effort_enum") or ["none", "low", "medium", "high", "xhigh"]
-    # 异常配置兜底：空列表 → 退回默认 5 档
-    if not effort_enum:
-        effort_enum = ["none", "low", "medium", "high", "xhigh"]
-    breakpoints = reasoning_map.get("budget_breakpoints")
-    if not breakpoints:
-        breakpoints = {"low": 2000, "medium": 8000, "high": 32000}
-    max_alias = reasoning_map.get("max_alias", "xhigh")
-    # max_alias 必须在 effort_enum 内，否则兜底成最高档
-    if max_alias not in effort_enum:
-        max_alias = effort_enum[-1]
-
-    thinking = body.get("thinking") or {}
-    ttype = thinking.get("type")
-    oc = body.get("output_config") or {}
-    effort = oc.get("effort")
-
-    if ttype == "disabled":
-        # 显式关闭思考，网关侧需要真的塞 reasoning_effort=none 才能让 reasoning_tokens 清零。
-        # 若该 supply 不支持 none 档，则不塞字段（返回 None）。
-        return "none" if "none" in effort_enum else None
-    if ttype not in ("enabled", "adaptive"):
-        return None  # thinking缺失/其他值 → 不产出（含裸output_config.effort场景）
-
-    if ttype == "adaptive":
-        if effort in effort_enum:
-            return effort
-        if effort == "max":
-            return max_alias  # Anthropic 最强档降级到该 supply 的目标档
-        # 不在枚举内的值 → 按强度就近钳位：枚举里能查到标准强度序的档位参与比较，
-        # 客户端 effort 强度超出枚举范围则钳到对应端点，落在范围内但未精确命中则取最近邻
-        # （并列取更高档，偏保守保留更多思考质量）。
-        effort_rank = _EFFORT_RANK.get(effort)
-        ranked_enum = [(e, _EFFORT_RANK[e]) for e in effort_enum if e in _EFFORT_RANK]
-        if effort_rank is not None and ranked_enum:
-            min_item = min(ranked_enum, key=lambda kv: kv[1])
-            max_item = max(ranked_enum, key=lambda kv: kv[1])
-            if effort_rank > max_item[1]:
-                return max_item[0]
-            if effort_rank < min_item[1]:
-                return min_item[0]
-            best = None
-            best_dist = None
-            for name, rank in ranked_enum:
-                dist = abs(rank - effort_rank)
-                if best is None or dist < best_dist or (dist == best_dist and rank > best[1]):
-                    best = (name, rank)
-                    best_dist = dist
-            return best[0]
-        # effort 不是标准词，或 effort_enum 里没有任何能识别的标准档 → 沿用原兜底逻辑
-        if "medium" in effort_enum:
-            return "medium"
-        return effort_enum[len(effort_enum) // 2]
-
-    # ttype == "enabled"：budget_tokens 按 breakpoints 从低到高分档（动态支持任意数量断点）
-    b = thinking.get("budget_tokens", 10000)
-    for tier_name, threshold in sorted(breakpoints.items(), key=lambda kv: kv[1]):
-        if b < threshold:
-            return tier_name
-    # 超过所有断点 → 最高档（effort_enum 最后一项）
-    return effort_enum[-1]
 
 
 # ============================================================
@@ -456,8 +374,21 @@ def _translate_assistant_message(content):
 # 模块 A：请求转换 Anthropic → OpenAI（正向规格 §1）
 # ============================================================
 
-def anthropic_to_openai_request(body: dict, model_is_reasoning: bool = True,
-                                reasoning_map: dict | None = None):
+def _merge_reasoning_fields(target: dict, fields: "dict | None") -> None:
+    """把 core.reasoning codec.encode() 产出的字段片段 merge 进 target（原地修改）。
+
+    约定：value 为 None → 删除该 key；其余 → 设置该 key；fields 为空/None → 不动。
+    与 core.reasoning.registry.apply_fields 语义一致（此处独立实现，保持
+    translate.py 不反向依赖 core.reasoning，维持依赖单向性）。
+    """
+    for key, value in (fields or {}).items():
+        if value is None:
+            target.pop(key, None)
+        else:
+            target[key] = value
+
+
+def anthropic_to_openai_request(body: dict, reasoning_fields: "dict | None" = None):
     """Anthropic /v1/messages body → (openai_body, ctx)。
 
     ctx = {
@@ -466,7 +397,9 @@ def anthropic_to_openai_request(body: dict, model_is_reasoning: bool = True,
         "request_model": str,                # 回填响应 model 字段
     }
     采用白名单：只转换规格 §1.1 列出字段，其余（container/mcp_servers 等）丢弃。
-    model_is_reasoning=False 时不发 reasoning_effort（非 reasoning 模型带此参数可能 400）。
+    reasoning_fields：调用方（server.py）用 core.reasoning 已经 decode→align→encode 好的
+    reasoning 字段片段（ChatReasoningCodec.encode 产出），本函数只负责 merge，不再自己算强度。
+    非 reasoning 模型场景由调用方传 None/{} 实现"不发 reasoning_effort"。
     """
     openai_body = {}
     ctx = {"tool_name_mapping": {}, "stream": False, "request_model": ""}
@@ -487,11 +420,8 @@ def anthropic_to_openai_request(body: dict, model_is_reasoning: bool = True,
         messages.insert(0, sys_msg)
     openai_body["messages"] = messages
 
-    # reasoning_effort（仅 reasoning 模型）
-    if model_is_reasoning:
-        effort = map_reasoning_effort(body, reasoning_map)
-        if effort is not None:
-            openai_body["reasoning_effort"] = effort
+    # reasoning 字段（已由调用方算好，本函数只 merge）
+    _merge_reasoning_fields(openai_body, reasoning_fields)
 
     # tools
     if body.get("tools"):
@@ -889,18 +819,6 @@ def responses_content_to_anthropic_blocks(content) -> list:
     return blocks
 
 
-def map_reasoning(body: dict) -> dict:
-    """Responses reasoning.effort -> Anthropic thinking + output_config（反向规格 §1.4）。
-
-    low/medium/high 直传；缺失/null 不注入。
-    """
-    r = body.get("reasoning") or {}
-    eff = r.get("effort")
-    if eff in ("low", "medium", "high"):
-        return {"thinking": {"type": "adaptive"}, "output_config": {"effort": eff}}
-    return {}
-
-
 def map_tool_choice(tc):
     """Responses tool_choice -> Anthropic tool_choice（反向规格 §1.6）。"""
     if tc == "auto":
@@ -932,12 +850,14 @@ def translate_tools(responses_tools) -> list:
 # 模块 A'：请求转换 Responses -> Anthropic（反向规格 §1）
 # ============================================================================
 
-def responses_to_anthropic_request(body: dict, max_tokens_default: int = 4096) -> dict:
+def responses_to_anthropic_request(body: dict, max_tokens_default: int = 4096,
+                                   reasoning_fields: "dict | None" = None) -> dict:
     """把 codex 的 Responses 请求体转换成 Anthropic /v1/messages 请求体。
 
     白名单策略：只转换反向规格 §1.1 表中字段，其余平台字段丢弃。
-    注：thinking 注入未按 model_is_reasoning 门控（任务签名未含该参数）；
-    非 reasoning 模型的门控由主文件外层负责。
+    reasoning_fields：调用方（server.py）用 core.reasoning 已经 decode→align→encode 好的
+    reasoning 字段片段（AnthropicReasoningCodec.encode 产出，即 thinking/output_config），
+    本函数只负责 merge，不再自己算强度/选语法。
     """
     ab: dict = {}
 
@@ -960,8 +880,8 @@ def responses_to_anthropic_request(body: dict, max_tokens_default: int = 4096) -
         or max_tokens_default
     )
 
-    # reasoning.effort -> thinking + output_config（§1.4）
-    ab.update(map_reasoning(body))
+    # reasoning 字段（已由调用方算好，本函数只 merge）
+    _merge_reasoning_fields(ab, reasoning_fields)
 
     # tools -> input_schema（§1.5）
     if body.get("tools"):
@@ -1432,7 +1352,7 @@ class AnthropicToResponsesStreamAdapter:
 # ############################################################################
 # §3 Anthropic → Responses（新组合，anthropic 请求 → responses 上游）
 #
-# 复用 §1 的辅助（truncate_tool_name / map_reasoning_effort /
+# 复用 §1 的辅助（truncate_tool_name /
 # anthropic_image_to_data_url），产出 Responses 扁平结构。响应侧把 Responses
 # 响应/事件还原为 Anthropic 格式，工具名经 ctx["tool_name_mapping"] 还原。
 # ############################################################################
@@ -1554,12 +1474,14 @@ def _a2r_translate_tool_choice(tc):
 # 模块 A''：请求转换 Anthropic → Responses（§3.1）
 # ============================================================================
 
-def anthropic_to_responses_request(body: dict, model_is_reasoning: bool = True,
-                                   reasoning_map: dict | None = None):
+def anthropic_to_responses_request(body: dict, reasoning_fields: "dict | None" = None):
     """Anthropic /v1/messages body → (responses_body, ctx)。
 
     ctx = {"tool_name_mapping": dict[str,str], "request_model": str}
-    白名单：只转换列出字段，其余丢弃。model_is_reasoning=False 时不注入 reasoning。
+    白名单：只转换列出字段，其余丢弃。
+    reasoning_fields：调用方（server.py）用 core.reasoning 已经 decode→align→encode 好的
+    reasoning 字段片段（ResponsesReasoningCodec.encode 产出，即 reasoning.effort），
+    本函数只负责 merge，不再自己算强度。非 reasoning 模型场景由调用方传 None/{} 实现。
     """
     responses_body: dict = {}
     ctx = {"tool_name_mapping": {}, "request_model": ""}
@@ -1588,11 +1510,8 @@ def anthropic_to_responses_request(body: dict, model_is_reasoning: bool = True,
     if "max_tokens" in body:
         responses_body["max_output_tokens"] = body["max_tokens"]
 
-    # thinking/output_config → reasoning.effort（仅 reasoning 模型）
-    if model_is_reasoning:
-        effort = map_reasoning_effort(body, reasoning_map)
-        if effort is not None:
-            responses_body["reasoning"] = {"effort": effort}
+    # reasoning 字段（已由调用方算好，本函数只 merge）
+    _merge_reasoning_fields(responses_body, reasoning_fields)
 
     # tools → Responses 扁平 function（复用 §1 _translate_tools 拿 mapping，再摊平）
     if body.get("tools"):
