@@ -134,10 +134,31 @@ class TestCapabilityFromConfig(unittest.TestCase):
         cap = ReasoningCapability.from_config(supply)
         self.assertEqual(cap.enum, (CE.LOW, CE.HIGH))
 
-    def test_effort_enum_all_unrecognized_falls_back_default(self):
+    def test_effort_enum_all_unrecognized_yields_empty(self):
+        # effort_enum 键存在即代表显式声明，全非法名解析后为空也是 ()，不回退默认5档
+        # （区别于键缺失才回退默认5档，见 test_default_when_empty_dict）。
         supply = {"reasoning_capability": {"effort_enum": ["bogus1", "bogus2"]}}
         cap = ReasoningCapability.from_config(supply)
+        self.assertEqual(cap.enum, ())
+
+    def test_effort_enum_key_present_empty_list_yields_empty_enum(self):
+        # effort_enum 显式配置为空列表 → () 空元组，代表该 supply 不支持任何档位
+        # （0档场景，区别于键完全缺失时的默认5档兜底）。
+        supply = {"reasoning_capability": {"effort_enum": []}}
+        cap = ReasoningCapability.from_config(supply)
+        self.assertEqual(cap.enum, ())
+        self.assertIsNone(cap.off_alias)
+
+    def test_effort_enum_key_missing_still_defaults(self):
+        # reasoning_capability 存在但没有 effort_enum 键 → 未配置，回归默认5档。
+        supply = {"reasoning_capability": {"off_alias": "low"}}
+        cap = ReasoningCapability.from_config(supply)
         self.assertEqual(cap.enum, (CE.OFF, CE.LOW, CE.MEDIUM, CE.HIGH, CE.XHIGH))
+
+    def test_effort_enum_short_enum_two_levels(self):
+        supply = {"reasoning_capability": {"effort_enum": ["high", "max"]}}
+        cap = ReasoningCapability.from_config(supply)
+        self.assertEqual(cap.enum, (CE.HIGH, CE.MAX))
 
 
 class TestAlign(unittest.TestCase):
@@ -202,6 +223,37 @@ class TestAlign(unittest.TestCase):
     def test_source_budget_none_when_not_present(self):
         out = align(self._intent(present=False, source_budget=999), self.default_cap)
         self.assertIsNone(out.source_budget)
+
+    def test_empty_enum_level_present_returns_none(self):
+        cap = ReasoningCapability.from_config({"reasoning_capability": {"effort_enum": []}})
+        out = align(self._intent(level=CE.HIGH), cap)
+        self.assertIsNone(out.level)
+
+    def test_empty_enum_explicit_off_returns_none(self):
+        cap = ReasoningCapability.from_config({"reasoning_capability": {"effort_enum": []}})
+        out = align(self._intent(explicit_off=True), cap)
+        self.assertIsNone(out.level)
+
+    def test_empty_enum_level_none_returns_none(self):
+        cap = ReasoningCapability.from_config({"reasoning_capability": {"effort_enum": []}})
+        out = align(self._intent(level=None), cap)
+        self.assertIsNone(out.level)
+
+    def test_empty_enum_source_budget_still_passed_through(self):
+        cap = ReasoningCapability.from_config({"reasoning_capability": {"effort_enum": []}})
+        out = align(self._intent(level=CE.HIGH, source_budget=999), cap)
+        self.assertIsNone(out.level)
+        self.assertEqual(out.source_budget, 999)
+
+    def test_short_enum_two_levels_monotonic_clamp(self):
+        cap = ReasoningCapability.from_config(
+            {"reasoning_capability": {"effort_enum": ["high", "max"]}})
+        self.assertEqual(align(self._intent(level=CE.OFF), cap).level, CE.HIGH)
+        self.assertEqual(align(self._intent(level=CE.LOW), cap).level, CE.HIGH)
+        self.assertEqual(align(self._intent(level=CE.HIGH), cap).level, CE.HIGH)
+        # XHIGH(5) 与 HIGH(4)/MAX(6) 距离并列(各1) → 取更高档 MAX
+        self.assertEqual(align(self._intent(level=CE.XHIGH), cap).level, CE.MAX)
+        self.assertEqual(align(self._intent(level=CE.MAX), cap).level, CE.MAX)
 
 
 # ============================================================================

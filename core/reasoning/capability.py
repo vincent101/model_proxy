@@ -36,14 +36,14 @@ class ReasoningCapability:
         supply = supply or {}
         rc = supply.get("reasoning_capability") or {}
 
-        raw_enum = rc.get("effort_enum")
-        if raw_enum:
+        if "effort_enum" in rc:
+            raw_enum = rc.get("effort_enum")
             parsed = []
-            for name in raw_enum:
+            for name in (raw_enum or []):
                 level = name_to_canonical(name)
                 if level is not None and level not in parsed:
                     parsed.append(level)
-            enum = tuple(sorted(parsed)) if parsed else _DEFAULT_ENUM
+            enum = tuple(sorted(parsed))  # 空列表/全非法名 → () 空元组，不回退默认档
         else:
             enum = _DEFAULT_ENUM
 
@@ -64,14 +64,17 @@ class AlignedEffort:
     source_budget: "int | None"        # 透传自 ReasoningIntent，供无损回填
 
 
-def _clamp_to_enum(level: CanonicalEffort, enum: tuple) -> CanonicalEffort:
+def _clamp_to_enum(level: CanonicalEffort, enum: tuple) -> "CanonicalEffort | None":
     """把 level 按 canonical 序数就近钳到 enum 里的一档。
 
+    - enum 为空 → None（该 supply 不支持任何 effort 档位）
     - 超过 enum 最高档 → enum 最高档
     - 低于 enum 最低档 → enum 最低档
     - 精确命中 → 原样返回
     - 落在范围内但未精确命中 → 取序数最近邻；并列取更高档（偏保守保留思考质量）
     """
+    if not enum:
+        return None
     lo, hi = enum[0], enum[-1]
     if level <= lo:
         return lo
@@ -97,6 +100,8 @@ def align(intent: ReasoningIntent, cap: ReasoningCapability) -> AlignedEffort:
     """
     if not intent.present:
         return AlignedEffort(level=None, source_budget=None)
+    if not cap.enum:
+        return AlignedEffort(level=None, source_budget=intent.source_budget)
     if intent.explicit_off:
         return AlignedEffort(level=cap.off_alias, source_budget=intent.source_budget)
     if intent.level is None:

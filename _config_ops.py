@@ -84,11 +84,78 @@ def confirm(prompt: str) -> bool:
 # 改成供 add/edit 内部调用+精确解析才回写）
 # ---------------------------------------------------------------------------
 
-def probe_effort(supply: dict) -> tuple[int | None, str, list[str] | None]:
+def _fix_mojibake(raw: bytes) -> str:
+    """尝试修复网关返回的UTF-8被当Latin-1重编码的双重编码乱码。
+    仅在检测到mojibake特征时生效，否则原样按utf-8解码返回。"""
+    plain = raw.decode("utf-8", errors="replace")
+    try:
+        fixed = raw.decode("utf-8", errors="ignore").encode("latin-1", errors="ignore").decode("utf-8", errors="ignore")
+    except Exception:
+        return plain
+    # 简单的mojibake特征检测：修复后中文字符明显增多则采用修复版
+    def _cjk_count(s):
+        return sum(1 for ch in s if '一' <= ch <= '鿿')
+    if _cjk_count(fixed) > _cjk_count(plain):
+        return fixed
+    return plain
+
+
+# 多措辞正则并联匹配，命中即止（对 _fix_mojibake 后的文本跑，无mojibake时退化为plain文本）。
+_ENUM_PATTERNS = [
+    r"[Ss]upported values (?:are)?\s*[:：]?\s*(.+)",
+    r"expected one of\s+(.+?)(?:\s+at line|$)",
+    r"(?:可选值为|可选值|valid values?)\s*[：:]\s*(.+)",
+]
+
+
+def _extract_enum_candidates(text: str) -> "list[str] | None":
+    """从命中的措辞捕获组文本里抽取候选档名。
+
+    兼容反引号包裹、单/双引号包裹，以及顿号/逗号/，/空格分隔的裸词，
+    合并去重保留原始顺序。不做 name_to_canonical 白名单清洗——按方案，
+    保留候选原始形态（可能含噪音），人工审查是唯一把关环节。
+    """
+    tail = None
+    for pat in _ENUM_PATTERNS:
+        m = re.search(pat, text)
+        if m:
+            tail = m.group(1)
+            break
+    if tail is None:
+        return None
+
+    backticked = re.findall(r"`([^`]+)`", tail)
+    quoted = re.findall(r"['\"]([^'\"]+)['\"]", tail)
+    # 裸词兜底：去掉已被反引号/引号包裹的片段后，剩余按顿号/逗号/空格分隔
+    bare_source = re.sub(r"`[^`]+`", " ", tail)
+    bare_source = re.sub(r"['\"][^'\"]+['\"]", " ", bare_source)
+    bare = [w for w in re.split(r"[、,，\s]+", re.split(r"[.。\n]", bare_source)[0]) if w.strip()]
+
+    seen = set()
+    cands = []
+    for w in backticked + quoted + bare:
+        w = w.strip().strip("、,，`'\"")
+        if w and w not in seen:
+            seen.add(w)
+            cands.append(w)
+
+    return cands or None
+
+
+def _is_response_complete(raw: bytes, text_fixed: str) -> bool:
+    """判断探测响应是否完整（未被截断）。主判据JSON完整性，其余作为参考。"""
+    try:
+        json.loads(text_fixed)
+        return True
+    except (json.JSONDecodeError, ValueError):
+        return False
+
+
+def probe_effort(supply: dict) -> "tuple[int | None, str, list[str] | None, bool]":
     """向 supply 上游发一个已知非法的 effort 值，尝试解析真实支持的枚举。
 
-    返回 (http_status_or_None, raw_body_text, enums_or_None)。
-    任何异常/超时都被吞掉，返回 (None, str(e), None)，调用方按"探测失败"处理。
+    只发一次探测请求。返回 (http_status_or_None, text_fixed, regex_candidates, is_complete)。
+    任何异常/超时都被吞掉，返回 (None, str(e), None, False)，调用方按"探测失败"处理。
     """
     url = (supply.get("url") or "").rstrip("/")
     proto = supply.get("protocol")
@@ -112,7 +179,7 @@ def probe_effort(supply: dict) -> tuple[int | None, str, list[str] | None]:
                 "reasoning": {"effort": PROBE_VALUE},
                 "input": "probe"}
     else:
-        return None, f"未知 protocol: {proto!r}", None
+        return None, f"未知 protocol: {proto!r}", None, False
 
     data = json.dumps(body).encode("utf-8")
     headers = {"Content-Type": "application/json",
@@ -120,59 +187,102 @@ def probe_effort(supply: dict) -> tuple[int | None, str, list[str] | None]:
     req = urllib.request.Request(target, data=data, headers=headers, method="POST")
 
     status = None
-    raw = ""
+    raw_bytes = b""
     try:
         with urllib.request.urlopen(req, timeout=30) as resp:
             status = resp.status
-            raw = resp.read().decode("utf-8", "replace")
+            raw_bytes = resp.read()
     except urllib.error.HTTPError as e:
         status = e.code
-        raw = e.read().decode("utf-8", "replace")
+        raw_bytes = e.read()
     except Exception as e:
-        return None, str(e), None
+        return None, str(e), None, False
 
-    # 宽松解析 'Supported values are: xxx, yyy, zzz' 之类措辞
-    m = re.search(r"[Ss]upported values (?:are)?\s*[:：]?\s*(.+)", raw)
-    enums = None
-    if m:
-        tail = m.group(1)
-        quoted = re.findall(r"['\"]([^'\"]+)['\"]", tail)
-        cands = quoted if quoted else [
-            w.strip() for w in re.split(r"[,，]", re.split(r"[.。\n]", tail)[0]) if w.strip()]
-        ident = re.compile(r"^[A-Za-z][A-Za-z0-9_-]*$")
-        enums = []
-        for w in cands:
-            if ident.match(w):
-                enums.append(w)
-            else:
-                break
-        enums = enums or None
+    text_fixed = _fix_mojibake(raw_bytes)
+    regex_candidates = _extract_enum_candidates(text_fixed)
+    is_complete = _is_response_complete(raw_bytes, text_fixed)
 
-    return status, raw, enums
+    return status, text_fixed, regex_candidates, is_complete
+
+
+def _llm_probe_official_doc(model_name: str, target_model: str, protocol: str) -> "dict | None":
+    """通过具备联网能力的上游查询官方文档，判断模型是否支持 reasoning effort 分档。
+
+    解析失败/请求失败/超时 → 静默降级，返回 None，不清洗白名单，原样返回解析出的dict。
+
+    未实现：当前代码库（_config_ops.py 现有的 urllib.request 直连机制）不具备
+    "指向某个可用 supply 发起联网检索并拿到搜索结果"的能力——现有 probe_effort()
+    只是直接对上游模型 API 发一个 JSON 请求，不涉及 web_search 工具调用；而
+    core/translate.py、core/server.py 对 Anthropic/Responses 托管的 web_search
+    类工具是跳过/丢弃处理，不会转发给上游模型执行真实网络检索。没有找到可复用的
+    联网上游调用机制，按方案要求在此按"合理降级"返回 None，不臆造新的联网方式。
+    """
+    return None
 
 
 def run_probe_and_maybe_accept(supply: dict, interactive_prompt: bool = True) -> dict | None:
-    """执行探测，展示结果，询问用户是否接受；返回要写入的 reasoning_capability dict 或 None（跳过/失败）。
+    """执行探测（a/b/c 三步），展示结果，询问用户是否接受；返回要写入的
+    reasoning_capability dict 或 None（跳过/失败/不写入）。
 
     interactive_prompt=False 时（非交互批量场景预留），探测成功也不写入，只打印，
     避免在没有人工确认的路径上悄悄写库——当前 CLI 所有调用点都是交互式，此参数保留扩展位。
     """
     print(f"正在探测 supply={supply.get('id')} protocol={supply.get('protocol')} "
           f"model={supply.get('target_model')} ...")
-    status, raw, enums = probe_effort(supply)
+    status, text_fixed, regex_candidates, is_complete = probe_effort(supply)
     print(f"HTTP status={status}")
-    if enums:
-        print(f"疑似支持的枚举: {enums}")
-        if not interactive_prompt:
-            print("（非交互模式，不自动写入，仅供参考）")
-            return None
-        if confirm(f"接受该结果并写入 reasoning_capability.effort_enum={enums}?"):
-            return {"effort_enum": enums}
-        print("已跳过，不写入 reasoning_capability。")
+
+    a_success = bool(regex_candidates) and is_complete
+
+    candidates = None
+    source_desc = None
+
+    if a_success:
+        print(f"探测命中，候选档位（请核对，可能含噪音): {regex_candidates}")
+        print(text_fixed[:500] + ("...(truncated)" if len(text_fixed) > 500 else ""))
+        candidates = regex_candidates
+        source_desc = "网关探测"
+    else:
+        if regex_candidates and not is_complete:
+            print(f"探测响应疑似被截断/不完整，候选可能不全: {regex_candidates}（不采纳，转查官方文档）")
+        doc_result = _llm_probe_official_doc(
+            supply.get("id", ""), supply.get("target_model", ""), supply.get("protocol", ""))
+        if doc_result is not None:
+            print(f"官方文档查询结果: supports_reasoning={doc_result.get('supports_reasoning')} "
+                  f"effort_enum={doc_result.get('effort_enum')} "
+                  f"confidence={doc_result.get('confidence')} "
+                  f"source_urls={doc_result.get('source_urls')}")
+            if regex_candidates:
+                print(f"（疑似截断，仅供交叉参考的探测候选: {regex_candidates}）")
+            candidates = doc_result.get("effort_enum")
+            source_desc = "官方文档查询，confidence=" + str(doc_result.get("confidence"))
+        else:
+            print("探测与文档查询均未得到结论，请人工核对官方文档后手动 edit")
+            print(text_fixed[:500] + ("...(truncated)" if len(text_fixed) > 500 else ""))
+            candidates = None
+            source_desc = None
+
+    if candidates is None:
         return None
-    print("探测未得确定结果,已留空用默认5档,如需精确档位请手动核对后编辑")
-    if raw:
-        print(raw[:500] + ("...(truncated)" if len(raw) > 500 else ""))
+
+    if not interactive_prompt:
+        print(f"（非交互模式，不自动写入，仅供参考，来源={source_desc}）")
+        return None
+
+    edited = input(
+        f"来源={source_desc}，候选档位={candidates}\n"
+        f"请核对/编辑要写入的档位列表（逗号分隔，留空=沿用上面候选，输入 - 表示空列表/不支持任何档位）: "
+    ).strip()
+    if edited == "-":
+        final_enum = []
+    elif edited:
+        final_enum = [w.strip() for w in edited.split(",") if w.strip()]
+    else:
+        final_enum = candidates
+
+    if confirm(f"接受并写入 reasoning_capability.effort_enum={final_enum}?"):
+        return {"effort_enum": final_enum}
+    print("已跳过，不写入 reasoning_capability。")
     return None
 
 
