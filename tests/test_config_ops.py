@@ -140,18 +140,46 @@ class TestRunProbeAndMaybeAcceptFlow(unittest.TestCase):
         self.assertIsNone(result)
 
     def test_truncated_then_doc_none_falls_to_manual_edit_no_crash(self):
-        # is_complete=False（截断）→ 转查文档 → doc_result=None（当前必然降级）→ candidates=None → 不写入
+        # is_complete=False（截断）→ 转查文档 → doc_result=None（当前必然降级）→ candidates=None
+        # → 仍进入人工输入环节（不能因为探测不出就直接放弃，人工可能依据外部信息判断）；
+        # 本用例模拟用户留空 = 跳过，不写入。
         with patch("_config_ops.probe_effort",
-                   return_value=(400, '{"error":{"message":"可选值为：none、low', ["none", "low"], False)):
+                   return_value=(400, '{"error":{"message":"可选值为：none、low', ["none", "low"], False)), \
+             patch("builtins.input", return_value=""):
             result = run_probe_and_maybe_accept(self._supply())
         self.assertIsNone(result)
 
     def test_b_branch_complete_json_no_regex_hit_falls_to_doc_none(self):
+        # candidates=None 仍进入人工输入环节；本用例模拟用户留空 = 跳过，不写入。
         with patch("_config_ops.probe_effort",
                    return_value=(400, '{"error":{"message":"Extra inputs are not permitted"}}',
-                                 None, True)):
+                                 None, True)), \
+             patch("builtins.input", return_value=""):
             result = run_probe_and_maybe_accept(self._supply())
         self.assertIsNone(result)
+
+    def test_no_candidates_user_can_manually_input_empty_list(self):
+        # candidates=None（a/b 均无结论），但人工依据外部信息（如已知官方文档结论）
+        # 判断该 supply 确认不支持任何档位，输入 "-" 应能写入空列表——这是本次修复的
+        # 核心场景：探测/文档查询都拿不出候选时，人工仍必须有输入空集的入口。
+        with patch("_config_ops.probe_effort",
+                   return_value=(400, '{"error":{"message":"Extra inputs are not permitted"}}',
+                                 None, True)), \
+             patch("builtins.input", return_value="-"), \
+             patch("_config_ops.confirm", return_value=True):
+            result = run_probe_and_maybe_accept(self._supply())
+        self.assertEqual(result, {"effort_enum": []})
+
+    def test_no_candidates_user_can_manually_input_explicit_list(self):
+        # candidates=None 时人工也可以直接敲入一组已知档位（比如凭官方文档结论），
+        # 不局限于"-"表示空集这一种输入。
+        with patch("_config_ops.probe_effort",
+                   return_value=(400, '{"error":{"message":"Extra inputs are not permitted"}}',
+                                 None, True)), \
+             patch("builtins.input", return_value="high,max"), \
+             patch("_config_ops.confirm", return_value=True):
+            result = run_probe_and_maybe_accept(self._supply())
+        self.assertEqual(result, {"effort_enum": ["high", "max"]})
 
     def test_user_can_edit_candidates_before_writing(self):
         with patch("_config_ops.probe_effort",

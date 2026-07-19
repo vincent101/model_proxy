@@ -257,28 +257,34 @@ def run_probe_and_maybe_accept(supply: dict, interactive_prompt: bool = True) ->
             candidates = doc_result.get("effort_enum")
             source_desc = "官方文档查询，confidence=" + str(doc_result.get("confidence"))
         else:
-            print("探测与文档查询均未得到结论，请人工核对官方文档后手动 edit")
+            print("探测与文档查询均未得到结论，请人工核对官方文档后手动确认")
             print(text_fixed[:500] + ("...(truncated)" if len(text_fixed) > 500 else ""))
             candidates = None
-            source_desc = None
-
-    if candidates is None:
-        return None
+            source_desc = "无自动结论，人工判断"
 
     if not interactive_prompt:
         print(f"（非交互模式，不自动写入，仅供参考，来源={source_desc}）")
         return None
 
+    # candidates 为 None（a/b 均无结论）时，仍进入人工输入环节——不能因为"探测不出"
+    # 就直接放弃，人工可能依据外部信息（官方文档/已知架构结论）判断出这个 supply
+    # 真实支持的档位（包括显式空集，表示确认不支持任何档位）。留空表示"跳过，不写入"，
+    # 与 candidates 非 None 时"留空=沿用候选"的语义不同，此处沿用候选无意义（候选为空）。
+    prompt_candidates_desc = f"候选档位={candidates}" if candidates is not None else "（无自动候选）"
     edited = input(
-        f"来源={source_desc}，候选档位={candidates}\n"
-        f"请核对/编辑要写入的档位列表（逗号分隔，留空=沿用上面候选，输入 - 表示空列表/不支持任何档位）: "
+        f"来源={source_desc}，{prompt_candidates_desc}\n"
+        f"请核对/编辑要写入的档位列表（逗号分隔；输入 - 表示空列表/确认不支持任何档位；"
+        f"留空={'沿用上面候选' if candidates is not None else '跳过，不写入'}）: "
     ).strip()
     if edited == "-":
         final_enum = []
     elif edited:
         final_enum = [w.strip() for w in edited.split(",") if w.strip()]
-    else:
+    elif candidates is not None:
         final_enum = candidates
+    else:
+        print("已跳过，不写入 reasoning_capability。")
+        return None
 
     if confirm(f"接受并写入 reasoning_capability.effort_enum={final_enum}?"):
         return {"effort_enum": final_enum}
