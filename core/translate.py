@@ -39,8 +39,9 @@ model_proxy_translate_reverse.py（§2 反向）合并而来，§3 为后续新�
       本转换器 feed(event_type, data) 接收的是已解析好的 (type, dict)，SSE 拆行由主文件负责；
       本文件的输出侧 responses_sse_bytes 产出 Responses 侧 `data: {json}\\n\\n`。
   修正2 thinking 块必现：每次响应首块永远是 thinking(index 0)，text/tool_use 从 index 1 起。
-      本状态机对 thinking/redacted_thinking 块显式跳过（cur_item_kind="thinking_skip"），
-      不产出 Responses 事件、不占 output_index，故 output_index 独立计数、与 Anthropic index 解耦。
+      本状态机将 thinking/redacted_thinking 块映射为 Responses reasoning item
+      （cur_item_kind="reasoning"），占用一个 output_index，故 output_index 与
+      Anthropic index 解耦但顺序一致（thinking 在前则 reasoning 占 index 0）。
   修正3 usage 落点：message_start.usage 为空 {}，完整 usage（input+output_tokens）在 message_delta。
       故 usage_in / usage_out 均从 message_delta 取，不依赖 message_start。
 """
@@ -110,6 +111,10 @@ def gen_conversation_id() -> str:
 
 def gen_tooluse_id() -> str:
     return "toolu_" + secrets.token_hex(12)
+
+
+def gen_reasoning_id() -> str:
+    return "rs_" + secrets.token_hex(16)      # reasoning item id
 
 
 # ------------------------------------------------------------------
@@ -986,6 +991,25 @@ def _input_to_messages(input_items) -> list:
 # 模块 B'：非流式响应转换 Anthropic -> Responses（反向规格 §2）
 # ============================================================================
 
+def _extract_reasoning_tokens(usage: dict) -> int:
+    """从 Anthropic usage dict 防御性多路径读取 reasoning/thinking token 数。
+
+    候选路径（按优先级）：
+        usage.output_tokens_details.thinking_tokens
+        usage.output_tokens_details.reasoning_tokens
+        usage.thinking_tokens
+    全部缺失则返回 0（保持旧行为，不臆造数据）。
+    """
+    u = usage or {}
+    otd = u.get("output_tokens_details") or {}
+    return (
+        otd.get("thinking_tokens")
+        or otd.get("reasoning_tokens")
+        or u.get("thinking_tokens")
+        or 0
+    )
+
+
 def _anthropic_usage_to_responses(usage: dict) -> dict:
     """Anthropic usage -> Responses usage（反向规格 §2.3）。"""
     if not usage:
@@ -999,7 +1023,7 @@ def _anthropic_usage_to_responses(usage: dict) -> dict:
         "input_tokens": in_tok,
         "input_tokens_details": {"cached_tokens": u.get("cache_read_input_tokens", 0) or 0},
         "output_tokens": out_tok,
-        "output_tokens_details": {"reasoning_tokens": 0},
+        "output_tokens_details": {"reasoning_tokens": _extract_reasoning_tokens(u)},
         "total_tokens": in_tok + out_tok,
     }
 
@@ -1039,9 +1063,21 @@ def anthropic_to_responses_response(resp: dict, model: str,
                 # Anthropic tool_use.input 是 dict -> Responses arguments 要 JSON 字符串
                 "arguments": json.dumps(block.get("input", {}), ensure_ascii=False),
             })
-        elif bt in ("thinking", "redacted_thinking"):
-            # 反向规格 §5.3 策略 A：首版丢弃
-            pass
+        elif bt == "thinking":
+            thinking_text = block.get("thinking", "") or ""
+            output.append({
+                "type": "reasoning",
+                "id": gen_reasoning_id(),
+                "summary": [{"type": "summary_text", "text": thinking_text}] if thinking_text else [],
+                "status": "completed",
+            })
+        elif bt == "redacted_thinking":
+            output.append({
+                "type": "reasoning",
+                "id": gen_reasoning_id(),
+                "summary": [],
+                "status": "completed",
+            })
         # 其他 block 忽略
 
     now = int(time.time())
@@ -1098,7 +1134,7 @@ class AnthropicToResponsesStreamAdapter:
         self.completed = False
 
         self.output_index = -1
-        self.cur_item_kind = None                # "message" | "function_call" | "thinking_skip"
+        self.cur_item_kind = None                # "message" | "function_call" | "reasoning"
         self.cur_item_id = None
         self.cur_text_buf = ""
 
@@ -1108,8 +1144,10 @@ class AnthropicToResponsesStreamAdapter:
 
         self.usage_in = 0
         self.usage_out = 0
+        self.usage_reasoning = 0
         self.final_stop_reason = None
         self.completed_items = []                # 已完成的 output item，供 response.completed
+        self.cur_reasoning_summary_buf = ""       # reasoning item 正文累积（thinking_delta）
 
     # ---- 内部工具 ----
 
@@ -1146,7 +1184,7 @@ class AnthropicToResponsesStreamAdapter:
                 "input_tokens": self.usage_in,
                 "input_tokens_details": {"cached_tokens": 0},
                 "output_tokens": self.usage_out,
-                "output_tokens_details": {"reasoning_tokens": 0},
+                "output_tokens_details": {"reasoning_tokens": self.usage_reasoning},
                 "total_tokens": self.usage_in + self.usage_out,
             }
         return skel
@@ -1183,8 +1221,7 @@ class AnthropicToResponsesStreamAdapter:
             elif cbt == "tool_use":
                 self._start_tool_item(events, cb)
             elif cbt in ("thinking", "redacted_thinking"):
-                # 修正2：thinking 块显式跳过，不产事件、不占 output_index。
-                self.cur_item_kind = "thinking_skip"
+                self._start_reasoning_item(events)
 
         elif event_type == "content_block_delta":
             d = data.get("delta") or {}
@@ -1210,14 +1247,26 @@ class AnthropicToResponsesStreamAdapter:
                         "output_index": self.output_index,
                         "delta": partial,
                     }))
-            # thinking_delta / signature_delta：跳过
+            elif dt == "thinking_delta" and self.cur_item_kind == "reasoning":
+                txt = d.get("thinking", "")
+                if txt:
+                    self.cur_reasoning_summary_buf += txt
+                    events.append(self._emit({
+                        "type": "response.reasoning_summary_text.delta",
+                        "item_id": self.cur_item_id,
+                        "output_index": self.output_index,
+                        "summary_index": 0,
+                        "delta": txt,
+                    }))
+            # signature_delta：跳过（Responses 协议无对应字段）
 
         elif event_type == "content_block_stop":
             if self.cur_item_kind == "message":
                 self._stop_message_item(events)
             elif self.cur_item_kind == "function_call":
                 self._stop_tool_item(events)
-            # thinking_skip：不产事件
+            elif self.cur_item_kind == "reasoning":
+                self._stop_reasoning_item(events)
             self.cur_item_kind = None
 
         elif event_type == "message_delta":
@@ -1227,6 +1276,9 @@ class AnthropicToResponsesStreamAdapter:
                 self.usage_out = usage.get("output_tokens")
             if "input_tokens" in usage and usage.get("input_tokens") is not None:
                 self.usage_in = usage.get("input_tokens")
+            # 流式场景 message_delta.usage 目前观察到的结构不含 thinking 明细，
+            # 防御性读取：真实有值时自然带出，无值维持 0（不臆造）。
+            self.usage_reasoning = _extract_reasoning_tokens(usage) or self.usage_reasoning
             self.final_stop_reason = (data.get("delta") or {}).get("stop_reason")
 
         elif event_type == "message_stop":
@@ -1296,6 +1348,48 @@ class AnthropicToResponsesStreamAdapter:
             "status": "completed",
             "role": "assistant",
             "content": [part],
+        }
+        events.append(self._emit({
+            "type": "response.output_item.done",
+            "output_index": self.output_index,
+            "item": item,
+        }))
+        self.completed_items.append(item)
+
+    # ---- reasoning item ----
+
+    def _start_reasoning_item(self, events: list) -> None:
+        self.output_index += 1
+        self.cur_item_kind = "reasoning"
+        self.cur_item_id = gen_reasoning_id()
+        self.cur_reasoning_summary_buf = ""
+        events.append(self._emit({
+            "type": "response.output_item.added",
+            "output_index": self.output_index,
+            "item": {
+                "id": self.cur_item_id,
+                "type": "reasoning",
+                "status": "in_progress",
+                "summary": [],
+            },
+        }))
+
+    def _stop_reasoning_item(self, events: list) -> None:
+        buf = self.cur_reasoning_summary_buf
+        if buf:
+            events.append(self._emit({
+                "type": "response.reasoning_summary_part.done",
+                "item_id": self.cur_item_id,
+                "output_index": self.output_index,
+                "summary_index": 0,
+                "part": {"type": "summary_text", "text": buf},
+            }))
+        summary = [{"type": "summary_text", "text": buf}] if buf else []
+        item = {
+            "id": self.cur_item_id,
+            "type": "reasoning",
+            "status": "completed",
+            "summary": summary,
         }
         events.append(self._emit({
             "type": "response.output_item.done",

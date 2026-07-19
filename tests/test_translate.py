@@ -829,14 +829,65 @@ def test_B_tool_use_response():
     eq(out["reasoning"], {"effort": None, "summary": None}, "B 无 effort 回显 null")
 
 
-def test_B_thinking_dropped():
+def test_B_thinking_to_reasoning_item():
     resp = {"content": [{"type": "thinking", "thinking": "让我想想"},
                         {"type": "text", "text": "答案"}],
             "usage": {"input_tokens": 5, "output_tokens": 3}}
     out = pt.anthropic_to_responses_response(resp, model="m")
-    eq(len(out["output"]), 1, "B thinking 块被丢弃，只剩 text item")
-    eq(out["output"][0]["type"], "message", "B 剩下的是 message")
-    eq(out["usage"]["output_tokens_details"]["reasoning_tokens"], 0, "B reasoning_tokens=0")
+    eq(len(out["output"]), 2, "B thinking 转 reasoning item，output 含 2 项")
+    reasoning_item, message_item = out["output"]
+    eq(reasoning_item["type"], "reasoning", "B 第1项是 reasoning")
+    check(reasoning_item["id"].startswith("rs_"), "B reasoning item id rs_ 前缀")
+    eq(reasoning_item["status"], "completed", "B reasoning item status=completed")
+    eq(reasoning_item["summary"], [{"type": "summary_text", "text": "让我想想"}],
+       "B 非空 thinking 正文 summary 有值")
+    eq(message_item["type"], "message", "B 第2项是 message")
+    eq(out["usage"]["output_tokens_details"]["reasoning_tokens"], 0,
+       "B usage 无 thinking 明细字段时 reasoning_tokens 仍为 0")
+
+
+def test_B_thinking_empty_text_summary_empty():
+    resp = {"content": [{"type": "thinking", "thinking": ""},
+                        {"type": "text", "text": "答案"}],
+            "usage": {"input_tokens": 5, "output_tokens": 3}}
+    out = pt.anthropic_to_responses_response(resp, model="m")
+    eq(out["output"][0]["summary"], [], "B thinking 正文空串 summary=[]（不伪造占位文字）")
+
+
+def test_B_redacted_thinking_summary_empty():
+    resp = {"content": [{"type": "redacted_thinking", "data": "encrypted-blob"},
+                        {"type": "text", "text": "答案"}],
+            "usage": {"input_tokens": 5, "output_tokens": 3}}
+    out = pt.anthropic_to_responses_response(resp, model="m")
+    reasoning_item = out["output"][0]
+    eq(reasoning_item["type"], "reasoning", "B redacted_thinking 也转 reasoning item")
+    eq(reasoning_item["summary"], [], "B redacted_thinking summary=[]")
+    check("encrypted_content" not in reasoning_item, "B redacted_thinking 不映射 encrypted_content")
+
+
+def test_B_reasoning_tokens_multi_path():
+    # 路径1：output_tokens_details.thinking_tokens
+    out1 = pt.anthropic_to_responses_response(
+        {"content": [], "usage": {"input_tokens": 1, "output_tokens": 2,
+                                   "output_tokens_details": {"thinking_tokens": 7}}},
+        model="m")
+    eq(out1["usage"]["output_tokens_details"]["reasoning_tokens"], 7,
+       "B reasoning_tokens 读取 output_tokens_details.thinking_tokens")
+    # 路径2：output_tokens_details.reasoning_tokens
+    out2 = pt.anthropic_to_responses_response(
+        {"content": [], "usage": {"input_tokens": 1, "output_tokens": 2,
+                                   "output_tokens_details": {"reasoning_tokens": 9}}},
+        model="m")
+    eq(out2["usage"]["output_tokens_details"]["reasoning_tokens"], 9,
+       "B reasoning_tokens 读取 output_tokens_details.reasoning_tokens")
+    # 路径3：顶层 thinking_tokens
+    out3 = pt.anthropic_to_responses_response(
+        {"content": [], "usage": {"input_tokens": 1, "output_tokens": 2, "thinking_tokens": 5}},
+        model="m")
+    eq(out3["usage"]["output_tokens_details"]["reasoning_tokens"], 5,
+       "B reasoning_tokens 读取顶层 thinking_tokens")
+    # total_tokens 不重复累加 reasoning
+    eq(out1["usage"]["total_tokens"], 3, "B total_tokens=input+output，不重复加 reasoning")
 
 
 def test_B_tools_echo():
@@ -906,11 +957,14 @@ def _sample_text_events():
 def test_C_text_stream():
     adapter = pt.AnthropicToResponsesStreamAdapter(model="gpt-5.6-sol")
     events = _run(adapter, _sample_text_events())
-    # 期望事件序列（thinking 块被完全跳过）
+    # 期望事件序列：thinking(空正文，只有 signature) → reasoning item added/done（无 delta，无 summary_part.done）
+    # 顺延到 text item 在 output_index 1
     eq(_types(events), [
         "response.created",
         "response.in_progress",
-        "response.output_item.added",
+        "response.output_item.added",       # reasoning item, output_index 0
+        "response.output_item.done",        # reasoning item done（正文空，无 summary_part.done）
+        "response.output_item.added",       # message item, output_index 1
         "response.content_part.added",
         "response.output_text.delta",
         "response.output_text.delta",
@@ -918,23 +972,31 @@ def test_C_text_stream():
         "response.content_part.done",
         "response.output_item.done",
         "response.completed",
-    ], "C 纯文本事件序列（thinking 跳过，无多余事件）")
+    ], "C 纯文本事件序列（thinking 转 reasoning item，text 顺延到 index 1）")
     _assert_seq_contiguous(events, "C 纯文本")
-    # thinking 不占 output_index：message item 应在 output_index 0
-    added = [e for e in events if e["type"] == "response.output_item.added"][0]
-    eq(added["output_index"], 0, "C thinking 跳过后 message 在 output_index 0")
-    check(added["item"]["id"].startswith("msg_"), "C message item id msg_ 前缀")
+    added_items = [e for e in events if e["type"] == "response.output_item.added"]
+    reasoning_added, message_added = added_items
+    eq(reasoning_added["output_index"], 0, "C reasoning item 占 output_index 0")
+    eq(reasoning_added["item"]["type"], "reasoning", "C 首个 item 是 reasoning")
+    check(reasoning_added["item"]["id"].startswith("rs_"), "C reasoning item id rs_ 前缀")
+    eq(message_added["output_index"], 1, "C message 顺延到 output_index 1")
+    check(message_added["item"]["id"].startswith("msg_"), "C message item id msg_ 前缀")
+    # reasoning item done：正文空 summary=[]
+    done_items = [e for e in events if e["type"] == "response.output_item.done"]
+    reasoning_done = done_items[0]
+    eq(reasoning_done["item"]["summary"], [], "C reasoning 正文空 summary=[]")
+    eq(reasoning_done["item"]["status"], "completed", "C reasoning item 收尾 completed")
     # 完整文本
-    done = [e for e in events if e["type"] == "response.output_text.done"][0]
-    eq(done["text"], "Hi! 有什么我可以帮你的吗？😊", "C output_text.done 完整文本")
-    # completed 携带 usage 与 output
+    text_done = [e for e in events if e["type"] == "response.output_text.done"][0]
+    eq(text_done["text"], "Hi! 有什么我可以帮你的吗？😊", "C output_text.done 完整文本")
+    # completed 携带 usage 与 output（reasoning + message 共 2 项）
     completed = events[-1]
     eq(completed["response"]["status"], "completed", "C completed status")
     eq(completed["response"]["service_tier"], "default", "C completed service_tier=default")
     eq(completed["response"]["usage"]["input_tokens"], 9, "C completed usage input")
     eq(completed["response"]["usage"]["output_tokens"], 22, "C completed usage output")
     eq(completed["response"]["usage"]["total_tokens"], 31, "C completed total_tokens=input+output")
-    eq(len(completed["response"]["output"]), 1, "C completed output 含 1 item")
+    eq(len(completed["response"]["output"]), 2, "C completed output 含 2 item（reasoning+message）")
     # created/in_progress 骨架
     created = events[0]
     eq(created["response"]["status"], "in_progress", "C created status=in_progress")
@@ -942,10 +1004,10 @@ def test_C_text_stream():
     check("usage" not in created["response"], "C created 无 usage")
 
 
-def test_C_thinking_skipped_no_events():
-    """thinking_delta/signature_delta 不产出事件、不占 index（专测修正2）。"""
+def test_C_thinking_to_reasoning_item_full_lifecycle():
+    """thinking 正文非空：产出 output_item.added→summary.delta→summary_part.done→output_item.done
+    完整生命周期，占用 output_index 0；signature_delta 仍跳过；text item 顺延到 output_index 1。"""
     adapter = pt.AnthropicToResponsesStreamAdapter(model="m")
-    # 只喂 thinking 块 + text 块
     evs = _run(adapter, [
         ("message_start", {"message": {"usage": {}}}),
         ("content_block_start", {"content_block": {"type": "thinking", "thinking": ""}}),
@@ -959,15 +1021,23 @@ def test_C_thinking_skipped_no_events():
                            "usage": {"input_tokens": 1, "output_tokens": 1}}),
         ("message_stop", {}),
     ])
-    # thinking 相关不应产生任何 output_text.delta 或 item 事件
-    thinking_leak = [e for e in evs if e["type"] in (
-        "response.reasoning_summary_text.delta",)]
-    eq(thinking_leak, [], "C thinking 不产 reasoning 事件")
-    # 只有 1 个 output item（text），output_index 0
+    # reasoning_summary_text.delta 应产出（正文非空），signature_delta 不产出任何事件
+    reasoning_deltas = [e for e in evs if e["type"] == "response.reasoning_summary_text.delta"]
+    eq(len(reasoning_deltas), 1, "C thinking 正文非空产出 1 条 summary.delta")
+    eq(reasoning_deltas[0]["delta"], "想", "C summary.delta 内容透传")
+    # reasoning item 占 output_index 0，text item 顺延到 1
     added = [e for e in evs if e["type"] == "response.output_item.added"]
-    eq(len(added), 1, "C thinking 跳过后仅 1 个 output item")
-    eq(added[0]["output_index"], 0, "C text item output_index=0（thinking 未占用）")
-    _assert_seq_contiguous(evs, "C thinking 跳过")
+    eq(len(added), 2, "C reasoning item + text item 共 2 个 output item")
+    eq(added[0]["output_index"], 0, "C reasoning item output_index=0")
+    eq(added[0]["item"]["type"], "reasoning", "C item0 类型 reasoning")
+    eq(added[1]["output_index"], 1, "C text item output_index=1（顺延）")
+    # reasoning item done：summary 非空 + summary_part.done 先发
+    part_done = [e for e in evs if e["type"] == "response.reasoning_summary_part.done"]
+    eq(len(part_done), 1, "C 正文非空发 1 条 summary_part.done")
+    reasoning_item_done = [e for e in evs if e["type"] == "response.output_item.done"][0]
+    eq(reasoning_item_done["item"]["summary"], [{"type": "summary_text", "text": "想"}],
+       "C reasoning item done summary 含正文")
+    _assert_seq_contiguous(evs, "C thinking 完整生命周期")
 
 
 # 实测样本B（工具，含首块 thinking）改写
@@ -996,17 +1066,21 @@ def test_C_tool_stream():
     eq(_types(events), [
         "response.created",
         "response.in_progress",
-        "response.output_item.added",
+        "response.output_item.added",       # reasoning item, output_index 0
+        "response.output_item.done",        # reasoning item done（正文空）
+        "response.output_item.added",       # function_call item, output_index 1
         "response.function_call_arguments.delta",
         "response.function_call_arguments.delta",
         "response.function_call_arguments.delta",
         "response.function_call_arguments.done",
         "response.output_item.done",
         "response.completed",
-    ], "C 工具事件序列（无 content_part 事件）")
+    ], "C 工具事件序列（thinking 转 reasoning item 顺延，无 content_part 事件）")
     _assert_seq_contiguous(events, "C 工具")
-    added = [e for e in events if e["type"] == "response.output_item.added"][0]
-    eq(added["output_index"], 0, "C 工具 output_index 0（thinking 跳过）")
+    added_items = [e for e in events if e["type"] == "response.output_item.added"]
+    eq(added_items[0]["output_index"], 0, "C reasoning item output_index 0")
+    added = added_items[1]
+    eq(added["output_index"], 1, "C 工具 output_index 顺延到 1")
     check(added["item"]["id"].startswith("item_"), "C function_call item id item_ 前缀")
     eq(added["item"]["call_id"], "toolu_01", "C call_id 透传 tool_use.id")
     eq(added["item"]["name"], "get_weather", "C name 透传")
@@ -1015,13 +1089,14 @@ def test_C_tool_stream():
     done = [e for e in events if e["type"] == "response.function_call_arguments.done"][0]
     eq(done["arguments"], "{\"city\": \"北京\"}", "C arguments.done 拼接完整（原样透传拼接）")
     eq(done["name"], "get_weather", "C arguments.done 带 name")
-    item_done = [e for e in events if e["type"] == "response.output_item.done"][0]
+    item_done = [e for e in events if e["type"] == "response.output_item.done"][1]
     eq(item_done["item"]["status"], "completed", "C function_call item 收尾 completed")
     eq(item_done["item"]["arguments"], "{\"city\": \"北京\"}", "C item.done arguments 完整")
 
 
 def test_C_text_and_tool_mixed():
-    """文本(idx1) + 工具(idx2)：thinking idx0 跳过；Responses output_index 0(message)、1(function_call)。"""
+    """thinking(idx0) + 文本(idx1) + 工具(idx2)：thinking 转 reasoning item 占 output_index 0，
+    message 顺延到 1，function_call 顺延到 2。"""
     adapter = pt.AnthropicToResponsesStreamAdapter(model="m")
     evs = _run(adapter, [
         ("message_start", {"message": {"usage": {}}}),
@@ -1039,17 +1114,19 @@ def test_C_text_and_tool_mixed():
         ("message_stop", {}),
     ])
     added = [e for e in evs if e["type"] == "response.output_item.added"]
-    eq(len(added), 2, "C 混合出 2 个 output item")
-    eq(added[0]["output_index"], 0, "C message output_index 0")
-    eq(added[0]["item"]["type"], "message", "C item0 message")
-    eq(added[1]["output_index"], 1, "C function_call output_index 1")
-    eq(added[1]["item"]["type"], "function_call", "C item1 function_call")
+    eq(len(added), 3, "C 混合出 3 个 output item（reasoning+message+function_call）")
+    eq(added[0]["output_index"], 0, "C reasoning output_index 0")
+    eq(added[0]["item"]["type"], "reasoning", "C item0 reasoning")
+    eq(added[1]["output_index"], 1, "C message output_index 1（顺延）")
+    eq(added[1]["item"]["type"], "message", "C item1 message")
+    eq(added[2]["output_index"], 2, "C function_call output_index 2（顺延）")
+    eq(added[2]["item"]["type"], "function_call", "C item2 function_call")
     _assert_seq_contiguous(evs, "C 文本+工具混合")
-    eq(len(evs[-1]["response"]["output"]), 2, "C completed output 含 2 item")
+    eq(len(evs[-1]["response"]["output"]), 3, "C completed output 含 3 item")
 
 
 def test_C_multi_tool():
-    """多工具并发：thinking idx0 跳过；两 tool_use 各占 output_index 0、1。"""
+    """多工具并发：thinking idx0 转 reasoning item；两 tool_use 顺延占 output_index 1、2。"""
     adapter = pt.AnthropicToResponsesStreamAdapter(model="m")
     evs = _run(adapter, [
         ("message_start", {"message": {"usage": {}}}),
@@ -1066,11 +1143,13 @@ def test_C_multi_tool():
         ("message_stop", {}),
     ])
     added = [e for e in evs if e["type"] == "response.output_item.added"]
-    eq(len(added), 2, "C 多工具出 2 个 item")
-    eq(added[0]["output_index"], 0, "C 工具1 output_index 0")
-    eq(added[1]["output_index"], 1, "C 工具2 output_index 1")
-    eq(added[0]["item"]["call_id"], "a", "C 工具1 call_id")
-    eq(added[1]["item"]["call_id"], "b", "C 工具2 call_id")
+    eq(len(added), 3, "C 多工具出 3 个 item（reasoning+工具1+工具2）")
+    eq(added[0]["output_index"], 0, "C reasoning output_index 0")
+    eq(added[0]["item"]["type"], "reasoning", "C item0 reasoning")
+    eq(added[1]["output_index"], 1, "C 工具1 output_index 1（顺延）")
+    eq(added[2]["output_index"], 2, "C 工具2 output_index 2（顺延）")
+    eq(added[1]["item"]["call_id"], "a", "C 工具1 call_id")
+    eq(added[2]["item"]["call_id"], "b", "C 工具2 call_id")
     _assert_seq_contiguous(evs, "C 多工具")
 
 
