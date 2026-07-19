@@ -618,8 +618,17 @@ class ModelProxyHandler(BaseHTTPRequestHandler):
                 _parsed = urllib.parse.urlparse(self.path)
                 _qs = {k: v for k, v in urllib.parse.parse_qsl(_parsed.query)
                        if k not in {"beta"}}
-                _clean_path = _parsed.path + ("?" + urllib.parse.urlencode(_qs) if _qs else "")
-                target_url = base_url + _clean_path
+                _query_suffix = "?" + urllib.parse.urlencode(_qs) if _qs else ""
+                if source == "responses":
+                    # base_url 已配到完整 /v1/responses 层级（与 ANTHROPIC_TO_RESPONSES 分支
+                    # 同源假设），不能再拼客户端 path，否则重复拼接成 /v1/responses/v1/responses
+                    # 导致 404。detect_source 只在 path 精确以 /v1/responses 结尾时才判定为
+                    # responses（子路径如 /v1/responses/{id} 不会被识别为 responses，会被判为
+                    # unknown 走 UNSUPPORTED），因此这里丢弃客户端 path 是安全的，只保留 query。
+                    target_url = base_url + _query_suffix
+                else:
+                    _clean_path = _parsed.path + _query_suffix
+                    target_url = base_url + _clean_path
 
             elif mode == ANTHROPIC_TO_CHAT:
                 # 组合3：anthropic 请求 → chat 上游。转成 OpenAI body，打 native chat 端点。
