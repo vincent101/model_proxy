@@ -1,2 +1,4 @@
 .claude_model_proxy.log
 __pycache__/
+model_proxy_config.json
+model_proxy_config.json.bak.*

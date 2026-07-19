@@ -4,8 +4,8 @@ tools/model_proxy/core/server.py — 本地多协议路由代理主体
 多协议 AI 模型代理主程序：HTTP server、路由决策、转发编排、协议转换、控制 API。
 入口为 tools/model_proxy/model_proxy.py（thin wrapper 调用本模块 main()）。
 与线上 proxy.py（18888）完全隔离并行：新端口 18889、新配置
-~/.claude/model_proxy_config.json、新进程锁 /tmp/claude_model_proxy.lock、
-新日志 tools/model_proxy/.claude_model_proxy.log。
+tools/model_proxy/model_proxy_config.json（可用 MODEL_PROXY_CONFIG 环境变量覆盖）、
+新进程锁 /tmp/claude_model_proxy.lock、新日志 tools/model_proxy/.claude_model_proxy.log。
 
 仅使用 Python 标准库，不引入第三方依赖，也不 import proxy.py。
 """
@@ -57,8 +57,12 @@ logging.basicConfig(
 )
 log = logging.getLogger(__name__)
 
-# 默认路径（全部 v2 命名）
-_DEFAULT_CONFIG_PATH = Path.home() / ".claude" / "model_proxy_config.json"
+# 默认路径（全部 v2 命名）：锚定包目录 tools/model_proxy/model_proxy_config.json，
+# 可用环境变量 MODEL_PROXY_CONFIG 覆盖（与 model_proxy_cli.sh 的 CONFIG_FILE 逻辑一致）。
+_DEFAULT_CONFIG_PATH = Path(
+    os.environ.get("MODEL_PROXY_CONFIG")
+    or (Path(__file__).resolve().parent.parent / "model_proxy_config.json")
+)
 _LOCK_FILE = Path("/tmp/claude_model_proxy.lock")
 
 # 控制路径前缀（v2，避免与 18888 的 /proxy 混淆）
@@ -247,10 +251,10 @@ class CooldownStore:
         with self._lock:
             self._until[supply_id] = until
 
-    def clear(self, supply_id: str) -> None:
-        """手动清除某 supply 的冷却（控制 API 用）。"""
+    def clear_all(self) -> None:
+        """清空所有 supply 的冷却（仅手动 reload 调用，mtime 自动 reload 绝不调用）。"""
         with self._lock:
-            self._until.pop(supply_id, None)
+            self._until.clear()
 
     def snapshot(self) -> dict[str, float]:
         """返回 supply_id -> 剩余秒（仅含仍在冷却中的 supply，用于 status 展示）。"""
@@ -874,12 +878,6 @@ class ModelProxyHandler(BaseHTTPRequestHandler):
             self._handle_reload(cs, cd)
             return
 
-        # POST /model_proxy/supply/<id>/cooldown/clear
-        if method == "POST" and path.startswith("/model_proxy/supply/") and path.endswith("/cooldown/clear"):
-            supply_id = path[len("/model_proxy/supply/"):-len("/cooldown/clear")]
-            self._handle_cooldown_clear(cd, supply_id)
-            return
-
         self._send_json(404, {"error": "not found"})
 
     # ------------------------------------------------------------------
@@ -908,16 +906,14 @@ class ModelProxyHandler(BaseHTTPRequestHandler):
         })
 
     def _handle_reload(self, cs: "ConfigStore", cd: "CooldownStore"):
-        cs.reload()
-        self._send_json(200, {"ok": True})
+        """手动 reload：强制重载配置 + 无条件清空所有 supply 的冷却。
 
-    def _handle_cooldown_clear(self, cd: "CooldownStore", supply_id: str):
-        """手动清除某 supply 的冷却。
-
-        id 不存在也返回 ok:true——clear 语义是"确保不在冷却中"，本身幂等，
-        对不存在的 id 调用与对已清除的 id 重复调用效果一致，不视为错误。
+        与 mtime 驱动的自动 maybe_reload()（每请求经 _forward 调用）的关键区别：
+        手动 reload 是运维显式动作（改配置后确认生效），清空 cooldown 是合理的用户预期；
+        自动 reload 只是发现文件变了顺手换配置，不应该悄悄影响运行中的冷却状态。
         """
-        cd.clear(supply_id)
+        cs.reload()
+        cd.clear_all()
         self._send_json(200, {"ok": True})
 
     # ------------------------------------------------------------------
