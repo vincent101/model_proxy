@@ -83,7 +83,6 @@ class TestCapabilityFromConfig(unittest.TestCase):
     def test_default_when_no_supply(self):
         cap = ReasoningCapability.from_config(None)
         self.assertEqual(cap.enum, (CE.OFF, CE.LOW, CE.MEDIUM, CE.HIGH, CE.XHIGH))
-        self.assertEqual(cap.max_alias, CE.XHIGH)
         self.assertEqual(cap.off_alias, CE.OFF)
 
     def test_default_when_empty_dict(self):
@@ -93,22 +92,10 @@ class TestCapabilityFromConfig(unittest.TestCase):
     def test_glm_style_capability(self):
         supply = {"reasoning_capability": {
             "effort_enum": ["none", "minimal", "low", "medium", "high"],
-            "max_alias": "high",
         }}
         cap = ReasoningCapability.from_config(supply)
         self.assertEqual(cap.enum, (CE.OFF, CE.MINIMAL, CE.LOW, CE.MEDIUM, CE.HIGH))
-        self.assertEqual(cap.max_alias, CE.HIGH)
         self.assertEqual(cap.off_alias, CE.OFF)   # enum 含 OFF，缺省 off_alias=OFF
-
-    def test_max_alias_not_in_enum_falls_back_to_highest(self):
-        supply = {"reasoning_capability": {"effort_enum": ["low", "high"], "max_alias": "bogus"}}
-        cap = ReasoningCapability.from_config(supply)
-        self.assertEqual(cap.max_alias, CE.HIGH)
-
-    def test_max_alias_absent_defaults_to_enum_highest(self):
-        supply = {"reasoning_capability": {"effort_enum": ["low", "medium", "high"]}}
-        cap = ReasoningCapability.from_config(supply)
-        self.assertEqual(cap.max_alias, CE.HIGH)
 
     def test_off_alias_none_when_enum_lacks_off(self):
         supply = {"reasoning_capability": {"effort_enum": ["low", "medium", "high"]}}
@@ -159,40 +146,40 @@ class TestAlign(unittest.TestCase):
         self.assertEqual(out.level, CE.OFF)
 
     def test_explicit_off_with_no_off_alias(self):
-        cap = ReasoningCapability(enum=(CE.LOW, CE.HIGH), max_alias=CE.HIGH, off_alias=None)
+        cap = ReasoningCapability(enum=(CE.LOW, CE.HIGH), off_alias=None)
         out = align(self._intent(explicit_off=True), cap)
         self.assertIsNone(out.level)
 
-    def test_max_uses_max_alias(self):
-        cap = ReasoningCapability(enum=(CE.LOW, CE.MEDIUM, CE.HIGH), max_alias=CE.HIGH, off_alias=None)
+    def test_max_clamped_to_enum_highest(self):
+        cap = ReasoningCapability(enum=(CE.LOW, CE.MEDIUM, CE.HIGH), off_alias=None)
         out = align(self._intent(level=CE.MAX), cap)
         self.assertEqual(out.level, CE.HIGH)
 
     def test_exact_match_passthrough(self):
-        cap = ReasoningCapability(enum=(CE.LOW, CE.MEDIUM, CE.HIGH), max_alias=CE.HIGH, off_alias=None)
+        cap = ReasoningCapability(enum=(CE.LOW, CE.MEDIUM, CE.HIGH), off_alias=None)
         out = align(self._intent(level=CE.MEDIUM), cap)
         self.assertEqual(out.level, CE.MEDIUM)
 
     def test_clamp_above_highest(self):
-        cap = ReasoningCapability(enum=(CE.LOW, CE.MEDIUM, CE.HIGH), max_alias=CE.HIGH, off_alias=None)
+        cap = ReasoningCapability(enum=(CE.LOW, CE.MEDIUM, CE.HIGH), off_alias=None)
         out = align(self._intent(level=CE.XHIGH), cap)
         self.assertEqual(out.level, CE.HIGH)
 
     def test_clamp_below_lowest(self):
-        cap = ReasoningCapability(enum=(CE.LOW, CE.MEDIUM, CE.HIGH), max_alias=CE.HIGH, off_alias=None)
+        cap = ReasoningCapability(enum=(CE.LOW, CE.MEDIUM, CE.HIGH), off_alias=None)
         out = align(self._intent(level=CE.OFF), cap)
         self.assertEqual(out.level, CE.LOW)
 
     def test_nearest_neighbor_non_tie(self):
         # enum=[LOW, XHIGH]，intent=MEDIUM：距 LOW 距离 1，距 XHIGH 距离 3 → LOW
-        cap = ReasoningCapability(enum=(CE.LOW, CE.XHIGH), max_alias=CE.XHIGH, off_alias=None)
+        cap = ReasoningCapability(enum=(CE.LOW, CE.XHIGH), off_alias=None)
         out = align(self._intent(level=CE.MEDIUM), cap)
         self.assertEqual(out.level, CE.LOW)
 
     def test_nearest_neighbor_tie_prefers_higher(self):
         # enum=[OFF, XHIGH]，intent=MEDIUM(3)：距 OFF(0) 距离3，距 XHIGH(5) 距离2 → 非并列，验证独立并列场景
         # 构造真正并列：enum=[LOW(2), HIGH(4)]，intent=MEDIUM(3)：距 LOW 距离1，距 HIGH 距离1 → 并列取更高档 HIGH
-        cap = ReasoningCapability(enum=(CE.LOW, CE.HIGH), max_alias=CE.HIGH, off_alias=None)
+        cap = ReasoningCapability(enum=(CE.LOW, CE.HIGH), off_alias=None)
         out = align(self._intent(level=CE.MEDIUM), cap)
         self.assertEqual(out.level, CE.HIGH)
 
@@ -216,11 +203,11 @@ class TestMonotonicity(unittest.TestCase):
     def _caps(self):
         return [
             ReasoningCapability.from_config(None),                                    # 默认 5 档
-            ReasoningCapability(enum=(CE.LOW, CE.MEDIUM, CE.HIGH), max_alias=CE.HIGH, off_alias=None),  # 3 档短枚举
-            ReasoningCapability(enum=(CE.LOW, CE.HIGH), max_alias=CE.HIGH, off_alias=None),             # 2 档跳档
-            ReasoningCapability(enum=(CE.OFF, CE.XHIGH), max_alias=CE.XHIGH, off_alias=CE.OFF),         # 极端两端
+            ReasoningCapability(enum=(CE.LOW, CE.MEDIUM, CE.HIGH), off_alias=None),     # 3 档短枚举
+            ReasoningCapability(enum=(CE.LOW, CE.HIGH), off_alias=None),                # 2 档跳档
+            ReasoningCapability(enum=(CE.OFF, CE.XHIGH), off_alias=CE.OFF),             # 极端两端
             ReasoningCapability.from_config({"reasoning_capability": {
-                "effort_enum": ["none", "minimal", "low", "medium", "high"], "max_alias": "high"}}),
+                "effort_enum": ["none", "minimal", "low", "medium", "high"]}}),
         ]
 
     def test_monotonic_exhaustive_pairs(self):

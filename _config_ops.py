@@ -167,8 +167,7 @@ def run_probe_and_maybe_accept(supply: dict, interactive_prompt: bool = True) ->
             print("（非交互模式，不自动写入，仅供参考）")
             return None
         if confirm(f"接受该结果并写入 reasoning_capability.effort_enum={enums}?"):
-            max_alias = enums[-1]
-            return {"effort_enum": enums, "max_alias": max_alias}
+            return {"effort_enum": enums}
         print("已跳过，不写入 reasoning_capability。")
         return None
     print("探测未得确定结果,已留空用默认5档,如需精确档位请手动核对后编辑")

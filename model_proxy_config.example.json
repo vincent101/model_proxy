@@ -30,8 +30,7 @@
       "appkey": "<APPKEY_PLACEHOLDER>",
       "target_model": "glm-5.2",
       "reasoning_capability": {
-        "effort_enum": ["none", "minimal", "low", "medium", "high"],
-        "max_alias": "high"
+        "effort_enum": ["none", "minimal", "low", "medium", "high"]
       }
     }
   ],

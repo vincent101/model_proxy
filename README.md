@@ -21,7 +21,7 @@ tools/model_proxy/
 ├── _install_ops.py                    # install 子命令实现（四个 SDK 接入）
 ├── core/                              # 核心实现包
 │   ├── server.py                      # 主体：HTTP server、路由决策、转发编排、控制 API
-│   ├── translate.py                   # 双向协议转换器（正向 Anthropic↔Chat + 反向 Responses↔Anthropic）
+│   ├── translate.py                   # 多协议结构转换器（§1 Anthropic⇄Chat / §2 Responses⇄Anthropic / §3 Anthropic⇄Responses）；reasoning 强度处理已外迁到 core.reasoning.*
 │   └── reasoning/                     # effort/thinking 强度处理领域层
 │       ├── ladder.py                  # canonical 强度全序 + budget↔canonical 换算
 │       ├── capability.py              # ReasoningCapability + align()（唯一钳位点）
@@ -59,12 +59,12 @@ tools/model_proxy/
 - `cooldown_seconds`（可选）：该 supply 触发失败后的冷却时长，不填则用顶层
   `default_cooldown_seconds`。
 - `reasoning_capability`（可选）：该 supply 真实支持的 effort 档位能力描述。不配置时用代码
-  内置默认 5 档（`effort_enum: ["none","low","medium","high","xhigh"]` + `max_alias: "xhigh"`
-  + `off_alias: "none"`）。配置后按该 supply 覆盖，不影响其他 supply。字段：
+  内置默认 5 档（`effort_enum: ["none","low","medium","high","xhigh"]` + `off_alias: "none"`）。
+  配置后按该 supply 覆盖，不影响其他 supply。字段：
   - `effort_enum`：该 supply 真实支持的 effort 档位有序列表（低→高）。
-  - `max_alias`（可选）：canonical `MAX` 档降级映射到的目标档；不填则取 `effort_enum` 最高档。
   - `off_alias`（可选）：显式关闭思考落到的目标档；不填则若 `effort_enum` 含
     `none`/`off` 落到该档，否则不塞字段。
+  - canonical `MAX` 档不设专属别名，统一按 `effort_enum` 就近钳位规则钳到该枚举最高档。
   - budget 分档断点（Anthropic `thinking.budget_tokens` 语义）是全局固定常量
     （`ladder.py` 的 `_BUDGET_ANCHORS`），与上游厂商无关，不支持 per-supply 自定义。
 
@@ -78,8 +78,7 @@ tools/model_proxy/
     "appkey": "<APPKEY_PLACEHOLDER>",
     "target_model": "glm-5.2",
     "reasoning_capability": {
-      "effort_enum": ["none", "low", "medium", "high"],
-      "max_alias": "high"
+      "effort_enum": ["none", "low", "medium", "high"]
     }
   }
   ```
@@ -166,7 +165,8 @@ model 标签。
 - 强度高于枚举最高档 → 钳到最高档（尽量给到该 supply 能提供的最强档）。
 - 强度低于枚举最低档 → 钳到最低档。
 - 恰好命中枚举内某档 → 精确命中，直传。
-- `max`（Anthropic 特殊字面值）→ 走 `max_alias` 专用逻辑，不参与强度钳位。
+- `max`（Anthropic 特殊字面值，canonical 序数恒大于任何枚举最高档）→ 与其他档位一样走统一
+  钳位规则，结果等价于钳到该枚举最高档，不设专属别名。
 - 枚举跳档（如 `["low","xhigh"]`）时客户端发的中间强度未精确命中 → 取强度序上最接近的一档；
   两侧距离相等则取更高档（偏保守，保留更多思考质量）。
 
@@ -194,29 +194,42 @@ MODEL_PROXY_PORT=18889 python3 tools/model_proxy/model_proxy.py &
 用 `tools/model_proxy/model_proxy_cli.sh`（已在仓库里可直接执行）：
 
 ```bash
-model_proxy_cli.sh status                            # 运行状态 + supplies/routes/strategies/cooldown 概览
+model_proxy_cli.sh status                            # 运行状态 + supplies/routes/cooldown 概览
 model_proxy_cli.sh reload                             # 触发配置热重载（无条件清空所有 cooldown）
+
+model_proxy_cli.sh supply                              # 不带子命令：打印 list 后进入交互菜单
+                                                        #   [a]dd/[e]dit/[d]el/[p]robe/[q]uit
 model_proxy_cli.sh supply list                         # 列出所有 supply（appkey 脱敏尾4位、cooldown）
 model_proxy_cli.sh supply add                          # 交互式新增 supply（同步探测 effort，写配置后 reload）
 model_proxy_cli.sh supply edit <id>                    # 交互式编辑 supply（含改 appkey、可选重新探测 effort）
 model_proxy_cli.sh supply del <id>                     # 删除 supply（二次确认，被 route 引用则拒绝）
 model_proxy_cli.sh supply probe <id>                   # 只跑 effort 探测，接受则回写 reasoning_capability
-model_proxy_cli.sh route list                          # 列出所有 route 家族模板
-model_proxy_cli.sh route add                           # 交互式新增 route 家族模板
+
+model_proxy_cli.sh route                                # 不带子命令：打印 list 后进入交互菜单
+                                                        #   [a]dd/[e]dit/[d]el/[q]uit
+model_proxy_cli.sh route list                          # 列出所有 route（家族模板：opus/sonnet/haiku 三档 + failover）
+model_proxy_cli.sh route add                           # 交互式新增 route 家族模板（写配置后 reload）
 model_proxy_cli.sh route edit <id>                     # 交互式编辑 route 的 tiers/failover
 model_proxy_cli.sh route del <id>                      # 删除 route（二次确认，被 strategy 引用则拒绝）
+
+model_proxy_cli.sh strategy                             # 不带子命令：打印 list 后进入交互菜单
+                                                        #   [a]dd/[e]dit/[d]el/[q]uit
 model_proxy_cli.sh strategy list                       # 列出所有 client_token -> route_id 绑定
-model_proxy_cli.sh strategy add                        # 交互式新增 strategy 绑定
+model_proxy_cli.sh strategy add                        # 交互式新增 strategy 绑定（写配置后 reload）
 model_proxy_cli.sh strategy edit <token>                # 交互式编辑 strategy 的 route_id/note
 model_proxy_cli.sh strategy del <token>                 # 删除 strategy（二次确认，无下游引用检查）
-model_proxy_cli.sh switch <client_token> <route_id>     # 切换某 token 绑定的 route 家族
+
+model_proxy_cli.sh switch <client_token> <route_id>     # 切换某 token 绑定的 route 家族（改 strategy.route_id 后 reload）
 model_proxy_cli.sh install                              # 交互式列出四个 SDK + 本机检测状态，选择安装
 model_proxy_cli.sh install --list                       # 只列出四个 SDK 检测状态，不安装
-model_proxy_cli.sh on                                   # 启动（已在监听则跳过）
-model_proxy_cli.sh off                                  # 停止
+model_proxy_cli.sh on                                   # 启动 model_proxy.py（已在监听则跳过）
+model_proxy_cli.sh off                                  # 停止 model_proxy.py（严格按脚本绝对路径匹配，绝不影响 v1 的 proxy.py）
+model_proxy_cli.sh --help / -h                          # 显示此帮助
 ```
 
-- `supply`/`route`/`strategy` 子命令均为交互式增改配置，原子写盘后自动触发 reload。
+- `supply`/`route`/`strategy` 三者不带子命令时进入交互菜单（先打印 list，再选操作，
+  操作完可回菜单继续或 `q`/回车退出）；带子命令（list/add/edit/del/probe）时兼容旧用法，
+  直接执行、不进菜单，脚本化调用不受影响。原子写盘后自动触发 reload。
 - `supply probe <id>`：向该 supply 上游直接发一个已知非法的 effort 值
   （`__probe_invalid__`），按 protocol 构造对应探测请求（anthropic 走 `output_config.effort`、
   chat 走 `reasoning_effort`、responses 走 `reasoning.effort`），从报错响应里用宽松正则

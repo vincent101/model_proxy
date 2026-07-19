@@ -1,26 +1,40 @@
-"""model_proxy 双向协议转换器（合并版）。
+"""model_proxy 多协议结构转换器。
 
-本文件由原 model_proxy_translate.py（正向）与 model_proxy_translate_reverse.py
-（反向）合并而来，涵盖两个方向的协议转换职责：
+职责边界：本文件只负责协议之间**结构字段**（messages/tools/tool_result/system/
+content blocks/流式事件）的转换；reasoning 强度的解析与钳位由 `core.reasoning.*`
+完成，本文件各 `*_request` 函数只接收调用方（server.py）已经算好的
+`reasoning_fields` 片段，原地 merge 进目标 body，不自行判断/计算强度。
 
-  §1 Anthropic ⇄ OpenAI Chat（正向）
+涵盖三组协议组合：
+
+  §1 Anthropic ⇄ OpenAI Chat
       Anthropic /v1/messages 请求 → OpenAI Chat Completions；
       OpenAI Chat 响应（含流式）→ Anthropic。
-        A   请求转换   anthropic_to_openai_request(body, model_is_reasoning=True) -> (openai_body, ctx)
-        B   非流式响应 openai_to_anthropic_response(resp, ctx=None) -> anthropic_dict
-        C+D 流式       class OpenAIToAnthropicStreamAdapter: feed(chunk)->list, finalize()->list
+        请求转换   anthropic_to_openai_request(body, reasoning_fields=None) -> (openai_body, ctx)
+        非流式响应 openai_to_anthropic_response(resp, ctx=None) -> anthropic_dict
+        流式       class OpenAIToAnthropicStreamAdapter: feed(chunk)->list, finalize()->list
 
-  §2 Responses ⇄ Anthropic（反向）
+  §2 Responses ⇄ Anthropic（客户端讲 Responses，后端为 Anthropic）
       OpenAI Responses 请求 → Anthropic /v1/messages；
       Anthropic 响应（含流式）→ Responses。
-        A'   请求转换   responses_to_anthropic_request(body, max_tokens_default=4096) -> anthropic_body
-        B'   非流式响应 anthropic_to_responses_response(resp, model, ...) -> responses_dict
-        C'+D' 流式      class AnthropicToResponsesStreamAdapter: feed(type, data)->list, finalize()->list
+        请求转换   responses_to_anthropic_request(body, max_tokens_default=4096, reasoning_fields=None) -> anthropic_body
+        非流式响应 anthropic_to_responses_response(resp, model, ...) -> responses_dict
+        流式       class AnthropicToResponsesStreamAdapter: feed(type, data)->list, finalize()->list
 
-严格照 docs/model_proxy_translate_spec.md（合并后的双向规格）实现，字段映射不得自创。
+  §3 Anthropic ⇄ Responses（客户端讲 Anthropic，后端为 Responses）
+      Anthropic /v1/messages 请求 → OpenAI Responses；
+      Responses 响应（含流式）→ Anthropic。
+        请求转换   anthropic_to_responses_request(body, reasoning_fields=None) -> (responses_body, ctx)
+        非流式响应 responses_to_anthropic_response(resp, ctx=None) -> anthropic_dict
+        流式       class ResponsesToAnthropicStreamAdapter: feed(event)->list, finalize()->list
+
+严格照 docs/model_proxy_translate_spec.md 的规格实现，字段映射不得自创。
 纯标准库（json / hashlib / secrets / time），无网络 IO，可脱离 HTTP 单测。
 
-反向侧 3 处对规格 §2（原反向 §3）假设的实测修正：
+历史脚注：本文件由原 model_proxy_translate.py（§1/§2 正向）与
+model_proxy_translate_reverse.py（§2 反向）合并而来，§3 为后续新增协议组合。
+
+§2/§3 涉及 Anthropic SSE 解析的 3 处实测修正：
   修正1 wire format：Anthropic SSE 是 `event:xxx\\ndata:{json}`（冒号后无空格）。
       本转换器 feed(event_type, data) 接收的是已解析好的 (type, dict)，SSE 拆行由主文件负责；
       本文件的输出侧 responses_sse_bytes 产出 Responses 侧 `data: {json}\\n\\n`。

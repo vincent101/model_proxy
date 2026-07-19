@@ -65,7 +65,7 @@ _CANONICAL_TO_BUDGET = {
 }
 
 # 配置文件 / 通用协议字符串 → canonical 的规范名称表（协议无关，供 capability.from_config
-# 解析 effort_enum/max_alias/off_alias 字符串用）。"off"/"none" 两种拼法都接受
+# 解析 effort_enum/off_alias 字符串用）。"off"/"none" 两种拼法都接受
 # （旧 schema 用 "none" 表达最低/关闭档，这里两者等价）。
 _NAME_TO_CANONICAL = {
     "off": CanonicalEffort.OFF,

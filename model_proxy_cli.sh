@@ -20,25 +20,38 @@ print_help() {
 
 status                            显示运行状态 + supplies/routes/cooldown 概览
 reload                            触发配置热重载（无条件清空所有 cooldown）
+
+supply                            不带子命令：打印 supply list 后进入交互菜单
+                                    [a]dd / [e]dit / [d]el / [p]robe / [q]uit
 supply list                       列出所有 supply（appkey 脱敏尾4位、cooldown）
 supply add                        交互式新增 supply（同步探测 effort，写配置后 reload）
 supply edit <id>                  交互式编辑 supply（含改 appkey、可选重新探测 effort）
 supply del <id>                   删除 supply（二次确认，被 route 引用则拒绝）
 supply probe <id>                 只跑 effort 探测，接受则回写 reasoning_capability
+
+route                             不带子命令：打印 route list 后进入交互菜单
+                                    [a]dd / [e]dit / [d]el / [q]uit
 route list                        列出所有 route（家族模板：opus/sonnet/haiku 三档 + failover）
 route add                         交互式新增 route 家族模板（写配置后 reload）
 route edit <id>                   交互式编辑 route 的 tiers/failover
 route del <id>                    删除 route（二次确认，被 strategy 引用则拒绝）
+
+strategy                          不带子命令：打印 strategy list 后进入交互菜单
+                                    [a]dd / [e]dit / [d]el / [q]uit
 strategy list                     列出所有 strategy（client_token -> route_id 绑定）
 strategy add                      交互式新增 strategy 绑定（写配置后 reload）
 strategy edit <token>             交互式编辑 strategy 的 route_id/note
 strategy del <token>              删除 strategy（二次确认，无下游引用检查）
+
 switch <client_token> <route_id>  切换某 token 绑定的 route 家族（改 strategy.route_id 后 reload）
 install                           交互式列出四个 SDK + 本机检测状态，选择安装
 install --list                    只列出四个 SDK 检测状态，不安装
 on                                启动 model_proxy.py（已在监听则跳过）
 off                               停止 model_proxy.py（严格按脚本绝对路径匹配，绝不影响 v1 的 proxy.py）
 --help / -h                       显示此帮助
+
+说明: supply/route/strategy 三者均支持"不带子命令进入交互菜单"，
+      带子命令（list/add/edit/del/probe）时兼容旧用法，直接执行不进菜单。
 EOF
 }
 
@@ -150,66 +163,144 @@ cmd_reload() {
   reload_proxy
 }
 
-# ---- supply ----
+# ---- supply：单动作函数（供旧子命令分发与新交互菜单共同复用） ----
+cmd_supply_list()  { run_config_ops supply-list; }
+cmd_supply_add()   { run_config_ops supply-add; }
+cmd_supply_edit()  {
+  local id="${1:-}"
+  if [[ -z "$id" ]]; then echo "用法: supply edit <id>"; return 1; fi
+  run_config_ops supply-edit "$id"
+}
+cmd_supply_del()   {
+  local id="${1:-}"
+  if [[ -z "$id" ]]; then echo "用法: supply del <id>"; return 1; fi
+  run_config_ops supply-del "$id"
+}
+cmd_supply_probe() {
+  local id="${1:-}"
+  if [[ -z "$id" ]]; then echo "用法: supply probe <id>"; return 1; fi
+  run_config_ops supply-probe "$id"
+}
+
+# ---- supply：入口。不带子命令 -> 打印 list 后进入交互菜单；带子命令 -> 兼容旧用法直接执行 ----
 cmd_supply() {
   local subcmd="${1:-}"
+  if [[ -z "$subcmd" ]]; then
+    while true; do
+      cmd_supply_list
+      echo ""
+      read -p "操作: [a]dd / [e]dit / [d]el / [p]robe / [q]uit: " op
+      case "$op" in
+        a) cmd_supply_add ;;
+        e) read -p "要编辑的 supply id: " eid; cmd_supply_edit "$eid" ;;
+        d) read -p "要删除的 supply id: " did; cmd_supply_del "$did" ;;
+        p) read -p "要探测的 supply id: " pid; cmd_supply_probe "$pid" ;;
+        q|"") break ;;
+        *) echo "未知操作" ;;
+      esac
+      echo ""
+    done
+    return 0
+  fi
   case "$subcmd" in
-    list)   run_config_ops supply-list ;;
-    add)    run_config_ops supply-add ;;
-    edit)
-      if [[ -z "${2:-}" ]]; then echo "用法: supply edit <id>"; return 1; fi
-      run_config_ops supply-edit "$2"
-      ;;
-    del)
-      if [[ -z "${2:-}" ]]; then echo "用法: supply del <id>"; return 1; fi
-      run_config_ops supply-del "$2"
-      ;;
-    probe)
-      if [[ -z "${2:-}" ]]; then echo "用法: supply probe <id>"; return 1; fi
-      run_config_ops supply-probe "$2"
-      ;;
+    list)   cmd_supply_list ;;
+    add)    cmd_supply_add ;;
+    edit)   cmd_supply_edit "${2:-}" ;;
+    del)    cmd_supply_del "${2:-}" ;;
+    probe)  cmd_supply_probe "${2:-}" ;;
     *)
       echo "用法: supply list | supply add | supply edit <id> | supply del <id> | supply probe <id>"
+      return 1
       ;;
   esac
 }
 
-# ---- route ----
+# ---- route：单动作函数 ----
+cmd_route_list() { run_config_ops route-list; }
+cmd_route_add()  { run_config_ops route-add; }
+cmd_route_edit() {
+  local id="${1:-}"
+  if [[ -z "$id" ]]; then echo "用法: route edit <id>"; return 1; fi
+  run_config_ops route-edit "$id"
+}
+cmd_route_del()  {
+  local id="${1:-}"
+  if [[ -z "$id" ]]; then echo "用法: route del <id>"; return 1; fi
+  run_config_ops route-del "$id"
+}
+
+# ---- route：入口。不带子命令 -> 打印 list 后进入交互菜单；带子命令 -> 兼容旧用法直接执行 ----
 cmd_route() {
   local subcmd="${1:-}"
+  if [[ -z "$subcmd" ]]; then
+    while true; do
+      cmd_route_list
+      echo ""
+      read -p "操作: [a]dd / [e]dit / [d]el / [q]uit: " op
+      case "$op" in
+        a) cmd_route_add ;;
+        e) read -p "要编辑的 route id: " eid; cmd_route_edit "$eid" ;;
+        d) read -p "要删除的 route id: " did; cmd_route_del "$did" ;;
+        q|"") break ;;
+        *) echo "未知操作" ;;
+      esac
+      echo ""
+    done
+    return 0
+  fi
   case "$subcmd" in
-    list)   run_config_ops route-list ;;
-    add)    run_config_ops route-add ;;
-    edit)
-      if [[ -z "${2:-}" ]]; then echo "用法: route edit <id>"; return 1; fi
-      run_config_ops route-edit "$2"
-      ;;
-    del)
-      if [[ -z "${2:-}" ]]; then echo "用法: route del <id>"; return 1; fi
-      run_config_ops route-del "$2"
-      ;;
+    list)   cmd_route_list ;;
+    add)    cmd_route_add ;;
+    edit)   cmd_route_edit "${2:-}" ;;
+    del)    cmd_route_del "${2:-}" ;;
     *)
       echo "用法: route list | route add | route edit <id> | route del <id>"
+      return 1
       ;;
   esac
 }
 
-# ---- strategy ----
+# ---- strategy：单动作函数 ----
+cmd_strategy_list() { run_config_ops strategy-list; }
+cmd_strategy_add()  { run_config_ops strategy-add; }
+cmd_strategy_edit() {
+  local token="${1:-}"
+  if [[ -z "$token" ]]; then echo "用法: strategy edit <token>"; return 1; fi
+  run_config_ops strategy-edit "$token"
+}
+cmd_strategy_del()  {
+  local token="${1:-}"
+  if [[ -z "$token" ]]; then echo "用法: strategy del <token>"; return 1; fi
+  run_config_ops strategy-del "$token"
+}
+
+# ---- strategy：入口。不带子命令 -> 打印 list 后进入交互菜单；带子命令 -> 兼容旧用法直接执行 ----
 cmd_strategy() {
   local subcmd="${1:-}"
+  if [[ -z "$subcmd" ]]; then
+    while true; do
+      cmd_strategy_list
+      echo ""
+      read -p "操作: [a]dd / [e]dit / [d]el / [q]uit: " op
+      case "$op" in
+        a) cmd_strategy_add ;;
+        e) read -p "要编辑的 strategy token: " etok; cmd_strategy_edit "$etok" ;;
+        d) read -p "要删除的 strategy token: " dtok; cmd_strategy_del "$dtok" ;;
+        q|"") break ;;
+        *) echo "未知操作" ;;
+      esac
+      echo ""
+    done
+    return 0
+  fi
   case "$subcmd" in
-    list)   run_config_ops strategy-list ;;
-    add)    run_config_ops strategy-add ;;
-    edit)
-      if [[ -z "${2:-}" ]]; then echo "用法: strategy edit <token>"; return 1; fi
-      run_config_ops strategy-edit "$2"
-      ;;
-    del)
-      if [[ -z "${2:-}" ]]; then echo "用法: strategy del <token>"; return 1; fi
-      run_config_ops strategy-del "$2"
-      ;;
+    list)   cmd_strategy_list ;;
+    add)    cmd_strategy_add ;;
+    edit)   cmd_strategy_edit "${2:-}" ;;
+    del)    cmd_strategy_del "${2:-}" ;;
     *)
       echo "用法: strategy list | strategy add | strategy edit <token> | strategy del <token>"
+      return 1
       ;;
   esac
 }

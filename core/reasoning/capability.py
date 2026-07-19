@@ -21,7 +21,6 @@ _DEFAULT_ENUM = (
 class ReasoningCapability:
     """一个 supply 真实支持的 reasoning 档位能力描述。"""
     enum: tuple             # 有序的 CanonicalEffort 元组（低→高），该 supply 真实支持的档位
-    max_alias: CanonicalEffort        # canonical MAX 的落点；缺省 = enum 最高档
     off_alias: "CanonicalEffort | None"  # explicit_off 的落点；缺省 = enum 含 OFF 则 OFF 否则 None
 
     @classmethod
@@ -29,9 +28,10 @@ class ReasoningCapability:
         """解析 supply 的 reasoning_capability 字段（新 schema），缺省用默认 5 档。
 
         新 schema：
-            {"effort_enum": ["none","low","medium","high"], "max_alias": "high", "off_alias": "none"}
+            {"effort_enum": ["none","low","medium","high"], "off_alias": "none"}
         effort_enum 里的字符串档名（协议无关规范名，见 ladder.name_to_canonical）转换成
         CanonicalEffort 元组，按值升序排列、去重。未识别的档名忽略（不报错，容错优先）。
+        MAX 档不设专属别名，统一走 align() 里的 _clamp_to_enum 钳到 enum 最高档。
         """
         supply = supply or {}
         rc = supply.get("reasoning_capability") or {}
@@ -47,10 +47,6 @@ class ReasoningCapability:
         else:
             enum = _DEFAULT_ENUM
 
-        max_alias = name_to_canonical(rc.get("max_alias"))
-        if max_alias is None or max_alias not in enum:
-            max_alias = enum[-1]
-
         if "off_alias" in rc:
             off_alias = name_to_canonical(rc.get("off_alias"))
             if off_alias is not None and off_alias not in enum:
@@ -58,7 +54,7 @@ class ReasoningCapability:
         else:
             off_alias = CanonicalEffort.OFF if CanonicalEffort.OFF in enum else None
 
-        return cls(enum=enum, max_alias=max_alias, off_alias=off_alias)
+        return cls(enum=enum, off_alias=off_alias)
 
 
 @dataclass(frozen=True)
@@ -105,7 +101,5 @@ def align(intent: ReasoningIntent, cap: ReasoningCapability) -> AlignedEffort:
         return AlignedEffort(level=cap.off_alias, source_budget=intent.source_budget)
     if intent.level is None:
         return AlignedEffort(level=None, source_budget=intent.source_budget)
-    if intent.level == CanonicalEffort.MAX:
-        return AlignedEffort(level=cap.max_alias, source_budget=intent.source_budget)
     clamped = _clamp_to_enum(intent.level, cap.enum)
     return AlignedEffort(level=clamped, source_budget=intent.source_budget)
