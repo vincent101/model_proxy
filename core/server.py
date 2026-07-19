@@ -554,6 +554,16 @@ class ModelProxyHandler(BaseHTTPRequestHandler):
         # 6. failover 循环（tried_set 为请求内局部集合，不改全局状态）
         tried_set: set[str] = set()
         _reasoning_retried = False   # reasoning 语法重试只做一次，作用域覆盖整个请求周期
+
+        # reasoning_intent 必须在循环外、基于客户端原始 body_json 只 decode 一次。
+        # body_json 在循环体内会被原地改写（model 改写为 target_model、reasoning_fields
+        # 通过 apply_fields 写回），若在循环内重新 decode，第二轮起会对"已被上一轮写入
+        # 结果污染过"的 body_json 解码，导致客户端原始意图被错误钳位/升档（bug 修复记录，
+        # 见 docs/proxy_v2_buildplan.md 或 commit message）。align() 仍需在循环内按每轮
+        # supply 的 capability 重新计算，因为不同 supply 的钳位上限不同。
+        src_codec = get_codec(source)
+        reasoning_intent = src_codec.decode(body_json or {})
+
         while True:
             supply = select_supply(supplies_list, supply_map, cd, tried_set)
             if supply is None:
@@ -583,9 +593,7 @@ class ModelProxyHandler(BaseHTTPRequestHandler):
             # ANTHROPIC_TO_CHAT / ANTHROPIC_TO_RESPONSES / RESPONSES_TO_ANTHROPIC）全部走这同一条
             # 链路，差异只在 get_codec 拿到哪个 codec。PASSTHROUGH anthropic→anthropic 现在也用
             # 目标 Claude 模型的 capability 钳位（现状缺失的能力）。
-            src_codec = get_codec(source)
             tgt_codec = get_codec(target)
-            reasoning_intent = src_codec.decode(body_json or {})
             reasoning_cap = ReasoningCapability.from_config(supply)
             aligned_effort = align(reasoning_intent, reasoning_cap)
             reasoning_variant = tgt_codec.select_variant(pref_store.snapshot(target_model or ""))

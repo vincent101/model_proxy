@@ -53,16 +53,28 @@ class TestLadder(unittest.TestCase):
         self.assertEqual(budget_to_canonical(1_000_000), CE.MAX)
 
     def test_canonical_to_budget_representative_values(self):
-        self.assertEqual(canonical_to_budget(CE.LOW), 2000)
-        self.assertEqual(canonical_to_budget(CE.MEDIUM), 8000)
-        self.assertEqual(canonical_to_budget(CE.HIGH), 32000)
-        self.assertEqual(canonical_to_budget(CE.XHIGH), 64000)
+        # 代表值必须落在 budget_to_canonical 对应区间*内部*，不能卡在断点上，
+        # 否则往返会漂移一档（见 test_budget_roundtrip）。
+        self.assertEqual(canonical_to_budget(CE.LOW), 1500)
+        self.assertEqual(canonical_to_budget(CE.MEDIUM), 5000)
+        self.assertEqual(canonical_to_budget(CE.HIGH), 16000)
+        self.assertEqual(canonical_to_budget(CE.XHIGH), 48000)
         self.assertEqual(canonical_to_budget(CE.MAX), 128000)
 
     def test_canonical_to_budget_monotonic(self):
         levels = [CE.OFF, CE.MINIMAL, CE.LOW, CE.MEDIUM, CE.HIGH, CE.XHIGH, CE.MAX]
         budgets = [canonical_to_budget(l) for l in levels]
         self.assertEqual(budgets, sorted(budgets))
+
+    def test_budget_roundtrip(self):
+        """canonical_to_budget 反算的代表值喂回 budget_to_canonical 必须往返一致，
+        不能因为代表值卡在分档边界而漂移一档（bug 修复回归测试）。"""
+        for level in [CE.LOW, CE.MEDIUM, CE.HIGH, CE.XHIGH]:
+            budget = canonical_to_budget(level)
+            self.assertEqual(
+                budget_to_canonical(budget), level,
+                f"{level.name} 往返不一致: canonical_to_budget={budget} -> "
+                f"budget_to_canonical={budget_to_canonical(budget).name}")
 
     def test_name_to_canonical(self):
         self.assertEqual(name_to_canonical("low"), CE.LOW)
@@ -510,6 +522,81 @@ class TestRegistry(unittest.TestCase):
         apply_fields(body, {})
         apply_fields(body, None)
         self.assertEqual(body, {"a": 1})
+
+
+# ============================================================================
+# _forward 多轮循环内 reasoning_intent 不被污染（bug 修复回归测试）
+#
+# server.py::_forward 本身依赖 HTTPServer/BaseHTTPRequestHandler，不适合直接实例化
+# 单测；这里复现的是修复前后行为差异的核心不变量：decode() 只应对客户端原始 body
+# 调用一次，不应在循环体对"已被上一轮 apply_fields 写入结果"的同一个 body 重新
+# decode。用 codec 直接模拟 _forward 循环两轮的最小逻辑骨架来断言这个不变量。
+# ============================================================================
+
+class TestForwardLoopReasoningIntentNotPolluted(unittest.TestCase):
+
+    def setUp(self):
+        self.codec = get_codec("anthropic")
+        self.cap = ReasoningCapability.from_config(None)
+
+    def test_fixed_behavior_decode_once_reused_across_rounds(self):
+        """修复后的正确做法：decode 在循环外只调用一次，循环内复用同一个 intent，
+        即使 body_json 被 apply_fields 原地改写，intent 也不受影响。"""
+        body = {"thinking": {"type": "adaptive"}, "output_config": {"effort": "high"}}
+        reasoning_intent = self.codec.decode(body)  # 循环外，只调用一次
+        self.assertEqual(reasoning_intent.level, CE.HIGH)
+
+        # round 1：align + encode(enabled variant) + apply_fields 原地写回 body
+        aligned1 = align(reasoning_intent, self.cap)
+        fields1 = self.codec.encode(aligned1, self.cap, ANTHROPIC_ENABLED)
+        apply_fields(body, fields1)
+        self.assertEqual(body["thinking"]["type"], "enabled")
+
+        # round 2（模拟上游 400 拒绝后重试）：不重新 decode，直接复用 reasoning_intent
+        aligned2 = align(reasoning_intent, self.cap)
+        fields2 = self.codec.encode(aligned2, self.cap, ANTHROPIC_ADAPTIVE)
+        apply_fields(body, fields2)
+
+        # 断言：即便 body 已经被两轮写入污染，reasoning_intent 本身岿然不变
+        self.assertEqual(reasoning_intent.level, CE.HIGH)
+        self.assertEqual(aligned1.level, CE.HIGH)
+        self.assertEqual(aligned2.level, CE.HIGH)
+
+    def test_anti_pattern_redecoding_polluted_body_permanently_clamps_across_supplies(self):
+        """反向验证修复2的必要性：failover 跨到 capability 不同的 supply 时，若在循环内
+        对被污染的 body 重新 decode（修复前的错误做法），原始高强度意图会被第一轮命中的
+        窄 capability 永久钳低，即使换到支持更高档的 supply 也恢复不了（README 承诺的
+        "按强度就近钳位，不会强度倒挂"被违反）。修复1（区间内部代表值）只解决同档反算的
+        往返漂移，不解决这个跨 capability 的永久钳低问题——必须靠修复2（decode 只用一次
+        不变的原始 intent）解决。"""
+        body = {"thinking": {"type": "adaptive"}, "output_config": {"effort": "xhigh"}}
+        original_intent = self.codec.decode(body)
+        self.assertEqual(original_intent.level, CE.XHIGH)
+
+        # round 1：命中一个窄 capability 的 supply（只到 HIGH），钳低后 encode 写回 body
+        narrow_cap = ReasoningCapability(enum=(CE.LOW, CE.MEDIUM, CE.HIGH), off_alias=None)
+        aligned1 = align(original_intent, narrow_cap)
+        self.assertEqual(aligned1.level, CE.HIGH)  # 被钳到 HIGH
+        fields1 = self.codec.encode(aligned1, narrow_cap, ANTHROPIC_ENABLED)
+        apply_fields(body, fields1)  # body 被写成 budget_tokens=16000（HIGH 代表值）
+
+        # round 2：failover 换到支持 XHIGH 的宽 capability supply
+        wide_cap = ReasoningCapability.from_config(None)  # OFF..XHIGH
+
+        # 错误做法（修复前）：对已被污染的 body 重新 decode，拿到的是 round1 钳低后的 HIGH，
+        # 不是客户端原始的 XHIGH ——即使 supply 换了、capability 变宽了也恢复不了。
+        intent_round2_buggy = self.codec.decode(body)
+        aligned2_buggy = align(intent_round2_buggy, wide_cap)
+        self.assertEqual(intent_round2_buggy.level, CE.HIGH)
+        self.assertEqual(aligned2_buggy.level, CE.HIGH,
+                          "永久钳低复现：即使 round2 capability 支持 XHIGH，"
+                          "重新 decode 被污染的 body 也只能拿到 round1 钳低后的 HIGH")
+
+        # 正确做法（修复后）：复用循环外算好的 original_intent，重新 align 到新 capability，
+        # 强度能正确恢复到 XHIGH。
+        aligned2_fixed = align(original_intent, wide_cap)
+        self.assertEqual(aligned2_fixed.level, CE.XHIGH,
+                          "修复后：换到支持 XHIGH 的 supply，强度应恢复到客户端原始意图 XHIGH")
 
 
 if __name__ == "__main__":

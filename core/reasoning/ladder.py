@@ -48,19 +48,23 @@ _BUDGET_ANCHORS: list = [
 ]
 
 # canonical → budget 代表值反算表（仅在目标要 budget 语法但没有 source_budget 可回填
-# 时兜底使用）。LOW/MEDIUM/HIGH/XHIGH/MAX 由 architect 给定；OFF/MINIMAL 不在原设计
-# 范围内——OFF 在 AnthropicReasoningCodec.encode 里总是转成 thinking.type=disabled，
-# 不会走到这张表；MINIMAL 理论上可能在 source_budget 缺失且 aligned.level=MINIMAL 时
-# 触发（仅当某 anthropic supply 的 reasoning_capability 显式配置了 minimal 档，且恰好
-# 该请求没有原始 budget 可回填），这条边界 architect 蓝图未给出数值，此处按 LOW 断点
-# 的一半（1000）保守外推，保持"数值越大强度越高"单调，未被真实场景验证。
+# 时兜底使用）。代表值必须落在 _BUDGET_ANCHORS 对应的区间*内部*（不能卡在区间边界），
+# 否则 canonical_to_budget(level) 再喂回 budget_to_canonical() 会因为边界比较是 `<`
+# 而漂移到下一档，往返不一致（bug 修复记录：LOW→2000→MEDIUM、MEDIUM→8000→HIGH、
+# HIGH→32000→XHIGH、XHIGH→64000→MAX，全部四档曾漂移一档）。
+# 区间：LOW<2000, 2000<=MEDIUM<8000, 8000<=HIGH<32000, 32000<=XHIGH<64000, MAX>=64000。
+# OFF 在 AnthropicReasoningCodec.encode 里总是转成 thinking.type=disabled，不会走到
+# 这张表；MINIMAL 理论上可能在 source_budget 缺失且 aligned.level=MINIMAL 时触发
+# （仅当某 anthropic supply 的 reasoning_capability 显式配置了 minimal 档，且恰好该
+# 请求没有原始 budget 可回填），这条边界 architect 蓝图未给出数值，此处按 LOW 区间
+# 内部值（1500）的一半（1000）保守外推，保持"数值越大强度越高"单调，未被真实场景验证。
 _CANONICAL_TO_BUDGET = {
     CanonicalEffort.OFF: 0,
     CanonicalEffort.MINIMAL: 1000,
-    CanonicalEffort.LOW: 2000,
-    CanonicalEffort.MEDIUM: 8000,
-    CanonicalEffort.HIGH: 32000,
-    CanonicalEffort.XHIGH: 64000,
+    CanonicalEffort.LOW: 1500,
+    CanonicalEffort.MEDIUM: 5000,
+    CanonicalEffort.HIGH: 16000,
+    CanonicalEffort.XHIGH: 48000,
     CanonicalEffort.MAX: 128000,
 }
 
