@@ -2,43 +2,42 @@
 
 ## 这是什么
 
-多协议 AI 模型代理，同时支持 Claude Code（Anthropic `/v1/messages` 协议）和 codex-cli
-（OpenAI Responses `/v1/responses` 协议）接入，并可跨协议互相访问对方生态的模型——例如
-在 Claude Code 里实际调用 GPT，在 codex 里实际调用 Claude。
+本地多协议 AI 模型代理，端口 18889（默认，可配）。同时支持 Claude Code（Anthropic
+`/v1/messages`）、codex-cli（OpenAI Responses `/v1/responses`）等多个 SDK 接入，并可跨协议
+互相访问对方生态的模型——例如在 Claude Code 里实际调用 GPT，在 codex 里实际调用 Claude。
 
-与 v1（`tools/proxy.py`）的关系：v1 是纯 Anthropic 生态的 appkey/profile 轮转代理，服务
-Claude Code 单一协议，在端口 **18888** 生产运行。v2（本目录 `model_proxy.py`）是新一代多协议
-代理，支持协议互转，在端口 **18889**（默认，可配）**实验性**运行。两者当前完全独立并行，
-互不依赖、互不干扰，可同时保留。
+与 `tools/proxy.py`（纯 Anthropic 生态的 appkey/profile 轮转代理，端口 18888，Claude Code
+单一协议生产运行）完全独立并行，互不依赖、互不干扰，可同时保留。
 
 ## 目录结构
 
 ```
 tools/model_proxy/
 ├── model_proxy.py                     # 入口（thin wrapper，转发到 core.server.main）
-├── model_proxy_config.example.json    # 配置样例
-├── model_proxy_cli.sh                 # 手动控制脚本
+├── model_proxy_config.json            # 实际配置（600 权限，不纳入 git 跟踪）
+├── model_proxy_config.example.json    # 配置样例（不含真实凭证，纳入 git 跟踪）
+├── model_proxy_cli.sh                 # 控制脚本
+├── _config_ops.py                     # supply/route/strategy 的增删改实现（被 cli 调用）
+├── _install_ops.py                    # install 子命令实现（四个 SDK 接入）
 ├── core/                              # 核心实现包
-│   ├── __init__.py
 │   ├── server.py                      # 主体：HTTP server、路由决策、转发编排、控制 API
-│   └── translate.py                   # 双向协议转换器（正向 Anthropic↔Chat + 反向 Responses↔Anthropic）
-├── tests/                             # 单测
-│   ├── __init__.py
-│   ├── test_route.py                  # 三阶段路由匹配单测（resolve_route/resolve_tier/select_supply_list/select_supply）
-│   └── test_translate.py              # 双向协议转换器合并单测
-├── docs/                              # 规格/蓝图文档
-│   ├── model_proxy_buildplan.md       # 施工蓝图（模块划分、实施顺序、风险点）
-│   └── model_proxy_translate_spec.md  # 双向协议转换规格（Part 1 正向 / Part 2 反向）
-└── samples/                           # 实测样本（网关真实响应，供规格核对字段用）
-    ├── anthropic_stream_samples.txt
-    └── responses_api_samples.txt
+│   ├── translate.py                   # 双向协议转换器（正向 Anthropic↔Chat + 反向 Responses↔Anthropic）
+│   └── reasoning/                     # effort/thinking 强度处理领域层
+│       ├── ladder.py                  # canonical 强度全序 + budget↔canonical 换算
+│       ├── capability.py              # ReasoningCapability + align()（唯一钳位点）
+│       └── codecs.py / registry.py    # 各协议 decode/encode/选语法
+├── tests/                              # 单测
+├── docs/                               # 规格/蓝图文档
+└── samples/                            # 实测样本（网关真实响应，供规格核对字段用）
 ```
 
 ## 配置怎么写
 
-配置文件路径固定为 `~/.claude/model_proxy_config.json`（不随代码迁移，本目录只提供
-`model_proxy_config.example.json` 作为样例，不含真实凭证）。核心是三段式结构：
-**supplies**（供给单元）+ **routes**（家族模板）+ **strategies**（token→家族绑定）。
+配置文件路径默认 `tools/model_proxy/model_proxy_config.json`（600 权限，已加入
+`tools/model_proxy/.gitignore`，不被 git 跟踪；含真实 appkey/token，不要手动纳入版本控制）。
+可用环境变量 `MODEL_PROXY_CONFIG` 覆盖路径。本目录 `model_proxy_config.example.json` 是不含
+真实凭证的样例，继续跟踪。核心是三段式结构：**supplies**（供给单元）+ **routes**（家族模板）
++ **strategies**（token→家族绑定）。
 
 ### supplies：一个供给单元 = 一个上游端点
 
@@ -59,73 +58,34 @@ tools/model_proxy/
 - `target_model`：实际下发给上游的模型名（客户端请求里的 model 字段会被替换成这个）。
 - `cooldown_seconds`（可选）：该 supply 触发失败后的冷却时长，不填则用顶层
   `default_cooldown_seconds`。
-- `reasoning_capability`（可选）：per-supply 的 effort 档位能力描述，见下。
+- `reasoning_capability`（可选）：该 supply 真实支持的 effort 档位能力描述。不配置时用代码
+  内置默认 5 档（`effort_enum: ["none","low","medium","high","xhigh"]` + `max_alias: "xhigh"`
+  + `off_alias: "none"`）。配置后按该 supply 覆盖，不影响其他 supply。字段：
+  - `effort_enum`：该 supply 真实支持的 effort 档位有序列表（低→高）。
+  - `max_alias`（可选）：canonical `MAX` 档降级映射到的目标档；不填则取 `effort_enum` 最高档。
+  - `off_alias`（可选）：显式关闭思考落到的目标档；不填则若 `effort_enum` 含
+    `none`/`off` 落到该档，否则不塞字段。
+  - budget 分档断点（Anthropic `thinking.budget_tokens` 语义）是全局固定常量
+    （`ladder.py` 的 `_BUDGET_ANCHORS`），与上游厂商无关，不支持 per-supply 自定义。
 
-> 已移除旧的 `reasoning` 布尔字段。实测证明它试图防范的"非 reasoning 模型收到 thinking/reasoning
-> 字段就 400"从未真实发生；真正会 400 的是 thinking **语法变体**不对（如新版 claude-sonnet-5
-> 拒绝 `thinking.type=enabled` 要求改用 `adaptive`），这已由 `core.reasoning` 领域层
-> （`AnthropicReasoningCodec.interpret_rejection` + `SyntaxPreferenceStore`）统一处理。
-> 现在无条件走 reasoning 语法自适应，不再有粗粒度门控开关。
+  示例（某供应商只支持 5 档中的 `none/low/medium/high`，无 `xhigh`）：
 
-#### reasoning_capability（可选）：覆盖该 supply 真实支持的 effort 档位
-
-强度处理是三层正交架构（`core/reasoning/`）：
-- `ladder.py`：canonical 强度全序（跨协议统一序数）+ budget↔canonical 换算（全局常量锚点，
-  不再是 per-supply 可配置项）。
-- `capability.py`：`ReasoningCapability`（per-supply 能力）+ `align()`（唯一钳位点）。
-- `codecs.py` / `registry.py`：各协议（anthropic/chat/responses）decode/encode/选语法。
-
-`reasoning_capability` 是**每个 supply 自己的可选字段**，不配置时该 supply 用代码内置的默认
-5 档（等价于 `effort_enum: ["none","low","medium","high","xhigh"]` + `max_alias: "xhigh"` +
-`off_alias: "none"`，与旧版本行为完全一致）。配置后按该 supply 覆盖 `ReasoningCapability`，
-不影响其他 supply。**budget 分档断点已上收为全局常量（`ladder.py` 的 `_BUDGET_ANCHORS`），
-不再支持 per-supply 自定义**（Anthropic budget 语义本身是固定的，与上游厂商无关）。
-
-不同供应商真实支持的 effort 档位不一样。以下是 glm 家族的实测示例（来自 `probe-effort` 探测）：
-
-```json
-{
-  "id": "glm-52-sankuai-3339",
-  "url": "https://aigc.sankuai.com/v1/anthropic",
-  "protocol": "anthropic",
-  "appkey": "<APPKEY_PLACEHOLDER>",
-  "target_model": "glm-5.2",
-  "reasoning_capability": {
-    "effort_enum": ["none", "minimal", "low", "medium", "high"],
-    "max_alias": "high"
+  ```json
+  {
+    "id": "glm-sankuai",
+    "url": "https://aigc.sankuai.com/v1/anthropic",
+    "protocol": "anthropic",
+    "appkey": "<APPKEY_PLACEHOLDER>",
+    "target_model": "glm-5.2",
+    "reasoning_capability": {
+      "effort_enum": ["none", "low", "medium", "high"],
+      "max_alias": "high"
+    }
   }
-}
-```
+  ```
 
-- `effort_enum`：该 supply 真实支持的 effort 档位有序列表（低→高）。
-  缺省 `["none","low","medium","high","xhigh"]`。
-  > `minimal` 是**疑似**支持，非精确确认：glm 上游对非法 effort 值的报错 body 会被截断成
-  > 不完整 JSON，`probe-effort` 无法按标准 JSON 解析，`minimal` 是从截断后的乱码报错文本片段里
-  > "看起来像"识别出来的枚举词。生效前建议用户自行向 glm 核实该档位真实存在，若核实后发现不支持，
-  > 从 `effort_enum` 里删掉即可（删掉后该词退化为"枚举外的值"，走下面的跨模型强度钳位逻辑）。
-  > 无 `xhigh` 是确认无疑的（glm 最高档就是 `high`）。
-- `max_alias`：canonical `MAX` 档降级映射到的目标档；若不在 `effort_enum` 内自动兜底到最高档。
-  缺省 = `effort_enum` 最高档（例：glm 无 xhigh，配 `"high"`，`max` 会正确映射到 `high`）。
-- `off_alias`（可选）：显式关闭思考（Anthropic `thinking.type=disabled`）落到的目标档；
-  缺省 = `effort_enum` 含 `none`/`off` 则落到该档，否则不塞字段。
-
-档位不确定时可用 `probe-effort` 子命令向上游探测（见下）。
-
-#### 跨模型 effort 映射机制：强度就近钳位，不会强度倒挂
-
-客户端发的 effort 意图（`none`/`low`/`medium`/`high`/`xhigh`，强度依次递增）未必落在目标 supply
-真实支持的 `effort_enum` 里。例如客户端按 Claude 的 5 档模型发起请求，但目标 supply 只支持 3 档
-`["low","medium","high"]`：
-
-- 客户端发 `xhigh`（不在枚举里，但强度上高于枚举最高档 `high`）→ 钳到枚举最高档 `high`
-  （尽量给到该 supply 能提供的最强档，而不是退到中间档）。
-- 客户端发 `none`（不在枚举里，强度低于枚举最低档 `low`）→ 钳到枚举最低档 `low`。
-- 客户端发 `high`（恰好在枚举里）→ 精确命中，直传 `high`。
-- 客户端发 `max`（Anthropic 特殊字面值）→ 走 `max_alias` 专用逻辑，不参与强度钳位。
-- 若枚举跳过了某档（如 `effort_enum=["low","xhigh"]`），客户端发 `medium` 会落在枚举强度范围内但
-  未精确命中 → 取强度序上最接近的一档；若两侧距离相等则取更高的一档（偏保守，保留更多思考质量）。
-
-按整体强度序就近钳位，不会出现"发更强意图反而映射到更弱档位"的强度倒挂。
+  档位不确定时可用 `supply probe <id>` 向上游探测（探测结果不保证准确，供人工核实，
+  详见「怎么控制」）。
 
 ### routes：家族模板 = 一个 route id + 三档（opus/sonnet/haiku）各自的 supplies 列表
 
@@ -149,10 +109,9 @@ tools/model_proxy/
   `off` 时失败直接返回给客户端，不重试。failover 是 route（家族）级开关，不细分到 tier。
 
 **多档共享同一组真实上游**：不是每个家族都天然有三种不同能力的模型——比如某家族只有
-「强/快」两种真实模型，硬套三档反而要在 `supplies` 里复制冗余条目。这种情况下**多个 tier
-可以直接填同一组 supply id 列表**，不需要引入额外抽象层，`select_supply_list` 按 tier 名取
-列表的逻辑天然支持这种共享，代码不用改。例如 deepseek 家族只有 `pro`/`flash` 两种真实模型，
-`opus` 和 `sonnet` 都打 `pro`，`haiku` 单独打 `flash`：
+「强/快」两种真实模型，硬套三档反而要在 `supplies` 里复制冗余条目。这种情况下多个 tier
+可以直接填同一组 supply id 列表，不需要引入额外抽象层。例如 deepseek 家族只有 `pro`/`flash`
+两种真实模型，`opus` 和 `sonnet` 都打 `pro`，`haiku` 单独打 `flash`：
 
 ```json
 {
@@ -167,8 +126,7 @@ tools/model_proxy/
 ```
 
 供给单元命名建议按**真实能力**取名（如 `ds-pro-k0`/`ds-flash-k0`），不要用 `opus`/`sonnet`
-这类档位词——档位是请求侧的分类，不代表上游真的有对应数量的独立模型，用档位词命名 supply
-容易让人误以为每档必然对应一个独立真实模型。
+这类档位词——档位是请求侧的分类，不代表上游真的有对应数量的独立模型。
 
 ### strategies：client_token → route_id 绑定（运行时可切换）
 
@@ -182,23 +140,45 @@ tools/model_proxy/
 - `note`：可选备注。
 - 禁用一个 token 直接删除其 strategy 记录即可（无 enabled 开关）。
 
-**匹配流程（三阶段）**：请求进来后 ① 用 `client_token` 查 strategies 拿到 `route_id`，再用
+**三阶段匹配流程**：请求进来后 ① 用 `client_token` 查 strategies 拿到 `route_id`，再用
 `route_id` 拿到 route 家族；② 把请求体 `model` 字段**精确查表**映射成 tier 名
 （`claude-opus`→opus / `claude-sonnet`→sonnet / `claude-haiku`→haiku，仅这三个精确值，
 非子串猜测）；③ 从 route 的 `tiers` 里按 tier 取出该档 supplies 列表交给 failover 选择。
 
-> **注意**：新架构下 `model` 字段不是上述三个预设值之一时，选路直接 **400 失败，不再有兜底降级**。
-> `settings.json` 里的 `ANTHROPIC_DEFAULT_OPUS_MODEL`/`ANTHROPIC_DEFAULT_SONNET_MODEL`/
-> `ANTHROPIC_DEFAULT_HAIKU_MODEL` 三个值现在是固定档位标签（分别填 `claude-opus`/`claude-sonnet`/
-> `claude-haiku`），**不需要改**；运行时切换家族用 `model_proxy_cli.sh switch <token> <route_id>`
-> 改 strategy 绑定，不动 model 标签。
+`model` 字段不是上述三个预设值之一时，选路直接 400 失败，不兜底。`settings.json` 里的
+`ANTHROPIC_DEFAULT_OPUS_MODEL`/`ANTHROPIC_DEFAULT_SONNET_MODEL`/
+`ANTHROPIC_DEFAULT_HAIKU_MODEL` 三个值固定填 `claude-opus`/`claude-sonnet`/`claude-haiku`；
+运行时切换家族用 `model_proxy_cli.sh switch <token> <route_id>` 改 strategy 绑定，不动
+model 标签。
 
-顶层还有 `admin_token`（控制 API 鉴权）和 `default_cooldown_seconds`（默认冷却时长）。
+### 顶层字段
+
+- `admin_token`：控制 API 鉴权，供 `X-Proxy-Admin-Token` 请求头校验。
+- `default_cooldown_seconds`：supply 未单独配置 `cooldown_seconds` 时的默认冷却时长。
+
 完整样例见 `model_proxy_config.example.json`。
+
+### effort 跨模型钳位
+
+客户端发的 effort 意图（`none`/`low`/`medium`/`high`/`xhigh`，强度依次递增，及 Anthropic 的
+`max`）未必落在目标 supply 真实支持的 `effort_enum` 里。按强度就近钳位：
+
+- 强度高于枚举最高档 → 钳到最高档（尽量给到该 supply 能提供的最强档）。
+- 强度低于枚举最低档 → 钳到最低档。
+- 恰好命中枚举内某档 → 精确命中，直传。
+- `max`（Anthropic 特殊字面值）→ 走 `max_alias` 专用逻辑，不参与强度钳位。
+- 枚举跳档（如 `["low","xhigh"]`）时客户端发的中间强度未精确命中 → 取强度序上最接近的一档；
+  两侧距离相等则取更高档（偏保守，保留更多思考质量）。
+
+按整体强度序就近钳位，不会出现「发更强意图反而映射到更弱档位」的强度倒挂。
 
 ## 怎么启动
 
-手动启动（不随 Claude Code 会话自动拉起，这点和 v1 不同）：
+```bash
+tools/model_proxy/model_proxy_cli.sh on
+```
+
+或手动：
 
 ```bash
 MODEL_PROXY_PORT=18889 python3 tools/model_proxy/model_proxy.py &
@@ -206,84 +186,89 @@ MODEL_PROXY_PORT=18889 python3 tools/model_proxy/model_proxy.py &
 
 端口默认 18889，可用 `MODEL_PROXY_PORT` 环境变量覆盖。日志写到本目录
 `.claude_model_proxy.log`（启动时自动截断保留最后 1000 行），进程锁在
-`/tmp/claude_model_proxy.lock`（防止同一时刻起多个实例）。
+`/tmp/claude_model_proxy.lock`（防止同一时刻起多个实例）。不接 SessionStart hook，
+不会随 Claude Code 会话自动拉起，需要手动管理生命周期。
 
-**当前不接 SessionStart hook**：v2 还未经真实流量充分验证，不会像 v1 那样在每次
-Claude Code 会话启动时自动拉起，需要手动管理生命周期。
+## 怎么控制（CLI）
 
-## 怎么控制
-
-用 `tools/model_proxy/model_proxy_cli.sh`（先 `chmod +x`，已在仓库里可直接执行）：
+用 `tools/model_proxy/model_proxy_cli.sh`（已在仓库里可直接执行）：
 
 ```bash
-tools/model_proxy/model_proxy_cli.sh status               # 查看运行状态 + supplies/routes/cooldown
-tools/model_proxy/model_proxy_cli.sh reload               # 触发配置热重载
-tools/model_proxy/model_proxy_cli.sh clear-cooldown <id>  # 手动清除某 supply 的冷却（幂等）
-tools/model_proxy/model_proxy_cli.sh supply list          # 列出所有 supply
-tools/model_proxy/model_proxy_cli.sh supply add           # 交互式新增 supply
-tools/model_proxy/model_proxy_cli.sh supply rotate-appkey <id> <key>  # 替换 appkey 并解冷
-tools/model_proxy/model_proxy_cli.sh probe-effort <supply_id>  # 探测该 supply 真实支持的 effort 枚举
-tools/model_proxy/model_proxy_cli.sh route list           # 列出所有 route 家族模板
-tools/model_proxy/model_proxy_cli.sh route add            # 交互式新增 route 家族模板
-tools/model_proxy/model_proxy_cli.sh strategy list        # 列出所有 token→家族 绑定
-tools/model_proxy/model_proxy_cli.sh strategy add         # 交互式新增 strategy 绑定
-tools/model_proxy/model_proxy_cli.sh switch <token> <route_id>  # 切换某 token 绑定的家族
-tools/model_proxy/model_proxy_cli.sh migrate              # 选一个 strategy 的 token 写入 settings.json
-tools/model_proxy/model_proxy_cli.sh on                   # 启动（已在监听则跳过）
-tools/model_proxy/model_proxy_cli.sh off                  # 停止
+model_proxy_cli.sh status                            # 运行状态 + supplies/routes/strategies/cooldown 概览
+model_proxy_cli.sh reload                             # 触发配置热重载（无条件清空所有 cooldown）
+model_proxy_cli.sh supply list                         # 列出所有 supply（appkey 脱敏尾4位、cooldown）
+model_proxy_cli.sh supply add                          # 交互式新增 supply（同步探测 effort，写配置后 reload）
+model_proxy_cli.sh supply edit <id>                    # 交互式编辑 supply（含改 appkey、可选重新探测 effort）
+model_proxy_cli.sh supply del <id>                     # 删除 supply（二次确认，被 route 引用则拒绝）
+model_proxy_cli.sh supply probe <id>                   # 只跑 effort 探测，接受则回写 reasoning_capability
+model_proxy_cli.sh route list                          # 列出所有 route 家族模板
+model_proxy_cli.sh route add                           # 交互式新增 route 家族模板
+model_proxy_cli.sh route edit <id>                     # 交互式编辑 route 的 tiers/failover
+model_proxy_cli.sh route del <id>                      # 删除 route（二次确认，被 strategy 引用则拒绝）
+model_proxy_cli.sh strategy list                       # 列出所有 client_token -> route_id 绑定
+model_proxy_cli.sh strategy add                        # 交互式新增 strategy 绑定
+model_proxy_cli.sh strategy edit <token>                # 交互式编辑 strategy 的 route_id/note
+model_proxy_cli.sh strategy del <token>                 # 删除 strategy（二次确认，无下游引用检查）
+model_proxy_cli.sh switch <client_token> <route_id>     # 切换某 token 绑定的 route 家族
+model_proxy_cli.sh install                              # 交互式列出四个 SDK + 本机检测状态，选择安装
+model_proxy_cli.sh install --list                       # 只列出四个 SDK 检测状态，不安装
+model_proxy_cli.sh on                                   # 启动（已在监听则跳过）
+model_proxy_cli.sh off                                  # 停止
 ```
 
-- `supply`/`route`/`strategy` 子命令支持交互式增改配置（原子写盘后自动 reload），
-  `switch <token> <route_id>` 用参数式改某 token 的 route 家族绑定，`migrate` 可从
-  已有 strategies 里选一个 client_token 写入 `~/.claude/settings.json`。详细用法见 `--help`。
-
-- `probe-effort <supply_id>`：向该 supply 上游直接发一个已知非法的 effort 值
+- `supply`/`route`/`strategy` 子命令均为交互式增改配置，原子写盘后自动触发 reload。
+- `supply probe <id>`：向该 supply 上游直接发一个已知非法的 effort 值
   （`__probe_invalid__`），按 protocol 构造对应探测请求（anthropic 走 `output_config.effort`、
   chat 走 `reasoning_effort`、responses 走 `reasoning.effort`），从报错响应里用宽松正则
-  尝试提取"Supported values are: ..."之类枚举并打印。**仅辅助人工审阅，不自动写入 config**
-  （供应商报错格式差异大、glm 的 body 还会被截断、Responses 端点报错走 200-with-failed-status
-  而非 400），解析结果不保证准确，需人工判断后手动填 `reasoning_capability`。
-
+  尝试提取"Supported values are: ..."之类枚举并打印，询问是否接受写入
+  `reasoning_capability`。解析结果不保证准确（供应商报错格式差异大，部分响应体会被截断），
+  需人工核实后再接受。
 - 端口默认 18889，同样支持 `MODEL_PROXY_PORT` 环境变量覆盖。
-- `admin_token` 从 `~/.claude/model_proxy_config.json` 读取，用于控制 API 的
-  `X-Proxy-Admin-Token` 鉴权头。
+- `admin_token` 从配置文件读取，用于控制 API 的 `X-Proxy-Admin-Token` 鉴权头。
 - `off` 只按本脚本同目录下 `model_proxy.py` 的绝对路径精确匹配进程，不会影响 v1 的
   `tools/proxy.py`（18888 生产进程）——两者进程 fingerprint 完全不同，已实测验证隔离。
 
-## v1 ↔ v2 怎么切换/回退
+## 接入各SDK (install)
 
-客户端配置里指向哪个端口/哪个 token 决定用哪套代理：
+`install` 命令按 SDK 协议从 strategies 里过滤出协议匹配的 client_token，交互式选择后：
+已检测到该 SDK 配置目录则备份原文件后按其格式写入；未检测到则打印配置片段供手动粘贴。
+只读 strategies，不改 token→route 绑定关系。
 
-- **Claude Code**：改 `~/.claude/settings.json` 里 `env.ANTHROPIC_BASE_URL`（v1 通常是
-  `http://localhost:18888/`，切到 v2 改成 `http://localhost:18889/`）及对应
-  `ANTHROPIC_AUTH_TOKEN`（需匹配 v2 配置里某条 strategy 的 `client_token`）。
-- **codex-cli**：改其配置里 Responses API 的 base_url/token，同理指向 18889。
+支持四个 SDK：
 
-切回 v1 只需把 base_url 改回 18888，两个 proxy 进程互不干扰，可以同时保留运行，随时切换
-不需要互相停止。
+- **claude**（Claude Code，Anthropic 协议）：写 `~/.claude/settings.json` 的
+  `env.ANTHROPIC_BASE_URL`/`ANTHROPIC_AUTH_TOKEN`，并补齐三个档位环境变量
+  （`ANTHROPIC_DEFAULT_OPUS_MODEL`/`_SONNET_MODEL`/`_HAIKU_MODEL` 固定填
+  `claude-opus`/`claude-sonnet`/`claude-haiku`）。
+- **codex**（codex-cli，Responses 协议）：写 `~/.codex/config.toml` 的
+  `[model_providers.model_proxy]` 段（`base_url`/`wire_api="responses"`/`env_key`）及顶层
+  `model`/`model_provider`；appkey 走环境变量 `MODEL_PROXY_CODEX_TOKEN` 注入，不写入配置文件。
+- **hermes**（协议可选，按 `api_mode` 决定）：标准库无 yaml 解析器，为避免破坏现有文件结构，
+  统一打印 `custom_providers` 配置片段供手动粘贴到 `~/.hermes/config.yaml`。
+- **openclaw**（协议可选，按 `api` 决定）：写 `~/.openclaw/openclaw.json` 的
+  `models.providers.<name>`；若现有文件用了 json5 专属语法（标准库 json 解析失败）则降级为
+  打印片段，不强行写入。
 
-## 当前状态
+四个 SDK 各自按其协议（claude=anthropic，codex=responses，hermes/openclaw 协议可选由用户
+在候选 token 里选定）过滤候选 client_token；无匹配协议的 token 时会提示先用 `strategy add`
+新增对应绑定。检测到多个匹配 token 时交互式列出供选择。
 
-**实验性，未经大规模真实使用验证。**
+## 当前状态/已知限制
 
-已完成的能力：
-- 四种协议组合的转发/转换：
-  1. anthropic → anthropic（PASSTHROUGH，字节透传 + thinking 方言适配）
-  2. responses → responses（PASSTHROUGH，字节透传）
-  3. anthropic → chat（FORWARD，经 `core/translate.py` 正向部分转换）
-  4. responses → anthropic（REVERSE，经 `core/translate.py` 反向部分转换）
+- 已支持四种协议组合的转发/转换：anthropic→anthropic、responses→responses（均字节透传，
+  含 thinking 方言自适应）、anthropic→chat、responses→anthropic（经 `core/translate.py` 转换）。
 - cross-supply failover：上游 401/403/429/5xx 触发对应 supply 冷却并按 route 顺序切换到下一个
   supply（不限协议，跨供给单元）。
-- thinking 方言适配（仅组合1）：识别网关对 `thinking.type` 的 400 拒绝，缓存并转换为对方接受
+- thinking/effort 方言自适应：识别网关对 reasoning 语法的 400 拒绝，缓存并转换为对方接受
   的格式重试。
-- 错误路径加固：UNSUPPORTED 组合、上游 4xx/5xx、流式中途中断均按客户端协议包裹成合法的
+- 错误路径加固：不支持的协议组合、上游 4xx/5xx、流式中途中断均按客户端协议包裹成合法的
   error 响应/事件，不会让客户端挂死。
-
-已知限制：
+- 配置支持热重载，不需要重启进程：`ConfigStore` 用 mtime 比对（每次转发请求都会
+  `maybe_reload()`），也可用 `model_proxy_cli.sh reload` 主动触发一次强制重载并清空 cooldown。
+  若配置文件解析失败（JSON 非法等），保留旧配置并记录 warning 日志，不会导致进程崩溃或
+  配置被清空。
 - 没有自动重启/自愈 hook，进程崩溃不会自动拉起，需要手动 `on`。
-- **配置支持热重载，不需要重启进程**：`ConfigStore` 用 mtime 比对（每次请求经过
-  `_forward` 都会 `maybe_reload()`），也可用 `model_proxy_cli.sh reload` 主动触发一次强制
-  重载（`ConfigStore.reload()`）。若配置文件解析失败（JSON 非法等），会保留旧配置并记录
-  warning 日志，不会导致进程崩溃或配置被清空。
-- 未接入自动化测试覆盖真实上游网络调用（转换器单测均为脱网络单测，`_forward` 转发编排本身
-  未做端到端自动化测试，依赖手动 curl 验证）。
+- 未接入自动化测试覆盖真实上游网络调用（转换器单测均为脱网络单测，转发编排本身未做端到端
+  自动化测试，依赖手动 curl 验证）。
+- effort 探测（`supply probe`）解析结果不保证准确，仅供人工审阅参考。
+</content>
