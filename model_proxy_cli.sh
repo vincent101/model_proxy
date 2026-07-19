@@ -84,9 +84,11 @@ run_config_ops() {
     echo "Error: config not found: $CONFIG_FILE"
     return 1
   fi
+  local subcmd="$1"
+  shift
   local marker
   marker=$(mktemp)
-  CONFIG_OPS_RELOAD_MARKER="$marker" python3 "$CONFIG_OPS" "$@" "$CONFIG_FILE"
+  CONFIG_OPS_RELOAD_MARKER="$marker" python3 "$CONFIG_OPS" "$subcmd" "$CONFIG_FILE" "$@"
   local rc=$?
   if [[ -f "$marker" ]] && [[ "$(cat "$marker")" == "yes" ]]; then
     reload_proxy
