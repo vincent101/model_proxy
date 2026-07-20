@@ -57,6 +57,18 @@ logging.basicConfig(
 )
 log = logging.getLogger(__name__)
 
+# ---------------------------------------------------------------------------
+# reasoning debug 开关：默认关闭，不污染生产日志（沿用 MODEL_PROXY_CONFIG/
+# MODEL_PROXY_PORT 的环境变量风格，进程启动时读取一次，不支持热切换）。
+# 开启后把本模块 logger 的 effective level 调到 DEBUG（只影响 `log` 这一个具名
+# logger，root 仍是 WARNING），调用点用 log.isEnabledFor(logging.DEBUG) 判断，
+# 关闭时不做任何字符串拼接。
+# 手动开启：MODEL_PROXY_REASONING_DEBUG=1 再启动/重启进程（export 后运行
+# model_proxy_cli.sh on 也会被 nohup 子进程继承）。
+# ---------------------------------------------------------------------------
+if os.environ.get("MODEL_PROXY_REASONING_DEBUG", "").strip().lower() in ("1", "true", "on", "yes"):
+    log.setLevel(logging.DEBUG)
+
 # 默认路径（全部 v2 命名）：锚定包目录 tools/model_proxy/model_proxy_config.json，
 # 可用环境变量 MODEL_PROXY_CONFIG 覆盖（与 model_proxy_cli.sh 的 CONFIG_FILE 逻辑一致）。
 _DEFAULT_CONFIG_PATH = Path(
@@ -419,6 +431,54 @@ def _extract_upstream_error_message(resp_body: bytes, fallback_limit: int = 500)
     return resp_body[:fallback_limit].decode("utf-8", "replace")
 
 
+def _fmt_effort(level) -> str:
+    """CanonicalEffort|None → 可读字符串，如 'XHIGH(5)' / 'None'。"""
+    if level is None:
+        return "None"
+    return f"{level.name}({int(level)})"
+
+
+def _log_reasoning_debug(
+    supply_id: str,
+    target_model: "str | None",
+    reasoning_cap: "ReasoningCapability",
+    reasoning_intent: "Any",
+    aligned_effort: "Any",
+    reasoning_variant: str,
+    reasoning_fields: dict,
+) -> None:
+    """reasoning debug 旁路日志：拼出"客户端意图 → 钳位结果"的一眼可读对比。
+
+    只在 log.isEnabledFor(logging.DEBUG) 为真时才被调用（调用点已判断一次，这里
+    再判一次防御性重复调用），避免关闭开关时仍做字符串拼接。
+    """
+    if not log.isEnabledFor(logging.DEBUG):
+        return
+    intent_str = _fmt_effort(reasoning_intent.level)
+    aligned_str = _fmt_effort(aligned_effort.level)
+    if reasoning_intent.level is not None and aligned_effort.level is not None:
+        if aligned_effort.level == reasoning_intent.level:
+            tag = "unchanged"
+        elif aligned_effort.level < reasoning_intent.level:
+            tag = "clamped"
+        else:
+            tag = "raised"  # 理论上不应出现（align() 单调不减保证），仅防御性标注
+    elif reasoning_intent.explicit_off:
+        tag = "explicit_off"
+    else:
+        tag = "n/a"
+    cap_str = ",".join(e.name for e in reasoning_cap.enum) if reasoning_cap.enum else "()"
+    log.debug(
+        "reasoning_debug: supply=%s target_model=%s cap=[%s] "
+        "intent=%s(source_budget=%s,explicit_off=%s,present=%s) -> aligned=%s [%s] "
+        "variant=%s fields=%s",
+        supply_id, target_model, cap_str,
+        intent_str, reasoning_intent.source_budget, reasoning_intent.explicit_off, reasoning_intent.present,
+        aligned_str, tag,
+        reasoning_variant, reasoning_fields,
+    )
+
+
 def _responses_failed_event(adapter: "pt.AnthropicToResponsesStreamAdapter", message: str) -> dict:
     """构造反向流式中途出错的 response.failed 收尾事件（反向规格 §5.1）。
 
@@ -598,6 +658,10 @@ class ModelProxyHandler(BaseHTTPRequestHandler):
             aligned_effort = align(reasoning_intent, reasoning_cap)
             reasoning_variant = tgt_codec.select_variant(pref_store.snapshot(target_model or ""))
             reasoning_fields = tgt_codec.encode(aligned_effort, reasoning_cap, reasoning_variant)
+            if log.isEnabledFor(logging.DEBUG):
+                _log_reasoning_debug(
+                    supply_id, target_model, reasoning_cap, reasoning_intent,
+                    aligned_effort, reasoning_variant, reasoning_fields)
 
             # ---- 按 mode 计算 send_body / target_url / 转换上下文 ----
             # fwd_ctx：请求转换上下文（tool_name_mapping/request_model），
