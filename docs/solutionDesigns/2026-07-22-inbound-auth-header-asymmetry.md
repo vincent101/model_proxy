@@ -1,4 +1,5 @@
 ---
+created: 2026-07-23 21:23:29
 type: design-decision
 date: 2026-07-22
 status: draft
