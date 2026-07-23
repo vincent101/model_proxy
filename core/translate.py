@@ -66,6 +66,11 @@ _FINISH_REASON_MAP = {
     "content_filter": "end_turn",
 }
 
+# reasoning_content 空回答兜底：content 空但 reasoning_content 非空时，把思考内容填进
+# text block，避免客户端收到空 content 数组。可整体关闭（改此常量）。
+_ENABLE_REASONING_FALLBACK = True
+_REASONING_FALLBACK_PREFIX = "[模型仅返回思考过程，未生成正式回答]\n\n"
+
 
 # ############################################################################
 # §0 公共辅助：id 生成 / SSE 序列化 / 通用映射
@@ -515,6 +520,16 @@ def openai_to_anthropic_response(resp: dict, ctx: dict = None) -> dict:
             "input": parsed,
         })
 
+    # 空回答兜底：content 与 tool_calls 都为空，但 reasoning_content 非空
+    if _ENABLE_REASONING_FALLBACK and not content_blocks:
+        reasoning = message.get("reasoning_content")
+        if isinstance(reasoning, str) and reasoning.strip():
+            content_blocks.append({
+                "type": "text",
+                "text": _REASONING_FALLBACK_PREFIX + reasoning,
+            })
+            logger.info("empty content fallback: filled reasoning_content into text block")
+
     # stop_reason 映射
     stop_reason = map_finish_reason(choice.get("finish_reason"))
 
@@ -529,6 +544,9 @@ def openai_to_anthropic_response(resp: dict, ctx: dict = None) -> dict:
         "input_tokens": u.get("prompt_tokens", 0),
         "output_tokens": u.get("completion_tokens", 0),
     }
+    _rt = _extract_reasoning_tokens(u)      # 统一 helper，读 completion_tokens_details.reasoning_tokens
+    if _rt:                                 # 有值才加 details，无值保持旧结构（不加空字段）
+        anthropic_usage["output_tokens_details"] = {"reasoning_tokens": _rt}
 
     # content_filter_results：丢弃 + 记 log（§2.4）
     if resp.get("content_filter_results") or (choice.get("finish_reason") == "content_filter"):
@@ -582,6 +600,9 @@ class OpenAIToAnthropicStreamAdapter:
         self.message_id = gen_msg_id()
         self.openai_index_to_anthropic_index = {}
         self._finalized = False
+        self.reasoning_buf = ""              # 累积 delta.reasoning_content
+        self.produced_content_block = False  # 是否产出过 text/tool block（不含 reasoning 累积）
+        self.reasoning_tokens = 0
 
     # ---- 事件构造 helper（§3.2） ----
 
@@ -671,6 +692,9 @@ class OpenAIToAnthropicStreamAdapter:
             self.input_tokens = usage.get("prompt_tokens", 0)
         if usage.get("completion_tokens") is not None:
             self.output_tokens = usage.get("completion_tokens", self.output_tokens)
+        _rt = _extract_reasoning_tokens(usage)
+        if _rt:
+            self.reasoning_tokens = _rt
 
     # ---- 核心：feed（§3.4） ----
 
@@ -700,6 +724,7 @@ class OpenAIToAnthropicStreamAdapter:
 
         # (B) 文本增量
         if delta.get("content"):
+            self.produced_content_block = True
             if self.cur_type != "text":
                 if self.block_open:
                     events.append(self._content_block_stop(self.cur_index))
@@ -711,7 +736,12 @@ class OpenAIToAnthropicStreamAdapter:
 
         # (C) 工具增量（§4）
         if delta.get("tool_calls"):
+            self.produced_content_block = True
             events.extend(self._handle_tool_calls_delta(delta["tool_calls"]))
+
+        # (C.5) 思考增量：仅累积，不实时透传（finalize 时若从未产出内容才补块）
+        if delta.get("reasoning_content"):
+            self.reasoning_buf += delta["reasoning_content"]
 
         # (D) finish_reason 到达：仅记状态，不立即收尾
         if finish is not None:
@@ -770,9 +800,25 @@ class OpenAIToAnthropicStreamAdapter:
         if self.block_open:
             events.append(self._content_block_stop(self.cur_index))
             self.block_open = False
+        # 空回答兜底：从未产出任何 text/tool block，但累积了 reasoning_content
+        if (not self.produced_content_block
+                and _ENABLE_REASONING_FALLBACK
+                and self.reasoning_buf.strip()):
+            self.cur_index += 1
+            events.append(self._content_block_start_text(self.cur_index))
+            events.append(self._content_block_delta_text(
+                self.cur_index, _REASONING_FALLBACK_PREFIX + self.reasoning_buf))
+            events.append(self._content_block_stop(self.cur_index))
         events.append(self._message_delta_event())
         events.append(self._message_stop_event())
         return events
+
+    def usage_tuple(self) -> tuple[int, int, int]:
+        """统一 usage 读取接口：返回 (usage_in, usage_out, usage_reasoning)。
+
+        供 server.py access 日志统一调用，避免按 adapter 类型分别取不同命名的属性。
+        """
+        return (self.input_tokens, self.output_tokens, self.reasoning_tokens)
 
 
 # ############################################################################
@@ -992,19 +1038,23 @@ def _input_to_messages(input_items) -> list:
 # ============================================================================
 
 def _extract_reasoning_tokens(usage: dict) -> int:
-    """从 Anthropic usage dict 防御性多路径读取 reasoning/thinking token 数。
+    """从任意上游协议 usage dict 防御性多路径读取 reasoning/thinking token 数。
 
-    候选路径（按优先级）：
-        usage.output_tokens_details.thinking_tokens
-        usage.output_tokens_details.reasoning_tokens
-        usage.thinking_tokens
-    全部缺失则返回 0（保持旧行为，不臆造数据）。
+    覆盖 chat / responses / anthropic 三协议已知路径（互不冲突，一个 usage 只命中一类）：
+        usage.output_tokens_details.thinking_tokens        # anthropic
+        usage.output_tokens_details.reasoning_tokens       # responses / anthropic
+        usage.completion_tokens_details.reasoning_tokens   # chat（OpenAI 风格）
+        usage.thinking_tokens                              # anthropic 顶层别名
+    全部缺失/为 0 则返回 0（不臆造）。各 details 用 `or {}` 防 null（chat 上游实测
+    output_tokens_details 为 null）。
     """
     u = usage or {}
     otd = u.get("output_tokens_details") or {}
+    ctd = u.get("completion_tokens_details") or {}
     return (
         otd.get("thinking_tokens")
         or otd.get("reasoning_tokens")
+        or ctd.get("reasoning_tokens")
         or u.get("thinking_tokens")
         or 0
     )
@@ -1297,6 +1347,13 @@ class AnthropicToResponsesStreamAdapter:
         if not self.completed:
             self._emit_completed(events)
         return events
+
+    def usage_tuple(self) -> tuple[int, int, int]:
+        """统一 usage 读取接口：返回 (usage_in, usage_out, usage_reasoning)。
+
+        供 server.py access 日志统一调用，避免按 adapter 类型分别取不同命名的属性。
+        """
+        return (self.usage_in, self.usage_out, self.usage_reasoning)
 
     # ---- message item ----
 
@@ -1706,6 +1763,9 @@ def responses_to_anthropic_response(resp: dict, ctx: dict = None) -> dict:
     cached = (u.get("input_tokens_details") or {}).get("cached_tokens")
     if cached:
         anthropic_usage["cache_read_input_tokens"] = cached
+    _rt = _extract_reasoning_tokens(u)      # 读 output_tokens_details.reasoning_tokens
+    if _rt:
+        anthropic_usage["output_tokens_details"] = {"reasoning_tokens": _rt}
 
     return {
         "id": resp.get("id") or gen_msg_id(),
@@ -1752,6 +1812,7 @@ class ResponsesToAnthropicStreamAdapter:
         self.message_id = gen_msg_id()
         self._finalized = False
         self._completed = False
+        self.usage_reasoning = 0
 
     # ---- 事件构造 helper（复用 Anthropic 事件形态） ----
 
@@ -1896,6 +1957,7 @@ class ResponsesToAnthropicStreamAdapter:
                 self.input_tokens = u.get("input_tokens") or 0
             if u.get("output_tokens") is not None:
                 self.output_tokens = u.get("output_tokens") or 0
+            self.usage_reasoning = _extract_reasoning_tokens(u) or self.usage_reasoning
             if self.final_stop_reason is None:
                 self.final_stop_reason = "tool_use" if self.cur_type == "tool_use" else "end_turn"
             events.extend(self._emit_finish())
@@ -1926,3 +1988,10 @@ class ResponsesToAnthropicStreamAdapter:
         if self._completed:
             return []
         return self._emit_finish()
+
+    def usage_tuple(self) -> tuple[int, int, int]:
+        """统一 usage 读取接口：返回 (usage_in, usage_out, usage_reasoning)。
+
+        供 server.py access 日志统一调用，避免按 adapter 类型分别取不同命名的属性。
+        """
+        return (self.input_tokens, self.output_tokens, self.usage_reasoning)

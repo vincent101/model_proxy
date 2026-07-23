@@ -94,6 +94,36 @@ class TestHelpers(unittest.TestCase):
 
 
 # ============================================================
+# _extract_reasoning_tokens：全协议统一提取 helper
+# ============================================================
+
+class TestExtractReasoningTokens(unittest.TestCase):
+
+    def test_chat_path(self):
+        self.assertEqual(
+            pt._extract_reasoning_tokens({"completion_tokens_details": {"reasoning_tokens": 47}}),
+            47)
+
+    def test_responses_path(self):
+        self.assertEqual(
+            pt._extract_reasoning_tokens({"output_tokens_details": {"reasoning_tokens": 9}}),
+            9)
+
+    def test_anthropic_path_regression(self):
+        self.assertEqual(
+            pt._extract_reasoning_tokens({"output_tokens_details": {"thinking_tokens": 7}}),
+            7)
+
+    def test_null_details_defense(self):
+        usage = {"output_tokens_details": None, "completion_tokens_details": {"reasoning_tokens": 5}}
+        self.assertEqual(pt._extract_reasoning_tokens(usage), 5)
+
+    def test_all_missing_returns_zero(self):
+        self.assertEqual(pt._extract_reasoning_tokens({}), 0)
+        self.assertEqual(pt._extract_reasoning_tokens(None), 0)
+
+
+# ============================================================
 # 模块 A：请求转换
 # ============================================================
 
@@ -255,24 +285,29 @@ class TestRequestTranslate(unittest.TestCase):
     def test_reasoning_effort_emitted_when_reasoning(self):
         # 带 thinking.type=adaptive 才触发；裸 output_config 不再触发
         # reasoning_fields 由调用方（server.py）用 core.reasoning 链路算好后传入，
-        # 这里模拟该链路：AnthropicReasoningCodec.decode → align(默认 cap) → ChatReasoningCodec.encode
-        from core.reasoning.capability import ReasoningCapability, align
+        # 这里模拟该链路：AnthropicReasoningCodec.decode → remap(源=target 同一 cap，
+        # 等效原单侧钳位语义) → abstract_encode → ChatReasoningCodec.syntax_adapt
+        from core.reasoning.capability import ModelReasoningCapability, abstract_encode, remap
         from core.reasoning.registry import get_codec
         body = {"messages": [], "thinking": {"type": "adaptive"}, "output_config": {"effort": "high"}}
         intent = get_codec("anthropic").decode(body)
-        aligned = align(intent, ReasoningCapability.from_config(None))
-        fields = get_codec("chat").encode(aligned, ReasoningCapability.from_config(None), "chat_effort")
+        cap = ModelReasoningCapability.from_config(None)
+        target_effort = remap(intent, cap, cap)
+        abstract = abstract_encode(target_effort)
+        fields = get_codec("chat").syntax_adapt(abstract, "chat_effort")
         out, _ = pt.anthropic_to_openai_request(body, reasoning_fields=fields)
         self.assertEqual(out["reasoning_effort"], "high")
 
     def test_reasoning_effort_not_emitted_for_bare_output_config(self):
         # 裸 output_config.effort（无 thinking）→ decode 不产出意图 → 不塞 reasoning_effort
-        from core.reasoning.capability import ReasoningCapability, align
+        from core.reasoning.capability import ModelReasoningCapability, abstract_encode, remap
         from core.reasoning.registry import get_codec
         body = {"messages": [], "output_config": {"effort": "high"}}
         intent = get_codec("anthropic").decode(body)
-        aligned = align(intent, ReasoningCapability.from_config(None))
-        fields = get_codec("chat").encode(aligned, ReasoningCapability.from_config(None), "chat_effort")
+        cap = ModelReasoningCapability.from_config(None)
+        target_effort = remap(intent, cap, cap)
+        abstract = abstract_encode(target_effort)
+        fields = get_codec("chat").syntax_adapt(abstract, "chat_effort")
         out, _ = pt.anthropic_to_openai_request(body, reasoning_fields=fields)
         self.assertNotIn("reasoning_effort", out)
 
@@ -309,6 +344,16 @@ class TestResponseTranslate(unittest.TestCase):
         self.assertEqual(out["stop_reason"], "end_turn")
         self.assertIsNone(out["stop_sequence"])
         self.assertEqual(out["usage"], {"input_tokens": 10, "output_tokens": 5})
+
+    def test_usage_reasoning_tokens_from_chat(self):
+        """#5：usage 带 completion_tokens_details.reasoning_tokens=47 -> output_tokens_details 回填。"""
+        resp = {
+            "choices": [{"message": {"content": "Hello"}, "finish_reason": "stop"}],
+            "usage": {"prompt_tokens": 10, "completion_tokens": 5,
+                      "completion_tokens_details": {"reasoning_tokens": 47}},
+        }
+        out = pt.openai_to_anthropic_response(resp, {})
+        self.assertEqual(out["usage"]["output_tokens_details"]["reasoning_tokens"], 47)
 
     def test_tool_calls(self):
         resp = {
@@ -380,6 +425,59 @@ class TestResponseTranslate(unittest.TestCase):
             "finish_reason": "tool_calls"}]}
         out = pt.openai_to_anthropic_response(resp, {})
         self.assertTrue(out["content"][0]["id"].startswith("toolu_"))
+
+    def test_reasoning_fallback_length(self):
+        """content 空、reasoning_content 非空、finish_reason=length -> 兜底为 text block。"""
+        resp = {"choices": [{
+            "message": {"content": "", "reasoning_content": "思考…"},
+            "finish_reason": "length",
+        }]}
+        out = pt.openai_to_anthropic_response(resp, {})
+        self.assertEqual(len(out["content"]), 1)
+        block = out["content"][0]
+        self.assertEqual(block["type"], "text")
+        self.assertTrue(block["text"].startswith(pt._REASONING_FALLBACK_PREFIX))
+        self.assertIn("思考…", block["text"])
+        self.assertEqual(out["stop_reason"], "max_tokens")  # 保持不变
+
+    def test_reasoning_fallback_finish_reason_stop(self):
+        """finish_reason 非 length 也兜底。"""
+        resp = {"choices": [{
+            "message": {"content": "", "reasoning_content": "思考中"},
+            "finish_reason": "stop",
+        }]}
+        out = pt.openai_to_anthropic_response(resp, {})
+        self.assertEqual(len(out["content"]), 1)
+        self.assertTrue(out["content"][0]["text"].startswith(pt._REASONING_FALLBACK_PREFIX))
+
+    def test_reasoning_fallback_not_triggered_with_real_content(self):
+        """有正式回答时不兜底，reasoning_content 被忽略。"""
+        resp = {"choices": [{
+            "message": {"content": "正式答案", "reasoning_content": "思考"},
+            "finish_reason": "stop",
+        }]}
+        out = pt.openai_to_anthropic_response(resp, {})
+        self.assertEqual(out["content"], [{"type": "text", "text": "正式答案"}])
+
+    def test_reasoning_fallback_not_triggered_with_tool_calls(self):
+        """有 tool_calls 时不兜底，即便 content 空、reasoning_content 非空。"""
+        resp = {"choices": [{
+            "message": {
+                "content": "",
+                "reasoning_content": "思考",
+                "tool_calls": [{"id": "c1", "function": {"name": "f", "arguments": "{}"}}],
+            },
+            "finish_reason": "tool_calls",
+        }]}
+        out = pt.openai_to_anthropic_response(resp, {})
+        self.assertEqual(len(out["content"]), 1)
+        self.assertEqual(out["content"][0]["type"], "tool_use")
+
+    def test_reasoning_fallback_no_reasoning_keeps_old_behavior(self):
+        """content 空且无 reasoning_content -> 保持老行为，content 为空数组。"""
+        resp = {"choices": [{"message": {"content": ""}, "finish_reason": "stop"}]}
+        out = pt.openai_to_anthropic_response(resp, {})
+        self.assertEqual(out["content"], [])
 
 
 # ============================================================
@@ -636,6 +734,88 @@ class TestStreamUsageFix(unittest.TestCase):
         self.assertEqual(md["usage"]["input_tokens"], 50)
         self.assertEqual(md["usage"]["output_tokens"], 10)
 
+    def test_usage_tuple(self):
+        """usage_tuple() 统一接口：无 reasoning 时第三位为 0。"""
+        chunks = [
+            {"choices": [{"delta": {"content": "Hi"}, "finish_reason": "stop"}],
+             "usage": {"prompt_tokens": 50, "completion_tokens": 10}},
+        ]
+        ad = pt.OpenAIToAnthropicStreamAdapter({}, "gpt-4o")
+        collect(ad, chunks)
+        self.assertEqual(ad.usage_tuple(), (50, 10, 0))
+
+    def test_usage_tuple_reasoning_nonzero(self):
+        """末帧 usage chunk 带 completion_tokens_details.reasoning_tokens=35 -> usage_tuple()[2]==35（#6）。"""
+        chunks = [
+            {"choices": [{"delta": {"content": "Hi"}, "finish_reason": "stop"}]},
+            {"choices": [],
+             "usage": {"prompt_tokens": 50, "completion_tokens": 10,
+                       "completion_tokens_details": {"reasoning_tokens": 35}}},
+        ]
+        ad = pt.OpenAIToAnthropicStreamAdapter({}, "gpt-4o")
+        collect(ad, chunks)
+        self.assertEqual(ad.usage_tuple(), (50, 10, 35))
+
+
+class TestStreamReasoningFallback(unittest.TestCase):
+    """空回答 reasoning_content 兜底（流式，finalize 时补块）。"""
+
+    def test_reasoning_only_finalize_adds_text_block(self):
+        """全程只有 delta.reasoning_content 分片、无 content/tool_calls -> finalize 补一个 text block。"""
+        chunks = [
+            {"choices": [{"delta": {"reasoning_content": "思"}, "finish_reason": None}]},
+            {"choices": [{"delta": {"reasoning_content": "考中"}, "finish_reason": None}]},
+            {"choices": [{"delta": {}, "finish_reason": "length"}]},
+        ]
+        ad = pt.OpenAIToAnthropicStreamAdapter({}, "m")
+        events = collect(ad, chunks)
+        self.assertEqual(types_of(events), [
+            "message_start", "ping",
+            "content_block_start", "content_block_delta", "content_block_stop",
+            "message_delta", "message_stop",
+        ])
+        start = events[2]
+        self.assertEqual(start["index"], 0)
+        self.assertEqual(start["content_block"], {"type": "text", "text": ""})
+        delta_ev = events[3]
+        self.assertEqual(delta_ev["delta"]["type"], "text_delta")
+        self.assertTrue(delta_ev["delta"]["text"].startswith(pt._REASONING_FALLBACK_PREFIX))
+        self.assertIn("思考中", delta_ev["delta"]["text"])
+        self.assertEqual(events[4], {"type": "content_block_stop", "index": 0})
+        md = events[5]
+        self.assertEqual(md["delta"]["stop_reason"], "max_tokens")
+
+    def test_reasoning_then_real_content_no_extra_block(self):
+        """先思考分片再正式回答分片 -> 只产出正式回答 text block，finalize 不补额外块。"""
+        chunks = [
+            {"choices": [{"delta": {"reasoning_content": "先想想"}, "finish_reason": None}]},
+            {"choices": [{"delta": {"content": "答案"}, "finish_reason": None}]},
+            {"choices": [{"delta": {}, "finish_reason": "stop"}]},
+        ]
+        ad = pt.OpenAIToAnthropicStreamAdapter({}, "m")
+        events = collect(ad, chunks)
+        self.assertEqual(types_of(events), [
+            "message_start", "ping",
+            "content_block_start", "content_block_delta", "content_block_stop",
+            "message_delta", "message_stop",
+        ])
+        # 只有一个 text block，内容是正式回答，不含前缀/思考
+        self.assertEqual(sum(1 for e in events if e["type"] == "content_block_start"), 1)
+        delta_ev = events[3]
+        self.assertEqual(delta_ev["delta"]["text"], "答案")
+
+    def test_reasoning_empty_no_fallback_block(self):
+        """无 reasoning_content 分片时，finalize 不产出多余块（保持老行为）。"""
+        chunks = [
+            {"choices": [{"delta": {}, "finish_reason": "stop"}]},
+        ]
+        ad = pt.OpenAIToAnthropicStreamAdapter({}, "m")
+        events = collect(ad, chunks)
+        self.assertEqual(types_of(events), [
+            "message_start", "ping",
+            "message_delta", "message_stop",
+        ])
+
 # ############################################################################
 # §2 反向 Responses → Anthropic
 # ############################################################################
@@ -684,13 +864,15 @@ def test_A_max_tokens_priority():
 
 
 def _responses_body_to_reasoning_fields(body, variant="anthropic_adaptive"):
-    """测试辅助：模拟 server.py 的 decode→align→encode 链路（responses→anthropic）。"""
-    from core.reasoning.capability import ReasoningCapability, align
+    """测试辅助：模拟 server.py 的 decode→remap→abstract_encode→syntax_adapt 链路
+    （responses→anthropic）。"""
+    from core.reasoning.capability import ModelReasoningCapability, abstract_encode, remap
     from core.reasoning.registry import get_codec
-    cap = ReasoningCapability.from_config(None)
+    cap = ModelReasoningCapability.from_config(None)
     intent = get_codec("responses").decode(body)
-    aligned = align(intent, cap)
-    return get_codec("anthropic").encode(aligned, cap, variant)
+    target_effort = remap(intent, cap, cap)
+    abstract = abstract_encode(target_effort)
+    return get_codec("anthropic").syntax_adapt(abstract, variant)
 
 
 def test_A_reasoning_effort():
@@ -1223,6 +1405,21 @@ def test_C_finalize_no_double_completed():
     eq(len(completed), 1, "C 正常流仅 1 个 response.completed")
 
 
+def test_C_usage_tuple():
+    """usage_tuple() 统一接口：三元组读到累加后的 usage_in/out/reasoning。"""
+    adapter = pt.AnthropicToResponsesStreamAdapter(model="m")
+    _run(adapter, [
+        ("message_start", {"message": {"usage": {}}}),
+        ("content_block_start", {"content_block": {"type": "text", "text": ""}}),
+        ("content_block_delta", {"delta": {"type": "text_delta", "text": "hi"}}),
+        ("content_block_stop", {}),
+        ("message_delta", {"delta": {"stop_reason": "end_turn"},
+                            "usage": {"input_tokens": 5, "output_tokens": 3}}),
+        ("message_stop", {}),
+    ])
+    eq(adapter.usage_tuple(), (5, 3, 0), "C usage_tuple 无 reasoning 累加器场景返回 0")
+
+
 # ---------------------------------------------------------------------------
 # 辅助：SSE 序列化 + id 格式
 # ---------------------------------------------------------------------------
@@ -1357,13 +1554,15 @@ class TestARRequest(unittest.TestCase):
         self.assertEqual(rb["max_output_tokens"], 128)
 
     def _anthropic_body_to_responses_reasoning_fields(self, body):
-        """测试辅助：模拟 server.py 的 decode→align→encode 链路（anthropic→responses）。"""
-        from core.reasoning.capability import ReasoningCapability, align
+        """测试辅助：模拟 server.py 的 decode→remap→abstract_encode→syntax_adapt 链路
+        （anthropic→responses）。"""
+        from core.reasoning.capability import ModelReasoningCapability, abstract_encode, remap
         from core.reasoning.registry import get_codec
-        cap = ReasoningCapability.from_config(None)
+        cap = ModelReasoningCapability.from_config(None)
         intent = get_codec("anthropic").decode(body)
-        aligned = align(intent, cap)
-        return get_codec("responses").encode(aligned, cap, "resp_effort")
+        target_effort = remap(intent, cap, cap)
+        abstract = abstract_encode(target_effort)
+        return get_codec("responses").syntax_adapt(abstract, "resp_effort")
 
     def test_ar_reasoning_effort_tiers(self):
         # thinking enabled budget 分档：<2000→low, <8000→medium, <32000→high, <64000→xhigh
@@ -1425,6 +1624,14 @@ class TestARResponse(unittest.TestCase):
         self.assertEqual(ar["model"], "m")
         self.assertEqual(ar["usage"]["input_tokens"], 5)
         self.assertEqual(ar["usage"]["output_tokens"], 3)
+
+    def test_ar_usage_reasoning_tokens(self):
+        """#7：usage 带 output_tokens_details.reasoning_tokens=12 -> 原样回填。"""
+        resp = {"output": [{"type": "message", "content": [{"type": "output_text", "text": "答案"}]}],
+                "usage": {"input_tokens": 5, "output_tokens": 3,
+                          "output_tokens_details": {"reasoning_tokens": 12}}}
+        ar = pt.responses_to_anthropic_response(resp)
+        self.assertEqual(ar["usage"]["output_tokens_details"]["reasoning_tokens"], 12)
 
     def test_ar_function_call_response(self):
         resp = {"id": "r", "output": [
@@ -1562,6 +1769,24 @@ class TestARStream(unittest.TestCase):
         md = [e for e in evs if e["type"] == "message_delta"][0]
         self.assertEqual(md["usage"]["output_tokens"], 8)
         self.assertEqual(md["usage"]["input_tokens"], 8)
+
+    def test_ar_usage_tuple(self):
+        """usage_tuple() 统一接口：无 reasoning 时第三位为 0。"""
+        adapter = pt.ResponsesToAnthropicStreamAdapter({}, "m")
+        _run_ar_stream(adapter, _ar_text_stream_events())
+        self.assertEqual(adapter.usage_tuple(), (8, 8, 0))
+
+    def test_ar_usage_tuple_reasoning_nonzero(self):
+        """#8：response.completed.usage.output_tokens_details.reasoning_tokens=8 -> usage_tuple()[2]==8。"""
+        adapter = pt.ResponsesToAnthropicStreamAdapter({}, "m")
+        events = _ar_text_stream_events()[:-1] + [
+            ("response.completed", {"response": {
+                "id": "resp_c", "status": "completed",
+                "usage": {"input_tokens": 8, "output_tokens": 8,
+                          "output_tokens_details": {"reasoning_tokens": 8}}}}),
+        ]
+        _run_ar_stream(adapter, events)
+        self.assertEqual(adapter.usage_tuple(), (8, 8, 8))
 
     def test_ar_tool_stream_sequence(self):
         adapter = pt.ResponsesToAnthropicStreamAdapter({}, "m")

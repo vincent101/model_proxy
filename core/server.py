@@ -4,7 +4,7 @@ tools/model_proxy/core/server.py — 本地多协议路由代理主体
 多协议 AI 模型代理主程序：HTTP server、路由决策、转发编排、协议转换、控制 API。
 入口为 tools/model_proxy/model_proxy.py（thin wrapper 调用本模块 main()）。
 与线上 proxy.py（18888）完全隔离并行：新端口 18889、新配置
-tools/model_proxy/model_proxy_config.json（可用 MODEL_PROXY_CONFIG 环境变量覆盖）、
+tools/model_proxy/config/model_proxy_config.json（可用 MODEL_PROXY_CONFIG 环境变量覆盖）、
 新进程锁 /tmp/claude_model_proxy.lock、新日志 tools/model_proxy/.claude_model_proxy.log。
 
 仅使用 Python 标准库，不引入第三方依赖，也不 import proxy.py。
@@ -15,19 +15,22 @@ import json
 import logging
 import os
 import sys
+import tempfile
 import threading
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
+from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any, Callable
 
 # 合并后的双向协议转换器（core 包内相对导入）
 from . import translate as pt
-from .reasoning.capability import ReasoningCapability, align
-from .reasoning.registry import apply_fields, get_codec
+from .reasoning.capability import ModelReasoningCapability, abstract_encode, remap
+from .reasoning.ladder import CanonicalEffort
+from .reasoning.registry import apply_fields, get_codec, resolve_protocol
 
 # ---------------------------------------------------------------------------
 # L0 基座
@@ -37,7 +40,7 @@ from .reasoning.registry import apply_fields, get_codec
 LOG_FILE = Path(__file__).resolve().parent.parent / ".claude_model_proxy.log"
 
 
-def _trim_log(path: Path, keep: int = 1000) -> None:
+def _trim_log(path: Path, keep: int = 5000) -> None:
     """启动时截断日志，只保留最后 keep 行。"""
     try:
         if not path.exists():
@@ -57,6 +60,170 @@ logging.basicConfig(
 )
 log = logging.getLogger(__name__)
 
+# access logger：单独 INFO 级别，复用同一日志文件、不向 root 传播（root 仍 WARNING，
+# 避免误收其他 INFO 噪声）。固定前缀 ACCESS，key=value 单行文本，与现有 WARNING 行
+# 风格一致，grep/awk 友好（见 docs/solutionDesigns/2026-07-22-access-log-and-latency.md）。
+_access_handler = logging.FileHandler(LOG_FILE)
+_access_handler.setFormatter(logging.Formatter("%(asctime)s %(message)s"))
+access_log = logging.getLogger("model_proxy.access")
+access_log.setLevel(logging.INFO)
+access_log.addHandler(_access_handler)
+access_log.propagate = False
+
+# ---------------------------------------------------------------------------
+# 累计用量账本：独立于 access 日志文件，只增不截、不受 _trim_log 影响。
+# 按天分桶 + supply×route×strategy 组合键，见
+# docs/solutionDesigns/2026-07-23-usage-totals-ledger.md
+# ---------------------------------------------------------------------------
+
+_CST = timezone(timedelta(hours=8))          # UTC+8，中国标准时间，固定偏移
+
+
+def _cst_now() -> datetime:
+    """显式带时区的当前时间，绝不用 naive datetime.now()。"""
+    return datetime.now(_CST)
+
+
+TOTALS_FILE = Path(__file__).resolve().parent.parent / ".claude_model_proxy_totals.json"
+KEEP_DAYS = 400  # 明细天桶保留窗口，超窗归档进 months_archive
+
+
+def _atomic_write_json(path: Path, obj: dict) -> None:
+    """mkstemp + os.replace 原子写盘，模式与 _config_ops.atomic_write 一致，
+    但不跨包 import（依赖方向/形参语义不同，本函数在 server.py 内自持一份）。
+    """
+    _dir = str(path.parent)
+    fd, tmp = tempfile.mkstemp(dir=_dir, suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(obj, f, indent=2, ensure_ascii=False)
+        os.replace(tmp, str(path))
+    except Exception:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
+def _zero_bucket() -> dict:
+    """天桶/月归档/total 顶层的零值结构。"""
+    return {"requests": 0, "ok": 0, "fail": 0, "sum_ms": 0, "combos": {}}
+
+
+def _zero_combo() -> dict:
+    """combos 单条目的零值结构（不存 sum_ms，见方案 §1）。"""
+    return {"requests": 0, "ok": 0, "fail": 0, "usage_in": 0, "usage_out": 0, "usage_reasoning": 0}
+
+
+class UsageTotalsStore:
+    """独立账本：按天分桶，桶内 supply×route×strategy 组合键累加。
+
+    与 access 日志完全独立（无调用关系），不受 `_trim_log` 影响；文件只增不截。
+    """
+
+    def __init__(self, path: Path):
+        self._path = path
+        self._lock = threading.Lock()
+        self._data: dict = self._load()
+
+    def _load(self) -> dict:
+        if not self._path.exists():
+            return {
+                "version": 2,
+                "since": _cst_now().strftime("%Y-%m-%d"),
+                "keep_days": KEEP_DAYS,
+                "total": _zero_bucket(),
+                "months_archive": {},
+                "days": {},
+            }
+        try:
+            with open(self._path, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except (json.JSONDecodeError, OSError) as e:
+            log.warning("usage totals ledger corrupt, resetting: %s", e)
+            try:
+                ts = int(time.time())
+                corrupt_path = self._path.with_name(self._path.name + f".corrupt.{ts}")
+                os.replace(str(self._path), str(corrupt_path))
+            except OSError:
+                pass
+            return {
+                "version": 2,
+                "since": _cst_now().strftime("%Y-%m-%d"),
+                "keep_days": KEEP_DAYS,
+                "total": _zero_bucket(),
+                "months_archive": {},
+                "days": {},
+            }
+
+    @staticmethod
+    def _combo_key(acc: dict) -> str:
+        return (
+            f"supply={acc.get('supply') or '(none)'}"
+            f"|route={acc.get('route') or '(none)'}"
+            f"|strategy={acc.get('strategy') or '(none)'}"
+        )
+
+    def record(self, acc: dict, ms: int) -> None:
+        """核心记账方法：锁内累加内存 dict + 归档检查 + 原子落盘。"""
+        with self._lock:
+            day_key = _cst_now().strftime("%Y-%m-%d")
+            days = self._data.setdefault("days", {})
+            day_bucket = days.setdefault(day_key, _zero_bucket())
+            total_bucket = self._data.setdefault("total", _zero_bucket())
+
+            combo_key = self._combo_key(acc)
+            ok = 1 if acc.get("status") == 200 else 0
+            fail = 0 if ok else 1
+            usage_in = acc.get("usage_in", 0) or 0
+            usage_out = acc.get("usage_out", 0) or 0
+            usage_reasoning = acc.get("usage_reasoning", 0) or 0
+
+            for bucket in (day_bucket, total_bucket):
+                bucket["requests"] += 1
+                bucket["ok"] += ok
+                bucket["fail"] += fail
+                bucket["sum_ms"] += ms
+                combo = bucket.setdefault("combos", {}).setdefault(combo_key, _zero_combo())
+                combo["requests"] += 1
+                combo["ok"] += ok
+                combo["fail"] += fail
+                combo["usage_in"] += usage_in
+                combo["usage_out"] += usage_out
+                combo["usage_reasoning"] += usage_reasoning
+
+            self._archive_if_needed()
+            _atomic_write_json(self._path, self._data)
+
+    def _archive_if_needed(self) -> None:
+        """days 超过 KEEP_DAYS 时，把最旧的天桶按组合键汇总进 months_archive 后删除。
+        必须持锁调用（由 record 内已持锁的调用点触发）。
+        """
+        days = self._data.setdefault("days", {})
+        while len(days) > KEEP_DAYS:
+            oldest_key = min(days.keys())
+            oldest_bucket = days.pop(oldest_key)
+            month_key = oldest_key[:7]  # "YYYY-MM"
+            months_archive = self._data.setdefault("months_archive", {})
+            month_bucket = months_archive.setdefault(month_key, _zero_bucket())
+            month_bucket["requests"] += oldest_bucket.get("requests", 0)
+            month_bucket["ok"] += oldest_bucket.get("ok", 0)
+            month_bucket["fail"] += oldest_bucket.get("fail", 0)
+            month_bucket["sum_ms"] += oldest_bucket.get("sum_ms", 0)
+            month_combos = month_bucket.setdefault("combos", {})
+            for combo_key, combo_val in oldest_bucket.get("combos", {}).items():
+                dest = month_combos.setdefault(combo_key, _zero_combo())
+                dest["requests"] += combo_val.get("requests", 0)
+                dest["ok"] += combo_val.get("ok", 0)
+                dest["fail"] += combo_val.get("fail", 0)
+                dest["usage_in"] += combo_val.get("usage_in", 0)
+                dest["usage_out"] += combo_val.get("usage_out", 0)
+                dest["usage_reasoning"] += combo_val.get("usage_reasoning", 0)
+
+
+usage_totals = UsageTotalsStore(TOTALS_FILE)
+
 # ---------------------------------------------------------------------------
 # reasoning debug 开关：默认关闭，不污染生产日志（沿用 MODEL_PROXY_CONFIG/
 # MODEL_PROXY_PORT 的环境变量风格，进程启动时读取一次，不支持热切换）。
@@ -69,11 +236,11 @@ log = logging.getLogger(__name__)
 if os.environ.get("MODEL_PROXY_REASONING_DEBUG", "").strip().lower() in ("1", "true", "on", "yes"):
     log.setLevel(logging.DEBUG)
 
-# 默认路径（全部 v2 命名）：锚定包目录 tools/model_proxy/model_proxy_config.json，
+# 默认路径（全部 v2 命名）：锚定包目录 tools/model_proxy/config/model_proxy_config.json，
 # 可用环境变量 MODEL_PROXY_CONFIG 覆盖（与 model_proxy_cli.sh 的 CONFIG_FILE 逻辑一致）。
 _DEFAULT_CONFIG_PATH = Path(
     os.environ.get("MODEL_PROXY_CONFIG")
-    or (Path(__file__).resolve().parent.parent / "model_proxy_config.json")
+    or (Path(__file__).resolve().parent.parent / "config" / "model_proxy_config.json")
 )
 _LOCK_FILE = Path("/tmp/claude_model_proxy.lock")
 
@@ -305,6 +472,30 @@ _TRANSLATOR_TABLE = {
 }
 
 
+def extract_client_token(headers) -> str:
+    """从入站请求头提取 client_token。
+
+    Anthropic 原生 API 标准鉴权方式是 x-api-key（无 Bearer 前缀）；OpenAI Chat
+    Completions/Responses API 标准方式是 Authorization: Bearer <key>。不同生态的
+    客户端可能只发其中一种，均需支持，否则某些合法客户端（如仅发 x-api-key 的
+    Anthropic 风格客户端）会因 token 解析为空而 401（no strategy/route matched）。
+
+    优先级：Authorization: Bearer 优先，缺失则回退 x-api-key，都无则返回空串。
+    两者都提供但值不同时取 Authorization（此处 client_token 只是路由查表键，
+    无密钥校验语义，不报错；与出站转发同一 appkey 双发 Authorization+x-api-key
+    保持对称）。
+
+    两个边界处理（RFC 6750 规定 Bearer scheme 大小写不敏感；x-api-key 常见客户端
+    实现可能带首尾空白）：
+    - "Bearer " 前缀判断大小写不敏感（如 "bearer xxx"/"BEARER xxx" 也要识别）。
+    - x-api-key 取值 strip 首尾空白，避免带空白的 token 直接进查表导致查不到 strategy。
+    """
+    auth_header = headers.get("Authorization", "") or ""
+    if auth_header[:7].lower() == "bearer ":
+        return auth_header[7:].strip()
+    return (headers.get("x-api-key", "") or "").strip()
+
+
 def detect_source(path: str, body: dict | None) -> str:
     """识别入站 source 协议。
 
@@ -312,11 +503,12 @@ def detect_source(path: str, body: dict | None) -> str:
     /chat/completions → chat；否则看 body 特征；都不中 → unknown。
     """
     clean = path.split("?", 1)[0].rstrip("/")
-    if clean.endswith("/v1/messages"):
+    clean_lower = clean.lower()
+    if clean_lower.endswith("/v1/messages"):
         return "anthropic"
-    if clean.endswith("/v1/responses"):
+    if clean_lower.endswith("/v1/responses"):
         return "responses"
-    if clean.endswith("/chat/completions"):
+    if clean_lower.endswith("/chat/completions"):
         return "chat"
     # body 特征兜底
     if isinstance(body, dict):
@@ -330,6 +522,36 @@ def detect_source(path: str, body: dict | None) -> str:
     return "unknown"
 
 
+def _sanitize_forward_query(path: str) -> str:
+    """出站 URL 的 query 净化：从客户端 path 的 query 里剔除 beta 参数后重新编码。
+
+    返回值形如 "?foo=1"（含 query 时）或 ""（无 query 时），供调用方拼在完整终态
+    端点 url 之后。原名 _build_passthrough_target_url，因四个转发分支现在统一复用
+    同一条 target_url 计算逻辑（supply.url 已是完整终态端点，不再需要按分支拼接
+    协议相关后缀），故只保留其中仍然必须的 query 净化部分，改名去掉
+    "passthrough" 专属语义，其余拼接逻辑不再需要（见 core/server.py 中 target_url
+    的统一计算处）。
+
+    为什么统一丢弃客户端 path：客户端 SDK 把 base_url 配到本代理后，各家自己拼接
+    path 的方式不统一（有的会拼 /v1/messages，有的拼 /v1/responses，有的直连根
+    路径），代理入站不应该对这些差异敏感；只用配置好的 supply.url 发出真实上游
+    请求，才能保证转发目标稳定，不受客户端拼接方式影响，避免路径重复（如
+    /v1/responses/v1/responses 这种旧 bug）。
+
+    为什么不怕丢 path 里的信息：PASSTHROUGH 只在 source ∈ {anthropic, responses}
+    时触发（见 _TRANSLATOR_TABLE），而 detect_source 仅在 path 精确以
+    /v1/messages 或 /v1/responses 结尾时才判定为这两种 source。带资源 ID 的子
+    路径（如 /v1/messages/{id}、/v1/files/{id}）尾缀不匹配、body 也无对应特征
+    时会落到 unknown，pick_translator 返回 UNSUPPORTED 直接 501 拒绝，根本进不
+    了 PASSTHROUGH 分支。因此走到这里的请求，其 path 里除标准端点尾缀外不包含
+    任何有意义信息，丢弃是安全的。非 PASSTHROUGH 分支的客户端 path 同理不包含
+    有意义信息，一并统一净化 query 不影响正确性。
+    """
+    parsed = urllib.parse.urlparse(path)
+    qs = {k: v for k, v in urllib.parse.parse_qsl(parsed.query) if k not in {"beta"}}
+    return "?" + urllib.parse.urlencode(qs) if qs else ""
+
+
 _MODEL_TIER_MAP = {
     "claude-opus": "opus",
     "claude-sonnet": "sonnet",
@@ -337,12 +559,18 @@ _MODEL_TIER_MAP = {
 }
 
 
-def resolve_route(strategies: list, routes_map: dict, client_token: str) -> dict | None:
-    """阶段1：client_token → strategy → route_id → route。"""
+def resolve_strategy(strategies: list, client_token: str) -> "dict | None":
+    """client_token → 匹配的第一条 strategy 记录本身（不解析 route）。"""
     for s in strategies:
         if s.get("client_token") == client_token:
-            return routes_map.get(s.get("route_id"))
+            return s
     return None
+
+
+def resolve_route(strategies: list, routes_map: dict, client_token: str) -> dict | None:
+    """阶段1：client_token → strategy → route_id → route。"""
+    s = resolve_strategy(strategies, client_token)
+    return routes_map.get(s.get("route_id")) if s else None
 
 
 def resolve_tier(model: str | None) -> str | None:
@@ -350,6 +578,27 @@ def resolve_tier(model: str | None) -> str | None:
     if not model:
         return None
     return _MODEL_TIER_MAP.get(model)
+
+
+def resolve_source_capability(strategy: "dict | None", tier: "str | None") -> ModelReasoningCapability:
+    """source 侧能力建模：从 strategy 记录的 tiers_source_capability[tier] 取 source 侧能力；
+    strategy 为 None、无该字段、或该 tier 未声明 → 回退默认全档序列（与 target 侧"未配置时走
+    默认5档"的处理原则一致）。
+
+    tiers_source_capability 挂在 strategy（client_token 归属）下，而不是顶层独立表——
+    client_token 才是真正代表"哪个客户端接入"的身份标识（request_model 字面值被多个 SDK
+    共享，不代表客户端身份，见 README「tiers_source_capability」一节说明）。
+
+    单条 tier entry 结构 {"effort_enum":[...], "off_alias":...} 与 target 侧
+    supply["reasoning_capability"] 同构，包一层 "reasoning_capability" 键后复用同一个
+    ModelReasoningCapability.from_config 解析，不重复实现解析逻辑。
+
+    与 _MODEL_TIER_MAP/resolve_tier/resolve_route/select_supply 正交并存，不改动
+    既有 tier 路由逻辑。
+    """
+    tier_map = (strategy or {}).get("tiers_source_capability") if strategy else None
+    entry = tier_map.get(tier) if isinstance(tier_map, dict) and tier else None
+    return ModelReasoningCapability.from_config({"reasoning_capability": entry} if entry else None)
 
 
 def select_supply_list(route: dict, tier: str) -> list | None:
@@ -376,8 +625,11 @@ def select_supply(supplies: list, supply_map: dict, cooldown: "CooldownStore",
 
 
 def detect_target(supply: dict) -> str:
-    """target 协议 = supply["protocol"]。"""
-    return supply.get("protocol", "")
+    """target 协议：优先显式 supply["protocol"]，否则从 supply["url"] 尾缀推断
+    （唯一权威实现见 core.reasoning.registry.resolve_protocol，本函数不重复判断逻辑）。
+    推断失败时抛 ValueError，由调用方（_forward）捕获并转为合法错误响应。
+    """
+    return resolve_protocol(supply)
 
 
 def pick_translator(source: str, target: str) -> str:
@@ -441,41 +693,50 @@ def _fmt_effort(level) -> str:
 def _log_reasoning_debug(
     supply_id: str,
     target_model: "str | None",
-    reasoning_cap: "ReasoningCapability",
-    reasoning_intent: "Any",
-    aligned_effort: "Any",
+    source_cap: "ModelReasoningCapability",
+    target_cap: "ModelReasoningCapability",
+    raw_intent: "Any",
+    target_effort: "Any",
+    abstract: "Any",
     reasoning_variant: str,
-    reasoning_fields: dict,
+    reasoning_wire: dict,
 ) -> None:
-    """reasoning debug 旁路日志：拼出"客户端意图 → 钳位结果"的一眼可读对比。
+    """reasoning debug 旁路日志：拼出"客户端意图 → 相对映射结果"的一眼可读对比。
 
     只在 log.isEnabledFor(logging.DEBUG) 为真时才被调用（调用点已判断一次，这里
     再判一次防御性重复调用），避免关闭开关时仍做字符串拼接。
+
+    相对映射下 target_effort.level 可能高于、低于或等于 raw_intent.level（跨模型
+    思考档数不同时会出现"increased"，这是相对排名映射的正常结果，不再像旧版绝对钳位
+    那样"raised"代表异常）。
     """
     if not log.isEnabledFor(logging.DEBUG):
         return
-    intent_str = _fmt_effort(reasoning_intent.level)
-    aligned_str = _fmt_effort(aligned_effort.level)
-    if reasoning_intent.level is not None and aligned_effort.level is not None:
-        if aligned_effort.level == reasoning_intent.level:
+    intent_str = _fmt_effort(raw_intent.level)
+    target_str = _fmt_effort(target_effort.level)
+    if raw_intent.level is not None and target_effort.level is not None:
+        if target_effort.level == raw_intent.level:
             tag = "unchanged"
-        elif aligned_effort.level < reasoning_intent.level:
-            tag = "clamped"
+        elif target_effort.level < raw_intent.level:
+            tag = "decreased"
         else:
-            tag = "raised"  # 理论上不应出现（align() 单调不减保证），仅防御性标注
-    elif reasoning_intent.explicit_off:
-        tag = "explicit_off"
+            tag = "increased"  # 相对映射的正常结果（非异常），见方案文档 §3.4 haiku 例子
+    elif target_effort.stripped:
+        tag = "stripped"
+    elif raw_intent.level == CanonicalEffort.OFF:
+        tag = "off"
     else:
         tag = "n/a"
-    cap_str = ",".join(e.name for e in reasoning_cap.enum) if reasoning_cap.enum else "()"
+    src_cap_str = ",".join(e.name for e in source_cap.enum) if source_cap.enum else "()"
+    tgt_cap_str = ",".join(e.name for e in target_cap.enum) if target_cap.enum else "()"
     log.debug(
-        "reasoning_debug: supply=%s target_model=%s cap=[%s] "
-        "intent=%s(source_budget=%s,explicit_off=%s,present=%s) -> aligned=%s [%s] "
-        "variant=%s fields=%s",
-        supply_id, target_model, cap_str,
-        intent_str, reasoning_intent.source_budget, reasoning_intent.explicit_off, reasoning_intent.present,
-        aligned_str, tag,
-        reasoning_variant, reasoning_fields,
+        "reasoning_debug: supply=%s target_model=%s src_cap=[%s] tgt_cap=[%s] "
+        "intent=%s(source_budget=%s,present=%s) -> target=%s [%s] abstract_kind=%s "
+        "variant=%s wire=%s",
+        supply_id, target_model, src_cap_str, tgt_cap_str,
+        intent_str, raw_intent.source_budget, raw_intent.present,
+        target_str, tag, abstract.kind.value,
+        reasoning_variant, reasoning_wire,
     )
 
 
@@ -540,17 +801,49 @@ class ModelProxyHandler(BaseHTTPRequestHandler):
         if self.path.startswith(_CONTROL_PATH_PREFIX):
             self._dispatch_control("GET")
         else:
-            self._forward("GET")
+            self._forward_logged("GET")
 
     def do_POST(self):
         if self.path.startswith(_CONTROL_PATH_PREFIX):
             self._dispatch_control("POST")
         else:
-            self._forward("POST")
+            self._forward_logged("POST")
 
-    def do_PUT(self):    self._forward("PUT")
-    def do_DELETE(self): self._forward("DELETE")
-    def do_PATCH(self):  self._forward("PATCH")
+    def do_PUT(self):    self._forward_logged("PUT")
+    def do_DELETE(self): self._forward_logged("DELETE")
+    def do_PATCH(self):  self._forward_logged("PATCH")
+
+    # ------------------------------------------------------------------
+    # access 日志：整请求一条，覆盖 _forward 的整个生命周期
+    # ------------------------------------------------------------------
+
+    def _forward_logged(self, method: str) -> None:
+        """包一层 _forward：收集 self._acc 字段 + 打点耗时，finally 里统一 emit 一条
+        ACCESS 记录。_dispatch_control 路径不设 self._acc，故不经过此包装，也不产生
+        ACCESS 记录（见 _write_* 里的 hasattr 守卫）。
+        """
+        self._acc = {
+            "status": 0, "source": "", "route": "", "tier": "",
+            "supply": "", "failover": 0, "attempts": 0, "token": "",
+            "usage_in": 0, "usage_out": 0, "usage_reasoning": 0,
+            "strategy": "",
+        }
+        t0 = time.monotonic()
+        try:
+            self._forward(method)
+        finally:
+            a = self._acc
+            ms = int((time.monotonic() - t0) * 1000)
+            access_log.info(
+                "ACCESS ms=%d status=%s source=%s route=%s tier=%s supply=%s "
+                "failover=%s attempts=%s usage_in=%s usage_out=%s usage_reasoning=%s token=%s",
+                ms, a["status"], a["source"],
+                a["route"], a["tier"], a["supply"], a["failover"], a["attempts"],
+                a["usage_in"], a["usage_out"], a["usage_reasoning"], a["token"])
+            try:
+                usage_totals.record(a, ms)
+            except Exception:
+                log.warning("usage_totals.record failed", exc_info=True)
 
     # ------------------------------------------------------------------
     # 转发编排（阶段1：纯透传路由 + cooldown + failover）
@@ -566,9 +859,9 @@ class ModelProxyHandler(BaseHTTPRequestHandler):
         content_length = int(self.headers.get("Content-Length", 0) or 0)
         raw_body = self.rfile.read(content_length) if content_length > 0 else b""
 
-        # 2. Bearer token
-        auth_header = self.headers.get("Authorization", "")
-        token = auth_header[len("Bearer "):] if auth_header.startswith("Bearer ") else ""
+        # 2. client_token（Authorization: Bearer 优先，回退 x-api-key，见 extract_client_token 注释）
+        token = extract_client_token(self.headers)
+        self._acc["token"] = token[-4:] if token else ""
 
         # 3. 解析 body 拿 model
         body_json: dict[str, Any] | None = None
@@ -581,17 +874,21 @@ class ModelProxyHandler(BaseHTTPRequestHandler):
 
         # 4. source 协议识别
         source = detect_source(self.path, body_json)
+        self._acc["source"] = source
 
         # 5. 三阶段匹配：strategy → route → tier → supplies 列表
         strategies = cs.get_strategies()
         routes_map = cs.get_routes_map()
-        route = resolve_route(strategies, routes_map, token)
+        strategy = resolve_strategy(strategies, token)
+        self._acc["strategy"] = strategy.get("client_token", "") if strategy else ""
+        route = routes_map.get(strategy.get("route_id")) if strategy else None
         if route is None:
             log.warning("no strategy/route matched: token_tail4=%s source=%s",
                         token[-4:] if token else "", source)
             self._write_buffered_response(
                 401, [], error_body_for_source(source, 401, "no strategy/route matched"))
             return
+        self._acc["route"] = route.get("id")
 
         tier = resolve_tier(request_model)
         if tier is None:
@@ -599,6 +896,7 @@ class ModelProxyHandler(BaseHTTPRequestHandler):
             self._write_buffered_response(
                 400, [], error_body_for_source(source, 400, f"unknown model tier: {request_model}"))
             return
+        self._acc["tier"] = tier
 
         supplies_list = select_supply_list(route, tier)
         if not supplies_list:
@@ -615,14 +913,25 @@ class ModelProxyHandler(BaseHTTPRequestHandler):
         tried_set: set[str] = set()
         _reasoning_retried = False   # reasoning 语法重试只做一次，作用域覆盖整个请求周期
 
-        # reasoning_intent 必须在循环外、基于客户端原始 body_json 只 decode 一次。
-        # body_json 在循环体内会被原地改写（model 改写为 target_model、reasoning_fields
+        # raw_intent 必须在循环外、基于客户端原始 body_json 只 decode 一次。
+        # body_json 在循环体内会被原地改写（model 改写为 target_model、reasoning_wire
         # 通过 apply_fields 写回），若在循环内重新 decode，第二轮起会对"已被上一轮写入
         # 结果污染过"的 body_json 解码，导致客户端原始意图被错误钳位/升档（bug 修复记录，
-        # 见 docs/proxy_v2_buildplan.md 或 commit message）。align() 仍需在循环内按每轮
-        # supply 的 capability 重新计算，因为不同 supply 的钳位上限不同。
+        # 见 docs/proxy_v2_buildplan.md 或 commit message）。remap() 仍需在循环内按每轮
+        # supply 的 target capability 重新计算，因为不同 supply 的能力上限不同；
+        # source capability 只依赖 strategy+tier（strategy 才代表客户端身份，
+        # request_model 字面值会被多个 SDK 共享，见 resolve_source_capability 注释），
+        # 同样在循环外只算一次（strategy 已在阶段5解析过，这里直接复用，不重新查找）。
         src_codec = get_codec(source)
-        reasoning_intent = src_codec.decode(body_json or {})
+        raw_intent = src_codec.decode(body_json or {})
+        source_cap = resolve_source_capability(strategy, tier)
+
+        # 400 自适应重试优化（方案文档 §4.3）：reasoning 语法重试的 continue 只改变
+        # variant，不改变 intent/两侧 cap，remap+abstract_encode 结果可复用；只有
+        # failover 换 supply 的 continue 才需要重新计算（target_cap 可能不同）。
+        _reasoning_cache_supply_id: "str | None" = None
+        _cached_target_effort = None
+        _cached_abstract = None
 
         while True:
             supply = select_supply(supplies_list, supply_map, cd, tried_set)
@@ -635,7 +944,15 @@ class ModelProxyHandler(BaseHTTPRequestHandler):
                 return
 
             supply_id = supply.get("id", "")
-            target = detect_target(supply)
+            self._acc["supply"] = supply_id
+            self._acc["attempts"] += 1
+            try:
+                target = detect_target(supply)
+            except ValueError as e:
+                log.warning("detect_target failed: supply=%s err=%s", supply_id, e)
+                self._write_buffered_response(
+                    500, [], error_body_for_source(source, 500, str(e)))
+                return
             mode = pick_translator(source, target)
 
             if mode == UNSUPPORTED:
@@ -646,60 +963,62 @@ class ModelProxyHandler(BaseHTTPRequestHandler):
                 return
 
             target_model = supply.get("target_model")
+            # supply["url"] 现在语义是完整终态请求端点（不再是 base），代码侧零拼接。
+            # 四个转发分支统一用这个 target_url，不再各自拼接协议相关后缀（见
+            # _sanitize_forward_query 函数级注释）。
             base_url = supply.get("url", "").rstrip("/")
+            target_url = base_url + _sanitize_forward_query(self.path)
 
-            # ---- reasoning 统一链路：decode(source) → align(cap) → select_variant → encode(target) ----
+            # ---- reasoning 统一链路：resolve_source_capability → remap → select_variant →
+            # ---- abstract_encode → syntax_adapt ----
             # 四种协议组合（PASSTHROUGH anthropic→anthropic / PASSTHROUGH responses→responses /
             # ANTHROPIC_TO_CHAT / ANTHROPIC_TO_RESPONSES / RESPONSES_TO_ANTHROPIC）全部走这同一条
             # 链路，差异只在 get_codec 拿到哪个 codec。PASSTHROUGH anthropic→anthropic 现在也用
-            # 目标 Claude 模型的 capability 钳位（现状缺失的能力）。
+            # 目标 Claude 模型的 capability 做相对映射（现状缺失的能力）。
             tgt_codec = get_codec(target)
-            reasoning_cap = ReasoningCapability.from_config(supply)
-            aligned_effort = align(reasoning_intent, reasoning_cap)
+            target_cap = ModelReasoningCapability.from_config(supply)
+            if supply_id == _reasoning_cache_supply_id and _cached_abstract is not None:
+                # 同一 supply 的 reasoning 语法重试（continue 未加入 tried_set）：intent/两侧
+                # cap 均未变，复用已算好的 target_effort/abstract，只重跑
+                # select_variant+syntax_adapt（方案文档 §4.3）。
+                target_effort = _cached_target_effort
+                abstract = _cached_abstract
+            else:
+                target_effort = remap(raw_intent, source_cap, target_cap)
+                abstract = abstract_encode(target_effort)
+                _cached_target_effort = target_effort
+                _cached_abstract = abstract
+                _reasoning_cache_supply_id = supply_id
             reasoning_variant = tgt_codec.select_variant(pref_store.snapshot(target_model or ""))
-            reasoning_fields = tgt_codec.encode(aligned_effort, reasoning_cap, reasoning_variant)
+            reasoning_wire = tgt_codec.syntax_adapt(abstract, reasoning_variant)
             if log.isEnabledFor(logging.DEBUG):
                 _log_reasoning_debug(
-                    supply_id, target_model, reasoning_cap, reasoning_intent,
-                    aligned_effort, reasoning_variant, reasoning_fields)
+                    supply_id, target_model, source_cap, target_cap, raw_intent,
+                    target_effort, abstract, reasoning_variant, reasoning_wire)
 
             # ---- 按 mode 计算 send_body / target_url / 转换上下文 ----
             # fwd_ctx：请求转换上下文（tool_name_mapping/request_model），
             # ANTHROPIC_TO_CHAT 与 ANTHROPIC_TO_RESPONSES 用
             fwd_ctx: dict[str, Any] | None = None
             if mode == PASSTHROUGH:
-                # 改写 model → target_model；target_url = supply.url + 清洗后的客户端 path
+                # 改写 model → target_model；target_url 已在分支前统一算好（完整端点 + 净化后 query）
                 send_body = raw_body
                 if target_model and isinstance(body_json, dict) and "model" in body_json:
                     body_json["model"] = target_model
                     send_body = json.dumps(body_json, ensure_ascii=False).encode("utf-8")
-                # reasoning 字段按目标 capability 钳位后原地 merge（含 anthropic→anthropic 与
-                # responses→responses：source==target 时 encode 的 variant 就是该协议唯一/学到的
-                # 语法，PASSTHROUGH 不代表"不处理 reasoning"，只代表 body 结构本身不用转换）
-                if isinstance(body_json, dict) and reasoning_fields:
-                    apply_fields(body_json, reasoning_fields)
+                # reasoning 字段按目标 capability 相对映射后原地 merge（含 anthropic→anthropic 与
+                # responses→responses：source==target 时 syntax_adapt 的 variant 就是该协议唯一/
+                # 学到的语法，PASSTHROUGH 不代表"不处理 reasoning"，只代表 body 结构本身不用转换）
+                if isinstance(body_json, dict) and reasoning_wire:
+                    apply_fields(body_json, reasoning_wire)
                     send_body = json.dumps(body_json, ensure_ascii=False).encode("utf-8")
-                _parsed = urllib.parse.urlparse(self.path)
-                _qs = {k: v for k, v in urllib.parse.parse_qsl(_parsed.query)
-                       if k not in {"beta"}}
-                _query_suffix = "?" + urllib.parse.urlencode(_qs) if _qs else ""
-                if source == "responses":
-                    # base_url 已配到完整 /v1/responses 层级（与 ANTHROPIC_TO_RESPONSES 分支
-                    # 同源假设），不能再拼客户端 path，否则重复拼接成 /v1/responses/v1/responses
-                    # 导致 404。detect_source 只在 path 精确以 /v1/responses 结尾时才判定为
-                    # responses（子路径如 /v1/responses/{id} 不会被识别为 responses，会被判为
-                    # unknown 走 UNSUPPORTED），因此这里丢弃客户端 path 是安全的，只保留 query。
-                    target_url = base_url + _query_suffix
-                else:
-                    _clean_path = _parsed.path + _query_suffix
-                    target_url = base_url + _clean_path
 
             elif mode == ANTHROPIC_TO_CHAT:
                 # 组合3：anthropic 请求 → chat 上游。转成 OpenAI body，打 native chat 端点。
                 # 请求转换失败（异常）→ 合法 Anthropic error，400（正向规格 §5.1）
                 try:
                     openai_body, fwd_ctx = pt.anthropic_to_openai_request(
-                        body_json or {}, reasoning_fields=reasoning_fields)
+                        body_json or {}, reasoning_fields=reasoning_wire)
                 except Exception as e:
                     log.warning("ANTHROPIC_TO_CHAT request translate failed: %s", e)
                     self._write_buffered_response(
@@ -710,15 +1029,14 @@ class ModelProxyHandler(BaseHTTPRequestHandler):
                     openai_body["model"] = target_model
                     fwd_ctx["request_model"] = target_model  # 响应 model 字段回填 target_model
                 send_body = json.dumps(openai_body, ensure_ascii=False).encode("utf-8")
-                # chat 端点固定后缀 /chat/completions（客户端 /v1/messages 不透传）
-                target_url = base_url + "/chat/completions"
+                # target_url 已在分支前统一算好（supply.url 现在已是完整 /chat/completions 端点）
 
             elif mode == ANTHROPIC_TO_RESPONSES:
                 # 新组合：anthropic 请求 → responses 上游。转成 Responses body，打完整 /v1/responses。
                 # 请求转换失败（异常）→ 合法 Anthropic error，400
                 try:
                     responses_body, fwd_ctx = pt.anthropic_to_responses_request(
-                        body_json or {}, reasoning_fields=reasoning_fields)
+                        body_json or {}, reasoning_fields=reasoning_wire)
                 except Exception as e:
                     log.warning("ANTHROPIC_TO_RESPONSES request translate failed: %s", e)
                     self._write_buffered_response(
@@ -729,8 +1047,7 @@ class ModelProxyHandler(BaseHTTPRequestHandler):
                     responses_body["model"] = target_model
                     fwd_ctx["request_model"] = target_model  # 响应 model 字段回填 target_model
                 send_body = json.dumps(responses_body, ensure_ascii=False).encode("utf-8")
-                # base_url 已配到完整 /v1/responses 层级，不拼子路径
-                target_url = base_url
+                # target_url 已在分支前统一算好（supply.url 已配到完整 /v1/responses 端点）
                 # Responses reasoning.effort 机制无 Anthropic thinking.type 400 拒绝问题
                 # （ResponsesReasoningCodec 单变体，interpret_rejection 恒 None），无需重试。
 
@@ -740,7 +1057,7 @@ class ModelProxyHandler(BaseHTTPRequestHandler):
                 try:
                     anthropic_body = pt.responses_to_anthropic_request(
                         body_json or {}, max_tokens_default=4096,
-                        reasoning_fields=reasoning_fields)
+                        reasoning_fields=reasoning_wire)
                 except Exception as e:
                     log.warning("RESPONSES_TO_ANTHROPIC request translate failed: %s", e)
                     self._write_buffered_response(
@@ -750,8 +1067,7 @@ class ModelProxyHandler(BaseHTTPRequestHandler):
                 if target_model:
                     anthropic_body["model"] = target_model
                 send_body = json.dumps(anthropic_body, ensure_ascii=False).encode("utf-8")
-                # anthropic 端点固定后缀 /v1/messages（客户端 /v1/responses 不透传）
-                target_url = base_url + "/v1/messages"
+                # target_url 已在分支前统一算好（supply.url 现在已是完整 /v1/messages 端点）
 
             # ---- 注入出站 appkey（Authorization Bearer + x-api-key）----
             appkey = supply.get("appkey", "")
@@ -789,19 +1105,23 @@ class ModelProxyHandler(BaseHTTPRequestHandler):
                 # 与 failover 重试的关键区别：不加入 tried_set、不调用 cd.cooldown）。
                 # 单变体 codec（Chat/Responses）interpret_rejection 恒 None，天然不触发重试；
                 # 只有 AnthropicReasoningCodec（双变体）在 tgt_codec 为它时才可能返回新变体。
+                # _reasoning_cache_supply_id 保留不变（不重置）：下一轮循环命中同一 supply_id
+                # 时会复用已缓存的 target_effort/abstract，只重跑 select_variant+syntax_adapt
+                # （方案文档 §4.3，remap/abstract_encode 结果与 variant 无关，无需重算）。
                 if (resp_status == 400 and not _reasoning_retried and target_model
-                        and reasoning_fields):
+                        and reasoning_wire):
                     next_variant = tgt_codec.interpret_rejection(resp_body, reasoning_variant)
                     if next_variant:
                         pref_store.learn(target_model, next_variant)
                         _reasoning_retried = True
                         continue  # 重新走 while 循环：select_supply 会再次选中同一 supply，
-                                  # 重新算 reasoning_fields 时 select_variant 命中刚学到的偏好，
+                                  # 重新算 reasoning_wire 时 select_variant 命中刚学到的偏好，
                                   # 自动改对语法后重发
 
                 if failover == "on" and resp_status in _FAILOVER_STATUSES:
                     log.warning("cooldown+failover: supply=%s status=%s key_tail4=%s",
                                 supply_id, resp_status, appkey[-4:] if appkey else "")
+                    self._acc["failover"] = 1
                     cd.cooldown(supply_id, cd_seconds)
                     tried_set.add(supply_id)
                     continue
@@ -817,6 +1137,7 @@ class ModelProxyHandler(BaseHTTPRequestHandler):
                 if failover == "on":
                     log.warning("cooldown+failover(net): supply=%s err=%s key_tail4=%s",
                                 supply_id, e, appkey[-4:] if appkey else "")
+                    self._acc["failover"] = 1
                     cd.cooldown(supply_id, cd_seconds)
                     tried_set.add(supply_id)
                     continue
@@ -829,6 +1150,7 @@ class ModelProxyHandler(BaseHTTPRequestHandler):
                 resp.close()
                 log.warning("cooldown+failover: supply=%s status=%s key_tail4=%s",
                             supply_id, resp_status, appkey[-4:] if appkey else "")
+                self._acc["failover"] = 1
                 cd.cooldown(supply_id, cd_seconds)
                 tried_set.add(supply_id)
                 continue
@@ -840,9 +1162,20 @@ class ModelProxyHandler(BaseHTTPRequestHandler):
                 # 透传：流式 chunked，非流式 buffered
                 if is_stream:
                     self._write_streaming_response(
-                        resp_status, list(resp.getheaders()), resp)
+                        resp_status, list(resp.getheaders()), resp, source)
                 else:
                     resp_body = resp.read()
+                    try:
+                        _pu = (json.loads(resp_body) or {}).get("usage") or {}
+                        # anthropic 侧: input_tokens/output_tokens；
+                        # chat/openai 侧: prompt_tokens/completion_tokens
+                        self._acc["usage_in"] = _pu.get(
+                            "input_tokens", _pu.get("prompt_tokens", 0)) or 0
+                        self._acc["usage_out"] = _pu.get(
+                            "output_tokens", _pu.get("completion_tokens", 0)) or 0
+                        self._acc["usage_reasoning"] = pt._extract_reasoning_tokens(_pu)
+                    except Exception:
+                        pass   # 解析失败不影响透传主流程，usage 记 0
                     self._write_buffered_response(
                         resp_status, list(resp.getheaders()), resp_body)
                     resp.close()
@@ -853,6 +1186,8 @@ class ModelProxyHandler(BaseHTTPRequestHandler):
                 if is_stream:
                     adapter = pt.OpenAIToAnthropicStreamAdapter(fwd_ctx, target_model or "")
                     self._write_translated_stream(resp, adapter)
+                    (self._acc["usage_in"], self._acc["usage_out"],
+                     self._acc["usage_reasoning"]) = adapter.usage_tuple()
                 else:
                     try:
                         raw_resp_body = resp.read()
@@ -868,6 +1203,11 @@ class ModelProxyHandler(BaseHTTPRequestHandler):
                             500, [], error_body_for_source(
                                 source, 500, f"proxy translate failed: {e}"))
                         return
+                    _u = anthropic_resp.get("usage") or {}
+                    self._acc["usage_in"] = _u.get("input_tokens", 0)
+                    self._acc["usage_out"] = _u.get("output_tokens", 0)
+                    self._acc["usage_reasoning"] = (
+                        _u.get("output_tokens_details") or {}).get("reasoning_tokens", 0)
                     self._write_buffered_response(
                         200, [("Content-Type", "application/json")],
                         json.dumps(anthropic_resp, ensure_ascii=False).encode("utf-8"))
@@ -878,6 +1218,8 @@ class ModelProxyHandler(BaseHTTPRequestHandler):
                 if is_stream:
                     adapter = pt.ResponsesToAnthropicStreamAdapter(fwd_ctx, target_model or "")
                     self._write_translated_stream_from_responses(resp, adapter)
+                    (self._acc["usage_in"], self._acc["usage_out"],
+                     self._acc["usage_reasoning"]) = adapter.usage_tuple()
                 else:
                     try:
                         raw_resp_body = resp.read()
@@ -894,6 +1236,11 @@ class ModelProxyHandler(BaseHTTPRequestHandler):
                             500, [], error_body_for_source(
                                 source, 500, f"proxy translate failed: {e}"))
                         return
+                    _u = anthropic_resp.get("usage") or {}
+                    self._acc["usage_in"] = _u.get("input_tokens", 0)
+                    self._acc["usage_out"] = _u.get("output_tokens", 0)
+                    self._acc["usage_reasoning"] = (
+                        _u.get("output_tokens_details") or {}).get("reasoning_tokens", 0)
                     self._write_buffered_response(
                         200, [("Content-Type", "application/json")],
                         json.dumps(anthropic_resp, ensure_ascii=False).encode("utf-8"))
@@ -907,6 +1254,8 @@ class ModelProxyHandler(BaseHTTPRequestHandler):
                     model=target_model or "",
                     ctx={"tools": _tools_echo, "reasoning_effort": _r_effort})
                 self._write_responses_stream(resp, adapter)
+                (self._acc["usage_in"], self._acc["usage_out"],
+                 self._acc["usage_reasoning"]) = adapter.usage_tuple()
             else:
                 try:
                     raw_resp_body = resp.read()
@@ -924,6 +1273,11 @@ class ModelProxyHandler(BaseHTTPRequestHandler):
                         500, [], error_body_for_source(
                             source, 500, f"proxy translate failed: {e}"))
                     return
+                _u = responses_resp.get("usage") or {}
+                self._acc["usage_in"] = _u.get("input_tokens", 0)
+                self._acc["usage_out"] = _u.get("output_tokens", 0)
+                self._acc["usage_reasoning"] = (
+                    _u.get("output_tokens_details") or {}).get("reasoning_tokens", 0)
                 self._write_buffered_response(
                     200, [("Content-Type", "application/json")],
                     json.dumps(responses_resp, ensure_ascii=False).encode("utf-8"))
@@ -1003,8 +1357,14 @@ class ModelProxyHandler(BaseHTTPRequestHandler):
 
     _SKIP_RESP_HEADERS = {"transfer-encoding", "content-length"}
 
-    def _write_streaming_response(self, status: int, headers: list[tuple[str, str]], resp) -> None:
-        """流式回写上游响应，使用 chunked 编码（组合1/2 透传）。"""
+    def _write_streaming_response(self, status: int, headers: list[tuple[str, str]], resp, source: str = "") -> None:
+        """流式回写上游响应，使用 chunked 编码（组合1/2 透传）。
+
+        source 非空时（PASSTHROUGH 流式），转发之后旁路嗅探 SSE 里的 usage 事件
+        写入 self._acc，透传字节本身不受影响（§7 方案）。
+        """
+        if hasattr(self, "_acc"):
+            self._acc["status"] = status
         self.send_response(status)
         for hname, hval in headers:
             if hname.lower() in self._SKIP_RESP_HEADERS:
@@ -1012,24 +1372,41 @@ class ModelProxyHandler(BaseHTTPRequestHandler):
             self.send_header(hname, hval)
         self.send_header("Transfer-Encoding", "chunked")
         self.end_headers()
+        sniff_buf = b""                      # 新增：usage 嗅探 buffer
         try:
             while True:
                 chunk = resp.read(8192)
                 if not chunk:
                     break
+                # —— 转发在前、无条件（行为一字未改）——
                 size_line = f"{len(chunk):X}\r\n".encode("ascii")
                 self.wfile.write(size_line)
                 self.wfile.write(chunk)
                 self.wfile.write(b"\r\n")
+                # —— 嗅探在后、纯旁路，异常绝不影响转发 ——
+                try:
+                    sniff_buf += chunk
+                    while b"\n\n" in sniff_buf:
+                        block, sniff_buf = sniff_buf.split(b"\n\n", 1)
+                        self._sniff_passthrough_usage(block, source)
+                except Exception:
+                    pass
             self.wfile.write(b"0\r\n\r\n")
             self.wfile.flush()
         except (BrokenPipeError, ConnectionResetError):
             pass
         finally:
+            try:
+                if sniff_buf.strip():
+                    self._sniff_passthrough_usage(sniff_buf.strip(), source)
+            except Exception:
+                pass
             resp.close()
 
     def _write_buffered_response(self, status: int, headers: list[tuple[str, str]], body: bytes) -> None:
         """回写已完整读取的 buffer 响应（非流式 / 错误响应用）。"""
+        if hasattr(self, "_acc"):
+            self._acc["status"] = status
         self.send_response(status)
         for hname, hval in headers:
             if hname.lower() in self._SKIP_RESP_HEADERS:
@@ -1050,7 +1427,14 @@ class ModelProxyHandler(BaseHTTPRequestHandler):
     # ------------------------------------------------------------------
 
     def _begin_sse_chunked(self) -> None:
-        """发 200 + text/event-stream 响应头，启用 chunked 逐事件写出。"""
+        """发 200 + text/event-stream 响应头，启用 chunked 逐事件写出。
+
+        本方法是 _write_translated_stream / _write_responses_stream /
+        _write_translated_stream_from_responses 三个转换流式写回函数唯一的共同
+        入口，三者只在成功路径调用（无显式 status 参数），故在此统一固定填 200。
+        """
+        if hasattr(self, "_acc"):
+            self._acc["status"] = 200
         self.send_response(200)
         self.send_header("Content-Type", "text/event-stream")
         self.send_header("Cache-Control", "no-cache")
@@ -1227,6 +1611,35 @@ class ModelProxyHandler(BaseHTTPRequestHandler):
                 pass
         finally:
             upstream_resp.close()
+
+    def _sniff_passthrough_usage(self, block: bytes, source: str) -> None:
+        """PASSTHROUGH 流式旁路：从一个完整 SSE 块里嗅探 usage，覆盖式写入 self._acc。
+        字节预筛跳过绝大多数无关块，只对目标块做 json 解析。异常由调用方 try 兜住。
+        """
+        if source == "anthropic":
+            if b"message_delta" not in block:          # 字节预筛
+                return
+            ev_type, data = self._parse_anthropic_sse_block(block)
+            if ev_type != "message_delta" or not isinstance(data, dict):
+                return
+            u = data.get("usage") or {}
+            if u.get("output_tokens") is not None:
+                self._acc["usage_out"] = u.get("output_tokens") or 0
+            if u.get("input_tokens") is not None:
+                self._acc["usage_in"] = u.get("input_tokens") or 0
+            r = pt._extract_reasoning_tokens(u)         # 复用 translate.py，兼容 thinking_tokens 别名
+            if r:
+                self._acc["usage_reasoning"] = r
+        elif source == "responses":
+            if b"response.completed" not in block:      # 字节预筛
+                return
+            ev_type, data = self._parse_anthropic_sse_block(block)
+            if ev_type != "response.completed" or not isinstance(data, dict):
+                return
+            u = (data.get("response") or {}).get("usage") or {}
+            self._acc["usage_in"] = u.get("input_tokens", 0) or 0
+            self._acc["usage_out"] = u.get("output_tokens", 0) or 0
+            self._acc["usage_reasoning"] = pt._extract_reasoning_tokens(u)
 
     @staticmethod
     def _parse_anthropic_sse_block(block: bytes):

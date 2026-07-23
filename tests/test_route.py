@@ -26,6 +26,9 @@ from core.server import (  # noqa: E402
     RESPONSES_TO_ANTHROPIC,
     ANTHROPIC_TO_RESPONSES,
     UNSUPPORTED,
+    _sanitize_forward_query,
+    extract_client_token,
+    detect_source,
 )
 
 
@@ -150,6 +153,103 @@ class TestPickTranslator(unittest.TestCase):
     def test_unsupported(self):
         self.assertEqual(pick_translator("chat", "anthropic"), UNSUPPORTED)
         self.assertEqual(pick_translator("responses", "chat"), UNSUPPORTED)
+
+
+class TestSanitizeForwardQuery(unittest.TestCase):
+    """出站 URL 的 query 净化：统一丢弃客户端 path，只保留剔除 beta 后的 query。
+
+    supply["url"] 现在语义是完整终态端点，四个转发分支的 target_url 均由
+    base_url + _sanitize_forward_query(path) 统一计算（原
+    _build_passthrough_target_url，见 core/server.py 改名说明）。
+    """
+
+    def test_anthropic_client_path_dropped(self):
+        base_url = "https://xxx/v1/anthropic/v1/messages"
+        result = base_url + _sanitize_forward_query("/v1/messages")
+        self.assertEqual(result, base_url)
+        self.assertNotIn("/v1/messages/v1/messages", result)
+
+    def test_responses_client_path_dropped_regression(self):
+        base_url = "https://xxx/v1/responses"
+        result = base_url + _sanitize_forward_query("/v1/responses")
+        self.assertEqual(result, base_url)
+
+    def test_query_kept_beta_stripped(self):
+        base_url = "https://xxx/v1/anthropic/v1/messages"
+        result = base_url + _sanitize_forward_query("/v1/messages?beta=xxx&foo=1")
+        self.assertEqual(result, base_url + "?foo=1")
+
+    def test_root_path_no_error(self):
+        base_url = "https://xxx/v1/anthropic/v1/messages"
+        result = base_url + _sanitize_forward_query("/")
+        self.assertEqual(result, base_url)
+
+
+class TestExtractClientToken(unittest.TestCase):
+    """入站 client_token 提取：Authorization: Bearer 优先，回退 x-api-key。"""
+
+    def test_only_authorization_bearer(self):
+        headers = {"Authorization": "Bearer xxx"}
+        self.assertEqual(extract_client_token(headers), "xxx")
+
+    def test_only_x_api_key(self):
+        # 本次修复的核心复现场景：客户端只发 x-api-key，无 Authorization
+        headers = {"x-api-key": "xxx"}
+        self.assertEqual(extract_client_token(headers), "xxx")
+
+    def test_both_same_value(self):
+        headers = {"Authorization": "Bearer xxx", "x-api-key": "xxx"}
+        self.assertEqual(extract_client_token(headers), "xxx")
+
+    def test_both_different_value_authorization_wins(self):
+        headers = {"Authorization": "Bearer a", "x-api-key": "b"}
+        self.assertEqual(extract_client_token(headers), "a")
+
+    def test_neither_present(self):
+        headers = {}
+        self.assertEqual(extract_client_token(headers), "")
+
+    def test_authorization_not_bearer_falls_back_to_x_api_key(self):
+        headers = {"Authorization": "Basic xxx", "x-api-key": "cc"}
+        self.assertEqual(extract_client_token(headers), "cc")
+
+    def test_bearer_scheme_case_insensitive(self):
+        # RFC 6750：Bearer scheme 大小写不敏感
+        headers = {"Authorization": "bearer cc"}
+        self.assertEqual(extract_client_token(headers), "cc")
+        headers = {"Authorization": "BEARER cc"}
+        self.assertEqual(extract_client_token(headers), "cc")
+
+    def test_x_api_key_value_stripped(self):
+        # 带首尾空白的 x-api-key 取值要 strip，否则查表会找不到 strategy
+        headers = {"x-api-key": " cc "}
+        self.assertEqual(extract_client_token(headers), "cc")
+
+    def test_bearer_value_stripped(self):
+        headers = {"Authorization": "Bearer  cc  "}
+        self.assertEqual(extract_client_token(headers), "cc")
+
+
+class TestDetectSourceCaseInsensitive(unittest.TestCase):
+    """detect_source 路径尾缀大小写归一。"""
+
+    def test_v1_messages_uppercase(self):
+        self.assertEqual(detect_source("/V1/MESSAGES", None), "anthropic")
+
+    def test_v1_messages_mixed_case(self):
+        self.assertEqual(detect_source("/V1/Messages", None), "anthropic")
+
+    def test_v1_responses_mixed_case(self):
+        self.assertEqual(detect_source("/V1/Responses", None), "responses")
+
+    def test_chat_completions_mixed_case(self):
+        self.assertEqual(detect_source("/Chat/Completions", None), "chat")
+
+    def test_lowercase_regression(self):
+        # 回归：现有全小写用例仍通过
+        self.assertEqual(detect_source("/v1/messages", None), "anthropic")
+        self.assertEqual(detect_source("/v1/responses", None), "responses")
+        self.assertEqual(detect_source("/chat/completions", None), "chat")
 
 
 class TestEndToEnd(unittest.TestCase):

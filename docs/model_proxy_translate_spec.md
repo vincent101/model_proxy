@@ -10,6 +10,8 @@
 
 ---
 
+> 实现落地说明：本规格成文时挂载点设想为 tools/proxy.py，实际实现已重构为独立包 core/translate.py（转换器）+ core/reasoning/（reasoning 强度处理）。下文 §0/§3.6/§6.5 中所有 "proxy.py"、"_forward 新增分支" 等挂载点描述均指此重构前设想，字段映射规格本身不受影响、仍为当前有效参照。
+
 # Part 1 正向：Anthropic ⇄ OpenAI Chat
 
 > 原标题：# Proxy 协议转换器规格：Anthropic ↔ OpenAI

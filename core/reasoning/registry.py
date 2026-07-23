@@ -23,6 +23,46 @@ def get_codec(protocol: str) -> ReasoningCodec:
     return codec
 
 
+_PROTOCOL_URL_SUFFIX = {          # 尾缀 → protocol，唯一权威表，按此顺序检查即可（三者互斥无公共后缀）
+    "/v1/messages": "anthropic",
+    "/v1/responses": "responses",
+    "/chat/completions": "chat",
+}
+
+
+def infer_protocol_from_url(url: str) -> "str | None":
+    """从完整终态 url 的路径尾缀推断 protocol。三个尾缀互斥无公共后缀，可用 endswith 可靠判断。
+    推断不到返回 None（调用方决定是否报错），不做任何猜测性兜底。
+    """
+    u = (url or "").split("?", 1)[0].rstrip("/")
+    for suffix, proto in _PROTOCOL_URL_SUFFIX.items():
+        if u.endswith(suffix):
+            return proto
+    return None
+
+
+def resolve_protocol(supply: dict) -> str:
+    """supply → protocol 的唯一权威解析，全代码库仅此一处实现该判断逻辑。
+
+    优先级：显式 supply["protocol"]（若合法）> 从 supply["url"] 尾缀推断 > 抛错。
+    绝不兜底默认某个协议——推断不到就是配置错误，必须让用户看到明确报错去修，
+    而不是让请求悄悄走错转换分支产生难排查的错误响应。
+    """
+    explicit = (supply.get("protocol") or "").strip()
+    if explicit:
+        if explicit not in _REGISTRY:
+            raise ValueError(f"supply {supply.get('id')!r}: 非法 protocol {explicit!r}，"
+                              f"合法值: {sorted(_REGISTRY.keys())}")
+        return explicit
+    inferred = infer_protocol_from_url(supply.get("url", ""))
+    if inferred is None:
+        raise ValueError(
+            f"supply {supply.get('id')!r}: 无法从 url 推断 protocol "
+            f"（url={supply.get('url')!r} 尾缀不属于 {list(_PROTOCOL_URL_SUFFIX)}），"
+            f"请显式填写 protocol 字段")
+    return inferred
+
+
 def apply_fields(body: dict, fields: dict) -> None:
     """把 encode() 返回的字段片段 merge 进 body（原地修改）。
 

@@ -25,11 +25,15 @@ class CanonicalEffort(IntEnum):
 
 
 @dataclass(frozen=True)
-class ReasoningIntent:
-    """decode() 的产出：客户端表达的 reasoning 意图，协议无关。"""
+class RawIntent:
+    """decode() 的产出：客户端表达的 reasoning 意图，协议无关，原名 ReasoningIntent。
+
+    explicit_off 字段已删除：关闭意图直接表达为 level=OFF, present=True，
+    不再用独立布尔字段（thinking.type=disabled 这类显式关闭，现在归一到
+    CanonicalEffort.OFF 这一个值即可表达，见 remap() 里的 OFF 吸收态 clause）。
+    """
     level: "CanonicalEffort | None"   # 归一化后的规范强度；None 表示未表达（present 仍可能为 True，见 decode 各分支）
     source_budget: "int | None"        # 客户端原始 budget_tokens（仅 Anthropic enabled 语法有意义），供无损回填
-    explicit_off: bool                 # thinking.type=disabled 这类显式关闭，区别于"未指定"
     present: bool                      # 客户端是否表达了 reasoning 意图（否则 encode 返回 {} 不塞字段）
 
 
@@ -53,11 +57,12 @@ _BUDGET_ANCHORS: list = [
 # 而漂移到下一档，往返不一致（bug 修复记录：LOW→2000→MEDIUM、MEDIUM→8000→HIGH、
 # HIGH→32000→XHIGH、XHIGH→64000→MAX，全部四档曾漂移一档）。
 # 区间：LOW<2000, 2000<=MEDIUM<8000, 8000<=HIGH<32000, 32000<=XHIGH<64000, MAX>=64000。
-# OFF 在 AnthropicReasoningCodec.encode 里总是转成 thinking.type=disabled，不会走到
-# 这张表；MINIMAL 理论上可能在 source_budget 缺失且 aligned.level=MINIMAL 时触发
-# （仅当某 anthropic supply 的 reasoning_capability 显式配置了 minimal 档，且恰好该
-# 请求没有原始 budget 可回填），这条边界 architect 蓝图未给出数值，此处按 LOW 区间
-# 内部值（1500）的一半（1000）保守外推，保持"数值越大强度越高"单调，未被真实场景验证。
+# OFF 在 abstract_encode() 里总是转成 AbstractKind.DISABLED，AnthropicReasoningCodec.
+# syntax_adapt 据此转成 thinking.type=disabled，不会走到这张表；MINIMAL 理论上可能在
+# source_budget 缺失且 abstract.level=MINIMAL 时触发（仅当某 anthropic supply 的
+# reasoning_capability 显式配置了 minimal 档，且恰好该请求没有原始 budget 可回填），
+# 这条边界 architect 蓝图未给出数值，此处按 LOW 区间内部值（1500）的一半（1000）保守
+# 外推，保持"数值越大强度越高"单调，未被真实场景验证。
 _CANONICAL_TO_BUDGET = {
     CanonicalEffort.OFF: 0,
     CanonicalEffort.MINIMAL: 1000,

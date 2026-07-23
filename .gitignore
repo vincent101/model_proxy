@@ -1,4 +1,6 @@
 .claude_model_proxy.log
+.claude_model_proxy_totals.json
+.claude_model_proxy_totals.json.corrupt.*
 __pycache__/
-model_proxy_config.json
-model_proxy_config.json.bak.*
+config/model_proxy_config.json
+config/model_proxy_config.json.bak.*

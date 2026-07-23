@@ -7,8 +7,9 @@
 MODEL_PROXY_PORT="${MODEL_PROXY_PORT:-18889}"
 MODEL_PROXY_BASE="http://127.0.0.1:${MODEL_PROXY_PORT}"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-CONFIG_FILE="${MODEL_PROXY_CONFIG:-$SCRIPT_DIR/model_proxy_config.json}"
+CONFIG_FILE="${MODEL_PROXY_CONFIG:-$SCRIPT_DIR/config/model_proxy_config.json}"
 LOG_FILE="$SCRIPT_DIR/.claude_model_proxy.log"
+TOTALS_FILE="$SCRIPT_DIR/.claude_model_proxy_totals.json"
 LOCK_FILE="/tmp/claude_model_proxy.lock"
 CONFIG_OPS="$SCRIPT_DIR/_config_ops.py"
 INSTALL_OPS="$SCRIPT_DIR/_install_ops.py"
@@ -21,37 +22,47 @@ print_help() {
 status                            显示运行状态 + supplies/routes/cooldown 概览
 reload                            触发配置热重载（无条件清空所有 cooldown）
 
-supply                            不带子命令：打印 supply list 后进入交互菜单
-                                    [a]dd / [e]dit / [d]el / [p]robe / [q]uit
-supply list                       列出所有 supply（appkey 脱敏尾4位、cooldown）
-supply add                        交互式新增 supply（同步探测 effort，写配置后 reload）
-supply edit <id>                  交互式编辑 supply（含改 appkey、可选重新探测 effort）
-supply del <id>                   删除 supply（二次确认，被 route 引用则拒绝）
-supply probe <id>                 只跑 effort 探测，接受则回写 reasoning_capability
+supply                            打印 supply list 后进入交互菜单，可选操作：
+                                    [a]dd  交互式新增 supply（同步探测 effort，写配置后 reload）
+                                    [e]dit 交互式编辑 supply（含改 appkey、可选重新探测 effort）
+                                    [d]el  删除 supply（二次确认，被 route 引用则拒绝）
+                                    [t]est 连通性测试；若连通，接着做 effort 探测并可确认写入 reasoning_capability
+                                    [q]uit 退出（回车亦可）
 
-route                             不带子命令：打印 route list 后进入交互菜单
-                                    [a]dd / [e]dit / [d]el / [q]uit
-route list                        列出所有 route（家族模板：opus/sonnet/haiku 三档 + failover）
-route add                         交互式新增 route 家族模板（写配置后 reload）
-route edit <id>                   交互式编辑 route 的 tiers/failover
-route del <id>                    删除 route（二次确认，被 strategy 引用则拒绝）
+route                             打印 route list 后进入交互菜单，可选操作：
+                                    [a]dd  交互式新增 route 家族模板（opus/sonnet/haiku 三档 + failover）
+                                    [e]dit 交互式编辑 route 的 tiers/failover
+                                    [d]el  删除 route（二次确认，被 strategy 引用则拒绝）
+                                    [q]uit 退出（回车亦可）
 
-strategy                          不带子命令：打印 strategy list 后进入交互菜单
-                                    [a]dd / [e]dit / [d]el / [q]uit
-strategy list                     列出所有 strategy（client_token -> route_id 绑定）
-strategy add                      交互式新增 strategy 绑定（写配置后 reload）
-strategy edit <token>             交互式编辑 strategy 的 route_id/note
-strategy del <token>              删除 strategy（二次确认，无下游引用检查）
+strategy                          打印 strategy list 后进入交互菜单，可选操作：
+                                    [a]dd  交互式新增 strategy 绑定（client_token -> route_id，写配置后 reload）
+                                    [e]dit 交互式编辑 strategy 的 route_id/note/source 能力
+                                    [d]el  删除 strategy（二次确认，无下游引用检查）
+                                    [q]uit 退出（回车亦可）
 
 switch <client_token> <route_id>  切换某 token 绑定的 route 家族（改 strategy.route_id 后 reload）
-install                           交互式列出四个 SDK + 本机检测状态，选择安装
-install --list                    只列出四个 SDK 检测状态，不安装
+install                           交互式列出四个 SDK + 本机检测状态，选择安装（不选直接回车即为只看状态退出）
 on                                启动 model_proxy.py（已在监听则跳过）
 off                               停止 model_proxy.py（严格按脚本绝对路径匹配，绝不影响 v1 的 proxy.py）
+
+logs [N]                          显示最近 N 条 ACCESS 访问日志（默认 30 条）
+stats [时间] [维度/过滤...]        读独立账本（不受日志截断影响），按 supply/route/strategy
+                                    任意维度组合切片。用法示例：
+                                      stats                          全历史 total，三维度各投影一段
+                                      stats today                    今天（UTC+8）
+                                      stats month                    本月（UTC+8）
+                                      stats 2026-07-23                指定某天
+                                      stats 2026-07                   指定某月
+                                      stats today supply              按 supply 投影
+                                      stats today supply=<id>         过滤单个 supply
+                                      stats today route=claude supply 过滤 route 后按 supply 投影
+                                    末尾附一行 max_ms（来自日志，受日志窗口限制，非账本口径）
 --help / -h                       显示此帮助
 
-说明: supply/route/strategy 三者均支持"不带子命令进入交互菜单"，
-      带子命令（list/add/edit/del/probe）时兼容旧用法，直接执行不进菜单。
+说明: supply/route/strategy/install 的增删改等操作只能通过对应一级入口进入交互菜单执行，
+      不再支持带子命令直达（如 supply add）。非交互（stdin 非 TTY）环境下进入这些入口只打印
+      一次 list 后直接退出，不进菜单。
 EOF
 }
 
@@ -178,43 +189,39 @@ cmd_supply_del()   {
   if [[ -z "$id" ]]; then echo "用法: supply del <id>"; return 1; fi
   run_config_ops supply-del "$id"
 }
-cmd_supply_probe() {
+cmd_supply_check() {
   local id="${1:-}"
-  if [[ -z "$id" ]]; then echo "用法: supply probe <id>"; return 1; fi
-  run_config_ops supply-probe "$id"
+  if [[ -z "$id" ]]; then echo "用法: supply test <id>"; return 1; fi
+  run_config_ops supply-check "$id"
 }
 
-# ---- supply：入口。不带子命令 -> 打印 list 后进入交互菜单；带子命令 -> 兼容旧用法直接执行 ----
+# ---- supply：入口。进入交互菜单（先打印 list，再循环选操作）。 ----
 cmd_supply() {
-  local subcmd="${1:-}"
-  if [[ -z "$subcmd" ]]; then
-    while true; do
-      cmd_supply_list
-      echo ""
-      read -p "操作: [a]dd / [e]dit / [d]el / [p]robe / [q]uit: " op
-      case "$op" in
-        a) cmd_supply_add ;;
-        e) read -p "要编辑的 supply id: " eid; cmd_supply_edit "$eid" ;;
-        d) read -p "要删除的 supply id: " did; cmd_supply_del "$did" ;;
-        p) read -p "要探测的 supply id: " pid; cmd_supply_probe "$pid" ;;
-        q|"") break ;;
-        *) echo "未知操作" ;;
-      esac
-      echo ""
-    done
+  cmd_supply_list
+  if [[ ! -t 0 ]]; then
+    echo ""
+    echo "当前非交互环境（stdin 非 TTY），不支持交互操作，退出。"
     return 0
   fi
-  case "$subcmd" in
-    list)   cmd_supply_list ;;
-    add)    cmd_supply_add ;;
-    edit)   cmd_supply_edit "${2:-}" ;;
-    del)    cmd_supply_del "${2:-}" ;;
-    probe)  cmd_supply_probe "${2:-}" ;;
-    *)
-      echo "用法: supply list | supply add | supply edit <id> | supply del <id> | supply probe <id>"
-      return 1
-      ;;
-  esac
+  echo ""
+  echo "可选操作: a=新增 supply / e=编辑 supply / d=删除 supply / t=连通性测试+effort探测 / q=退出"
+  while true; do
+    echo ""
+    read -p "操作: [a]dd / [e]dit / [d]el / [t]est / [q]uit: " op
+    case "$op" in
+      a) cmd_supply_add ;;
+      e) read -p "要编辑的 supply id: " eid; cmd_supply_edit "$eid" ;;
+      d) read -p "要删除的 supply id: " did; cmd_supply_del "$did" ;;
+      t) read -p "要测试的 supply id: " tid; cmd_supply_check "$tid" ;;
+      q|"") break ;;
+      *) echo "未知操作" ;;
+    esac
+    # 130 == 128+SIGINT：子进程内 Ctrl-C 被 python 捕获后约定用这个退出码，
+    # 这里识别到就整体退出菜单（回到 shell），而不是继续问下一轮操作。
+    if [[ $? -eq 130 ]]; then break; fi
+    echo ""
+    cmd_supply_list
+  done
 }
 
 # ---- route：单动作函数 ----
@@ -231,35 +238,30 @@ cmd_route_del()  {
   run_config_ops route-del "$id"
 }
 
-# ---- route：入口。不带子命令 -> 打印 list 后进入交互菜单；带子命令 -> 兼容旧用法直接执行 ----
+# ---- route：入口。进入交互菜单（先打印 list，再循环选操作）。 ----
 cmd_route() {
-  local subcmd="${1:-}"
-  if [[ -z "$subcmd" ]]; then
-    while true; do
-      cmd_route_list
-      echo ""
-      read -p "操作: [a]dd / [e]dit / [d]el / [q]uit: " op
-      case "$op" in
-        a) cmd_route_add ;;
-        e) read -p "要编辑的 route id: " eid; cmd_route_edit "$eid" ;;
-        d) read -p "要删除的 route id: " did; cmd_route_del "$did" ;;
-        q|"") break ;;
-        *) echo "未知操作" ;;
-      esac
-      echo ""
-    done
+  cmd_route_list
+  if [[ ! -t 0 ]]; then
+    echo ""
+    echo "当前非交互环境（stdin 非 TTY），不支持交互操作，退出。"
     return 0
   fi
-  case "$subcmd" in
-    list)   cmd_route_list ;;
-    add)    cmd_route_add ;;
-    edit)   cmd_route_edit "${2:-}" ;;
-    del)    cmd_route_del "${2:-}" ;;
-    *)
-      echo "用法: route list | route add | route edit <id> | route del <id>"
-      return 1
-      ;;
-  esac
+  echo ""
+  echo "可选操作: a=新增 route 家族 / e=编辑 route / d=删除 route / q=退出"
+  while true; do
+    echo ""
+    read -p "操作: [a]dd / [e]dit / [d]el / [q]uit: " op
+    case "$op" in
+      a) cmd_route_add ;;
+      e) read -p "要编辑的 route id: " eid; cmd_route_edit "$eid" ;;
+      d) read -p "要删除的 route id: " did; cmd_route_del "$did" ;;
+      q|"") break ;;
+      *) echo "未知操作" ;;
+    esac
+    if [[ $? -eq 130 ]]; then break; fi
+    echo ""
+    cmd_route_list
+  done
 }
 
 # ---- strategy：单动作函数 ----
@@ -276,35 +278,30 @@ cmd_strategy_del()  {
   run_config_ops strategy-del "$token"
 }
 
-# ---- strategy：入口。不带子命令 -> 打印 list 后进入交互菜单；带子命令 -> 兼容旧用法直接执行 ----
+# ---- strategy：入口。进入交互菜单（先打印 list，再循环选操作）。 ----
 cmd_strategy() {
-  local subcmd="${1:-}"
-  if [[ -z "$subcmd" ]]; then
-    while true; do
-      cmd_strategy_list
-      echo ""
-      read -p "操作: [a]dd / [e]dit / [d]el / [q]uit: " op
-      case "$op" in
-        a) cmd_strategy_add ;;
-        e) read -p "要编辑的 strategy token: " etok; cmd_strategy_edit "$etok" ;;
-        d) read -p "要删除的 strategy token: " dtok; cmd_strategy_del "$dtok" ;;
-        q|"") break ;;
-        *) echo "未知操作" ;;
-      esac
-      echo ""
-    done
+  cmd_strategy_list
+  if [[ ! -t 0 ]]; then
+    echo ""
+    echo "当前非交互环境（stdin 非 TTY），不支持交互操作，退出。"
     return 0
   fi
-  case "$subcmd" in
-    list)   cmd_strategy_list ;;
-    add)    cmd_strategy_add ;;
-    edit)   cmd_strategy_edit "${2:-}" ;;
-    del)    cmd_strategy_del "${2:-}" ;;
-    *)
-      echo "用法: strategy list | strategy add | strategy edit <token> | strategy del <token>"
-      return 1
-      ;;
-  esac
+  echo ""
+  echo "可选操作: a=新增 strategy 绑定 / e=编辑 strategy / d=删除 strategy / q=退出"
+  while true; do
+    echo ""
+    read -p "操作: [a]dd / [e]dit / [d]el / [q]uit: " op
+    case "$op" in
+      a) cmd_strategy_add ;;
+      e) read -p "要编辑的 strategy token: " etok; cmd_strategy_edit "$etok" ;;
+      d) read -p "要删除的 strategy token: " dtok; cmd_strategy_del "$dtok" ;;
+      q|"") break ;;
+      *) echo "未知操作" ;;
+    esac
+    if [[ $? -eq 130 ]]; then break; fi
+    echo ""
+    cmd_strategy_list
+  done
 }
 
 # ---- switch ----
@@ -322,10 +319,6 @@ cmd_install() {
   if [[ ! -f "$CONFIG_FILE" ]]; then
     echo "Error: config not found: $CONFIG_FILE"
     return 1
-  fi
-  if [[ "${1:-}" == "--list" ]]; then
-    python3 "$INSTALL_OPS" list "$CONFIG_FILE" "$MODEL_PROXY_PORT"
-    return $?
   fi
   python3 "$INSTALL_OPS" install "$CONFIG_FILE" "$MODEL_PROXY_PORT"
 }
@@ -384,6 +377,216 @@ cmd_off() {
   done
 }
 
+# ---- logs：最近 N 条 ACCESS 记录（默认 30） ----
+cmd_logs() {
+  local n="${1:-30}"
+  grep ' ACCESS ' "$LOG_FILE" | tail -n "$n"
+}
+
+# ---- stats：读独立账本（$TOTALS_FILE），组合键投影+过滤聚合；末尾补日志窗口内 max ms ----
+# 用法见 print_help；核心逻辑：选时间桶 -> 按 字段=值 过滤 -> 按裸维度名投影聚合 -> 打印。
+cmd_stats() {
+  if [[ ! -f "$TOTALS_FILE" ]]; then
+    echo "no stats yet (账本文件不存在: $TOTALS_FILE)"
+    return 0
+  fi
+
+  python3 - "$TOTALS_FILE" "$@" <<'PYEOF'
+import json
+import sys
+from datetime import datetime, timedelta, timezone
+
+CST = timezone(timedelta(hours=8))
+DIMS = ("supply", "route", "strategy")
+VAL_FIELDS = ("requests", "ok", "fail", "usage_in", "usage_out", "usage_reasoning")
+
+
+def zero_bucket():
+    return {"requests": 0, "ok": 0, "fail": 0, "sum_ms": 0, "combos": {}}
+
+
+def zero_group():
+    return {k: 0 for k in VAL_FIELDS}
+
+
+def cst_today_str():
+    return datetime.now(CST).strftime("%Y-%m-%d")
+
+
+def merge_bucket_into(dst, src):
+    dst["requests"] += src.get("requests", 0)
+    dst["ok"] += src.get("ok", 0)
+    dst["fail"] += src.get("fail", 0)
+    dst["sum_ms"] += src.get("sum_ms", 0)
+    for key, v in src.get("combos", {}).items():
+        combo = dst["combos"].setdefault(key, zero_group())
+        for f in VAL_FIELDS:
+            combo[f] += v.get(f, 0)
+
+
+def get_month_bucket(data, month_key):
+    """无条件合并 months_archive[月] 与 days 里剩余同月天桶。
+    二者互斥不重叠（归档时天桶已从 days 删除，见 core/server.py _archive_if_needed），
+    合并后即为完整月度数据，不会重复计算。"""
+    merged = zero_bucket()
+    archived = data.get("months_archive", {}).get(month_key)
+    if archived is not None:
+        merge_bucket_into(merged, archived)
+    for day_key, day_bucket in data.get("days", {}).items():
+        if day_key[:7] == month_key:
+            merge_bucket_into(merged, day_bucket)
+    return merged
+
+
+def select_bucket(data, time_sel):
+    """返回 (bucket_dict, label)。bucket_dict 含 requests/ok/fail/sum_ms/combos。"""
+    if time_sel is None or time_sel == "total":
+        return data.get("total", zero_bucket()), "total (全历史)"
+    if time_sel == "today":
+        day_key = cst_today_str()
+        return data.get("days", {}).get(day_key, zero_bucket()), f"{day_key} (today, UTC+8)"
+    if time_sel == "month":
+        month_key = cst_today_str()[:7]
+        bucket = get_month_bucket(data, month_key)
+        return bucket, f"{month_key} (month, UTC+8)"
+    if len(time_sel) == 10 and time_sel.count("-") == 2:
+        return data.get("days", {}).get(time_sel, zero_bucket()), f"{time_sel} (UTC+8)"
+    if len(time_sel) == 7 and time_sel.count("-") == 1:
+        bucket = get_month_bucket(data, time_sel)
+        return bucket, f"{time_sel} (UTC+8)"
+    print(f"Error: 无法识别的时间选择器: {time_sel!r}", file=sys.stderr)
+    sys.exit(1)
+
+
+def parse_combo_key(key):
+    dims = {}
+    for part in key.split("|"):
+        k, v = part.split("=", 1)
+        dims[k] = v
+    return dims
+
+
+def fmt_k(n):
+    if abs(n) >= 1000:
+        return f"{n / 1000:.1f}k"
+    return str(n)
+
+
+def main():
+    argv = sys.argv[1:]
+    totals_file = argv[0]
+    args = argv[1:]
+
+    with open(totals_file, "r", encoding="utf-8") as f:
+        data = json.load(f)
+
+    # 第 1 个非时间参数如果匹配时间选择器格式则消费为时间选择器，其余全部是维度/过滤参数。
+    time_sel = None
+    dim_args = args
+    if args:
+        first = args[0]
+        is_time_like = (
+            first in ("today", "month", "total")
+            or (len(first) == 10 and first.count("-") == 2)
+            or (len(first) == 7 and first.count("-") == 1)
+        )
+        if is_time_like:
+            time_sel = first
+            dim_args = args[1:]
+
+    bucket, label = select_bucket(data, time_sel)
+
+    filters = {}
+    proj = None
+    for tok in dim_args:
+        if "=" in tok:
+            field, val = tok.split("=", 1)
+            if field not in DIMS:
+                print(f"Error: 未知过滤字段: {field!r}（应为 supply/route/strategy）", file=sys.stderr)
+                sys.exit(1)
+            filters[field] = val
+        elif tok in DIMS:
+            proj = tok
+        else:
+            print(f"Error: 无法识别的参数: {tok!r}", file=sys.stderr)
+            sys.exit(1)
+
+    combos = bucket.get("combos", {})
+
+    def aggregate(proj_dim):
+        groups = {}
+        for key, v in combos.items():
+            dims = parse_combo_key(key)
+            if any(dims.get(f) != val for f, val in filters.items()):
+                continue
+            gkey = dims.get(proj_dim) if proj_dim else "(all)"
+            g = groups.setdefault(gkey, zero_group())
+            for f in VAL_FIELDS:
+                g[f] += v.get(f, 0)
+        return groups
+
+    # period 总计行：无过滤用桶顶层（含 avg_ms）；有过滤则由过滤后的组合求和（无 sum_ms/avg_ms）。
+    if filters:
+        all_groups = aggregate(None)
+        filtered_total = all_groups.get("(all)", zero_group())
+        period_requests = filtered_total["requests"]
+        period_ok = filtered_total["ok"]
+        period_fail = filtered_total["fail"]
+        avg_ms_str = "n/a（有过滤条件，账本不存组合键粒度 sum_ms）"
+        usage_in, usage_out, usage_reasoning = (
+            filtered_total["usage_in"], filtered_total["usage_out"], filtered_total["usage_reasoning"])
+    else:
+        period_requests = bucket.get("requests", 0)
+        period_ok = bucket.get("ok", 0)
+        period_fail = bucket.get("fail", 0)
+        sum_ms = bucket.get("sum_ms", 0)
+        avg_ms_str = f"{sum_ms / period_requests:.1f}" if period_requests else "0"
+        all_groups = aggregate(None)
+        filtered_total = all_groups.get("(all)", zero_group())
+        usage_in, usage_out, usage_reasoning = (
+            filtered_total["usage_in"], filtered_total["usage_out"], filtered_total["usage_reasoning"])
+
+    print(f"period: {label}   requests={period_requests}  ok={period_ok}  fail={period_fail}  "
+          f"avg_ms={avg_ms_str}  usage_in={fmt_k(usage_in)} usage_out={fmt_k(usage_out)} "
+          f"usage_reasoning={fmt_k(usage_reasoning)}")
+    if filters:
+        filt_desc = " ".join(f"{k}={v}" for k, v in filters.items())
+        print(f"filters: {filt_desc}")
+
+    def print_groups(proj_dim):
+        groups = aggregate(proj_dim)
+        if not groups:
+            print("  (no data)")
+            return
+        for gkey, g in sorted(groups.items(), key=lambda kv: -kv[1]["requests"]):
+            print(f"  {gkey:32} requests={g['requests']:<6} ok={g['ok']:<6} fail={g['fail']:<4} "
+                  f"in={fmt_k(g['usage_in'])} out={fmt_k(g['usage_out'])} reasoning={fmt_k(g['usage_reasoning'])}")
+
+    if proj:
+        print(f"by {proj}:")
+        print_groups(proj)
+    else:
+        # 都省略：默认对三个维度各做一次投影，各列一段
+        for d in DIMS:
+            print(f"by {d}:")
+            print_groups(d)
+
+
+main()
+PYEOF
+
+  echo "$(grep ' ACCESS ' "$LOG_FILE" 2>/dev/null | awk '
+  {
+    ms = 0
+    for (i = 1; i <= NF; i++) {
+      if ($i ~ /^ms=/) { split($i, a, "="); ms = a[2] }
+    }
+    if (ms > max_ms) max_ms = ms
+  }
+  END { printf "max_ms=%d", max_ms + 0 }
+  ')  (近日志窗口内，非账本口径)"
+}
+
 # ---- 主逻辑 ----
 case "${1:-}" in
   --help|-h)
@@ -396,13 +599,13 @@ case "${1:-}" in
     cmd_reload
     ;;
   supply)
-    cmd_supply "${2:-}" "${3:-}"
+    cmd_supply
     ;;
   route)
-    cmd_route "${2:-}" "${3:-}"
+    cmd_route
     ;;
   strategy)
-    cmd_strategy "${2:-}" "${3:-}"
+    cmd_strategy
     ;;
   switch)
     cmd_switch "${2:-}" "${3:-}"
@@ -415,6 +618,12 @@ case "${1:-}" in
     ;;
   off)
     cmd_off
+    ;;
+  logs)
+    cmd_logs "${2:-30}"
+    ;;
+  stats)
+    cmd_stats "${@:2}"
     ;;
   "")
     print_help

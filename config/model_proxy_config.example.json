@@ -4,28 +4,28 @@
   "supplies": [
     {
       "id": "claude-opus-k0",
-      "url": "https://aigc.sankuai.com/v1/anthropic",
+      "url": "https://aigc.sankuai.com/v1/anthropic/v1/messages",
       "protocol": "anthropic",
       "appkey": "<APPKEY_PLACEHOLDER>",
       "target_model": "claude-opus-4"
     },
     {
       "id": "claude-sonnet-k0",
-      "url": "https://aigc.sankuai.com/v1/anthropic",
+      "url": "https://aigc.sankuai.com/v1/anthropic/v1/messages",
       "protocol": "anthropic",
       "appkey": "<APPKEY_PLACEHOLDER>",
       "target_model": "claude-sonnet-4"
     },
     {
       "id": "claude-haiku-k0",
-      "url": "https://aigc.sankuai.com/v1/anthropic",
+      "url": "https://aigc.sankuai.com/v1/anthropic/v1/messages",
       "protocol": "anthropic",
       "appkey": "<APPKEY_PLACEHOLDER>",
       "target_model": "claude-haiku-3.5"
     },
     {
       "id": "glm-sonnet-k0",
-      "url": "https://aigc.sankuai.com/v1/anthropic",
+      "url": "https://aigc.sankuai.com/v1/anthropic/v1/messages",
       "protocol": "anthropic",
       "appkey": "<APPKEY_PLACEHOLDER>",
       "target_model": "glm-5.2",
@@ -55,7 +55,25 @@
     }
   ],
   "strategies": [
-    { "client_token": "cc",     "route_id": "claude", "note": "默认 Claude 家族" },
-    { "client_token": "cc-glm", "route_id": "glm",    "note": "切到 GLM 家族" }
+    {
+      "client_token": "cc",
+      "route_id": "claude",
+      "tiers_source_capability": {
+        "opus":   {"effort_enum": ["off", "low", "medium", "high", "xhigh"]},
+        "sonnet": {"effort_enum": ["off", "low", "medium", "high", "xhigh"]},
+        "haiku":  {"effort_enum": ["off", "low", "medium", "high"]}
+      },
+      "note": "默认 Claude 家族"
+    },
+    {
+      "client_token": "cc-glm",
+      "route_id": "glm",
+      "tiers_source_capability": {
+        "opus":   {"effort_enum": ["off", "low", "medium", "high", "xhigh"]},
+        "sonnet": {"effort_enum": ["off", "low", "medium", "high", "xhigh"]},
+        "haiku":  {"effort_enum": ["off", "low", "medium", "high"]}
+      },
+      "note": "切到 GLM 家族"
+    }
   ]
 }

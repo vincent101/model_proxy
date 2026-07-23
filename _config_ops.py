@@ -15,10 +15,14 @@ heredoc 样板。
 import json
 import os
 import re
+import socket
 import sys
 import tempfile
 import urllib.error
 import urllib.request
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from core.reasoning.registry import resolve_protocol
 
 PROBE_VALUE = "__probe_invalid__"
 VALID_PROTOCOLS = ("anthropic", "chat", "responses")
@@ -77,6 +81,31 @@ def done(reload_needed: bool) -> None:
 def confirm(prompt: str) -> bool:
     ans = input(f"{prompt} [y/N]: ").strip().lower()
     return ans in ("y", "yes")
+
+
+def prompt_source_capability(existing: "dict | None" = None) -> "dict | None":
+    """交互式录入 source 侧 tiers_source_capability。
+    对 opus/sonnet/haiku 逐 tier 询问；返回 {tier: {"effort_enum":[...]}} 或 None（全跳过）。
+    - 输入逗号分隔列表 -> 对应 effort_enum
+    - 输入 '-'        -> 空列表 []（该 tier 完全无思考能力）
+    - 留空           -> add 场景：不写该 tier 键（运行时走 _DEFAULT_ENUM）；
+                         edit 场景：保留 existing 里该 tier 原值（原本没有就仍不写）
+    绝不把默认值物化写入。不做白名单清洗（人工把关，跟现有 run_probe_and_maybe_accept 原则一致）。
+    """
+    existing = existing or {}
+    result = {}
+    for tier in TIER_NAMES:
+        cur = existing.get(tier)
+        cur_desc = cur.get("effort_enum") if cur else "(未声明，走默认5档)"
+        raw = input(f"  [{tier}] 支持的思考档位（逗号分隔；- 表示空列表[]；留空=保留/跳过）当前={cur_desc}: ").strip()
+        if raw == "-":
+            result[tier] = {"effort_enum": []}
+        elif raw:
+            result[tier] = {"effort_enum": [w.strip() for w in raw.split(",") if w.strip()]}
+        elif cur is not None:
+            result[tier] = cur
+        # else: 不写该tier键
+    return result or None
 
 
 # ---------------------------------------------------------------------------
@@ -151,35 +180,39 @@ def _is_response_complete(raw: bytes, text_fixed: str) -> bool:
         return False
 
 
-def probe_effort(supply: dict) -> "tuple[int | None, str, list[str] | None, bool]":
+def probe_effort(supply: dict) -> "tuple[int | None, str, list[str] | None, bool, Exception | None]":
     """向 supply 上游发一个已知非法的 effort 值，尝试解析真实支持的枚举。
 
-    只发一次探测请求。返回 (http_status_or_None, text_fixed, regex_candidates, is_complete)。
-    任何异常/超时都被吞掉，返回 (None, str(e), None, False)，调用方按"探测失败"处理。
+    只发一次探测请求。返回
+    (http_status_or_None, text_fixed, regex_candidates, is_complete, exc)。
+    正常完成/HTTP 错误响应路径下 `exc` 为 None；网络层异常（DNS 失败/连接超时/连接拒绝等）
+    时 `status` 为 None、`text_fixed` 为 `str(exc)`、`exc` 为捕获到的原始异常对象本身
+    （供 classify_supply_reachability 按异常类型细分原因，而不是只能用文本猜）。
     """
     url = (supply.get("url") or "").rstrip("/")
-    proto = supply.get("protocol")
     appkey = supply.get("appkey", "")
     model = supply.get("target_model", "")
 
+    try:
+        proto = resolve_protocol(supply)
+    except ValueError as e:
+        return None, str(e), None, False, e
+
+    target = url  # url 现在语义是完整终态端点，零拼接
+
     if proto == "anthropic":
-        target = url + "/v1/messages"
         body = {"model": model, "max_tokens": 16,
                 "thinking": {"type": "adaptive"},
                 "output_config": {"effort": PROBE_VALUE},
                 "messages": [{"role": "user", "content": "probe"}]}
     elif proto == "chat":
-        target = url + "/chat/completions"
         body = {"model": model, "max_tokens": 16,
                 "reasoning_effort": PROBE_VALUE,
                 "messages": [{"role": "user", "content": "probe"}]}
-    elif proto == "responses":
-        target = url  # url 已配到完整 /v1/responses 层级
+    else:  # responses
         body = {"model": model, "max_output_tokens": 16,
                 "reasoning": {"effort": PROBE_VALUE},
                 "input": "probe"}
-    else:
-        return None, f"未知 protocol: {proto!r}", None, False
 
     data = json.dumps(body).encode("utf-8")
     headers = {"Content-Type": "application/json",
@@ -196,41 +229,130 @@ def probe_effort(supply: dict) -> "tuple[int | None, str, list[str] | None, bool
         status = e.code
         raw_bytes = e.read()
     except Exception as e:
-        return None, str(e), None, False
+        return None, str(e), None, False, e
 
     text_fixed = _fix_mojibake(raw_bytes)
     regex_candidates = _extract_enum_candidates(text_fixed)
     is_complete = _is_response_complete(raw_bytes, text_fixed)
 
-    return status, text_fixed, regex_candidates, is_complete
+    return status, text_fixed, regex_candidates, is_complete, None
 
 
-def _llm_probe_official_doc(model_name: str, target_model: str, protocol: str) -> "dict | None":
-    """通过具备联网能力的上游查询官方文档，判断模型是否支持 reasoning effort 分档。
+class ReachabilityCategory:
+    """supply 连通性分类常量（保持与项目现有 CanonicalEffort 等风格一致的简单命名空间）。"""
+    DNS_ERROR = "dns_error"
+    TIMEOUT = "timeout"
+    CONN_REFUSED = "conn_refused"
+    NETWORK_OTHER = "network_other"
+    AUTH_ERROR = "auth_error"
+    MODEL_ERROR = "model_error"
+    REACHABLE = "reachable"
+    UNKNOWN = "unknown"
 
-    解析失败/请求失败/超时 → 静默降级，返回 None，不清洗白名单，原样返回解析出的dict。
 
-    未实现：当前代码库（_config_ops.py 现有的 urllib.request 直连机制）不具备
-    "指向某个可用 supply 发起联网检索并拿到搜索结果"的能力——现有 probe_effort()
-    只是直接对上游模型 API 发一个 JSON 请求，不涉及 web_search 工具调用；而
-    core/translate.py、core/server.py 对 Anthropic/Responses 托管的 web_search
-    类工具是跳过/丢弃处理，不会转发给上游模型执行真实网络检索。没有找到可复用的
-    联网上游调用机制，按方案要求在此按"合理降级"返回 None，不臆造新的联网方式。
+_MODEL_ERROR_KEYWORDS = ("model", "not found", "不存在", "无效模型", "invalid model")
+
+
+def classify_supply_reachability(status: "int | None", text_fixed: str,
+                                  exc: "Exception | None") -> "tuple[str, str]":
+    """纯函数：不发请求，只依据 probe_effort 的返回结果判定连通性失败原因。
+
+    返回 (category, description)，category 取值见 ReachabilityCategory，
+    description 是给用户看的中文人类可读描述。
     """
-    return None
+    if status is None:
+        # urllib.request.urlopen 真实抛出的网络层异常几乎总是 urllib.error.URLError，
+        # 底层原因（DNS/超时/拒绝连接）包在 exc.reason 里，不是裸的 socket.gaierror/
+        # ConnectionRefusedError 本身——所以 gaierror/ConnectionRefusedError 的 isinstance
+        # 判断必须同时覆盖「exc 本身就是该类型」和「exc 是 URLError 且 .reason 是该类型」
+        # 两种形态，否则 DNS_ERROR 分支在生产环境永远走不到（reviewer 发现的真实 bug）。
+        reason = getattr(exc, "reason", None) if isinstance(exc, urllib.error.URLError) else None
+        if isinstance(exc, socket.gaierror) or isinstance(reason, socket.gaierror):
+            return ReachabilityCategory.DNS_ERROR, "DNS解析失败，请检查url域名是否正确"
+        if isinstance(exc, (socket.timeout, TimeoutError)) or isinstance(reason, (socket.timeout, TimeoutError)):
+            return ReachabilityCategory.TIMEOUT, "连接超时，请检查网络/代理设置或目标服务是否可达"
+        if isinstance(exc, ConnectionRefusedError) or isinstance(reason, ConnectionRefusedError):
+            return ReachabilityCategory.CONN_REFUSED, "连接被拒绝，请检查目标端口/服务是否已启动"
+        if isinstance(exc, urllib.error.URLError):
+            reason_str = str(reason if reason is not None else exc)
+            if "timed out" in reason_str.lower():
+                return ReachabilityCategory.TIMEOUT, "连接超时，请检查网络/代理设置或目标服务是否可达"
+            if "connection refused" in reason_str.lower():
+                return ReachabilityCategory.CONN_REFUSED, "连接被拒绝，请检查目标端口/服务是否已启动"
+        return ReachabilityCategory.NETWORK_OTHER, f"网络层异常，无法归入已知类别: {exc}"
+
+    if status in (401, 403):
+        return ReachabilityCategory.AUTH_ERROR, f"HTTP {status}，appkey可能失效或无权限访问该模型"
+
+    if status == 404:
+        return ReachabilityCategory.MODEL_ERROR, "HTTP 404，target_model 或路径可能配置错误"
+
+    if status == 400:
+        low = text_fixed.lower()
+        if any(kw.lower() in low for kw in _MODEL_ERROR_KEYWORDS):
+            return ReachabilityCategory.MODEL_ERROR, "HTTP 400 且响应含模型相关关键词，target_model 可能配置错误"
+        return ReachabilityCategory.REACHABLE, "连通鉴权正常（400 是探测用的非法 effort 参数被拒，符合预期）"
+
+    if status is not None and 200 <= status <= 299:
+        return ReachabilityCategory.REACHABLE, "连通鉴权正常"
+
+    return ReachabilityCategory.UNKNOWN, f"HTTP {status}，未归入已知类别，请人工核查响应内容"
 
 
-def run_probe_and_maybe_accept(supply: dict, interactive_prompt: bool = True) -> dict | None:
-    """执行探测（a/b/c 三步），展示结果，询问用户是否接受；返回要写入的
+def _print_connectivity_status(status: "int | None", text_fixed: str, category: str, desc: str) -> None:
+    """打印结构化输出的第①项：当前接口联通状态（成功/失败及原因 + HTTP status，
+    失败时附上游原始响应/异常文本）。供 run_connectivity_test 和
+    run_probe_and_maybe_accept（独立跑分支）共用，保证展示格式统一。"""
+    if category == ReachabilityCategory.REACHABLE:
+        print(f"- 当前接口联通状态：成功（{desc}）")
+    else:
+        print(f"- 当前接口联通状态：失败，{desc}")
+    print(f"    HTTP status={status}")
+    if category != ReachabilityCategory.REACHABLE:
+        print(f"    {text_fixed}")
+
+
+def run_connectivity_test(supply: dict) -> "tuple[int | None, str, list[str] | None, bool, Exception | None]":
+    """独立的联通性测试：调用 probe_effort 并按分类打印结构化的"联通状态"一项。
+
+    返回 probe_effort 的原始五元组，供调用方在 REACHABLE 场景下直接复用
+    （通过 run_probe_and_maybe_accept 的 prefetched 参数），避免重复发请求。
+    """
+    print(f"正在测试 supply={supply.get('id')} protocol={supply.get('protocol')} "
+          f"model={supply.get('target_model')} 连通性 ...")
+    result = probe_effort(supply)
+    status, text_fixed, regex_candidates, is_complete, exc = result
+    category, desc = classify_supply_reachability(status, text_fixed, exc)
+    _print_connectivity_status(status, text_fixed, category, desc)
+    return result
+
+
+def run_probe_and_maybe_accept(supply: dict, interactive_prompt: bool = True,
+                                 prefetched: "tuple | None" = None) -> dict | None:
+    """执行探测，展示结果，询问用户是否接受；返回要写入的
     reasoning_capability dict 或 None（跳过/失败/不写入）。
 
     interactive_prompt=False 时（非交互批量场景预留），探测成功也不写入，只打印，
     避免在没有人工确认的路径上悄悄写库——当前 CLI 所有调用点都是交互式，此参数保留扩展位。
+
+    prefetched 非 None 时（须是 probe_effort 格式的五元组），跳过 probe_effort 调用，
+    直接复用传入的结果（并跳过"正在探测..."打印，因为调用方已在 run_connectivity_test
+    里打印过测试过程），避免对同一 supply 重复发起真实上游请求。
     """
-    print(f"正在探测 supply={supply.get('id')} protocol={supply.get('protocol')} "
-          f"model={supply.get('target_model')} ...")
-    status, text_fixed, regex_candidates, is_complete = probe_effort(supply)
-    print(f"HTTP status={status}")
+    if prefetched is not None:
+        # 被 connectivity_test_then_probe 串联调用：run_connectivity_test 已经打印过
+        # 结构化的「① 联通状态」一项，这里不再重复打印。
+        status, text_fixed, regex_candidates, is_complete, exc = prefetched
+    else:
+        print(f"正在探测 supply={supply.get('id')} protocol={supply.get('protocol')} "
+              f"model={supply.get('target_model')} ...")
+        status, text_fixed, regex_candidates, is_complete, exc = probe_effort(supply)
+
+    category, desc = classify_supply_reachability(status, text_fixed, exc)
+    if prefetched is None:
+        # 独立跑（无前置 run_connectivity_test）：补上「① 联通状态」一项，
+        # 保证独立调用和串联调用看到同样结构化的输出。
+        _print_connectivity_status(status, text_fixed, category, desc)
 
     a_success = bool(regex_candidates) and is_complete
 
@@ -238,44 +360,41 @@ def run_probe_and_maybe_accept(supply: dict, interactive_prompt: bool = True) ->
     source_desc = None
 
     if a_success:
-        print(f"探测命中，候选档位（请核对，可能含噪音): {regex_candidates}")
-        print(text_fixed[:500] + ("...(truncated)" if len(text_fixed) > 500 else ""))
+        print(f"- 从接口返回探测到的思考程度档位：成功，候选档位={regex_candidates}（请核对，可能含噪音）")
+        print(f"    {text_fixed}")
         candidates = regex_candidates
         source_desc = "网关探测"
     else:
-        if regex_candidates and not is_complete:
-            print(f"探测响应疑似被截断/不完整，候选可能不全: {regex_candidates}（不采纳，转查官方文档）")
-        doc_result = _llm_probe_official_doc(
-            supply.get("id", ""), supply.get("target_model", ""), supply.get("protocol", ""))
-        if doc_result is not None:
-            print(f"官方文档查询结果: supports_reasoning={doc_result.get('supports_reasoning')} "
-                  f"effort_enum={doc_result.get('effort_enum')} "
-                  f"confidence={doc_result.get('confidence')} "
-                  f"source_urls={doc_result.get('source_urls')}")
-            if regex_candidates:
-                print(f"（疑似截断，仅供交叉参考的探测候选: {regex_candidates}）")
-            candidates = doc_result.get("effort_enum")
-            source_desc = "官方文档查询，confidence=" + str(doc_result.get("confidence"))
+        if category != ReachabilityCategory.REACHABLE:
+            reason = f"连通性异常（{category}：{desc}），未能进行探测"
+        elif regex_candidates and not is_complete:
+            reason = f"响应疑似被截断，候选可能不全（不采纳，参考: {regex_candidates}）"
         else:
-            print("探测与文档查询均未得到结论，请人工核对官方文档后手动确认")
-            print(text_fixed[:500] + ("...(truncated)" if len(text_fixed) > 500 else ""))
-            candidates = None
-            source_desc = "无自动结论，人工判断"
+            reason = "探测正则不保证准确，供应商报错格式差异大，未提取到可信档位"
+        print(f"- 从接口返回探测到的思考程度档位：失败，{reason}")
+        print(f"    {text_fixed}")
+        candidates = None
+        source_desc = "探测无结论，请查官方文档后人工判断"
 
     if not interactive_prompt:
         print(f"（非交互模式，不自动写入，仅供参考，来源={source_desc}）")
         return None
 
-    # candidates 为 None（a/b 均无结论）时，仍进入人工输入环节——不能因为"探测不出"
+    # candidates 为 None（探测无结论）时，仍进入人工输入环节——不能因为"探测不出"
     # 就直接放弃，人工可能依据外部信息（官方文档/已知架构结论）判断出这个 supply
     # 真实支持的档位（包括显式空集，表示确认不支持任何档位）。留空表示"跳过，不写入"，
     # 与 candidates 非 None 时"留空=沿用候选"的语义不同，此处沿用候选无意义（候选为空）。
-    prompt_candidates_desc = f"候选档位={candidates}" if candidates is not None else "（无自动候选）"
-    edited = input(
-        f"来源={source_desc}，{prompt_candidates_desc}\n"
-        f"请核对/编辑要写入的档位列表（逗号分隔；输入 - 表示空列表/确认不支持任何档位；"
-        f"留空={'沿用上面候选' if candidates is not None else '跳过，不写入'}）: "
-    ).strip()
+    if candidates is not None:
+        edited = input(
+            f"- 请核对/编辑要写入的档位列表（来源=网关探测，逗号分隔；"
+            f"输入 - 表示空列表/确认不支持任何档位；留空=沿用上面候选 {candidates}）: "
+        ).strip()
+    else:
+        print("- 探测结果可信度有限，建议查看模型官方文档，确认支持的 reasoning effort 分档")
+        edited = input(
+            "    编辑要写入的档位列表（无自动候选，逗号分隔；"
+            "输入 - 表示确认不支持任何档位；留空=跳过，不写入）: "
+        ).strip()
     if edited == "-":
         final_enum = []
     elif edited:
@@ -286,10 +405,28 @@ def run_probe_and_maybe_accept(supply: dict, interactive_prompt: bool = True) ->
         print("已跳过，不写入 reasoning_capability。")
         return None
 
-    if confirm(f"接受并写入 reasoning_capability.effort_enum={final_enum}?"):
+    if confirm(f"- 接受并写入 reasoning_capability.effort_enum={final_enum}?"):
         return {"effort_enum": final_enum}
     print("已跳过，不写入 reasoning_capability。")
     return None
+
+
+def connectivity_test_then_probe(supply: dict) -> "tuple[str, str, dict | None]":
+    """连通性测试 + REACHABLE 时复用响应做 effort 探测确认。
+
+    只发一次上游请求（run_connectivity_test 内的 probe_effort 是唯一请求点）。
+    返回 (category, desc, rcap)：
+      - category/desc 来自 classify_supply_reachability，供调用方决定后续分支；
+      - rcap：REACHABLE 且用户接受写入时为 {"effort_enum":[...]}，否则 None。
+    非 REACHABLE 时不进入探测/写入环节，rcap 恒为 None。
+    """
+    result = run_connectivity_test(supply)
+    status, text_fixed, regex_candidates, is_complete, exc = result
+    category, desc = classify_supply_reachability(status, text_fixed, exc)
+    if category == ReachabilityCategory.REACHABLE:
+        rcap = run_probe_and_maybe_accept(supply, prefetched=result)
+        return category, desc, rcap
+    return category, desc, None
 
 
 # ---------------------------------------------------------------------------
@@ -326,9 +463,9 @@ def supply_add(path: str) -> None:
         err(f"supply id 已存在: {sid}")
         done(False); sys.exit(1)
 
-    surl = input("上游 URL: ").strip()
-    sproto = input("协议 [anthropic/chat/responses]: ").strip()
-    if sproto not in VALID_PROTOCOLS:
+    surl = input("完整终态端点 URL（如 https://aigc.sankuai.com/v1/anthropic/v1/messages，不是 base）: ").strip()
+    sproto = input("协议 [anthropic/chat/responses]（可选，留空则从 url 尾缀自动推断）: ").strip()
+    if sproto and sproto not in VALID_PROTOCOLS:
         err(f"协议非法: {sproto!r}（须为 {'/'.join(VALID_PROTOCOLS)}）")
         done(False); sys.exit(1)
     sappkey = input("Appkey: ").strip()
@@ -336,17 +473,31 @@ def supply_add(path: str) -> None:
     scooldown = input("冷却时长 cooldown_seconds (回车用全局默认): ").strip()
 
     entry: dict = {
-        "id": sid, "url": surl, "protocol": sproto,
+        "id": sid, "url": surl,
         "appkey": sappkey, "target_model": smodel,
     }
+    if sproto:
+        entry["protocol"] = sproto
     if scooldown:
         if not scooldown.isdigit() or int(scooldown) <= 0:
             err(f"cooldown_seconds 须为正整数: {scooldown!r}")
             done(False); sys.exit(1)
         entry["cooldown_seconds"] = int(scooldown)
 
-    # 同步探测（add 时无条件跑，用户在场即时决定接受/跳过）
-    rcap = run_probe_and_maybe_accept(entry)
+    # 保存前用唯一权威解析校验：protocol 留空时须能从 url 尾缀推断出来，否则拒绝保存。
+    try:
+        resolve_protocol(entry)
+    except ValueError as e:
+        err(str(e))
+        done(False); sys.exit(1)
+
+    # 连通性测试 + 同步探测（add 时无条件跑，用户在场即时决定接受/跳过）。
+    # REACHABLE 时复用同一次响应做档位解析，不再发第二次请求。
+    category, desc, rcap = connectivity_test_then_probe(entry)
+    if category != ReachabilityCategory.REACHABLE:
+        if not confirm(f"连通性测试未通过（{desc}），是否仍要保存该 supply？"):
+            print("已取消新增。")
+            done(False); sys.exit(1)
     if rcap:
         entry["reasoning_capability"] = rcap
 
@@ -375,9 +526,11 @@ def supply_edit(path: str, sid: str) -> None:
         raw = input(f"{label} [{shown}]: ").strip()
         return raw if raw else (current or "")
 
-    new_url = ask("url", "上游 URL", target.get("url", ""))
-    new_proto = ask("protocol", "协议 [anthropic/chat/responses]", target.get("protocol", ""))
-    if new_proto not in VALID_PROTOCOLS:
+    new_url = ask("url", "完整终态端点 URL（如 https://aigc.sankuai.com/v1/anthropic/v1/messages，不是 base）",
+                  target.get("url", ""))
+    new_proto = ask("protocol", "协议 [anthropic/chat/responses]（可选，留空则从 url 尾缀自动推断）",
+                     target.get("protocol", ""))
+    if new_proto and new_proto not in VALID_PROTOCOLS:
         err(f"协议非法: {new_proto!r}（须为 {'/'.join(VALID_PROTOCOLS)}）")
         done(False); sys.exit(1)
 
@@ -395,15 +548,28 @@ def supply_edit(path: str, sid: str) -> None:
             done(False); sys.exit(1)
 
     target["url"] = new_url
-    target["protocol"] = new_proto
+    if new_proto:
+        target["protocol"] = new_proto
+    else:
+        target.pop("protocol", None)  # 留空则不写入 protocol 键，运行时从 url 尾缀推断
     target["appkey"] = new_appkey
     target["target_model"] = new_model
     if raw_cd:
         target["cooldown_seconds"] = int(raw_cd)
 
-    # reasoning_capability 重新探测（可选）
+    # 保存前用唯一权威解析校验：protocol 留空时须能从 url 尾缀推断出来，否则拒绝保存。
+    try:
+        resolve_protocol(target)
+    except ValueError as e:
+        err(str(e))
+        done(False); sys.exit(1)
+
+    # reasoning_capability 重新探测（可选）：先跑连通性测试，REACHABLE 则复用响应做探测，
+    # 否则提示归因后跳过 rcap 写入（edit 自身有保存流程，不阻断整体 edit）。
     if confirm("reasoning_capability 重新探测?"):
-        rcap = run_probe_and_maybe_accept(target)
+        category, desc, rcap = connectivity_test_then_probe(target)
+        if category != ReachabilityCategory.REACHABLE:
+            print(f"连通性测试未通过（{desc}），跳过 reasoning_capability 探测。")
         if rcap:
             target["reasoning_capability"] = rcap
 
@@ -412,14 +578,21 @@ def supply_edit(path: str, sid: str) -> None:
     done(True)
 
 
-def supply_probe(path: str, sid: str) -> None:
-    """轻量子命令：只跑探测步骤，按 add/edit 同样规则回写（供批量补探）。"""
+def supply_check(path: str, sid: str) -> None:
+    """连通性测试 + REACHABLE 则继续 effort 探测确认，接受则写入 reasoning_capability。
+    整合原 supply-test（只读连通性）与 supply-probe（探测写入）为单一交互入口，
+    全流程只发一次上游请求。
+    """
     cfg = load_config(path)
     target = _find_supply(cfg, sid)
     if target is None:
         err(f"supply id 不存在: {sid}")
         done(False); sys.exit(1)
-    rcap = run_probe_and_maybe_accept(target)
+    category, desc, rcap = connectivity_test_then_probe(target)
+    if category != ReachabilityCategory.REACHABLE:
+        print("连通性测试未通过，跳过 effort 探测。")
+        done(False)
+        return
     if rcap:
         target["reasoning_capability"] = rcap
         atomic_write(path, cfg)
@@ -480,6 +653,11 @@ def _find_route(cfg: dict, rid: str) -> dict | None:
     return None
 
 
+def _split_supply_ids(raw: str) -> list[str]:
+    """逗号分隔解析，与 route_list 的展示格式（`",".join(...)`）保持一致。"""
+    return [w.strip() for w in raw.split(",") if w.strip()]
+
+
 def route_add(path: str) -> None:
     cfg = load_config(path)
     routes = cfg.setdefault("routes", [])
@@ -493,9 +671,9 @@ def route_add(path: str) -> None:
         err(f"route id 已存在: {rid}")
         done(False); sys.exit(1)
 
-    ropus = input("Opus 档 supplies (空格分隔, 按优先级排序): ").split()
-    rsonnet = input("Sonnet 档 supplies (空格分隔, 按优先级排序): ").split()
-    rhaiku = input("Haiku 档 supplies (空格分隔, 按优先级排序): ").split()
+    ropus = _split_supply_ids(input("Opus 档 supplies (逗号分隔, 按优先级排序): "))
+    rsonnet = _split_supply_ids(input("Sonnet 档 supplies (逗号分隔, 按优先级排序): "))
+    rhaiku = _split_supply_ids(input("Haiku 档 supplies (逗号分隔, 按优先级排序): "))
     rfailover = input("Failover [on/off]: ").strip()
 
     if rfailover not in VALID_FAILOVER:
@@ -528,8 +706,10 @@ def route_edit(path: str, rid: str) -> None:
     new_tiers = {}
     for tier_name in TIER_NAMES:
         cur = tiers.get(tier_name, [])
-        raw = input(f"{tier_name.capitalize()} 档 supplies [{' '.join(cur)}]: ").strip()
-        new_tiers[tier_name] = raw.split() if raw else cur
+        raw = input(
+            f"{tier_name.capitalize()} 档 supplies (逗号分隔) [{','.join(cur)}]: "
+        ).strip()
+        new_tiers[tier_name] = _split_supply_ids(raw) if raw else cur
 
     bad = [x for x in sum(new_tiers.values(), []) if x not in known_supplies]
     if bad:
@@ -610,9 +790,18 @@ def strategy_add(path: str) -> None:
     if srid not in known_routes:
         err(f"route id 不存在: {srid}")
         done(False); sys.exit(1)
+
+    print("录入 tiers_source_capability（source 侧能力，逐 tier 询问）:")
+    stiers_cap = prompt_source_capability()
+
     snote = input("Note (可选备注): ").strip()
 
-    strategies.append({"client_token": stoken, "route_id": srid, "note": snote})
+    entry: dict = {"client_token": stoken, "route_id": srid}
+    if stiers_cap is not None:
+        entry["tiers_source_capability"] = stiers_cap
+    entry["note"] = snote
+
+    strategies.append(entry)
     atomic_write(path, cfg)
     print(f"Added strategy: {stoken} -> {srid}")
     done(True)
@@ -632,6 +821,13 @@ def strategy_edit(path: str, token: str) -> None:
     if new_rid not in known_routes:
         err(f"route id 不存在: {new_rid}")
         done(False); sys.exit(1)
+
+    if confirm("重新录入 tiers_source_capability?"):
+        new_tiers_cap = prompt_source_capability(target.get("tiers_source_capability"))
+        if new_tiers_cap is not None:
+            target["tiers_source_capability"] = new_tiers_cap
+        else:
+            target.pop("tiers_source_capability", None)
 
     cur_note = target.get("note", "") or ""
     raw_note = input(f"Note [{cur_note}]: ").strip()
@@ -691,7 +887,7 @@ _DISPATCH = {
     "supply-add": (supply_add, 0),
     "supply-edit": (supply_edit, 1),
     "supply-del": (supply_del, 1),
-    "supply-probe": (supply_probe, 1),
+    "supply-check": (supply_check, 1),
     "route-list": (route_list, 0),
     "route-add": (route_add, 0),
     "route-edit": (route_edit, 1),
@@ -729,6 +925,13 @@ def main() -> None:
     except (json.JSONDecodeError, ValueError) as e:
         err(f"config 解析失败: {e}")
         sys.exit(1)
+    except KeyboardInterrupt:
+        # 交互过程中 Ctrl-C：静默退出，不吐 traceback；不写配置，等价用户主动取消。
+        # 退出码用 130（== 128+SIGINT，shell 生态里"进程被中断"的惯例值），
+        # 供 model_proxy_cli.sh 的菜单循环识别并整体退出，而不是继续问下一轮操作。
+        print("\n已取消。")
+        done(False)
+        sys.exit(130)
 
 
 if __name__ == "__main__":
