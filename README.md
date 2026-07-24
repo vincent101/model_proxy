@@ -9,8 +9,8 @@ created: 2026-07-17 18:52:18
 `/v1/messages`）、codex-cli（OpenAI Responses `/v1/responses`）等多个 SDK 接入，并可跨协议
 互相访问对方生态的模型——例如在 Claude Code 里实际调用 GPT，在 codex 里实际调用 Claude。
 
-与 `tools/proxy.py`（纯 Anthropic 生态的 appkey/profile 轮转代理，端口 18888，Claude Code
-单一协议生产运行）完全独立并行，互不依赖、互不干扰，可同时保留。
+v1（`tools/proxy.py`，端口 18888）已于 2026-07-24 下线，代码归档于
+`tools/model_proxy/history_versions/proxy-v1-archived-20260724.tar.gz`。
 
 ## 2. Quick Start
 
@@ -333,15 +333,15 @@ MODEL_PROXY_PORT=18889 python3 tools/model_proxy/model_proxy.py &
 
 `tools/model_proxy/hooker/ensure_model_proxy.sh` 已注册到 `.claude/settings.json` 的
 `hooks.SessionStart`，随 Claude Code 会话启动自动拉起（幂等：已运行则直接退出，未运行则启动
-并等待就绪最多 5 秒；PID 文件 `/tmp/claude_model_proxy.pid`、锁 `/tmp/claude_model_proxy_start.lock`，
-与 v1 代理（18888）的同类文件互相独立不冲突）。这条 hook 的路径正确性由 `install` 流程负责
+并等待就绪最多 5 秒；PID 文件 `/tmp/claude_model_proxy.pid`、锁 `/tmp/claude_model_proxy_start.lock`）。
+v1 代理（18888）已于 2026-07-24 下线归档，不再涉及并行关系。这条 hook 的路径正确性由 `install` 流程负责
 维护——`install` 每次运行都会检测 `SessionStart` 里是否存在一条正确指向当前 model_proxy 实际
 安装位置的 hook 条目，缺失/路径错误（如目录被移动过）时清理旧条目并预览确认后补齐，不需要
 手动同步维护这条硬编码路径。
 
 停止用 `model_proxy_cli.sh off`：只按本脚本同目录下 `model_proxy.py` 的绝对路径精确匹配进程，
-并额外反查监听该端口、命令行含 `model_proxy.py` 的 PID 兜底，不会影响 v1 的 `tools/proxy.py`
-（18888 生产进程）。
+并额外反查监听该端口、命令行含 `model_proxy.py` 的 PID 兜底（v1 代理已于 2026-07-24 下线归档，
+不再存在该进程）。
 
 ### 5.2 日志与观测
 
@@ -398,7 +398,7 @@ model_proxy_cli.sh strategy                          # 打印 list 后进入交�
 model_proxy_cli.sh switch <client_token> <route_id>  # 切换某 token 绑定的 route 家族（改 route_id 后 reload）
 model_proxy_cli.sh install                           # 交互式列出四个 SDK + 本机检测状态，选择安装
 model_proxy_cli.sh on                                # 启动 model_proxy.py（已在监听则跳过）
-model_proxy_cli.sh off                               # 停止 model_proxy.py（严格按脚本绝对路径匹配，不影响 v1 的 proxy.py）
+model_proxy_cli.sh off                               # 停止 model_proxy.py（严格按脚本绝对路径匹配进程）
 
 model_proxy_cli.sh logs [N]                          # 显示最近 N 条 ACCESS 访问日志（默认 30 条）
 model_proxy_cli.sh stats [时间] [维度/过滤...]        # 读独立累计账本，按 supply/route/strategy 任意
