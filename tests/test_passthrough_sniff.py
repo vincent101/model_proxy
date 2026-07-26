@@ -39,7 +39,7 @@ class _FakeUpstreamResp:
 def _make_handler():
     h = ModelProxyHandler.__new__(ModelProxyHandler)
     h.wfile = io.BytesIO()
-    h._acc = {"status": 0, "usage_in": 0, "usage_out": 0, "usage_reasoning": 0}
+    h._acc = {"status": 0, "usage_in": 0, "usage_out": 0}
     h.send_response = lambda status: None
     h.send_header = lambda k, v: None
     h.end_headers = lambda: None
@@ -69,7 +69,6 @@ class TestSniffPassthroughUsageUnit(unittest.TestCase):
         h._sniff_passthrough_usage(block, "anthropic")
         self.assertEqual(h._acc["usage_in"], 16)
         self.assertEqual(h._acc["usage_out"], 50)
-        self.assertEqual(h._acc["usage_reasoning"], 0)
 
     def test_anthropic_non_target_block_prefiltered_noop(self):
         h = _make_handler()
@@ -87,7 +86,6 @@ class TestSniffPassthroughUsageUnit(unittest.TestCase):
         h._sniff_passthrough_usage(block, "responses")
         self.assertEqual(h._acc["usage_in"], 17)
         self.assertEqual(h._acc["usage_out"], 41)
-        self.assertEqual(h._acc["usage_reasoning"], 33)
 
     def test_responses_non_target_block_prefiltered_noop(self):
         h = _make_handler()
@@ -102,7 +100,6 @@ class TestSniffPassthroughUsageUnit(unittest.TestCase):
         h._sniff_passthrough_usage(block, "responses")
         self.assertEqual(h._acc["usage_in"], 0)
         self.assertEqual(h._acc["usage_out"], 0)
-        self.assertEqual(h._acc["usage_reasoning"], 0)
 
     def test_malformed_json_does_not_raise(self):
         h = _make_handler()
@@ -142,7 +139,6 @@ class TestWriteStreamingResponseCrossChunk(unittest.TestCase):
         h._write_streaming_response(200, [], resp, "responses")
         self.assertEqual(h._acc["usage_in"], 17)
         self.assertEqual(h._acc["usage_out"], 41)
-        self.assertEqual(h._acc["usage_reasoning"], 33)
         self.assertEqual(_decode_chunked(h.wfile.getvalue()), sse)
 
     def test_split_exactly_inside_double_newline_separator(self):

@@ -24,11 +24,10 @@ from core.server import (  # noqa: E402
 
 
 def _acc(supply="s1", route="r1", strategy="cc", status=200,
-         usage_in=10, usage_out=20, usage_reasoning=1):
+         usage_in=10, usage_out=20):
     return {
         "supply": supply, "route": route, "strategy": strategy,
         "status": status, "usage_in": usage_in, "usage_out": usage_out,
-        "usage_reasoning": usage_reasoning,
     }
 
 
@@ -179,10 +178,10 @@ class TestArchiveBoundary(unittest.TestCase):
     def tearDown(self):
         self._tmpdir.cleanup()
 
-    def _combo(self, requests, ok, fail, usage_in, usage_out, usage_reasoning):
+    def _combo(self, requests, ok, fail, usage_in, usage_out):
         return {
             "requests": requests, "ok": ok, "fail": fail,
-            "usage_in": usage_in, "usage_out": usage_out, "usage_reasoning": usage_reasoning,
+            "usage_in": usage_in, "usage_out": usage_out,
         }
 
     def test_archive_moves_oldest_day_and_preserves_totals(self):
@@ -192,20 +191,20 @@ class TestArchiveBoundary(unittest.TestCase):
             "2025-01-01": {
                 "requests": 2, "ok": 2, "fail": 0, "sum_ms": 300,
                 "combos": {
-                    "supply=s1|route=r1|strategy=cc": self._combo(2, 2, 0, 20, 40, 2),
+                    "supply=s1|route=r1|strategy=cc": self._combo(2, 2, 0, 20, 40),
                 },
             },
             "2025-01-02": {
                 "requests": 3, "ok": 2, "fail": 1, "sum_ms": 450,
                 "combos": {
-                    "supply=s1|route=r1|strategy=cc": self._combo(2, 2, 0, 20, 40, 2),
-                    "supply=s2|route=r1|strategy=codex": self._combo(1, 0, 1, 5, 5, 0),
+                    "supply=s1|route=r1|strategy=cc": self._combo(2, 2, 0, 20, 40),
+                    "supply=s2|route=r1|strategy=codex": self._combo(1, 0, 1, 5, 5),
                 },
             },
             "2025-02-01": {
                 "requests": 1, "ok": 1, "fail": 0, "sum_ms": 100,
                 "combos": {
-                    "supply=s1|route=r1|strategy=cc": self._combo(1, 1, 0, 10, 20, 1),
+                    "supply=s1|route=r1|strategy=cc": self._combo(1, 1, 0, 10, 20),
                 },
             },
         }
@@ -249,15 +248,15 @@ class TestArchiveBoundary(unittest.TestCase):
         store._data["days"] = {
             "2025-03-01": {
                 "requests": 1, "ok": 1, "fail": 0, "sum_ms": 10,
-                "combos": {"supply=s1|route=r1|strategy=cc": self._combo(1, 1, 0, 1, 1, 0)},
+                "combos": {"supply=s1|route=r1|strategy=cc": self._combo(1, 1, 0, 1, 1)},
             },
             "2025-03-02": {
                 "requests": 1, "ok": 1, "fail": 0, "sum_ms": 10,
-                "combos": {"supply=s1|route=r1|strategy=cc": self._combo(1, 1, 0, 1, 1, 0)},
+                "combos": {"supply=s1|route=r1|strategy=cc": self._combo(1, 1, 0, 1, 1)},
             },
             "2025-03-03": {
                 "requests": 1, "ok": 1, "fail": 0, "sum_ms": 10,
-                "combos": {"supply=s1|route=r1|strategy=cc": self._combo(1, 1, 0, 1, 1, 0)},
+                "combos": {"supply=s1|route=r1|strategy=cc": self._combo(1, 1, 0, 1, 1)},
             },
         }
         self._archive_with_keep_days(store, keep_days=1)
@@ -277,11 +276,11 @@ class TestComboProjectionFilterLogic(unittest.TestCase):
     def _combos(self):
         return {
             "supply=s1|route=claude|strategy=cc": {
-                "requests": 3, "ok": 3, "fail": 0, "usage_in": 30, "usage_out": 60, "usage_reasoning": 3},
+                "requests": 3, "ok": 3, "fail": 0, "usage_in": 30, "usage_out": 60},
             "supply=s2|route=claude|strategy=cc": {
-                "requests": 2, "ok": 1, "fail": 1, "usage_in": 20, "usage_out": 40, "usage_reasoning": 2},
+                "requests": 2, "ok": 1, "fail": 1, "usage_in": 20, "usage_out": 40},
             "supply=s3|route=openai|strategy=codex": {
-                "requests": 5, "ok": 5, "fail": 0, "usage_in": 50, "usage_out": 100, "usage_reasoning": 5},
+                "requests": 5, "ok": 5, "fail": 0, "usage_in": 50, "usage_out": 100},
         }
 
     @staticmethod
@@ -296,8 +295,8 @@ class TestComboProjectionFilterLogic(unittest.TestCase):
                 continue
             gkey = dims.get(proj) if proj else "(all)"
             g = groups.setdefault(gkey, {"requests": 0, "ok": 0, "fail": 0,
-                                          "usage_in": 0, "usage_out": 0, "usage_reasoning": 0})
-            for f in ("requests", "ok", "fail", "usage_in", "usage_out", "usage_reasoning"):
+                                          "usage_in": 0, "usage_out": 0})
+            for f in ("requests", "ok", "fail", "usage_in", "usage_out"):
                 g[f] += v[f]
         return groups
 
@@ -344,7 +343,7 @@ class TestGetMonthBucketSplitArchive(unittest.TestCase):
 
     @staticmethod
     def _zero_combo():
-        return {"requests": 0, "ok": 0, "fail": 0, "usage_in": 0, "usage_out": 0, "usage_reasoning": 0}
+        return {"requests": 0, "ok": 0, "fail": 0, "usage_in": 0, "usage_out": 0}
 
     def _merge_bucket_into(self, dst, src):
         dst["requests"] += src.get("requests", 0)
@@ -353,7 +352,7 @@ class TestGetMonthBucketSplitArchive(unittest.TestCase):
         dst["sum_ms"] += src.get("sum_ms", 0)
         for key, v in src.get("combos", {}).items():
             combo = dst["combos"].setdefault(key, self._zero_combo())
-            for f in ("requests", "ok", "fail", "usage_in", "usage_out", "usage_reasoning"):
+            for f in ("requests", "ok", "fail", "usage_in", "usage_out"):
                 combo[f] += v.get(f, 0)
 
     def _get_month_bucket(self, data, month_key):
@@ -375,7 +374,7 @@ class TestGetMonthBucketSplitArchive(unittest.TestCase):
                     "requests": 1, "ok": 1, "fail": 0, "sum_ms": 100,
                     "combos": {"supply=s1|route=r1|strategy=cc":
                                {"requests": 1, "ok": 1, "fail": 0,
-                                "usage_in": 10, "usage_out": 20, "usage_reasoning": 1}},
+                                "usage_in": 10, "usage_out": 20}},
                 }
             },
             "days": {
@@ -383,7 +382,7 @@ class TestGetMonthBucketSplitArchive(unittest.TestCase):
                     "requests": 1, "ok": 1, "fail": 0, "sum_ms": 50,
                     "combos": {"supply=s1|route=r1|strategy=cc":
                                {"requests": 1, "ok": 1, "fail": 0,
-                                "usage_in": 5, "usage_out": 10, "usage_reasoning": 0}},
+                                "usage_in": 5, "usage_out": 10}},
                 }
             },
         }
@@ -404,7 +403,7 @@ class TestGetMonthBucketSplitArchive(unittest.TestCase):
                     "requests": 5, "ok": 5, "fail": 0, "sum_ms": 500,
                     "combos": {"supply=s1|route=r1|strategy=cc":
                                {"requests": 5, "ok": 5, "fail": 0,
-                                "usage_in": 50, "usage_out": 100, "usage_reasoning": 5}},
+                                "usage_in": 50, "usage_out": 100}},
                 }
             },
             "days": {
@@ -427,13 +426,13 @@ class TestGetMonthBucketSplitArchive(unittest.TestCase):
                     "requests": 2, "ok": 2, "fail": 0, "sum_ms": 20,
                     "combos": {"supply=s1|route=r1|strategy=cc":
                                {"requests": 2, "ok": 2, "fail": 0,
-                                "usage_in": 20, "usage_out": 40, "usage_reasoning": 2}},
+                                "usage_in": 20, "usage_out": 40}},
                 },
                 "2026-08-02": {
                     "requests": 1, "ok": 0, "fail": 1, "sum_ms": 5,
                     "combos": {"supply=s2|route=r1|strategy=codex":
                                {"requests": 1, "ok": 0, "fail": 1,
-                                "usage_in": 3, "usage_out": 3, "usage_reasoning": 0}},
+                                "usage_in": 3, "usage_out": 3}},
                 },
             },
         }
@@ -456,12 +455,12 @@ class TestGetMonthBucketSplitArchive(unittest.TestCase):
         batch1 = {
             "requests": 1, "ok": 1, "fail": 0, "sum_ms": 10,
             "combos": {"supply=s1|route=r1|strategy=cc":
-                       {"requests": 1, "ok": 1, "fail": 0, "usage_in": 1, "usage_out": 1, "usage_reasoning": 0}},
+                       {"requests": 1, "ok": 1, "fail": 0, "usage_in": 1, "usage_out": 1}},
         }
         batch2 = {
             "requests": 1, "ok": 1, "fail": 0, "sum_ms": 10,
             "combos": {"supply=s1|route=r1|strategy=cc":
-                       {"requests": 1, "ok": 1, "fail": 0, "usage_in": 1, "usage_out": 1, "usage_reasoning": 0}},
+                       {"requests": 1, "ok": 1, "fail": 0, "usage_in": 1, "usage_out": 1}},
         }
         self._merge_bucket_into(month_bucket, batch1)
         self._merge_bucket_into(month_bucket, batch2)
@@ -471,7 +470,7 @@ class TestGetMonthBucketSplitArchive(unittest.TestCase):
                 "2026-07-20": {
                     "requests": 1, "ok": 1, "fail": 0, "sum_ms": 10,
                     "combos": {"supply=s1|route=r1|strategy=cc":
-                               {"requests": 1, "ok": 1, "fail": 0, "usage_in": 1, "usage_out": 1, "usage_reasoning": 0}},
+                               {"requests": 1, "ok": 1, "fail": 0, "usage_in": 1, "usage_out": 1}},
                 }
             },
         }
@@ -487,16 +486,16 @@ class TestGetMonthBucketSplitArchive(unittest.TestCase):
                 "2026-07": {
                     "requests": 1, "ok": 1, "fail": 0, "sum_ms": 10,
                     "combos": {"supply=s1|route=claude|strategy=cc":
-                               {"requests": 1, "ok": 1, "fail": 0, "usage_in": 1, "usage_out": 1, "usage_reasoning": 0}},
+                               {"requests": 1, "ok": 1, "fail": 0, "usage_in": 1, "usage_out": 1}},
                 }
             },
             "days": {
                 "2026-07-15": {
                     "requests": 2, "ok": 2, "fail": 0, "sum_ms": 10,
                     "combos": {"supply=s1|route=claude|strategy=cc":
-                               {"requests": 1, "ok": 1, "fail": 0, "usage_in": 1, "usage_out": 1, "usage_reasoning": 0},
+                               {"requests": 1, "ok": 1, "fail": 0, "usage_in": 1, "usage_out": 1},
                                "supply=s2|route=claude|strategy=cc":
-                               {"requests": 1, "ok": 1, "fail": 0, "usage_in": 1, "usage_out": 1, "usage_reasoning": 0}},
+                               {"requests": 1, "ok": 1, "fail": 0, "usage_in": 1, "usage_out": 1}},
                 }
             },
         }

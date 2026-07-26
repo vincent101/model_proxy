@@ -398,7 +398,7 @@ from datetime import datetime, timedelta, timezone
 
 CST = timezone(timedelta(hours=8))
 DIMS = ("supply", "route", "strategy")
-VAL_FIELDS = ("requests", "ok", "fail", "usage_in", "usage_out", "usage_reasoning")
+VAL_FIELDS = ("requests", "ok", "fail", "usage_in", "usage_out")
 
 
 def zero_bucket():
@@ -533,8 +533,8 @@ def main():
         period_ok = filtered_total["ok"]
         period_fail = filtered_total["fail"]
         avg_ms_str = "n/a（有过滤条件，账本不存组合键粒度 sum_ms）"
-        usage_in, usage_out, usage_reasoning = (
-            filtered_total["usage_in"], filtered_total["usage_out"], filtered_total["usage_reasoning"])
+        usage_in, usage_out = (
+            filtered_total["usage_in"], filtered_total["usage_out"])
     else:
         period_requests = bucket.get("requests", 0)
         period_ok = bucket.get("ok", 0)
@@ -543,12 +543,11 @@ def main():
         avg_ms_str = f"{sum_ms / period_requests:.1f}" if period_requests else "0"
         all_groups = aggregate(None)
         filtered_total = all_groups.get("(all)", zero_group())
-        usage_in, usage_out, usage_reasoning = (
-            filtered_total["usage_in"], filtered_total["usage_out"], filtered_total["usage_reasoning"])
+        usage_in, usage_out = (
+            filtered_total["usage_in"], filtered_total["usage_out"])
 
     print(f"period: {label}   requests={period_requests}  ok={period_ok}  fail={period_fail}  "
-          f"avg_ms={avg_ms_str}  usage_in={fmt_k(usage_in)} usage_out={fmt_k(usage_out)} "
-          f"usage_reasoning={fmt_k(usage_reasoning)}")
+          f"avg_ms={avg_ms_str}  usage_in={fmt_k(usage_in)} usage_out={fmt_k(usage_out)}")
     if filters:
         filt_desc = " ".join(f"{k}={v}" for k, v in filters.items())
         print(f"filters: {filt_desc}")
@@ -560,7 +559,7 @@ def main():
             return
         for gkey, g in sorted(groups.items(), key=lambda kv: -kv[1]["requests"]):
             print(f"  {gkey:32} requests={g['requests']:<6} ok={g['ok']:<6} fail={g['fail']:<4} "
-                  f"in={fmt_k(g['usage_in'])} out={fmt_k(g['usage_out'])} reasoning={fmt_k(g['usage_reasoning'])}")
+                  f"in={fmt_k(g['usage_in'])} out={fmt_k(g['usage_out'])}")
 
     if proj:
         print(f"by {proj}:")

@@ -113,7 +113,7 @@ def _zero_bucket() -> dict:
 
 def _zero_combo() -> dict:
     """combos 单条目的零值结构（不存 sum_ms，见方案 §1）。"""
-    return {"requests": 0, "ok": 0, "fail": 0, "usage_in": 0, "usage_out": 0, "usage_reasoning": 0}
+    return {"requests": 0, "ok": 0, "fail": 0, "usage_in": 0, "usage_out": 0}
 
 
 class UsageTotalsStore:
@@ -178,7 +178,6 @@ class UsageTotalsStore:
             fail = 0 if ok else 1
             usage_in = acc.get("usage_in", 0) or 0
             usage_out = acc.get("usage_out", 0) or 0
-            usage_reasoning = acc.get("usage_reasoning", 0) or 0
 
             for bucket in (day_bucket, total_bucket):
                 bucket["requests"] += 1
@@ -191,7 +190,6 @@ class UsageTotalsStore:
                 combo["fail"] += fail
                 combo["usage_in"] += usage_in
                 combo["usage_out"] += usage_out
-                combo["usage_reasoning"] += usage_reasoning
 
             self._archive_if_needed()
             _atomic_write_json(self._path, self._data)
@@ -219,7 +217,6 @@ class UsageTotalsStore:
                 dest["fail"] += combo_val.get("fail", 0)
                 dest["usage_in"] += combo_val.get("usage_in", 0)
                 dest["usage_out"] += combo_val.get("usage_out", 0)
-                dest["usage_reasoning"] += combo_val.get("usage_reasoning", 0)
 
 
 usage_totals = UsageTotalsStore(TOTALS_FILE)
@@ -825,7 +822,7 @@ class ModelProxyHandler(BaseHTTPRequestHandler):
         self._acc = {
             "status": 0, "source": "", "route": "", "tier": "",
             "supply": "", "failover": 0, "attempts": 0, "token": "",
-            "usage_in": 0, "usage_out": 0, "usage_reasoning": 0,
+            "usage_in": 0, "usage_out": 0,
             "strategy": "",
         }
         t0 = time.monotonic()
@@ -836,10 +833,10 @@ class ModelProxyHandler(BaseHTTPRequestHandler):
             ms = int((time.monotonic() - t0) * 1000)
             access_log.info(
                 "ACCESS ms=%d status=%s source=%s route=%s tier=%s supply=%s "
-                "failover=%s attempts=%s usage_in=%s usage_out=%s usage_reasoning=%s token=%s",
+                "failover=%s attempts=%s usage_in=%s usage_out=%s token=%s",
                 ms, a["status"], a["source"],
                 a["route"], a["tier"], a["supply"], a["failover"], a["attempts"],
-                a["usage_in"], a["usage_out"], a["usage_reasoning"], a["token"])
+                a["usage_in"], a["usage_out"], a["token"])
             try:
                 usage_totals.record(a, ms)
             except Exception:
@@ -1173,7 +1170,6 @@ class ModelProxyHandler(BaseHTTPRequestHandler):
                             "input_tokens", _pu.get("prompt_tokens", 0)) or 0
                         self._acc["usage_out"] = _pu.get(
                             "output_tokens", _pu.get("completion_tokens", 0)) or 0
-                        self._acc["usage_reasoning"] = pt._extract_reasoning_tokens(_pu)
                     except Exception:
                         pass   # 解析失败不影响透传主流程，usage 记 0
                     self._write_buffered_response(
@@ -1186,8 +1182,7 @@ class ModelProxyHandler(BaseHTTPRequestHandler):
                 if is_stream:
                     adapter = pt.OpenAIToAnthropicStreamAdapter(fwd_ctx, target_model or "")
                     self._write_translated_stream(resp, adapter)
-                    (self._acc["usage_in"], self._acc["usage_out"],
-                     self._acc["usage_reasoning"]) = adapter.usage_tuple()
+                    (self._acc["usage_in"], self._acc["usage_out"], _) = adapter.usage_tuple()
                 else:
                     try:
                         raw_resp_body = resp.read()
@@ -1206,8 +1201,6 @@ class ModelProxyHandler(BaseHTTPRequestHandler):
                     _u = anthropic_resp.get("usage") or {}
                     self._acc["usage_in"] = _u.get("input_tokens", 0)
                     self._acc["usage_out"] = _u.get("output_tokens", 0)
-                    self._acc["usage_reasoning"] = (
-                        _u.get("output_tokens_details") or {}).get("reasoning_tokens", 0)
                     self._write_buffered_response(
                         200, [("Content-Type", "application/json")],
                         json.dumps(anthropic_resp, ensure_ascii=False).encode("utf-8"))
@@ -1218,8 +1211,7 @@ class ModelProxyHandler(BaseHTTPRequestHandler):
                 if is_stream:
                     adapter = pt.ResponsesToAnthropicStreamAdapter(fwd_ctx, target_model or "")
                     self._write_translated_stream_from_responses(resp, adapter)
-                    (self._acc["usage_in"], self._acc["usage_out"],
-                     self._acc["usage_reasoning"]) = adapter.usage_tuple()
+                    (self._acc["usage_in"], self._acc["usage_out"], _) = adapter.usage_tuple()
                 else:
                     try:
                         raw_resp_body = resp.read()
@@ -1239,8 +1231,6 @@ class ModelProxyHandler(BaseHTTPRequestHandler):
                     _u = anthropic_resp.get("usage") or {}
                     self._acc["usage_in"] = _u.get("input_tokens", 0)
                     self._acc["usage_out"] = _u.get("output_tokens", 0)
-                    self._acc["usage_reasoning"] = (
-                        _u.get("output_tokens_details") or {}).get("reasoning_tokens", 0)
                     self._write_buffered_response(
                         200, [("Content-Type", "application/json")],
                         json.dumps(anthropic_resp, ensure_ascii=False).encode("utf-8"))
@@ -1254,8 +1244,7 @@ class ModelProxyHandler(BaseHTTPRequestHandler):
                     model=target_model or "",
                     ctx={"tools": _tools_echo, "reasoning_effort": _r_effort})
                 self._write_responses_stream(resp, adapter)
-                (self._acc["usage_in"], self._acc["usage_out"],
-                 self._acc["usage_reasoning"]) = adapter.usage_tuple()
+                (self._acc["usage_in"], self._acc["usage_out"], _) = adapter.usage_tuple()
             else:
                 try:
                     raw_resp_body = resp.read()
@@ -1276,8 +1265,6 @@ class ModelProxyHandler(BaseHTTPRequestHandler):
                 _u = responses_resp.get("usage") or {}
                 self._acc["usage_in"] = _u.get("input_tokens", 0)
                 self._acc["usage_out"] = _u.get("output_tokens", 0)
-                self._acc["usage_reasoning"] = (
-                    _u.get("output_tokens_details") or {}).get("reasoning_tokens", 0)
                 self._write_buffered_response(
                     200, [("Content-Type", "application/json")],
                     json.dumps(responses_resp, ensure_ascii=False).encode("utf-8"))
@@ -1627,9 +1614,6 @@ class ModelProxyHandler(BaseHTTPRequestHandler):
                 self._acc["usage_out"] = u.get("output_tokens") or 0
             if u.get("input_tokens") is not None:
                 self._acc["usage_in"] = u.get("input_tokens") or 0
-            r = pt._extract_reasoning_tokens(u)         # 复用 translate.py，兼容 thinking_tokens 别名
-            if r:
-                self._acc["usage_reasoning"] = r
         elif source == "responses":
             if b"response.completed" not in block:      # 字节预筛
                 return
@@ -1639,7 +1623,6 @@ class ModelProxyHandler(BaseHTTPRequestHandler):
             u = (data.get("response") or {}).get("usage") or {}
             self._acc["usage_in"] = u.get("input_tokens", 0) or 0
             self._acc["usage_out"] = u.get("output_tokens", 0) or 0
-            self._acc["usage_reasoning"] = pt._extract_reasoning_tokens(u)
 
     @staticmethod
     def _parse_anthropic_sse_block(block: bytes):

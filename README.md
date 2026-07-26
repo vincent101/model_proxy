@@ -348,13 +348,16 @@ v1 代理（18888）已于 2026-07-24 下线归档，不再涉及并行关系。
 日志除 WARNING 级别（异常/降级路径，如 no route、cooldown+failover、stream interrupted 等）外，
 还有一条 INFO 级别的 `ACCESS` 访问日志：每个转发请求（不含 `/model_proxy/*` 控制端点）结束时
 记一条，覆盖整个请求生命周期，字段为
-`ms status source route tier supply failover attempts usage_in usage_out usage_reasoning token`
+`ms status source route tier supply failover attempts usage_in usage_out token`
 （`ms` 为端到端耗时毫秒，`token` 为客户端 token 尾4位）。两者共用同一文件，用固定前缀 `ACCESS`
 区分。
 
 token 用量统计：转换模式（Anthropic↔Chat/Responses，流式+非流式）、PASSTHROUGH 非流式、
 以及 PASSTHROUGH 流式（anthropic→anthropic、responses→responses 的流式请求）均会提取
-`usage_in`/`usage_out`/`usage_reasoning` 填入 access 行。PASSTHROUGH 流式采用「转发在前、
+`usage_in`/`usage_out` 填入 access 行。reasoning token 不再单独统计（原因见下）——协议转换时
+仍如实把上游 reasoning 明细透传给下游消费者（`core/translate.py` 的 `_extract_reasoning_tokens()`
+与各 adapter 的 `usage_tuple()` 未变），只是代理自身的统计观测链路不再追踪这一维度，详见
+`docs/solutionDesigns/2026-07-24-model-proxy-reasoning统计移除安全上线.md`。PASSTHROUGH 流式采用「转发在前、
 旁路嗅探在后」策略（`_write_streaming_response` 转发 chunk 后累积进本地 buffer，按 `\n\n`
 切出完整 SSE 事件块，从 anthropic 的 `message_delta` 或 responses 的 `response.completed`
 事件里覆盖式提取 usage），不改变、不阻塞原有转发时序，异常整体隔离不影响透传正确性。
@@ -365,7 +368,7 @@ token 用量统计：转换模式（Anthropic↔Chat/Responses，流式+非流�
 `.claude_model_proxy_totals.json`（与日志文件同目录），每请求在 `_forward_logged` 收口处同步累加、
 原子写盘：按天分桶，桶内以 `supply×route×strategy` 组合键（形如
 `supply=<s>|route=<r>|strategy=<t>`，strategy 段是 client_token 明文如 `cc`/`codex`）累加
-`requests`/`ok`/`fail`/`usage_in`/`usage_out`/`usage_reasoning`，另存 `total` 全历史汇总。账本
+`requests`/`ok`/`fail`/`usage_in`/`usage_out`，另存 `total` 全历史汇总。账本
 **只增不截**，不受进程重启与日志截断影响。天分桶只保留最近 `KEEP_DAYS=400` 天，超窗旧天桶汇总进
 `months_archive` 月归档节点（永久保留）。天/月边界固定按 UTC+8 划分（`timezone(timedelta(hours=8))`，
 不依赖系统时区）。账本供 `stats` 命令查询（见「CLI 命令参考」），与 ACCESS 日志完全独立。账本结构
