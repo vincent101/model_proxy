@@ -14,27 +14,42 @@ tags: [architect, model_proxy, session-routing, load-balancing]
 
 CC 客户端只能配 opus/sonnet/haiku 三档，用户无法在 CC 内按会话手动选后端。诉求：代理层"看会话"分配 route——同一 session 全程固定一个 route（稳定），不同 session 打散到 strategy 下的多个 route（均衡）。
 
-## 1. session 标识怎么稳定拿到（已核实，非推测）
+## 1. session 标识怎么稳定拿到（已在沙箱用真实 CC 请求实测，2026-07-28）
 
-**结论：可直接从请求 body 拿到稳定的 per-session 标识，无需 CC 额外配置、无需新增 header/env。**
+**结论：可直接从请求 body 拿到稳定的 per-session 标识，无需 CC 额外配置、无需新增 header/env。但取值格式与本文档最初的推测不同，已按实测结果修正。**
 
-- CC 发往 `/v1/messages` 的 body 含 `metadata.user_id`，实测格式为
-  `user_<设备/账号hash>_account_<account_uuid>_session_<session_uuid>`
-  （来源：多份 CC 抓包逆向分析，2026-03~06）。
-- 其中 `session_<uuid>` 段 = CC 每次会话 `randomUUID()` 生成、存内存、**生命周期 = 单次会话**（来源：CC 指纹/封号机制逆向报告）。即**同一会话的所有轮次该段不变，不同会话不同**——正是所需的 session_key。
-- 代理已在 `_forward` 里完整解析了 `body_json`（`core/server.py:867`），可直接取
-  `body_json["metadata"]["user_id"]` 并正则提取 `_session_([0-9a-f-]+)` 段作为 `session_key`。PASSTHROUGH（anthropic→anthropic，占 90%+ 流量）当前不读它，但字段就在 body 里，取用零成本。
+> ⚠️ **格式假设已被实测纠正**：下方最初写的 `user_<hash>_account_<uuid>_session_<uuid>` 拼接字符串格式**不成立**，是未经验证的推测。真实格式见下。
+
+- CC 发往 `/v1/messages` 的 body 含 `metadata.user_id`，**实测真实格式是一个 JSON 字符串**（沙箱环境用 `claude --setting-sources project,local` + 临时 `ANTHROPIC_BASE_URL` 覆盖打真实请求验证，非猜测）：
+  ```json
+  {"device_id":"<设备hash>","account_uuid":"","session_id":"<session_uuid>"}
+  ```
+  取值需要**二次 `json.loads`**：先取 `metadata.user_id`（一个字符串），再对这个字符串本身做 JSON 解析，取里面的 `session_id` 字段——不是原方案设想的正则抠子串。
+- 该 `session_id` = CC 每次会话生成、**生命周期 = 单次会话**，且**实测确认**：
+  - 同一会话跨轮次（`--session-id` 起始 + 后续请求）：session_id 不变。
+  - `-r <session_id>` 显式 resume：session_id 与恢复前一致，不变。
+  - `/compact` 触发的请求：session_id 不变。
+  - **子 agent（Task 工具派生请求，用 Explore 类型子agent实测）：复用父会话的 session_id，不生成新 id。** 整个"父请求 + 子agent 发出的多次调用"窗口内 `session_id` 全部相同。这意味着一个 CC 会话内派生的所有子 agent 请求会被分到**同一个** route，不会被打散到不同 route——如果用户预期"子agent也算独立会话参与分摊"，现状不满足，但如果预期"整个会话（含子agent）走同一后端"，现状恰好满足。
+- 代理已在 `_forward` 里完整解析了 `body_json`（`core/server.py:867` 附近），取用零成本，只需按上述二次解析写正确的 `extract_session_key`。PASSTHROUGH（anthropic→anthropic，占 90%+ 流量）当前不读它，但字段就在 body 里。
 
 **排除的备选方案**：`ANTHROPIC_CUSTOM_HEADERS` 官方支持自定义请求头（CC env-vars 文档确认），但它是**进程级静态值**（`export` 一次、会话内固定），无法承载"每会话不同的 id"——除非每会话单起进程设不同值，而现有 SessionStart hook 是单进程共享模型，不满足。故不走此路，metadata.user_id 已足够。
 
-**取不到 session_key 的兜底**（非 CC 客户端、字段缺失、格式变更）：退回 strategy 的默认 route（见 §4 schema 的 `default_route` / 列表首项），保证不 500。
+**取不到 session_key 的兜底**（非 CC 客户端、字段缺失、格式变更、非标准 JSON）：退回 strategy 的默认 route（见 §4 schema 的 `default_route` / 列表首项），保证不 500。
 
-### 待落地前实测确认（不阻塞设计，属验证动作）
+### 实测方法记录（供复现/后续回归）
 
-`session_<uuid>` 段在以下场景是否保持不变，公开资料未 100% 覆盖，需开代理 DEBUG dump 实测：
-- `/resume` 恢复会话（预期不变，同一会话）
-- `/compact` 压缩上下文（预期不变，未新建会话）
-- **子 agent（Task 工具派生的 subagent 请求）**：是否复用父会话 session_id，还是各自新 id？这直接影响"一个 CC 会话内派生的 subagent 会不会被分到不同 route"。**这一条最需要实测**。
+沙箱环境：`/tmp/model_proxy_sandbox`，端口 18899，与生产（`tools/model_proxy/`，端口 18889，pid 61666）完全隔离。用真实 `claude` CLI 触发请求指向沙箱的方法：
+
+```bash
+env ANTHROPIC_BASE_URL="http://127.0.0.1:18899/" ANTHROPIC_AUTH_TOKEN="cc" \
+  claude --setting-sources project,local -p "<prompt>" --session-id "<uuid>"
+```
+
+关键点：**必须带 `--setting-sources project,local`**（排除 `user` 来源），否则 `~/.claude/settings.json` 里的全局 `env.ANTHROPIC_BASE_URL` 优先级更高，会覆盖掉 shell 临时 env 变量，导致请求仍打到生产 18889（此前一次尝试未加此参数，误打了几条真实请求到生产，生产进程本身无损，仅多耗费几次真实配额，已知悉）。resume 用 `-r <session_id>`（而非 `-c`，`-c` 是"续最近一个会话"，在多会话并行时会选错）。
+
+### 已解决，无需再实测的项
+
+原文档标注的三项待实测（`/resume`、`/compact`、子agent）**均已完成实测**，结论见上，不再是开放问题。
 
 ## 2. 给定 session_key 如何在多 route 间稳定分配
 
@@ -186,13 +201,13 @@ CC 客户端只能配 opus/sonnet/haiku 三档，用户无法在 CC 内按会话
 
 ## 风险与权衡
 
-- **session_key 稳定性未 100% 实测**（§1 待确认三项，尤其 subagent）：若 subagent 请求带不同 session_id，则一个 CC 会话内的 subagent 会被分到别的 route——可能正是想要的（分摊），也可能不符合"整个会话一个 route"预期，取决于用户意图。**落地第一步应先 DEBUG dump 实测这三项，再定分配粒度。**
+- **session_key 稳定性已实测（§1）**：resume/compact/子agent 三项均确认 session_id 不变，子agent 复用父会话 id。风险已从"未验证"转为"已知行为"——一个 CC 会话（含其派生的所有子agent请求）会被视为同一个分配单位，整体落到同一个 route，不会被打散分摊。若用户诉求是"子agent 也算独立单位参与配额分摊"，现状不满足此诉求，需另行讨论（例如改用其他 session_key 来源），但不阻塞当前方案落地。
 - **归因指纹与 prefix cache**（旁支提示，非本方案引入）：CC 请求前缀含动态指纹块，第三方链路不剥离会破坏上游 prompt cache。这与 session 分配无关，但既然要读 body，提示一句：session_key 只从 `metadata.user_id` 稳定段取，勿用会变字段。
 - **跨 route = 跨模型家族**：route 语义是模型家族，多 route 分配意味着不同会话实际用不同模型能力。用户诉求(a)明确接受这点，但需确保 route_pool 里各 route 的三档 tier 都配了可用 supply，否则某会话被分到"缺该 tier 的 route"会 503。
 
 ## 验证方式
 
-1. **session_key 稳定性**：临时开代理 DEBUG，dump 入站 `metadata.user_id`；在同一会话多轮、`/resume`、`/compact`、触发 Task subagent 各观察 session 段是否恒定。
+1. **session_key 稳定性**：已在沙箱用真实 CC 请求实测完成（见 §1），同一会话多轮/`/resume`/`/compact`/子agent 均确认恒定，不再需要重复此步。
 2. **分配稳定性**：同一 session_key 多次请求 → ACCESS 日志中 route 恒定。
 3. **分配均衡性**：跑 N 个不同会话，统计各 route 命中比例是否≈权重比例。
 4. **failover 共存**：手动把 pin route 的某 supply 置坏 key → 确认 route 内 supply 级 failover 仍生效、不跨 route（选项 A）或按选定选项跨 route（B/C）。
