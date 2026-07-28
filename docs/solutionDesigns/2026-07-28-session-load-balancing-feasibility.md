@@ -1,9 +1,12 @@
 ---
 type: design-decision
-status: draft
+status: superseded
 target: "[[tools/model_proxy]]"
 tags: [architect, model_proxy, load-balancing, feasibility]
 ---
+
+> [!warning] 本文档已被覆盖（superseded）
+> 用户已拍板选择方向二（strategy 下多 route 按 session 分配），具体方案见 [[tools/model_proxy/docs/solutionDesigns/2026-07-28-session-route-dispatch-design.md]]。本文档原始结论（"不建议做/优先方向一"）不再有效，仅保留调研数据供参考。
 
 # model_proxy 基于 session 的负载均衡：调研与可行性评估
 

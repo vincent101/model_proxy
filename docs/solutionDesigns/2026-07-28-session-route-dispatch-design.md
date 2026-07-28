@@ -108,15 +108,79 @@ CC 客户端只能配 opus/sonnet/haiku 三档，用户无法在 CC 内按会话
 
 折中选项：**schema 先按理想预留 `dispatch.type` 字段，但首版只实现 `session_hash`**——结构可扩展、工作量接近务实。若用户认可这个折中，可直接采纳，无需在两极间选。
 
+## 4b. 手动指定 session → route（显式覆盖机制）
+
+### 先回答直接问题：现状不保存、不能手动改
+
+**§2 的一致性哈希方案分配结果是运行时纯计算得出的，不落盘、不写任何 session→route 映射文件。** 这是它"无状态、重启一致"的代价——**现状下用户无法手动指定某个 session 走某个 route**。`hash(session_key) % 权重` 每次现算，改不了、也看不到。要支持手动指定，必须**额外**引入一个显式映射（本节补充），它是加在哈希之上的一层，不是原方案已有的能力。
+
+### 补充设计：`session_overrides` 显式映射，优先于哈希
+
+**放在哪 / 什么结构**：放在 strategy 配置里新增 `session_overrides` 字段（一个 `session_key → route_id` 的对象），**不建议独立文件**。理由：现有 config 是单文件 `model_proxy_config.json`（strategy/route/supply 全在内），且已有 mtime 热重载（`ConfigStore.maybe_reload`，`server.py:348`）——放进同一文件可直接复用热重载，改完存盘即生效、无需重启，也不新增文件管理成本。
+
+草案（挂在 strategy 的 `dispatch` 下，紧邻分配规则）：
+
+```jsonc
+{
+  "client_token": "cc",
+  "route_pool": [
+    { "route_id": "claude",   "weight": 2 },
+    { "route_id": "deepseek", "weight": 1 },
+    { "route_id": "nation",   "weight": 1 }
+  ],
+  "dispatch": {
+    "type": "session_hash",
+    "session_key_source": "metadata.user_id",
+    "fallback": "on_missing_first",
+    "session_overrides": {
+      "3f2a9c1e-....-uuid": "deepseek",   // 手动把这个会话钉到 deepseek
+      "8b7d....-uuid":     "nation"
+    }
+  }
+}
+```
+
+### 运行时优先级（清晰的两级）
+
+选 route 时：
+1. **先查 `session_overrides[session_key]`** —— 命中且该 route_id 存在于 `routes` 中 → 直接用它，**跳过哈希**。
+2. **查不到** → 落回 §2 的 `hash(session_key) % 权重` 自动分配。
+3. `session_key` 取不到（非 CC / 字段缺失）→ 走 §4 的 `fallback`（route_pool 首项）。
+
+即 `select_route(strategy, session_key)` 的逻辑变为：`overrides 查表 → 命中即返回；否则哈希`。改动仍集中在这一个函数内，主流程不额外变。
+
+### 可观测性：用户怎么拿到要填的 session_id（必须一并解决）
+
+**这是前置阻塞点**：目前 ACCESS 日志不记录 session_id（见 §1，代理内部解析但从不落日志），用户**根本不知道要往 overrides 里填哪个 id**。所以手动覆盖机制必须**配套在 ACCESS 日志加 session 标识字段**，否则不可用。
+
+方案（够用即可）：
+- 在 ACCESS 日志每行加 `session=<session_key>` 字段（与现有 `token=cc` 同风格）。用户在 CC 里跑一轮 → `tail` 日志即可看到当前会话的 session_key → 复制去填 `session_overrides`。
+- **建议记录完整 session 段**（不截断），让 overrides 用精确全等匹配，最简单无歧义。若担心日志体积/隐私想记尾若干位，则 overrides 需相应支持"后缀匹配"——**不推荐后缀匹配**（引入歧义与误钉风险），故倾向记全量 + 全等匹配。
+
+（可选增强，非必需）加一个只读查询端点 `GET /model_proxy/sessions`，列出近期见过的 `session_key → 当前被分到的 route`，省去翻日志。属锦上添花，最小方案用日志字段即可。
+
+### 临时/过期？—— 不做，给"手动增删"即够用
+
+- **不引入 TTL / 过期 / 临时标记**。overrides 是用户手写进 config 的静态覆盖，语义就是"我要这个会话固定走这个 route"；会话结束后该条目变成无害的僵尸条目（对应 session_key 再不出现，永不命中），不影响任何请求。用户想清理就手动删——与"手动加"对称，认知成本最低。
+- 加 TTL 需要落盘时间戳 + 定期清理 + 时钟管理，是过度设计，不做。
+- 若日后僵尸条目积累碍眼，靠上面可选的 `/model_proxy/sessions` 端点辅助识别哪些还活跃即可，仍不需要自动过期。
+
+### 与原方案是否冲突（逐项确认无冲突）
+
+- **与哈希自动分配**：不冲突，纯"查表命中优先、否则哈希"两级串联；`session_overrides` 缺省为空 `{}` 时行为 = 原纯哈希方案，完全向后兼容。
+- **overrides 指向的 route 要不要在 route_pool 里重复定义？**——**不需要，且刻意允许它超出 route_pool**。overrides 的 route_id 只要求存在于顶层 `routes`（全局 route 定义），**不要求也在本 strategy 的 route_pool 权重列表内**。这是有意的：手动覆盖本就是"例外指定"，用户可能想把某会话钉到一个不在自动分摊池里的 route（如临时全 deepseek 跑某个重活）。校验规则：overrides 的 value 必须是合法 `routes` id；不校验其是否在 route_pool 内。哈希分配仍只在 route_pool 内进行，两者互不干扰。
+- **与开放问题 §3（route 全挂 A/B/C）**：不冲突。overrides 只决定"初始选哪个 route"，选定后该 route 全挂时的行为仍由 §3 选定的选项接管（若选 B/C 跨 route 兜底，被 override 钉住的会话在其 pin route 全挂时同样按该选项跌落）。
+- **与 schema 务实/理想/折中（§4）**：正交。`session_overrides` 作为 `dispatch` 下一个可选字段，三种 schema 取向都能容纳它。
+
 ## 5. 改动量与耦合面
 
 | 文件/模块 | 改动 |
 |---|---|
-| `core/server.py` | 新增 `extract_session_key(body_json)`（解析 metadata.user_id 的 session 段）+ `select_route(strategy, session_key, routes_map)`（哈希分配 + fallback）；`_forward` 在"resolve_strategy 之后、resolve_tier 之前"插入 route 选择（替换现在 `route = routes_map.get(strategy.get("route_id"))` 一处，`server.py:881`）；若选 §3 的 B/C 选项，failover 循环末尾加"pin route 全挂后跨 route"分支 + ACCESS 日志加字段 |
-| `_config_ops.py` | strategy 的 CRUD 与 schema 校验支持 `route_pool` / `dispatch`；`route_id` 与 `route_pool` 互斥校验；向后兼容旧单值 |
+| `core/server.py` | 新增 `extract_session_key(body_json)`（解析 metadata.user_id 的 session 段）+ `select_route(strategy, session_key, routes_map)`（**先查 session_overrides，未命中再哈希** + fallback）；`_forward` 在"resolve_strategy 之后、resolve_tier 之前"插入 route 选择（替换现在 `route = routes_map.get(strategy.get("route_id"))` 一处，`server.py:881`）；**ACCESS 日志加 `session` 字段**（供用户查 session_key，见 §4b）；若选 §3 的 B/C 选项，failover 循环末尾加"pin route 全挂后跨 route"分支 + 日志标记 |
+| `_config_ops.py` | strategy 的 CRUD 与 schema 校验支持 `route_pool` / `dispatch`（含 `session_overrides`）；`route_id` 与 `route_pool` 互斥校验；`session_overrides` 的 value 必须是合法 `routes` id（不校验是否在 route_pool 内，见 §4b）；向后兼容旧单值 |
 | `config/model_proxy_config.example.json` | 加一个多 route 池的示例 strategy |
 | `README.md` | 补 session 分配机制、schema 说明 |
-| （可选）ACCESS 日志 | 加 `session4`（session_key 尾4位）或 route 分配来源，便于验证"同会话是否稳定、跨会话是否均匀" |
+| ACCESS 日志（**必需**，非可选） | 加 `session=<session_key>` 字段——既用于验证"同会话稳定/跨会话均匀"，也是 §4b 手动覆盖的前提（用户靠它拿到要填的 session_id）。若日后要 `/model_proxy/sessions` 只读端点则另加，属可选增强 |
 
 **量级判断**：属**有正确性耦合**的改动——改 schema 要连带改校验、主流程 route 选择、并严格保证旧单值 `route_id` 配置（现网 cc/codex）不被破坏；`select_route` 与 failover 的边界要精确。核心逻辑集中（不算大 diff），但正确性敏感。**建议派 implementer 落地 + reviewer 复核**，不适合 runner 铺。
 
@@ -132,7 +196,8 @@ CC 客户端只能配 opus/sonnet/haiku 三档，用户无法在 CC 内按会话
 2. **分配稳定性**：同一 session_key 多次请求 → ACCESS 日志中 route 恒定。
 3. **分配均衡性**：跑 N 个不同会话，统计各 route 命中比例是否≈权重比例。
 4. **failover 共存**：手动把 pin route 的某 supply 置坏 key → 确认 route 内 supply 级 failover 仍生效、不跨 route（选项 A）或按选定选项跨 route（B/C）。
-5. **向后兼容**：现网 cc/codex 的单值 `route_id` 配置不改动即行为完全不变。
+5. **向后兼容**：现网 cc/codex 的单值 `route_id` 配置不改动即行为完全不变；`session_overrides` 缺省为空时行为 = 纯哈希方案。
+6. **手动覆盖（§4b）**：从 ACCESS 日志取某活跃会话的 `session` 值 → 写入 `session_overrides` 指到某 route → 热重载后确认该会话后续请求全落到指定 route；删除条目后确认落回哈希分配。
 
 ## 关联
 
