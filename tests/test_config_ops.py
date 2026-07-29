@@ -21,6 +21,7 @@ from _config_ops import (
     _extract_enum_candidates,
     _fix_mojibake,
     _is_response_complete,
+    _validate_strategy_route_fields,
     classify_supply_reachability,
     connectivity_test_then_probe,
     probe_effort,
@@ -451,6 +452,55 @@ class TestSupplyCheck(unittest.TestCase):
         mock_run_probe.assert_not_called()
         mock_write.assert_not_called()
         self.assertNotIn("reasoning_capability", cfg["supplies"][0])
+
+
+class TestValidateStrategyRouteFields(unittest.TestCase):
+    """_validate_strategy_route_fields：strategy 写盘前 route_id 与 route_pool 互斥校验。"""
+
+    def test_both_fields_present_raises_and_reports_error(self):
+        entry = {"client_token": "tok1", "route_id": "claude",
+                  "route_pool": ["claude", "nation"]}
+        with patch("_config_ops.err") as mock_err, \
+             patch("_config_ops.done") as mock_done:
+            with self.assertRaises(SystemExit) as ctx:
+                _validate_strategy_route_fields(entry)
+        self.assertEqual(ctx.exception.code, 1)
+        mock_err.assert_called_once()
+        self.assertIn("route_id", mock_err.call_args[0][0])
+        self.assertIn("route_pool", mock_err.call_args[0][0])
+        mock_done.assert_called_once_with(False)
+
+    def test_only_route_id_does_not_raise(self):
+        entry = {"client_token": "tok2", "route_id": "claude"}
+        with patch("_config_ops.err") as mock_err:
+            result = _validate_strategy_route_fields(entry)
+        self.assertIsNone(result)
+        mock_err.assert_not_called()
+
+    def test_only_route_pool_does_not_raise(self):
+        entry = {"client_token": "tok3", "route_pool": ["claude", "nation"]}
+        with patch("_config_ops.err") as mock_err:
+            result = _validate_strategy_route_fields(entry)
+        self.assertIsNone(result)
+        mock_err.assert_not_called()
+
+    def test_neither_field_present_does_not_raise(self):
+        # 脏配置（既无 route_id 也无 route_pool）不属于本函数职责，交由其他校验处理。
+        entry = {"client_token": "tok4"}
+        with patch("_config_ops.err") as mock_err:
+            result = _validate_strategy_route_fields(entry)
+        self.assertIsNone(result)
+        mock_err.assert_not_called()
+
+    def test_route_id_with_empty_route_pool_list_does_not_raise(self):
+        # 当前实现：route_pool 为空列表 [] 时视为 falsy，等同于"未配置 route_pool"，
+        # 不会与 route_id 冲突判定为互斥违规。此为当前实现的既有行为，用测试明确固化，
+        # 而非遗漏；若未来需要区分"字段存在但为空"与"字段不存在"，需先修改函数逻辑。
+        entry = {"client_token": "tok5", "route_id": "claude", "route_pool": []}
+        with patch("_config_ops.err") as mock_err:
+            result = _validate_strategy_route_fields(entry)
+        self.assertIsNone(result)
+        mock_err.assert_not_called()
 
 
 if __name__ == "__main__":

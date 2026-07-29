@@ -756,11 +756,28 @@ def route_del(path: str, rid: str) -> None:
 # strategy
 # ---------------------------------------------------------------------------
 
+def _strategy_route_desc(st: dict) -> str:
+    """打印用的 route 归属描述：兼容旧单值 route_id 与新 route_pool 写法（见
+    docs/solutionDesigns/2026-07-28-session-route-dispatch-design.md §4/§5）。
+    """
+    route_pool = st.get("route_pool")
+    if route_pool:
+        parts = []
+        for item in route_pool:
+            if not isinstance(item, dict):
+                continue
+            rid = item.get("route_id", "?")
+            weight = item.get("weight", 1)
+            parts.append(f"{rid}:{weight}")
+        return "pool[" + ",".join(parts) + "]"
+    return st.get("route_id", "?")
+
+
 def strategy_list(path: str) -> None:
     cfg = load_config(path)
     for st in cfg.get("strategies", []):
         tok = st.get("client_token", "?")
-        rid = st.get("route_id", "?")
+        rid = _strategy_route_desc(st)
         note = st.get("note", "") or ""
         print(f"  {tok:16} -> {rid:12} ({note})")
     done(False)
@@ -771,6 +788,20 @@ def _find_strategy(cfg: dict, token: str) -> dict | None:
         if s.get("client_token") == token:
             return s
     return None
+
+
+def _validate_strategy_route_fields(entry: dict) -> None:
+    """校验 route_id 与 route_pool 互斥（见设计文档 §4 校验规则）。
+
+    一条 strategy 若同时含 route_id 与 route_pool 两个字段，属非法/歧义配置
+    （core/server.py 的 extract_route_candidates 遇到这种态会忽略 route_id、
+    静默走 route_pool 分支，运行时可容错，但写盘时必须主动拒绝，避免脏配置
+    落地）。校验失败即报错并以非零退出码终止，不写盘。
+    """
+    if entry.get("route_id") and entry.get("route_pool"):
+        err(f"strategy client_token={entry.get('client_token', '?')} 同时配置了 "
+            f"route_id 与 route_pool，两者互斥，请只保留一个后再写入")
+        done(False); sys.exit(1)
 
 
 def strategy_add(path: str) -> None:
@@ -801,6 +832,7 @@ def strategy_add(path: str) -> None:
         entry["tiers_source_capability"] = stiers_cap
     entry["note"] = snote
 
+    _validate_strategy_route_fields(entry)
     strategies.append(entry)
     atomic_write(path, cfg)
     print(f"Added strategy: {stoken} -> {srid}")
@@ -815,12 +847,22 @@ def strategy_edit(path: str, token: str) -> None:
         done(False); sys.exit(1)
     known_routes = {r.get("id") for r in cfg.get("routes", [])}
 
-    cur_rid = target.get("route_id", "")
-    raw_rid = input(f"Route ID [{cur_rid}]: ").strip()
-    new_rid = raw_rid if raw_rid else cur_rid
-    if new_rid not in known_routes:
-        err(f"route id 不存在: {new_rid}")
-        done(False); sys.exit(1)
+    # route_pool 写法（新）不走本 CLI 的单值 Route ID 编辑（见
+    # docs/solutionDesigns/2026-07-28-session-route-dispatch-design.md §5：
+    # CLI 菜单本次不支持录入 route_pool/dispatch，但编辑其他字段时不能丢/不能因
+    # 强制要求单值 route_id 而报错阻塞）。target 引用是 cfg 内原字典，
+    # route_pool/dispatch 字段全程保留不动。
+    if target.get("route_pool"):
+        print(f"该 strategy 使用 route_pool 多路由写法（{_strategy_route_desc(target)}），"
+              f"本 CLI 暂不支持编辑 route_pool/dispatch，如需修改请直接编辑配置文件。")
+        new_rid = None
+    else:
+        cur_rid = target.get("route_id", "")
+        raw_rid = input(f"Route ID [{cur_rid}]: ").strip()
+        new_rid = raw_rid if raw_rid else cur_rid
+        if new_rid not in known_routes:
+            err(f"route id 不存在: {new_rid}")
+            done(False); sys.exit(1)
 
     if confirm("重新录入 tiers_source_capability?"):
         new_tiers_cap = prompt_source_capability(target.get("tiers_source_capability"))
@@ -833,10 +875,12 @@ def strategy_edit(path: str, token: str) -> None:
     raw_note = input(f"Note [{cur_note}]: ").strip()
     new_note = raw_note if raw_note else cur_note
 
-    target["route_id"] = new_rid
+    if new_rid is not None:
+        target["route_id"] = new_rid
     target["note"] = new_note
+    _validate_strategy_route_fields(target)
     atomic_write(path, cfg)
-    print(f"Edited strategy: {token} -> {new_rid}")
+    print(f"Edited strategy: {token} -> {_strategy_route_desc(target)}")
     done(True)
 
 
@@ -866,6 +910,12 @@ def switch(path: str, token: str, route_id: str) -> None:
     target = _find_strategy(cfg, token)
     if target is None:
         err(f"未找到该 token 的 strategy 绑定: {token}，请先用 strategy add 新增")
+        done(False); sys.exit(1)
+    if target.get("route_pool"):
+        # route_id 与 route_pool 互斥（见设计文档 §4 校验规则），不能对
+        # route_pool 写法的 strategy 写单值 route_id，避免产生非法/歧义配置。
+        err(f"该 strategy 使用 route_pool 多路由写法（{_strategy_route_desc(target)}），"
+            f"switch 只支持单值 route_id 的旧写法，如需调整请直接编辑配置文件。")
         done(False); sys.exit(1)
     if not any(r.get("id") == route_id for r in cfg.get("routes", [])):
         err(f"route id 不存在: {route_id}")

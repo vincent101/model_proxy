@@ -10,6 +10,7 @@ tools/model_proxy/config/model_proxy_config.json（可用 MODEL_PROXY_CONFIG 环
 仅使用 Python 标准库，不引入第三方依赖，也不 import proxy.py。
 """
 
+import hashlib
 import hmac
 import json
 import logging
@@ -493,6 +494,32 @@ def extract_client_token(headers) -> str:
     return (headers.get("x-api-key", "") or "").strip()
 
 
+def extract_session_key(body_json):
+    """从 metadata.user_id 提取 session_id，取不到返回 None。
+
+    临时观测函数，用于验证 session_route_dispatch 方案的 session_key 假设
+    （见 docs/solutionDesigns/2026-07-28-session-route-dispatch-design.md §1/§4b）。
+
+    实测修正（2026-07-28 沙箱实测）：真实 CC 请求的 metadata.user_id 不是设计文档
+    最初假设的拼接字符串 "user_..._session_<uuid>"，而是一个 JSON 字符串，形如：
+      '{"device_id":"...","account_uuid":"","session_id":"<uuid>"}'
+    需要二次 json.loads 后取 "session_id" 字段。
+    """
+    if not isinstance(body_json, dict):
+        return None
+    user_id = (body_json.get("metadata") or {}).get("user_id")
+    if not isinstance(user_id, str):
+        return None
+    try:
+        inner = json.loads(user_id)
+    except (json.JSONDecodeError, ValueError):
+        return None
+    if not isinstance(inner, dict):
+        return None
+    session_id = inner.get("session_id")
+    return session_id if isinstance(session_id, str) and session_id else None
+
+
 def detect_source(path: str, body: dict | None) -> str:
     """识别入站 source 协议。
 
@@ -568,6 +595,90 @@ def resolve_route(strategies: list, routes_map: dict, client_token: str) -> dict
     """阶段1：client_token → strategy → route_id → route。"""
     s = resolve_strategy(strategies, client_token)
     return routes_map.get(s.get("route_id")) if s else None
+
+
+def extract_route_candidates(strategy: "dict | None", session_key: "str | None",
+                              routes_map: dict) -> list:
+    """给定 strategy，返回按 session_hash 排好的 route 候选顺序列表（route dict 列表）。
+
+    用于 §3 选项B「pin route 全挂时跨 route 兜底」：候选列表第一项是主选（pin）
+    route，后续项按顺序作为兜底候选。设计见
+    docs/solutionDesigns/2026-07-28-session-route-dispatch-design.md §2/§4/§4b。
+
+    - strategy 为 None → 返回 []（无匹配）。
+    - strategy 只有旧字段 route_id（无 route_pool）→ 返回长度<=1 的列表，完全
+      向后兼容现状（route_id 不在 routes_map 中则返回 []）。
+    - strategy 有 route_pool（新写法）：
+      1. route_pool 每项 route_id 须存在于 routes_map，非法项跳过并 log.warning，
+         不因一条脏配置拖垒整个 strategy。
+      2. 若 dispatch.session_overrides[session_key] 命中且该 route_id 存在于
+         routes_map → 该 route 放第一候选，其余候选按一致性哈希排出的顺序
+         （命中项排除）跟在后面作为兜底。
+      3. 未命中 override 且 session_key 非空 → 一致性哈希
+         idx = md5(session_key) % 权重总和 定位主选 route，其余按权重区间顺序
+         （从主选处开始整体旋转）跟在后面兜底。
+      4. session_key 为空/缺失 → dispatch.fallback（当前只支持
+         "on_missing_first"）：route_pool 首项为主选，其余按原顺序跟随。
+    """
+    if not strategy:
+        return []
+
+    route_pool = strategy.get("route_pool")
+    if not route_pool:
+        # 旧写法：单值 route_id，行为与改动前完全一致。
+        route = routes_map.get(strategy.get("route_id"))
+        return [route] if route else []
+
+    if strategy.get("route_id"):
+        # 非法态：route_id 与 route_pool 互斥（见设计文档 §4 校验规则），
+        # _config_ops.py 写入侧已用 _validate_strategy_route_fields 拒绝该态，
+        # 但配置文件可能被手工/外部改动绕过写入侧校验，运行时兜底：不中断
+        # 请求，按 route_pool 处理并忽略 route_id，但要留日志可见性。
+        log.warning("strategy=%s 同时配置了 route_id 和 route_pool，已忽略 "
+                    "route_id，按 route_pool 处理", strategy.get("client_token", ""))
+
+    # 新写法：先校验 route_pool 每项引用合法性，跳过非法项。
+    valid_pool: list[dict] = []
+    for item in route_pool:
+        rid = item.get("route_id") if isinstance(item, dict) else None
+        if not rid or rid not in routes_map:
+            log.warning("route_pool entry invalid, skip: strategy=%s route_id=%r",
+                        strategy.get("client_token", ""), rid)
+            continue
+        weight = item.get("weight", 1)
+        if not isinstance(weight, int) or weight <= 0:
+            weight = 1
+        valid_pool.append({"route_id": rid, "weight": weight})
+    if not valid_pool:
+        return []
+
+    def _hash_rotate(pool: list, key: str) -> list:
+        """按一致性哈希定位主选项在 pool 中的位置，整体旋转后返回（主选在首位）。"""
+        total_weight = sum(p["weight"] for p in pool)
+        idx = int(hashlib.md5(key.encode("utf-8")).hexdigest(), 16) % total_weight
+        cum = 0
+        primary_pos = 0
+        for i, p in enumerate(pool):
+            cum += p["weight"]
+            if idx < cum:
+                primary_pos = i
+                break
+        return pool[primary_pos:] + pool[:primary_pos]
+
+    dispatch = strategy.get("dispatch") or {}
+    session_overrides = dispatch.get("session_overrides") or {}
+
+    if session_key:
+        override_rid = session_overrides.get(session_key)
+        ordered = _hash_rotate(valid_pool, session_key)
+        if override_rid and override_rid in routes_map:
+            rest = [routes_map[p["route_id"]] for p in ordered if p["route_id"] != override_rid]
+            return [routes_map[override_rid]] + rest
+        return [routes_map[p["route_id"]] for p in ordered]
+
+    # session_key 缺失 → dispatch.fallback（当前只实现 on_missing_first）：
+    # route_pool 首项为主选，其余按原顺序跟随。
+    return [routes_map[p["route_id"]] for p in valid_pool]
 
 
 def resolve_tier(model: str | None) -> str | None:
@@ -823,7 +934,7 @@ class ModelProxyHandler(BaseHTTPRequestHandler):
             "status": 0, "source": "", "route": "", "tier": "",
             "supply": "", "failover": 0, "attempts": 0, "token": "",
             "usage_in": 0, "usage_out": 0,
-            "strategy": "",
+            "strategy": "", "session": "", "route_failover": 0,
         }
         t0 = time.monotonic()
         try:
@@ -833,10 +944,12 @@ class ModelProxyHandler(BaseHTTPRequestHandler):
             ms = int((time.monotonic() - t0) * 1000)
             access_log.info(
                 "ACCESS ms=%d status=%s source=%s route=%s tier=%s supply=%s "
-                "failover=%s attempts=%s usage_in=%s usage_out=%s token=%s",
+                "failover=%s attempts=%s usage_in=%s usage_out=%s token=%s session=%s "
+                "route_failover=%s",
                 ms, a["status"], a["source"],
                 a["route"], a["tier"], a["supply"], a["failover"], a["attempts"],
-                a["usage_in"], a["usage_out"], a["token"])
+                a["usage_in"], a["usage_out"], a["token"], a["session"],
+                a["route_failover"])
             try:
                 usage_totals.record(a, ms)
             except Exception:
@@ -868,46 +981,40 @@ class ModelProxyHandler(BaseHTTPRequestHandler):
         except (json.JSONDecodeError, ValueError):
             body_json = None
         request_model = body_json.get("model") if isinstance(body_json, dict) else None
+        self._acc["session"] = extract_session_key(body_json) or ""
 
         # 4. source 协议识别
         source = detect_source(self.path, body_json)
         self._acc["source"] = source
 
-        # 5. 三阶段匹配：strategy → route → tier → supplies 列表
+        # 5. 三阶段匹配：strategy → route候选列表（session_hash分配 + B选项跨route兜底）
+        #    → tier → supplies 列表
         strategies = cs.get_strategies()
         routes_map = cs.get_routes_map()
         strategy = resolve_strategy(strategies, token)
         self._acc["strategy"] = strategy.get("client_token", "") if strategy else ""
-        route = routes_map.get(strategy.get("route_id")) if strategy else None
-        if route is None:
+        session_key = self._acc["session"] or None
+        route_candidates = extract_route_candidates(strategy, session_key, routes_map)
+        if not route_candidates:
             log.warning("no strategy/route matched: token_tail4=%s source=%s",
                         token[-4:] if token else "", source)
             self._write_buffered_response(
                 401, [], error_body_for_source(source, 401, "no strategy/route matched"))
             return
-        self._acc["route"] = route.get("id")
 
+        # tier 解析只与 request_model 有关，与候选哪个 route 无关，循环外只算一次。
         tier = resolve_tier(request_model)
         if tier is None:
-            log.warning("unknown model tier: model=%s route=%s", request_model, route.get("id"))
+            log.warning("unknown model tier: model=%s pinned_route=%s",
+                        request_model, route_candidates[0].get("id"))
             self._write_buffered_response(
                 400, [], error_body_for_source(source, 400, f"unknown model tier: {request_model}"))
             return
         self._acc["tier"] = tier
 
-        supplies_list = select_supply_list(route, tier)
-        if not supplies_list:
-            log.warning("route missing tier config: route=%s tier=%s", route.get("id"), tier)
-            self._write_buffered_response(
-                503, [], error_body_for_source(source, 503, f"route {route.get('id')} missing tier {tier}"))
-            return
-
         supply_map = cs.get_supply_map()
         default_cd = cs.get_default_cooldown()
-        failover = route.get("failover", "off")
 
-        # 6. failover 循环（tried_set 为请求内局部集合，不改全局状态）
-        tried_set: set[str] = set()
         _reasoning_retried = False   # reasoning 语法重试只做一次，作用域覆盖整个请求周期
 
         # raw_intent 必须在循环外、基于客户端原始 body_json 只 decode 一次。
@@ -930,345 +1037,388 @@ class ModelProxyHandler(BaseHTTPRequestHandler):
         _cached_target_effort = None
         _cached_abstract = None
 
-        while True:
-            supply = select_supply(supplies_list, supply_map, cd, tried_set)
-            if supply is None:
-                log.warning("all supplies failed or cooling: route=%s tier=%s",
-                            route.get("id"), tier)
+        # 6. route 候选外层循环（§3 选项B：pin route/其tier全挂时，按 session_hash
+        #    排好的候选顺序换下一个候选 route 重试；单候选（旧单值 route_id 配置）时
+        #    该外层循环退化为只跑一轮，行为与改动前完全一致，不产生 route_failover）。
+        num_candidates = len(route_candidates)
+        for candidate_idx, route in enumerate(route_candidates):
+            self._acc["route"] = route.get("id")
+            is_last_candidate = candidate_idx == num_candidates - 1
+
+            supplies_list = select_supply_list(route, tier)
+            if not supplies_list:
+                log.warning("route missing tier config: route=%s tier=%s", route.get("id"), tier)
+                if not is_last_candidate:
+                    log.warning(
+                        "route_failover: route=%s missing tier=%s config, trying next candidate route",
+                        route.get("id"), tier)
+                    self._acc["route_failover"] = 1
+                    continue
                 self._write_buffered_response(
                     503, [], error_body_for_source(
-                        source, 503, "all upstream supplies failed or cooling"))
+                        source, 503, f"route {route.get('id')} missing tier {tier}"))
                 return
 
-            supply_id = supply.get("id", "")
-            self._acc["supply"] = supply_id
-            self._acc["attempts"] += 1
-            try:
-                target = detect_target(supply)
-            except ValueError as e:
-                log.warning("detect_target failed: supply=%s err=%s", supply_id, e)
-                self._write_buffered_response(
-                    500, [], error_body_for_source(source, 500, str(e)))
-                return
-            mode = pick_translator(source, target)
+            failover = route.get("failover", "off")
 
-            if mode == UNSUPPORTED:
-                self._write_buffered_response(
-                    501, [], error_body_for_source(
-                        source, 501,
-                        f"unsupported combination source={source} target={target}"))
-                return
+            # tried_set 为请求内局部集合，每个候选 route 重置（不同 route 下 supply id
+            # 命名空间独立，冷却/已试状态不应跨 route 互相污染）；不改全局状态。
+            tried_set: set[str] = set()
+            route_exhausted = False
 
-            target_model = supply.get("target_model")
-            # supply["url"] 现在语义是完整终态请求端点（不再是 base），代码侧零拼接。
-            # 四个转发分支统一用这个 target_url，不再各自拼接协议相关后缀（见
-            # _sanitize_forward_query 函数级注释）。
-            base_url = supply.get("url", "").rstrip("/")
-            target_url = base_url + _sanitize_forward_query(self.path)
+            while True:
+                supply = select_supply(supplies_list, supply_map, cd, tried_set)
+                if supply is None:
+                    log.warning("all supplies failed or cooling: route=%s tier=%s",
+                                route.get("id"), tier)
+                    route_exhausted = True
+                    break
 
-            # ---- reasoning 统一链路：resolve_source_capability → remap → select_variant →
-            # ---- abstract_encode → syntax_adapt ----
-            # 四种协议组合（PASSTHROUGH anthropic→anthropic / PASSTHROUGH responses→responses /
-            # ANTHROPIC_TO_CHAT / ANTHROPIC_TO_RESPONSES / RESPONSES_TO_ANTHROPIC）全部走这同一条
-            # 链路，差异只在 get_codec 拿到哪个 codec。PASSTHROUGH anthropic→anthropic 现在也用
-            # 目标 Claude 模型的 capability 做相对映射（现状缺失的能力）。
-            tgt_codec = get_codec(target)
-            target_cap = ModelReasoningCapability.from_config(supply)
-            if supply_id == _reasoning_cache_supply_id and _cached_abstract is not None:
-                # 同一 supply 的 reasoning 语法重试（continue 未加入 tried_set）：intent/两侧
-                # cap 均未变，复用已算好的 target_effort/abstract，只重跑
-                # select_variant+syntax_adapt（方案文档 §4.3）。
-                target_effort = _cached_target_effort
-                abstract = _cached_abstract
-            else:
-                target_effort = remap(raw_intent, source_cap, target_cap)
-                abstract = abstract_encode(target_effort)
-                _cached_target_effort = target_effort
-                _cached_abstract = abstract
-                _reasoning_cache_supply_id = supply_id
-            reasoning_variant = tgt_codec.select_variant(pref_store.snapshot(target_model or ""))
-            reasoning_wire = tgt_codec.syntax_adapt(abstract, reasoning_variant)
-            if log.isEnabledFor(logging.DEBUG):
-                _log_reasoning_debug(
-                    supply_id, target_model, source_cap, target_cap, raw_intent,
-                    target_effort, abstract, reasoning_variant, reasoning_wire)
-
-            # ---- 按 mode 计算 send_body / target_url / 转换上下文 ----
-            # fwd_ctx：请求转换上下文（tool_name_mapping/request_model），
-            # ANTHROPIC_TO_CHAT 与 ANTHROPIC_TO_RESPONSES 用
-            fwd_ctx: dict[str, Any] | None = None
-            if mode == PASSTHROUGH:
-                # 改写 model → target_model；target_url 已在分支前统一算好（完整端点 + 净化后 query）
-                send_body = raw_body
-                if target_model and isinstance(body_json, dict) and "model" in body_json:
-                    body_json["model"] = target_model
-                    send_body = json.dumps(body_json, ensure_ascii=False).encode("utf-8")
-                # reasoning 字段按目标 capability 相对映射后原地 merge（含 anthropic→anthropic 与
-                # responses→responses：source==target 时 syntax_adapt 的 variant 就是该协议唯一/
-                # 学到的语法，PASSTHROUGH 不代表"不处理 reasoning"，只代表 body 结构本身不用转换）
-                if isinstance(body_json, dict) and reasoning_wire:
-                    apply_fields(body_json, reasoning_wire)
-                    send_body = json.dumps(body_json, ensure_ascii=False).encode("utf-8")
-
-            elif mode == ANTHROPIC_TO_CHAT:
-                # 组合3：anthropic 请求 → chat 上游。转成 OpenAI body，打 native chat 端点。
-                # 请求转换失败（异常）→ 合法 Anthropic error，400（正向规格 §5.1）
+                supply_id = supply.get("id", "")
+                self._acc["supply"] = supply_id
+                self._acc["attempts"] += 1
                 try:
-                    openai_body, fwd_ctx = pt.anthropic_to_openai_request(
-                        body_json or {}, reasoning_fields=reasoning_wire)
-                except Exception as e:
-                    log.warning("ANTHROPIC_TO_CHAT request translate failed: %s", e)
+                    target = detect_target(supply)
+                except ValueError as e:
+                    log.warning("detect_target failed: supply=%s err=%s", supply_id, e)
                     self._write_buffered_response(
-                        400, [], error_body_for_source(
-                            source, 400, f"proxy translate failed: {e}"))
+                        500, [], error_body_for_source(source, 500, str(e)))
                     return
-                if target_model:
-                    openai_body["model"] = target_model
-                    fwd_ctx["request_model"] = target_model  # 响应 model 字段回填 target_model
-                send_body = json.dumps(openai_body, ensure_ascii=False).encode("utf-8")
-                # target_url 已在分支前统一算好（supply.url 现在已是完整 /chat/completions 端点）
+                mode = pick_translator(source, target)
 
-            elif mode == ANTHROPIC_TO_RESPONSES:
-                # 新组合：anthropic 请求 → responses 上游。转成 Responses body，打完整 /v1/responses。
-                # 请求转换失败（异常）→ 合法 Anthropic error，400
+                if mode == UNSUPPORTED:
+                    self._write_buffered_response(
+                        501, [], error_body_for_source(
+                            source, 501,
+                            f"unsupported combination source={source} target={target}"))
+                    return
+
+                target_model = supply.get("target_model")
+                # supply["url"] 现在语义是完整终态请求端点（不再是 base），代码侧零拼接。
+                # 四个转发分支统一用这个 target_url，不再各自拼接协议相关后缀（见
+                # _sanitize_forward_query 函数级注释）。
+                base_url = supply.get("url", "").rstrip("/")
+                target_url = base_url + _sanitize_forward_query(self.path)
+
+                # ---- reasoning 统一链路：resolve_source_capability → remap → select_variant →
+                # ---- abstract_encode → syntax_adapt ----
+                # 四种协议组合（PASSTHROUGH anthropic→anthropic / PASSTHROUGH responses→responses /
+                # ANTHROPIC_TO_CHAT / ANTHROPIC_TO_RESPONSES / RESPONSES_TO_ANTHROPIC）全部走这同一条
+                # 链路，差异只在 get_codec 拿到哪个 codec。PASSTHROUGH anthropic→anthropic 现在也用
+                # 目标 Claude 模型的 capability 做相对映射（现状缺失的能力）。
+                tgt_codec = get_codec(target)
+                target_cap = ModelReasoningCapability.from_config(supply)
+                if supply_id == _reasoning_cache_supply_id and _cached_abstract is not None:
+                    # 同一 supply 的 reasoning 语法重试（continue 未加入 tried_set）：intent/两侧
+                    # cap 均未变，复用已算好的 target_effort/abstract，只重跑
+                    # select_variant+syntax_adapt（方案文档 §4.3）。
+                    target_effort = _cached_target_effort
+                    abstract = _cached_abstract
+                else:
+                    target_effort = remap(raw_intent, source_cap, target_cap)
+                    abstract = abstract_encode(target_effort)
+                    _cached_target_effort = target_effort
+                    _cached_abstract = abstract
+                    _reasoning_cache_supply_id = supply_id
+                reasoning_variant = tgt_codec.select_variant(pref_store.snapshot(target_model or ""))
+                reasoning_wire = tgt_codec.syntax_adapt(abstract, reasoning_variant)
+                if log.isEnabledFor(logging.DEBUG):
+                    _log_reasoning_debug(
+                        supply_id, target_model, source_cap, target_cap, raw_intent,
+                        target_effort, abstract, reasoning_variant, reasoning_wire)
+
+                # ---- 按 mode 计算 send_body / target_url / 转换上下文 ----
+                # fwd_ctx：请求转换上下文（tool_name_mapping/request_model），
+                # ANTHROPIC_TO_CHAT 与 ANTHROPIC_TO_RESPONSES 用
+                fwd_ctx: dict[str, Any] | None = None
+                if mode == PASSTHROUGH:
+                    # 改写 model → target_model；target_url 已在分支前统一算好（完整端点 + 净化后 query）
+                    send_body = raw_body
+                    if target_model and isinstance(body_json, dict) and "model" in body_json:
+                        body_json["model"] = target_model
+                        send_body = json.dumps(body_json, ensure_ascii=False).encode("utf-8")
+                    # reasoning 字段按目标 capability 相对映射后原地 merge（含 anthropic→anthropic 与
+                    # responses→responses：source==target 时 syntax_adapt 的 variant 就是该协议唯一/
+                    # 学到的语法，PASSTHROUGH 不代表"不处理 reasoning"，只代表 body 结构本身不用转换）
+                    if isinstance(body_json, dict) and reasoning_wire:
+                        apply_fields(body_json, reasoning_wire)
+                        send_body = json.dumps(body_json, ensure_ascii=False).encode("utf-8")
+
+                elif mode == ANTHROPIC_TO_CHAT:
+                    # 组合3：anthropic 请求 → chat 上游。转成 OpenAI body，打 native chat 端点。
+                    # 请求转换失败（异常）→ 合法 Anthropic error，400（正向规格 §5.1）
+                    try:
+                        openai_body, fwd_ctx = pt.anthropic_to_openai_request(
+                            body_json or {}, reasoning_fields=reasoning_wire)
+                    except Exception as e:
+                        log.warning("ANTHROPIC_TO_CHAT request translate failed: %s", e)
+                        self._write_buffered_response(
+                            400, [], error_body_for_source(
+                                source, 400, f"proxy translate failed: {e}"))
+                        return
+                    if target_model:
+                        openai_body["model"] = target_model
+                        fwd_ctx["request_model"] = target_model  # 响应 model 字段回填 target_model
+                    send_body = json.dumps(openai_body, ensure_ascii=False).encode("utf-8")
+                    # target_url 已在分支前统一算好（supply.url 现在已是完整 /chat/completions 端点）
+
+                elif mode == ANTHROPIC_TO_RESPONSES:
+                    # 新组合：anthropic 请求 → responses 上游。转成 Responses body，打完整 /v1/responses。
+                    # 请求转换失败（异常）→ 合法 Anthropic error，400
+                    try:
+                        responses_body, fwd_ctx = pt.anthropic_to_responses_request(
+                            body_json or {}, reasoning_fields=reasoning_wire)
+                    except Exception as e:
+                        log.warning("ANTHROPIC_TO_RESPONSES request translate failed: %s", e)
+                        self._write_buffered_response(
+                            400, [], error_body_for_source(
+                                source, 400, f"proxy translate failed: {e}"))
+                        return
+                    if target_model:
+                        responses_body["model"] = target_model
+                        fwd_ctx["request_model"] = target_model  # 响应 model 字段回填 target_model
+                    send_body = json.dumps(responses_body, ensure_ascii=False).encode("utf-8")
+                    # target_url 已在分支前统一算好（supply.url 已配到完整 /v1/responses 端点）
+                    # Responses reasoning.effort 机制无 Anthropic thinking.type 400 拒绝问题
+                    # （ResponsesReasoningCodec 单变体，interpret_rejection 恒 None），无需重试。
+
+                else:  # RESPONSES_TO_ANTHROPIC
+                    # 组合4：responses 请求 → anthropic 上游。转成 Anthropic body，打 /v1/messages。
+                    # 请求转换失败（异常）→ 合法 Responses error，400（反向规格 §5.1）
+                    try:
+                        anthropic_body = pt.responses_to_anthropic_request(
+                            body_json or {}, max_tokens_default=4096,
+                            reasoning_fields=reasoning_wire)
+                    except Exception as e:
+                        log.warning("RESPONSES_TO_ANTHROPIC request translate failed: %s", e)
+                        self._write_buffered_response(
+                            400, [], error_body_for_source(
+                                source, 400, f"proxy translate failed: {e}"))
+                        return
+                    if target_model:
+                        anthropic_body["model"] = target_model
+                    send_body = json.dumps(anthropic_body, ensure_ascii=False).encode("utf-8")
+                    # target_url 已在分支前统一算好（supply.url 现在已是完整 /v1/messages 端点）
+
+                # ---- 注入出站 appkey（Authorization Bearer + x-api-key）----
+                appkey = supply.get("appkey", "")
+                _skip_req_headers = {"host", "content-length", "authorization", "x-api-key"}
+                fwd_headers: dict[str, str] = {}
+                for key, val in self.headers.items():
+                    if key.lower() in _skip_req_headers:
+                        continue
+                    fwd_headers[key] = val
+                fwd_headers["Authorization"] = f"Bearer {appkey}"
+                fwd_headers["x-api-key"] = appkey
+                fwd_headers["Content-Length"] = str(len(send_body))
+                if mode != PASSTHROUGH:
+                    # 转换后 body 一律 JSON
+                    fwd_headers["Content-Type"] = "application/json"
+
+                req = urllib.request.Request(
+                    url=target_url,
+                    data=send_body if send_body else None,
+                    headers=fwd_headers,
+                    method=method,
+                )
+
+                cd_seconds = int(supply.get("cooldown_seconds", default_cd))
+
                 try:
-                    responses_body, fwd_ctx = pt.anthropic_to_responses_request(
-                        body_json or {}, reasoning_fields=reasoning_wire)
-                except Exception as e:
-                    log.warning("ANTHROPIC_TO_RESPONSES request translate failed: %s", e)
+                    resp = urllib.request.urlopen(req, timeout=600)
+                    resp_status = resp.status
+                except urllib.error.HTTPError as e:
+                    resp_status = e.code
+                    resp_headers = list(e.headers.items())
+                    resp_body = e.read()
+
+                    # reasoning 语法自适应重试（仅一次，不 rotate/cooldown supply，
+                    # 与 failover 重试的关键区别：不加入 tried_set、不调用 cd.cooldown）。
+                    # 单变体 codec（Chat/Responses）interpret_rejection 恒 None，天然不触发重试；
+                    # 只有 AnthropicReasoningCodec（双变体）在 tgt_codec 为它时才可能返回新变体。
+                    # _reasoning_cache_supply_id 保留不变（不重置）：下一轮循环命中同一 supply_id
+                    # 时会复用已缓存的 target_effort/abstract，只重跑 select_variant+syntax_adapt
+                    # （方案文档 §4.3，remap/abstract_encode 结果与 variant 无关，无需重算）。
+                    if (resp_status == 400 and not _reasoning_retried and target_model
+                            and reasoning_wire):
+                        next_variant = tgt_codec.interpret_rejection(resp_body, reasoning_variant)
+                        if next_variant:
+                            pref_store.learn(target_model, next_variant)
+                            _reasoning_retried = True
+                            continue  # 重新走 while 循环：select_supply 会再次选中同一 supply，
+                                      # 重新算 reasoning_wire 时 select_variant 命中刚学到的偏好，
+                                      # 自动改对语法后重发
+
+                    if failover == "on" and resp_status in _FAILOVER_STATUSES:
+                        log.warning("cooldown+failover: supply=%s status=%s key_tail4=%s",
+                                    supply_id, resp_status, appkey[-4:] if appkey else "")
+                        self._acc["failover"] = 1
+                        cd.cooldown(supply_id, cd_seconds)
+                        tried_set.add(supply_id)
+                        continue
+                    # 不 failover：按 source 协议包裹上游错误（阶段4 §5.2：不透传上游原始协议结构）
+                    upstream_msg = _extract_upstream_error_message(resp_body)
                     self._write_buffered_response(
-                        400, [], error_body_for_source(
-                            source, 400, f"proxy translate failed: {e}"))
+                        resp_status, [],
+                        error_body_for_source(
+                            source, resp_status,
+                            f"upstream error {resp_status}: {upstream_msg}"))
                     return
-                if target_model:
-                    responses_body["model"] = target_model
-                    fwd_ctx["request_model"] = target_model  # 响应 model 字段回填 target_model
-                send_body = json.dumps(responses_body, ensure_ascii=False).encode("utf-8")
-                # target_url 已在分支前统一算好（supply.url 已配到完整 /v1/responses 端点）
-                # Responses reasoning.effort 机制无 Anthropic thinking.type 400 拒绝问题
-                # （ResponsesReasoningCodec 单变体，interpret_rejection 恒 None），无需重试。
-
-            else:  # RESPONSES_TO_ANTHROPIC
-                # 组合4：responses 请求 → anthropic 上游。转成 Anthropic body，打 /v1/messages。
-                # 请求转换失败（异常）→ 合法 Responses error，400（反向规格 §5.1）
-                try:
-                    anthropic_body = pt.responses_to_anthropic_request(
-                        body_json or {}, max_tokens_default=4096,
-                        reasoning_fields=reasoning_wire)
-                except Exception as e:
-                    log.warning("RESPONSES_TO_ANTHROPIC request translate failed: %s", e)
+                except (urllib.error.URLError, OSError) as e:
+                    if failover == "on":
+                        log.warning("cooldown+failover(net): supply=%s err=%s key_tail4=%s",
+                                    supply_id, e, appkey[-4:] if appkey else "")
+                        self._acc["failover"] = 1
+                        cd.cooldown(supply_id, cd_seconds)
+                        tried_set.add(supply_id)
+                        continue
                     self._write_buffered_response(
-                        400, [], error_body_for_source(
-                            source, 400, f"proxy translate failed: {e}"))
+                        502, [], error_body_for_source(source, 502, f"upstream error: {e}"))
                     return
-                if target_model:
-                    anthropic_body["model"] = target_model
-                send_body = json.dumps(anthropic_body, ensure_ascii=False).encode("utf-8")
-                # target_url 已在分支前统一算好（supply.url 现在已是完整 /v1/messages 端点）
 
-            # ---- 注入出站 appkey（Authorization Bearer + x-api-key）----
-            appkey = supply.get("appkey", "")
-            _skip_req_headers = {"host", "content-length", "authorization", "x-api-key"}
-            fwd_headers: dict[str, str] = {}
-            for key, val in self.headers.items():
-                if key.lower() in _skip_req_headers:
-                    continue
-                fwd_headers[key] = val
-            fwd_headers["Authorization"] = f"Bearer {appkey}"
-            fwd_headers["x-api-key"] = appkey
-            fwd_headers["Content-Length"] = str(len(send_body))
-            if mode != PASSTHROUGH:
-                # 转换后 body 一律 JSON
-                fwd_headers["Content-Type"] = "application/json"
-
-            req = urllib.request.Request(
-                url=target_url,
-                data=send_body if send_body else None,
-                headers=fwd_headers,
-                method=method,
-            )
-
-            cd_seconds = int(supply.get("cooldown_seconds", default_cd))
-
-            try:
-                resp = urllib.request.urlopen(req, timeout=600)
-                resp_status = resp.status
-            except urllib.error.HTTPError as e:
-                resp_status = e.code
-                resp_headers = list(e.headers.items())
-                resp_body = e.read()
-
-                # reasoning 语法自适应重试（仅一次，不 rotate/cooldown supply，
-                # 与 failover 重试的关键区别：不加入 tried_set、不调用 cd.cooldown）。
-                # 单变体 codec（Chat/Responses）interpret_rejection 恒 None，天然不触发重试；
-                # 只有 AnthropicReasoningCodec（双变体）在 tgt_codec 为它时才可能返回新变体。
-                # _reasoning_cache_supply_id 保留不变（不重置）：下一轮循环命中同一 supply_id
-                # 时会复用已缓存的 target_effort/abstract，只重跑 select_variant+syntax_adapt
-                # （方案文档 §4.3，remap/abstract_encode 结果与 variant 无关，无需重算）。
-                if (resp_status == 400 and not _reasoning_retried and target_model
-                        and reasoning_wire):
-                    next_variant = tgt_codec.interpret_rejection(resp_body, reasoning_variant)
-                    if next_variant:
-                        pref_store.learn(target_model, next_variant)
-                        _reasoning_retried = True
-                        continue  # 重新走 while 循环：select_supply 会再次选中同一 supply，
-                                  # 重新算 reasoning_wire 时 select_variant 命中刚学到的偏好，
-                                  # 自动改对语法后重发
-
+                # 成功拿到响应：若为冷却信号码且允许 failover，则冷却后继续
                 if failover == "on" and resp_status in _FAILOVER_STATUSES:
+                    resp.close()
                     log.warning("cooldown+failover: supply=%s status=%s key_tail4=%s",
                                 supply_id, resp_status, appkey[-4:] if appkey else "")
                     self._acc["failover"] = 1
                     cd.cooldown(supply_id, cd_seconds)
                     tried_set.add(supply_id)
                     continue
-                # 不 failover：按 source 协议包裹上游错误（阶段4 §5.2：不透传上游原始协议结构）
-                upstream_msg = _extract_upstream_error_message(resp_body)
-                self._write_buffered_response(
-                    resp_status, [],
-                    error_body_for_source(
-                        source, resp_status,
-                        f"upstream error {resp_status}: {upstream_msg}"))
+
+                is_stream = isinstance(body_json, dict) and body_json.get("stream") is True
+
+                # ---- 按 mode 分派写回 ----
+                if mode == PASSTHROUGH:
+                    # 透传：流式 chunked，非流式 buffered
+                    if is_stream:
+                        self._write_streaming_response(
+                            resp_status, list(resp.getheaders()), resp, source)
+                    else:
+                        resp_body = resp.read()
+                        try:
+                            _pu = (json.loads(resp_body) or {}).get("usage") or {}
+                            # anthropic 侧: input_tokens/output_tokens；
+                            # chat/openai 侧: prompt_tokens/completion_tokens
+                            self._acc["usage_in"] = _pu.get(
+                                "input_tokens", _pu.get("prompt_tokens", 0)) or 0
+                            self._acc["usage_out"] = _pu.get(
+                                "output_tokens", _pu.get("completion_tokens", 0)) or 0
+                        except Exception:
+                            pass   # 解析失败不影响透传主流程，usage 记 0
+                        self._write_buffered_response(
+                            resp_status, list(resp.getheaders()), resp_body)
+                        resp.close()
+                    return
+
+                if mode == ANTHROPIC_TO_CHAT:
+                    # chat 响应 → Anthropic
+                    if is_stream:
+                        adapter = pt.OpenAIToAnthropicStreamAdapter(fwd_ctx, target_model or "")
+                        self._write_translated_stream(resp, adapter)
+                        (self._acc["usage_in"], self._acc["usage_out"], _) = adapter.usage_tuple()
+                    else:
+                        try:
+                            raw_resp_body = resp.read()
+                        finally:
+                            resp.close()
+                        # 响应转换失败（JSON 非法/转换器异常）→ 合法 Anthropic error，500（正向规格 §5.1）
+                        try:
+                            openai_resp = json.loads(raw_resp_body)
+                            anthropic_resp = pt.openai_to_anthropic_response(openai_resp, fwd_ctx)
+                        except Exception as e:
+                            log.warning("ANTHROPIC_TO_CHAT response translate failed: %s", e)
+                            self._write_buffered_response(
+                                500, [], error_body_for_source(
+                                    source, 500, f"proxy translate failed: {e}"))
+                            return
+                        _u = anthropic_resp.get("usage") or {}
+                        self._acc["usage_in"] = _u.get("input_tokens", 0)
+                        self._acc["usage_out"] = _u.get("output_tokens", 0)
+                        self._write_buffered_response(
+                            200, [("Content-Type", "application/json")],
+                            json.dumps(anthropic_resp, ensure_ascii=False).encode("utf-8"))
+                    return
+
+                if mode == ANTHROPIC_TO_RESPONSES:
+                    # responses 响应 → Anthropic
+                    if is_stream:
+                        adapter = pt.ResponsesToAnthropicStreamAdapter(fwd_ctx, target_model or "")
+                        self._write_translated_stream_from_responses(resp, adapter)
+                        (self._acc["usage_in"], self._acc["usage_out"], _) = adapter.usage_tuple()
+                    else:
+                        try:
+                            raw_resp_body = resp.read()
+                        finally:
+                            resp.close()
+                        # 响应转换失败（JSON 非法/转换器异常）→ 合法 Anthropic error，500
+                        try:
+                            responses_resp = json.loads(raw_resp_body)
+                            anthropic_resp = pt.responses_to_anthropic_response(
+                                responses_resp, fwd_ctx)
+                        except Exception as e:
+                            log.warning("ANTHROPIC_TO_RESPONSES response translate failed: %s", e)
+                            self._write_buffered_response(
+                                500, [], error_body_for_source(
+                                    source, 500, f"proxy translate failed: {e}"))
+                            return
+                        _u = anthropic_resp.get("usage") or {}
+                        self._acc["usage_in"] = _u.get("input_tokens", 0)
+                        self._acc["usage_out"] = _u.get("output_tokens", 0)
+                        self._write_buffered_response(
+                            200, [("Content-Type", "application/json")],
+                            json.dumps(anthropic_resp, ensure_ascii=False).encode("utf-8"))
+                    return
+
+                # RESPONSES_TO_ANTHROPIC：anthropic 响应 → Responses
+                _r_effort = ((body_json or {}).get("reasoning") or {}).get("effort")
+                _tools_echo = (body_json or {}).get("tools") or []
+                if is_stream:
+                    adapter = pt.AnthropicToResponsesStreamAdapter(
+                        model=target_model or "",
+                        ctx={"tools": _tools_echo, "reasoning_effort": _r_effort})
+                    self._write_responses_stream(resp, adapter)
+                    (self._acc["usage_in"], self._acc["usage_out"], _) = adapter.usage_tuple()
+                else:
+                    try:
+                        raw_resp_body = resp.read()
+                    finally:
+                        resp.close()
+                    # 响应转换失败（JSON 非法/转换器异常）→ 合法 Responses error，500（反向规格 §5.1）
+                    try:
+                        anthropic_resp = json.loads(raw_resp_body)
+                        responses_resp = pt.anthropic_to_responses_response(
+                            anthropic_resp, target_model or "",
+                            reasoning_effort=_r_effort, tools_echo=_tools_echo)
+                    except Exception as e:
+                        log.warning("RESPONSES_TO_ANTHROPIC response translate failed: %s", e)
+                        self._write_buffered_response(
+                            500, [], error_body_for_source(
+                                source, 500, f"proxy translate failed: {e}"))
+                        return
+                    _u = responses_resp.get("usage") or {}
+                    self._acc["usage_in"] = _u.get("input_tokens", 0)
+                    self._acc["usage_out"] = _u.get("output_tokens", 0)
+                    self._write_buffered_response(
+                        200, [("Content-Type", "application/json")],
+                        json.dumps(responses_resp, ensure_ascii=False).encode("utf-8"))
                 return
-            except (urllib.error.URLError, OSError) as e:
-                if failover == "on":
-                    log.warning("cooldown+failover(net): supply=%s err=%s key_tail4=%s",
-                                supply_id, e, appkey[-4:] if appkey else "")
-                    self._acc["failover"] = 1
-                    cd.cooldown(supply_id, cd_seconds)
-                    tried_set.add(supply_id)
+
+            # while 循环仅在 route_exhausted=True 时 break 到此处（其余分支均直接
+            # return 或 continue 留在 while 内）。§3 选项B：当前候选 route 全部
+            # supply 已冷却/失败，非最后一个候选则换下一个候选 route 重试；是最后
+            # 一个候选（含单候选、即旧单值 route_id 配置的现状行为）才最终 503。
+            if route_exhausted:
+                if not is_last_candidate:
+                    log.warning(
+                        "route_failover: route=%s tier=%s all supplies failed or cooling, "
+                        "trying next candidate route", route.get("id"), tier)
+                    self._acc["route_failover"] = 1
                     continue
                 self._write_buffered_response(
-                    502, [], error_body_for_source(source, 502, f"upstream error: {e}"))
+                    503, [], error_body_for_source(
+                        source, 503, "all upstream supplies failed or cooling"))
                 return
-
-            # 成功拿到响应：若为冷却信号码且允许 failover，则冷却后继续
-            if failover == "on" and resp_status in _FAILOVER_STATUSES:
-                resp.close()
-                log.warning("cooldown+failover: supply=%s status=%s key_tail4=%s",
-                            supply_id, resp_status, appkey[-4:] if appkey else "")
-                self._acc["failover"] = 1
-                cd.cooldown(supply_id, cd_seconds)
-                tried_set.add(supply_id)
-                continue
-
-            is_stream = isinstance(body_json, dict) and body_json.get("stream") is True
-
-            # ---- 按 mode 分派写回 ----
-            if mode == PASSTHROUGH:
-                # 透传：流式 chunked，非流式 buffered
-                if is_stream:
-                    self._write_streaming_response(
-                        resp_status, list(resp.getheaders()), resp, source)
-                else:
-                    resp_body = resp.read()
-                    try:
-                        _pu = (json.loads(resp_body) or {}).get("usage") or {}
-                        # anthropic 侧: input_tokens/output_tokens；
-                        # chat/openai 侧: prompt_tokens/completion_tokens
-                        self._acc["usage_in"] = _pu.get(
-                            "input_tokens", _pu.get("prompt_tokens", 0)) or 0
-                        self._acc["usage_out"] = _pu.get(
-                            "output_tokens", _pu.get("completion_tokens", 0)) or 0
-                    except Exception:
-                        pass   # 解析失败不影响透传主流程，usage 记 0
-                    self._write_buffered_response(
-                        resp_status, list(resp.getheaders()), resp_body)
-                    resp.close()
-                return
-
-            if mode == ANTHROPIC_TO_CHAT:
-                # chat 响应 → Anthropic
-                if is_stream:
-                    adapter = pt.OpenAIToAnthropicStreamAdapter(fwd_ctx, target_model or "")
-                    self._write_translated_stream(resp, adapter)
-                    (self._acc["usage_in"], self._acc["usage_out"], _) = adapter.usage_tuple()
-                else:
-                    try:
-                        raw_resp_body = resp.read()
-                    finally:
-                        resp.close()
-                    # 响应转换失败（JSON 非法/转换器异常）→ 合法 Anthropic error，500（正向规格 §5.1）
-                    try:
-                        openai_resp = json.loads(raw_resp_body)
-                        anthropic_resp = pt.openai_to_anthropic_response(openai_resp, fwd_ctx)
-                    except Exception as e:
-                        log.warning("ANTHROPIC_TO_CHAT response translate failed: %s", e)
-                        self._write_buffered_response(
-                            500, [], error_body_for_source(
-                                source, 500, f"proxy translate failed: {e}"))
-                        return
-                    _u = anthropic_resp.get("usage") or {}
-                    self._acc["usage_in"] = _u.get("input_tokens", 0)
-                    self._acc["usage_out"] = _u.get("output_tokens", 0)
-                    self._write_buffered_response(
-                        200, [("Content-Type", "application/json")],
-                        json.dumps(anthropic_resp, ensure_ascii=False).encode("utf-8"))
-                return
-
-            if mode == ANTHROPIC_TO_RESPONSES:
-                # responses 响应 → Anthropic
-                if is_stream:
-                    adapter = pt.ResponsesToAnthropicStreamAdapter(fwd_ctx, target_model or "")
-                    self._write_translated_stream_from_responses(resp, adapter)
-                    (self._acc["usage_in"], self._acc["usage_out"], _) = adapter.usage_tuple()
-                else:
-                    try:
-                        raw_resp_body = resp.read()
-                    finally:
-                        resp.close()
-                    # 响应转换失败（JSON 非法/转换器异常）→ 合法 Anthropic error，500
-                    try:
-                        responses_resp = json.loads(raw_resp_body)
-                        anthropic_resp = pt.responses_to_anthropic_response(
-                            responses_resp, fwd_ctx)
-                    except Exception as e:
-                        log.warning("ANTHROPIC_TO_RESPONSES response translate failed: %s", e)
-                        self._write_buffered_response(
-                            500, [], error_body_for_source(
-                                source, 500, f"proxy translate failed: {e}"))
-                        return
-                    _u = anthropic_resp.get("usage") or {}
-                    self._acc["usage_in"] = _u.get("input_tokens", 0)
-                    self._acc["usage_out"] = _u.get("output_tokens", 0)
-                    self._write_buffered_response(
-                        200, [("Content-Type", "application/json")],
-                        json.dumps(anthropic_resp, ensure_ascii=False).encode("utf-8"))
-                return
-
-            # RESPONSES_TO_ANTHROPIC：anthropic 响应 → Responses
-            _r_effort = ((body_json or {}).get("reasoning") or {}).get("effort")
-            _tools_echo = (body_json or {}).get("tools") or []
-            if is_stream:
-                adapter = pt.AnthropicToResponsesStreamAdapter(
-                    model=target_model or "",
-                    ctx={"tools": _tools_echo, "reasoning_effort": _r_effort})
-                self._write_responses_stream(resp, adapter)
-                (self._acc["usage_in"], self._acc["usage_out"], _) = adapter.usage_tuple()
-            else:
-                try:
-                    raw_resp_body = resp.read()
-                finally:
-                    resp.close()
-                # 响应转换失败（JSON 非法/转换器异常）→ 合法 Responses error，500（反向规格 §5.1）
-                try:
-                    anthropic_resp = json.loads(raw_resp_body)
-                    responses_resp = pt.anthropic_to_responses_response(
-                        anthropic_resp, target_model or "",
-                        reasoning_effort=_r_effort, tools_echo=_tools_echo)
-                except Exception as e:
-                    log.warning("RESPONSES_TO_ANTHROPIC response translate failed: %s", e)
-                    self._write_buffered_response(
-                        500, [], error_body_for_source(
-                            source, 500, f"proxy translate failed: {e}"))
-                    return
-                _u = responses_resp.get("usage") or {}
-                self._acc["usage_in"] = _u.get("input_tokens", 0)
-                self._acc["usage_out"] = _u.get("output_tokens", 0)
-                self._write_buffered_response(
-                    200, [("Content-Type", "application/json")],
-                    json.dumps(responses_resp, ensure_ascii=False).encode("utf-8"))
-            return
 
     # ------------------------------------------------------------------
     # control API dispatch
