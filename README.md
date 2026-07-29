@@ -84,10 +84,23 @@ tiers_source_                   opus:   [id, ...]  --------->  appkey / target_m
 对应一条 strategy               可被多条 strategy 复用               多个 route 可共享同一个 supply
 ```
 
+上面是单值 `route_id` 写法（一个 client_token 固定绑一个 route）。strategies 也可以改用
+`route_pool`（数组）绑多个 route，按 CC 会话 session_id 做一致性哈希分配，两者字段互斥，
+详见 3.4 节：
+
+```
+[strategies]
+client_token: "cc"
+route_pool: [{route_id:"claude",weight:2}, {route_id:"nation",weight:1}]  --▶ 按 session 分配到其中一个 route
+dispatch.session_overrides: {"<session_id>": "<route_id>"}                --▶ 手动覆盖，优先级最高
+```
+
 - **supplies**：每条 = 一个上游端点（url + 协议 + appkey + target_model + 可选能力）。
 - **routes**：家族模板，固定 opus/sonnet/haiku 三档，每档一个按优先级排列的 supply id 列表，
   取第一个未冷却的；route 本身不含 token，可被多条 strategy 复用。
-- **strategies**：把某个 client_token 绑定到某个 route 家族；运行时切家族用 `switch` 改 route_id。
+- **strategies**：把某个 client_token 绑定到某个 route——可以绑单个 route（`route_id`），也可以
+  绑一个 route_pool 做 session 级分配（`route_pool` + `dispatch`）；运行时切换单值写法用
+  `switch` 改 route_id。
 
 请求匹配时反向走这条链：token → strategy → route → tier → supply（见「三阶段匹配」）。
 
@@ -209,7 +222,8 @@ tiers_source_                   opus:   [id, ...]  --------->  appkey / target_m
   鉴权识别（client_token 提取）」，`Authorization: Bearer <token>` 与 `x-api-key: <token>`
   两种写法均支持）。
 - `route_id`：该 token 绑定的 route 家族 id，必须是 routes 里存在的 id。运行时切换家族用
-  `switch <token> <route_id>` 改这个字段。
+  `switch <token> <route_id>` 改这个字段。**与 `route_pool` 二选一、互斥**（见下方「按 session
+  分配到多个 route（route_pool）」）。
 - `tiers_source_capability`（可选）：该 client_token 各 tier 的 source 侧 reasoning 能力声明，
   结构与 supply 的 `reasoning_capability` 同构、解析逻辑复用同一套；某 tier 未声明或整条
   strategy 无此字段则回退默认 5 档。字段语义、为何挂 strategy、为何人工填详见「reasoning
@@ -218,6 +232,58 @@ tiers_source_                   opus:   [id, ...]  --------->  appkey / target_m
 - 禁用一个 token 直接删除其 strategy 记录即可（无 enabled 开关）。
 
 字段完整明细见附录 A：配置字段速查表。
+
+#### 按 session 分配到多个 route（route_pool）
+
+一个 client_token 除了绑单个 route（`route_id`），也可以绑一个 `route_pool`（多个候选
+route），按 Claude Code 会话 session_id 做一致性哈希分配——同一会话稳定落到同一个 route，不同
+会话打散到 route_pool 内多个 route，用于摊开配额/让不同会话用到不同后端组合。
+
+```json
+{
+  "client_token": "cc",
+  "route_pool": [
+    {"route_id": "claude", "weight": 1}
+  ],
+  "dispatch": {
+    "session_overrides": {
+      "c2e29916-326e-443f-91bf-72e5311b514a": "nation"
+    }
+  },
+  "note": "默认 Claude 家族（Claude Code SDK）"
+}
+```
+（以上结构改写自生产真实配置，appkey/admin_token 等凭证字段已脱敏省略。）
+
+- **`route_pool`**（数组，`{route_id, weight}`）：与 `route_id` 二选一、互斥。同时配置两者会被
+  `_config_ops.py` 的 `strategy add`/`edit` 拒绝写入；若绕过 CLI 直接改配置文件导致两者同时
+  存在，运行时（`extract_route_candidates`）会忽略 `route_id`、按 `route_pool` 处理并打
+  warning 日志，不会中断请求。
+  - `weight`（可选，默认 1）：参与一致性哈希的权重。非正整数会被静默视为 1（不报错、不把该
+    route 排除在外）。
+  - `route_pool` 里引用了不存在的 `route_id` 会被跳过并打 warning 日志，不拖垒整条 strategy；
+    若全部条目都非法，该 strategy 无可用候选，请求 401（no strategy/route matched）。
+- **`dispatch.session_overrides`**（对象，`session_id字符串 → route_id字符串`）：手动把指定
+  session_id 固定路由到某个 route，优先级高于自动哈希分配。**该 route_id 只需存在于顶层
+  `routes` 定义里，不要求也出现在这条 strategy 的 `route_pool` 列表内**——这是有意允许的
+  「例外指定」，用于临时把某个会话导到 route_pool 之外的 route 做调试/隔离。
+- **session_key 怎么来的**：从 CC 请求体 `metadata.user_id` 字段（一个 JSON 字符串）里解析出
+  `session_id`（`extract_session_key`）。同一个 CC 会话（含它派生的 Task 子agent 请求，子agent
+  复用父会话 session_id）全程稳定不变，不同会话不同。
+- **自动分配算法**：一致性哈希——`md5(session_key) % 权重总和` 定位到 `route_pool` 里的主选
+  route，其余候选按权重区间顺序（从主选处整体旋转）跟在后面作为兜底候选。同一 session_key
+  多次计算结果恒定；不同 session_key 会打散到不同 route。当前只实现这一种分配算法
+  （`dispatch.type` 是预留扩展位，代码里目前不读取该字段，无论写什么都按同一套哈希逻辑跑）。
+- **session_key 缺失时的行为**（未取到 session_id，如非 CC 客户端请求）：固定回退到
+  `route_pool` 首项作为主选，其余按 `route_pool` 原顺序跟随作为兜底候选。这一行为当前是
+  硬编码，`dispatch.fallback` 是预留字段，代码里不读取，写它不会改变实际行为。
+- **route 全挂时跨 route 兜底**：当前候选 route 下该 tier 的所有 supply 都不可用（缺 tier 配置，
+  或全部冷却/失败）时，自动换 `route_pool` 里按哈希排出的下一个候选 route 重试，直到某个候选
+  可用，或全部候选耗尽后最终返回 503。发生这种跨 route 切换时，ACCESS 日志记
+  `route_failover=1`（区别于同一个 route 内部换 supply 的 `failover=1`）。单候选（旧单值
+  `route_id` 写法）时这条外层循环只跑一轮，不产生 `route_failover`，行为与改动前完全一致。
+- **ACCESS 日志新增字段**：`session=<session_id或空>`（该请求解析出的 session_key，取不到为
+  空串）、`route_failover=<0或1>`（是否发生了跨 route 兜底）。
 
 ## 4. 请求处理流程
 
@@ -240,10 +306,14 @@ tiers_source_                   opus:   [id, ...]  --------->  appkey / target_m
 │     → source ∈ {anthropic, responses, chat, unknown}               │
 ├────────────────────────────────────────────────────────────────────┤
 │ ③ 三阶段匹配                                  （见「三阶段匹配」） │
-│     a. client_token ──查 strategies──▶ route_id ──▶ route          │
+│     a. client_token ──查 strategies──▶ route_id 直选                │
+│        或 route_pool ──session_hash/override──▶ route 候选列表    │
 │     b. body.model ──精确查表──▶ tier(opus/sonnet/haiku)            │
-│     c. route.tiers[tier] ──▶ supplies 列表 ──failover──▶ supply    │
-│     （查不到 strategy→401 / tier 非预设→400 / 无可用 supply→503）  │
+│     c. 候选 route 逐个：route.tiers[tier] ──▶ supplies 列表         │
+│        ──同route内failover──▶ supply；该候选全挂──▶ 换下一候选     │
+│        route（route_failover）                                     │
+│     （查不到 strategy→401 / tier 非预设→400 / 候选耗尽仍无可用     │
+│     supply→503）                                                    │
 ├────────────────────────────────────────────────────────────────────┤
 │ ④ effort 映射                          （见「effort 跨模型映射」） │
 │     decode(source) → remap(source_cap, target_cap)                 │
@@ -295,14 +365,22 @@ tiers_source_                   opus:   [id, ...]  --------->  appkey / target_m
 
 请求进来后：
 
-1. 用 `client_token` 查 strategies 拿到 `route_id`，再用 `route_id` 拿到 route 家族。
+1. 用 `client_token` 查 strategies 拿到该 strategy 的 route 候选列表（`extract_route_candidates`）：
+   - 旧写法 `route_id`（单值）：候选列表只有这一个 route（或该 id 不存在则候选为空）。
+   - 新写法 `route_pool`（多值）：按 `dispatch.session_overrides` 优先匹配、否则按
+     session_key 一致性哈希，排出一个有序候选列表（详见 3.4 节「按 session 分配到多个
+     route（route_pool）」）。
+   - 候选列表为空 → 401（no strategy/route matched）。
 2. 把请求体 `model` 字段精确查表映射成 tier 名（`claude-opus`→opus / `claude-sonnet`→
-   sonnet / `claude-haiku`→haiku，仅这三个精确值，非子串猜测）。
-3. 从 route 的 `tiers` 里按 tier 取出该档 supplies 列表，交给 failover 逐个选未冷却的。
+   sonnet / `claude-haiku`→haiku，仅这三个精确值，非子串猜测）。tier 解析只与 `model` 有关，
+   与候选哪个 route 无关。
+3. 按候选列表顺序逐个尝试 route：取该 route 的 `tiers[tier]` supplies 列表，交给同 route 内
+   failover 逐个选未冷却的 supply；若该候选 route 缺 tier 配置或该 tier 下所有 supply 都不可用，
+   换下一个候选 route 重试（记 `route_failover=1`），直到某候选可用或候选耗尽。
 
 `model` 字段不是上述三个预设值之一时，选路直接 400 失败，不兜底。`settings.json` 里的
 `ANTHROPIC_DEFAULT_OPUS_MODEL`/`_SONNET_MODEL`/`_HAIKU_MODEL` 固定填
-`claude-opus`/`claude-sonnet`/`claude-haiku`；切换家族用 `switch`，不动 model 标签。
+`claude-opus`/`claude-sonnet`/`claude-haiku`；切换单值写法的家族用 `switch`，不动 model 标签。
 
 ### 4.5 effort 跨模型映射
 
@@ -348,9 +426,10 @@ v1 代理（18888）已于 2026-07-24 下线归档，不再涉及并行关系。
 日志除 WARNING 级别（异常/降级路径，如 no route、cooldown+failover、stream interrupted 等）外，
 还有一条 INFO 级别的 `ACCESS` 访问日志：每个转发请求（不含 `/model_proxy/*` 控制端点）结束时
 记一条，覆盖整个请求生命周期，字段为
-`ms status source route tier supply failover attempts usage_in usage_out token`
-（`ms` 为端到端耗时毫秒，`token` 为客户端 token 尾4位）。两者共用同一文件，用固定前缀 `ACCESS`
-区分。
+`ms status source route tier supply failover attempts usage_in usage_out token session route_failover`
+（`ms` 为端到端耗时毫秒，`token` 为客户端 token 尾4位，`session` 为该请求解析出的 session_id
+取不到为空串，`route_failover` 为 0/1 标记本次请求是否发生了「pin route 全挂后跨 route 兜底」，
+区别于同 route 内换 supply 的 `failover`）。两者共用同一文件，用固定前缀 `ACCESS` 区分。
 
 token 用量统计：转换模式（Anthropic↔Chat/Responses，流式+非流式）、PASSTHROUGH 非流式、
 以及 PASSTHROUGH 流式（anthropic→anthropic、responses→responses 的流式请求）均会提取
@@ -412,6 +491,10 @@ model_proxy_cli.sh --help / -h                       # 显示帮助
 - `supply`/`route`/`strategy` 只能通过一级入口进入交互菜单（先打印 list，再选操作，可回菜单
   继续或 `q`/回车退出）；不再支持子命令直达（如 `supply add`）。所有写操作原子写盘
   （tempfile + os.replace）后自动触发 reload。
+- `switch <client_token> <route_id>` 仅适用于单值 `route_id` 写法的 strategy；对已配置
+  `route_pool` 的 strategy 会拒绝执行（`route_id` 与 `route_pool` 互斥），需直接编辑配置文件
+  调整。`strategy list`/交互菜单打印 route 归属时两种写法均兼容显示（单值直接打 route_id，
+  route_pool 打成 `pool[route_id:weight,...]` 形式）。
 - **非交互（stdin 非 TTY）环境**：调用 `supply`/`route`/`strategy` 时，先打印一次 list，然后
   检测到非 TTY 即直接退出，不进交互菜单，不会阻塞在 `read` 上等待永远不会到来的输入。
 - `strategy add`/`edit` 录入 `tiers_source_capability` 时逐 tier 人工问答（source 侧无可探测
@@ -625,7 +708,11 @@ token 里选定）过滤候选 client_token；无匹配协议的 token 时提示
 | 字段 | 类型 | 必填 | 语义 | 默认值 |
 |---|---|---|---|---|
 | `client_token` | string | 必填 | 客户端鉴权 token，代理据此查找 strategy | — |
-| `route_id` | string | 必填 | 绑定的 route 家族 id | — |
+| `route_id` | string | 与 `route_pool` 二选一 | 绑定的单个 route 家族 id；与 `route_pool` 互斥（同时出现写入侧拒绝，运行时容错按 route_pool 处理并打 warning） | — |
+| `route_pool` | `{route_id, weight}[]` | 与 `route_id` 二选一 | 按 session 一致性哈希分配的候选 route 列表；`weight` 可选，默认 1，非正整数静默视为 1 | — |
+| `dispatch.session_overrides` | `{session_id: route_id}` | 可选 | 手动把指定 session_id 固定路由到某个 route，优先级高于哈希分配；该 route_id 允许不在本 strategy 的 route_pool 内 | `{}` |
+| `dispatch.type` | string | 可选 | 预留分配策略扩展位，当前代码不读取该字段，只有一种哈希分配算法 | 不生效 |
+| `dispatch.fallback` | string | 可选 | 预留字段，当前代码不读取，session_key 缺失时行为固定为「route_pool 首项」，写该字段不改变实际行为 | 不生效 |
 | `tiers_source_capability.<opus\|sonnet\|haiku>.effort_enum` | string[] | 可选 | 该 tier 的 source 侧 effort 档位有序列表 | 默认 5 档 |
 | `tiers_source_capability.<opus\|sonnet\|haiku>.off_alias` | string | 可选 | 同 supply 语义 | 同 supply 缺省规则 |
 | `note` | string | 可选 | 备注 | — |

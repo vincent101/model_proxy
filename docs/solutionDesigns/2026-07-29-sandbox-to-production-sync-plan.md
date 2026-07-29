@@ -1,6 +1,6 @@
 ---
 type: design-decision
-status: draft
+status: confirmed
 target: "[[tools/model_proxy]]"
 tags: [architect, model_proxy, deployment, rollback, session-route-dispatch]
 ---
