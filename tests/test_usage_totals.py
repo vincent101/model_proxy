@@ -334,7 +334,7 @@ class TestComboProjectionFilterLogic(unittest.TestCase):
 class TestGetMonthBucketSplitArchive(unittest.TestCase):
     """复刻 model_proxy_cli.sh cmd_stats 内 get_month_bucket 的修复后逻辑：
     月度数据分裂在 months_archive 与 days 两处时必须无条件合并，不丢不重。
-    见 docs/solutionDesigns/2026-07-23-usage-totals-ledger.md 及 reviewer 复现场景。
+    见 docs/designs/2026-07-23-usage-totals-ledger.md 及 reviewer 复现场景。
     """
 
     @staticmethod

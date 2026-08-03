@@ -100,9 +100,9 @@ README 三项新改动描述与当前代码一致：账本（KEEP_DAYS=400、com
 
 ## 关联
 
-- [[docs/solutionDesigns/2026-07-23-usage-totals-ledger]]
-- [[docs/solutionDesigns/2026-07-23-chat-reasoning-content-fallback]]
-- [[docs/solutionDesigns/2026-07-23-usage-reasoning-extraction-unify]]
-- [[docs/solutionDesigns/2026-07-23-readme-sync-3changes]]
-- [[docs/solutionDesigns/2026-07-22-inbound-auth-header-asymmetry]]
+- [[docs/designs/2026-07-23-usage-totals-ledger]]
+- [[docs/designs/2026-07-23-chat-reasoning-content-fallback]]
+- [[docs/designs/2026-07-23-usage-reasoning-extraction-unify]]
+- [[docs/designs/2026-07-23-readme-sync-3changes]]
+- [[docs/designs/2026-07-22-inbound-auth-header-asymmetry]]
 - [[docs/model_proxy_translate_spec]]

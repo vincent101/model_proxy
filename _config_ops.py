@@ -758,7 +758,7 @@ def route_del(path: str, rid: str) -> None:
 
 def _strategy_route_desc(st: dict) -> str:
     """打印用的 route 归属描述：兼容旧单值 route_id 与新 route_pool 写法（见
-    docs/solutionDesigns/2026-07-28-session-route-dispatch-design.md §4/§5）。
+    docs/designs/2026-07-28-session-route-dispatch-design.md §4/§5）。
     """
     route_pool = st.get("route_pool")
     if route_pool:
@@ -848,7 +848,7 @@ def strategy_edit(path: str, token: str) -> None:
     known_routes = {r.get("id") for r in cfg.get("routes", [])}
 
     # route_pool 写法（新）不走本 CLI 的单值 Route ID 编辑（见
-    # docs/solutionDesigns/2026-07-28-session-route-dispatch-design.md §5：
+    # docs/designs/2026-07-28-session-route-dispatch-design.md §5：
     # CLI 菜单本次不支持录入 route_pool/dispatch，但编辑其他字段时不能丢/不能因
     # 强制要求单值 route_id 而报错阻塞）。target 引用是 cfg 内原字典，
     # route_pool/dispatch 字段全程保留不动。

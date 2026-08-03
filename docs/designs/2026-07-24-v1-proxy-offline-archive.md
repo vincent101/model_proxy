@@ -204,4 +204,4 @@ git status --short | grep -E "proxy\.py|proxy_cli|ensure_proxy|claude_proxy|hist
 - [[tools/proxy.py]]（归档对象，v1 主程序）
 - [[tools/model_proxy/README.md]]（#3 需同步措辞）
 - [[tools/config_backup/lib/backup.sh]]（#2，建议单独一轮处理）
-- [[tools/model_proxy/docs/solutionDesigns/2026-07-22-install-manage-sessionstart-hook.md]]（v2 hook 安装逻辑，说明为何无法复用其卸载 v1）
+- [[tools/model_proxy/docs/designs/2026-07-22-install-manage-sessionstart-hook.md]]（v2 hook 安装逻辑，说明为何无法复用其卸载 v1）

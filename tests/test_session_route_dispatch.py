@@ -4,7 +4,7 @@
 extract_route_candidates（strategy → 候选 route 列表：旧单值 route_id 兼容、
 route_pool 一致性哈希、session_overrides 优先、fallback、脏配置容错、
 route_id 与 route_pool 互斥非法态的运行时兜底），见设计文档
-docs/solutionDesigns/2026-07-28-session-route-dispatch-design.md。
+docs/designs/2026-07-28-session-route-dispatch-design.md。
 
 运行：cd tools/model_proxy && python3 -m unittest tests.test_session_route_dispatch
 """

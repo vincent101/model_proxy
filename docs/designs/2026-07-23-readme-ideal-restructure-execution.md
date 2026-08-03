@@ -17,7 +17,7 @@ tags: [architect, model_proxy, documentation, refactor]
 
 ## 背景与问题
 
-现状 README 按"配置文件结构"组织（supplies→routes→strategies→字段明细），60% 篇幅压在最庞大最烧脑的配置理论上，缺 quick start，reasoning 语义分散 4 处重复，且 docs 目录描述漏列 `solutionDesigns/`。重构目标：改为"按读者认知路径组织"（跑通→概念→链路→深入→限制），字段明细降级为速查附录，reasoning 收敛到单一深讲节，修正 A1 事实错误、补 B3 缺失说明。
+现状 README 按"配置文件结构"组织（supplies→routes→strategies→字段明细），60% 篇幅压在最庞大最烧脑的配置理论上，缺 quick start，reasoning 语义分散 4 处重复，且 docs 目录描述漏列 `designs/`。重构目标：改为"按读者认知路径组织"（跑通→概念→链路→深入→限制），字段明细降级为速查附录，reasoning 收敛到单一深讲节，修正 A1 事实错误、补 B3 缺失说明。
 
 ---
 
@@ -120,7 +120,7 @@ tags: [architect, model_proxy, documentation, refactor]
 - **附**：`admin_token` / `default_cooldown_seconds` 两个顶层字段（现状 L269-L274「顶层字段」节）并入本附录顶层字段表，`完整样例见 config/model_proxy_config.example.json` 一句放附录末尾。
 
 ### `## 附录 B：目录结构`
-- **要点**：现状 L12-L34 的目录树，**修正 A1**（补 `docs/solutionDesigns/`）。素材见「五·A1」。
+- **要点**：现状 L12-L34 的目录树，**修正 A1**（补 `docs/designs/`）。素材见「五·A1」。
 - **覆盖现状**：L12-L34（现状「目录结构」整节，从正文第二节位置移到附录 B——目录结构对新读者不是认知路径关键，降级为查阅附录）。
 
 ---
@@ -130,7 +130,7 @@ tags: [architect, model_proxy, documentation, refactor]
 | 现状章节 / 内容块 | 现状 L行号 | 去向（新结构） | 处理方式 |
 |---|---|---|---|
 | 「这是什么」 | L3-L10 | § 1 这是什么 | 精简搬迁 |
-| 「目录结构」目录树 | L12-L34 | 附录 B 目录结构 | 移到附录 + **A1 修正补 solutionDesigns** |
+| 「目录结构」目录树 | L12-L34 | 附录 B 目录结构 | 移到附录 + **A1 修正补 designs** |
 | 「配置怎么写」总述（三段结构） | L36-L42 | § 3.1 三段关系总览 | 搬迁 + 加文字关系图 |
 | 「配置怎么写」热重载一句（见「怎么启动」） | L44 | § 5.3 配置热重载 | 合并（交叉引用改，见清单 #1） |
 | supplies 示例 + 字段列表 + anthropic 注意框 | L46-L82 | § 3.2 supplies（示例+一句话）+ 附录 A（字段明细） | 拆分：示例留正文、字段明细下沉附录 A |
@@ -337,7 +337,7 @@ tags: [architect, model_proxy, documentation, refactor]
 
 | 项 | 内容 | 放在新结构哪节 |
 |---|---|---|
-| **A1** | 目录树补 `docs/solutionDesigns/`（当期设计记录，区别于 `archive/` 历史归档） | 附录 B 目录结构 |
+| **A1** | 目录树补 `docs/designs/`（当期设计记录，区别于 `archive/` 历史归档） | 附录 B 目录结构 |
 | B3-1 | detect_installed"目录存在即已装"口径 | § 7 接入各 SDK（四·5·a） |
 | B3-2 | install base_url 期望形态表 | § 7 接入各 SDK（四·5·b） |
 | B3-3 | codex base_url 未核对官方文档提示 | § 7 + § 8（四·5·c） |
@@ -347,7 +347,7 @@ tags: [architect, model_proxy, documentation, refactor]
 > ```
 > ├── docs/                              # 文档
 > │   ├── model_proxy_translate_spec.md  # 协议转换活规格
-> │   ├── solutionDesigns/               # 当期设计记录（如入站鉴权/access日志/SessionStart hook）
+> │   ├── designs/               # 当期设计记录（如入站鉴权/access日志/SessionStart hook）
 > │   └── archive/                       # 历史设计记录归档
 > ```
 
@@ -403,7 +403,7 @@ implementer 落地后，按以下清单人工核对（或派 reviewer）：
 1. **信息无丢失**：现状 436 行每个内容块都能在新结构找到落点（对照本文「二、搬迁映射表」逐行勾）。
 2. **交叉引用无断链**：按「六、交叉引用检查清单」13 条 + 新增指针逐条核对，每个"见 § X"或"见「X」"都能在新结构找到对应节。
 3. **reasoning 不重复**：全文搜 "STRIP" / "DISABLED" / "相对排名" / "off_alias"，确认深讲只出现在 § 6，其余处只有一句话指针。
-4. **A1 已修**：附录 B 目录树含 `docs/solutionDesigns/`。
+4. **A1 已修**：附录 B 目录树含 `docs/designs/`。
 5. **B3 四条已补**：§ 7 有 detect_installed 口径 + base_url 表 + codex 提示；§ 5.5 有 stats trim 说明；§ 8 有 codex 条目。
 6. **图对齐**：Obsidian 阅读视图打开，§ 3.1 关系图、§ 4.1 链路图无错行。
 7. **与代码一致性抽查**：Quick Start 命令实跑一遍（`on` / `install` / `logs` / `status`）确认输出与素材描述一致；base_url 表对照 `_install_ops.py` 实际写入值。
@@ -411,7 +411,7 @@ implementer 落地后，按以下清单人工核对（或派 reviewer）：
 ## 关联
 
 - [[tools/model_proxy/README.md]]（重构目标文件）
-- [[tools/model_proxy/docs/solutionDesigns/2026-07-22-inbound-auth-header-asymmetry]]
-- [[tools/model_proxy/docs/solutionDesigns/2026-07-22-access-log-and-latency]]
-- [[tools/model_proxy/docs/solutionDesigns/2026-07-22-install-manage-sessionstart-hook]]
+- [[tools/model_proxy/docs/designs/2026-07-22-inbound-auth-header-asymmetry]]
+- [[tools/model_proxy/docs/designs/2026-07-22-access-log-and-latency]]
+- [[tools/model_proxy/docs/designs/2026-07-22-install-manage-sessionstart-hook]]
 - `tools/model_proxy/docs/archive/reasoning_relative_remap_redesign.md`

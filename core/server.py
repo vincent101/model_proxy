@@ -63,7 +63,7 @@ log = logging.getLogger(__name__)
 
 # access logger：单独 INFO 级别，复用同一日志文件、不向 root 传播（root 仍 WARNING，
 # 避免误收其他 INFO 噪声）。固定前缀 ACCESS，key=value 单行文本，与现有 WARNING 行
-# 风格一致，grep/awk 友好（见 docs/solutionDesigns/2026-07-22-access-log-and-latency.md）。
+# 风格一致，grep/awk 友好（见 docs/designs/2026-07-22-access-log-and-latency.md）。
 _access_handler = logging.FileHandler(LOG_FILE)
 _access_handler.setFormatter(logging.Formatter("%(asctime)s %(message)s"))
 access_log = logging.getLogger("model_proxy.access")
@@ -74,7 +74,7 @@ access_log.propagate = False
 # ---------------------------------------------------------------------------
 # 累计用量账本：独立于 access 日志文件，只增不截、不受 _trim_log 影响。
 # 按天分桶 + supply×route×strategy 组合键，见
-# docs/solutionDesigns/2026-07-23-usage-totals-ledger.md
+# docs/designs/2026-07-23-usage-totals-ledger.md
 # ---------------------------------------------------------------------------
 
 _CST = timezone(timedelta(hours=8))          # UTC+8，中国标准时间，固定偏移
@@ -498,7 +498,7 @@ def extract_session_key(body_json):
     """从 metadata.user_id 提取 session_id，取不到返回 None。
 
     临时观测函数，用于验证 session_route_dispatch 方案的 session_key 假设
-    （见 docs/solutionDesigns/2026-07-28-session-route-dispatch-design.md §1/§4b）。
+    （见 docs/designs/2026-07-28-session-route-dispatch-design.md §1/§4b）。
 
     实测修正（2026-07-28 沙箱实测）：真实 CC 请求的 metadata.user_id 不是设计文档
     最初假设的拼接字符串 "user_..._session_<uuid>"，而是一个 JSON 字符串，形如：
@@ -603,7 +603,7 @@ def extract_route_candidates(strategy: "dict | None", session_key: "str | None",
 
     用于 §3 选项B「pin route 全挂时跨 route 兜底」：候选列表第一项是主选（pin）
     route，后续项按顺序作为兜底候选。设计见
-    docs/solutionDesigns/2026-07-28-session-route-dispatch-design.md §2/§4/§4b。
+    docs/designs/2026-07-28-session-route-dispatch-design.md §2/§4/§4b。
 
     - strategy 为 None → 返回 []（无匹配）。
     - strategy 只有旧字段 route_id（无 route_pool）→ 返回长度<=1 的列表，完全

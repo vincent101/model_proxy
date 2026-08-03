@@ -85,7 +85,7 @@ token 用量统计：转换模式（Anthropic↔Chat/Responses，流式+非流�
 **只增不截**，不受进程重启与日志截断影响。天分桶只保留最近 `KEEP_DAYS=400` 天，超窗旧天桶汇总进
 `months_archive` 月归档节点（永久保留）。天/月边界固定按 UTC+8 划分（`timezone(timedelta(hours=8))`，
 不依赖系统时区）。账本供 `stats` 命令查询（见「CLI 命令参考」），与 ACCESS 日志完全独立。账本结构
-细节见设计记录 `docs/solutionDesigns/2026-07-23-usage-totals-ledger.md`。
+细节见设计记录 `docs/designs/2026-07-23-usage-totals-ledger.md`。
 ```
 
 **与 5.5 stats 描述的关系**：5.5 是 CLI 命令视角（stats 怎么用），5.2 新增段是数据/观测视角（账本是什么、机制如何）。两者视角不同、不重复，各留一句指针互指即可（本段末已指向设计记录，5.5 无需再改指向）。

@@ -436,7 +436,7 @@ token 用量统计：转换模式（Anthropic↔Chat/Responses，流式+非流�
 `usage_in`/`usage_out` 填入 access 行。reasoning token 不再单独统计（原因见下）——协议转换时
 仍如实把上游 reasoning 明细透传给下游消费者（`core/translate.py` 的 `_extract_reasoning_tokens()`
 与各 adapter 的 `usage_tuple()` 未变），只是代理自身的统计观测链路不再追踪这一维度，详见
-`docs/solutionDesigns/2026-07-24-model-proxy-reasoning统计移除安全上线.md`。PASSTHROUGH 流式采用「转发在前、
+`docs/designs/2026-07-24-model-proxy-reasoning统计移除安全上线.md`。PASSTHROUGH 流式采用「转发在前、
 旁路嗅探在后」策略（`_write_streaming_response` 转发 chunk 后累积进本地 buffer，按 `\n\n`
 切出完整 SSE 事件块，从 anthropic 的 `message_delta` 或 responses 的 `response.completed`
 事件里覆盖式提取 usage），不改变、不阻塞原有转发时序，异常整体隔离不影响透传正确性。
@@ -451,7 +451,7 @@ token 用量统计：转换模式（Anthropic↔Chat/Responses，流式+非流�
 **只增不截**，不受进程重启与日志截断影响。天分桶只保留最近 `KEEP_DAYS=400` 天，超窗旧天桶汇总进
 `months_archive` 月归档节点（永久保留）。天/月边界固定按 UTC+8 划分（`timezone(timedelta(hours=8))`，
 不依赖系统时区）。账本供 `stats` 命令查询（见「CLI 命令参考」），与 ACCESS 日志完全独立。账本结构
-细节见设计记录 `docs/solutionDesigns/2026-07-23-usage-totals-ledger.md`。
+细节见设计记录 `docs/designs/2026-07-23-usage-totals-ledger.md`。
 
 ### 5.3 配置热重载
 
@@ -748,7 +748,7 @@ tools/model_proxy/
 ├── tests/                              # 单测
 ├── docs/                              # 文档
 │   ├── model_proxy_translate_spec.md  # 协议转换活规格
-│   ├── solutionDesigns/               # 当期设计记录（如入站鉴权/access日志/SessionStart hook）
+│   ├── designs/               # 当期设计记录（如入站鉴权/access日志/SessionStart hook）
 │   └── archive/                       # 历史设计记录归档
 └── samples/                            # 实测样本（网关真实响应，供规格核对字段用）
 ```
