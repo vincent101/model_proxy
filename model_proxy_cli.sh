@@ -157,9 +157,22 @@ for r in data.get('routes', []):
 print('strategies (token 绑定):')
 for st in data.get('strategies', []):
     tok = st.get('client_token', '?')
-    rid = st.get('route_id', '?')
     note = st.get('note', '') or ''
-    print(f'  {tok:16} -> {rid:12} ({note})')
+    route_id = st.get('route_id')
+    route_pool = st.get('route_pool')
+    if route_id:
+        rid_desc = route_id
+    elif route_pool:
+        pool_desc = ','.join(
+            f\"{p.get('route_id', '?')}:{p.get('weight', 1)}\" for p in route_pool
+        )
+        overrides = ((st.get('dispatch') or {}).get('session_overrides')) or {}
+        rid_desc = f'pool[{pool_desc}]'
+        if overrides:
+            rid_desc += f' +{len(overrides)}个session覆盖'
+    else:
+        rid_desc = '?'
+    print(f'  {tok:16} -> {rid_desc:12} ({note})')
 cooldown = data.get('cooldown', {})
 if cooldown:
     print('cooldown (剩余秒):')
