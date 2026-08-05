@@ -71,7 +71,13 @@ handleTriggerKey(e2) {
 | `#` | ✓ 可达（228 条到达） | ✗ `InstructionModeManager` | 228（单行 1） | **双废** |
 | `@` | ✗ 文件引用语义，客户端做路径补全 | — | 36（单行 20） | 语义冲突 |
 | `/` | ✗ slash command | — | 1（恰是文件路径） | 语义冲突 |
-| **`$`** | **✓ 无拦截** | **✓ 无拦截** | **0** | **✓ 采用** |
+| **`$`** | **✓ 无拦截** | **✓ 无拦截**（有一条件性例外，见下注） | **0** | **✓ 采用** |
+
+> **`$` 的条件性风险（Claudian codex provider）**：Claudian 的 provider 各有自己的下拉触发符——`CodexWorkspace.getDropdownConfig()` 返回 `triggerChars: ["/", "$"]` 且 `skillPrefix: "$"`（而 `claude` 与 `opencode` 都只有 `["/"]`）。若 codex provider 启用，行首 `$` 会弹技能下拉，且 `SlashCommandDropdown.handleKeydown` 对 Enter 的处理是 `if (this.filteredItems.length > 0) { preventDefault(); selectItem(); return true; }`——**会吞掉 Enter**。
+>
+> **当前无风险，且有两重兜底**：① `.claudian/claudian-settings.json` 中 `providerConfigs.codex.enabled = false`，而 `handleKeydown` 首行即 `if (!this.enabled || !this.isVisible()) return false`，下拉不会 visible；② 即便启用，`showDropdown` 内有 `if (searchText.length > 0 && this.filteredItems.length === 0) { this.hide(); return; }`，只要没有 codex 技能的名称/描述含子串 `route`，下拉自动隐藏、Enter 正常放行。
+>
+> **但这是一条持续性外部依赖**，性质与 §1.0 的约束同类：若日后启用 codex provider 且恰有技能名/描述含 `route`，`$route` 的 Enter 会被吞。旁证：`normalizeHiddenCommandName` 的实现是 `value.trim().replace(/^[/$]+/, "")`——同时剥 `/` 与 `$`，说明插件作者确实把 `$` 视作命令前缀之一。
 
 `$` 的验证明细（三项全过）：
 1. **Claudian 无拦截**：`main.js` 内 `key === "$"` 出现 **0 次**；全文件仅 `BangBashModeManager`/`InstructionModeManager` 两个输入模式拦截器，分别只管 `!`/`#`。
@@ -435,6 +441,9 @@ env ANTHROPIC_BASE_URL="http://127.0.0.1:18899/" ANTHROPIC_AUTH_TOKEN="cc" \
 |---|---|---|---|
 | **V1** | **`$route nation` 在两个客户端都能原样到达 API** | 沙箱起只 dump body 的 stub；**CLI 与 Claudian 各发一次**，检查 `messages[-1]` 文本是否精确等于输入 | **方案作废**（通道不存在），需另找可达前缀。**必须两个客户端都测**——这正是 `#` 方案翻车的原因（见 §1.0/§1.2） |
 | **V2** | user 消息是否被追加 `<system-reminder>` | 同 V1，检查 content 形态：是否多 block、text 内是否含换行 | 「单行」约束需调整（否则指令永不匹配） |
+| V2b | `system` 字段的线格式 | 同一次 dump 一并看：`body["system"]` 是 `str` 还是 `list`、blocks 形态下是否带 `cache_control` | 仅影响日后若要读 system（本方案不读，属信息补全） |
+
+> **V1/V2/V2b 可用同一次 dump 一次性覆盖**，无需分三次跑。若同时想验证 Claudian 自定义系统提示词的落点，可临时把该设置设为唯一 token（如 `ZZPROBE_7f3a`）后发一条消息，测完改回空串。
 | V3 | usage 填 0 是否让客户端显示异常 | 自造响应后观察客户端用量显示 | 改为填合理估算值 |
 | V4 | 自造 SSE 序列客户端能否正常消费 | 对比 `samples/anthropic_stream_samples.txt`，观察客户端是否卡住/报错；**Claudian 与 CLI 各验一次**（两者 SSE 消费实现不同） | 补齐缺失事件 |
 | V5 | 写路径无别名污染 | 单测：写入后断言 `ConfigStore._config` 未被就地改动（deepcopy 生效） | 修实现（§4.2） |
