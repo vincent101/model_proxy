@@ -204,8 +204,8 @@ message_stop
 
 | 场景 | 文案要素 |
 |---|---|
-| 切换成功 | 目标 route、**下一条消息起生效**、当前 session 短标识、如何撤销（`$route reset`） |
-| 查询（`$route`） | 当前生效 route、来源（手动 override / 自动哈希 / 默认）、可用 route id 列表 |
+| 切换成功 | 目标 route、**下一条消息起生效**、当前 session 短标识、如何撤销（`$route reset`）、**本次清理了哪些条目（§5.4，不静默删）** |
+| 查询（`$route`） | 当前生效 route、来源（手动 override / 自动哈希 / 默认）、可用 route id 列表、override 总条数 |
 | route 不存在 | 明确报错 + **列出全部可用 route id**（避免用户猜） |
 | 写盘失败 | 明确「切换未生效」+ 原因摘要（见 §4.4） |
 
@@ -442,6 +442,10 @@ env ANTHROPIC_BASE_URL="http://127.0.0.1:18899/" ANTHROPIC_AUTH_TOKEN="cc" \
 | V7 | 兼容性回归 | 现网 `cc`/`codex` 配置不变时行为完全一致；不含指令的消息一律照常转发 | 阻断上线 |
 | V8 | 生效语义 | 切换后下一条请求的 ACCESS `route=` 变为目标 route；`$route reset` 后落回哈希 | — |
 | V9 | fail-open | 构造各种「像指令但不完全匹配」的消息（多行、大小写不同、三个 token、`$route` 出现在句中而非行首），确认全部正常转发不被吞 | 收紧匹配（§1.4 规则 5） |
+| **V10** | **旧式纯字符串 override 不被误删** | 用现网 5 条旧格式（`"sess":"nation"`）跑一次 `$route` 切换，断言 5 条**全部保留**（无 `last_seen` 者不参与清理，§5.4） | **上线即清空现网配置**——最严重的回归 |
+| V11 | 清理判据正确 | 构造 `last_seen` 分别为 6 天 / 8 天前的条目，断言只删 8 天那条；断言当前 session 永不被清理 | 修判据 |
+| V12 | 清理与变更同一次原子写 | 断言一次 `$route` 只产生一次 `os.replace`，无中间态 | 修实现（避免两次写盘） |
+| V13 | `last_seen` 不写热路径 | 压测命中 override 的普通请求，断言无写盘 IO（只改内存） | 修实现（§5.4 代价一节） |
 
 ---
 
@@ -449,17 +453,18 @@ env ANTHROPIC_BASE_URL="http://127.0.0.1:18899/" ANTHROPIC_AUTH_TOKEN="cc" \
 
 | 文件/模块 | 改动 |
 |---|---|
-| `core/server.py` | 新增指令解析（取最后一条 user 文本 + 严格匹配）、命令 handler（切换/查询/reset）、自造响应写回（流式复用 `anthropic_sse_bytes` + `AnthropicStreamAdapter` helper；非流式构造 JSON）、override 写入（**deepcopy 后改，见 §4.2**）；`_forward` 在 987↔997 之间插入一次分流判定；ACCESS 加 `builtin=` 字段 |
+| `core/server.py` | 新增指令解析（取最后一条 user 文本 + 严格匹配）、命令 handler（切换/查询/reset）、自造响应写回（流式复用 `anthropic_sse_bytes` + `AnthropicStreamAdapter` helper；非流式构造 JSON）、override 写入（**deepcopy 后改，见 §4.2**）；`_forward` 在 987↔997 之间插入一次分流判定；ACCESS 加 `builtin=` 字段；**`last_seen` 内存记账（命中时更新，不写盘）+ 7 天清理（随写操作触发，与变更同一次原子写）+ 新旧两种 override 条目形态兼容读取**（§5.4） |
 | `_config_ops.py` | 若走 sidecar：新增 sidecar 读写与合并；若走主 config：`atomic_write` 加 `fcntl.flock` 并**同步改造 CLI 侧**取锁 |
 | `ConfigStore`（`core/server.py`） | 若走 sidecar：加一份 mtime 监听与合并逻辑 |
 | `model_proxy_cli.sh` | 主 config 方案下需加锁；建议补 `prune-overrides` 清理命令 |
 | `README.md` | 补内建命令章节、语法、生效语义、可用 route 查询方式 |
-| `tests/` | 匹配规则单测（含 §8 V9 的 fail-open 反例集）、别名污染单测（V5）、SSE 序列断言（V4） |
+| `tests/` | 匹配规则单测（含 §8 V9 的 fail-open 反例集）、别名污染单测（V5）、SSE 序列断言（V4）、**清理逻辑单测（V10-V13，其中 V10 旧格式兼容为必测）** |
 
-**耦合性质**：**有正确性耦合**。三处敏感点：
+**耦合性质**：**有正确性耦合**。四处敏感点：
 1. 匹配规则放宽会**吞掉用户真实消息并返回假响应**（最坏后果，需 fail-open 反例集覆盖）
 2. 写路径的**别名污染**会绕过热重载语义、且失败无法回滚（§4.2）
 3. 不得为「切换绝对生效」而破坏 `extract_route_candidates` 的有序候选列表结构，否则**静默打断 route_failover**（§6）
+4. **清理逻辑误判会删掉活跃 override**：现网 5 条是旧式纯字符串 value（无 `last_seen`），若把「无时间戳」当作「已过期」，**功能上线的第一次写操作就会清空现网全部配置**（V10 为必测项，§5.4）
 
 **建议：派 implementer 落地 + reviewer 复核。** 不适合 runner。
 
@@ -471,12 +476,16 @@ env ANTHROPIC_BASE_URL="http://127.0.0.1:18899/" ANTHROPIC_AUTH_TOKEN="cc" \
 
 ## 10. 开放问题（需用户拍板，不替选）
 
-> 语法选型**已关闭**：用户拍板 `$`，且已通过双客户端拦截检查与历史碰撞检查（§1.3）。剩余开放项如下。
+> **已关闭的两项**：
+> - 语法选型 → 用户拍板 `$`，已通过双客户端拦截检查与历史碰撞检查（§1.3）。
+> - 僵尸条目治理 → 用户拍板**做自动清理、阈值 7 天、随 `$route` 写操作触发**，并明示接受误删风险（「被误删也没关系，可以再切过去」）。这是对前置设计「不做 TTL」取向的有意反转，理由见 §5.4。
 
-1. **主 config vs sidecar**（§4.5）：我**建议 sidecar**（代理独占写，消除与 CLI 的并发写冲突，且不必改造 CLI 侧）。仍满足「持久化、可见、可手改」。请确认。
+剩余开放项：
+
+1. **主 config vs sidecar**（§4.5）：我**建议 sidecar**（代理独占写，消除与 CLI 的并发写冲突，且不必改造 CLI 侧）。**7 天清理功能进一步强化了这个建议**——`last_seen` 是高频变动的运行时状态，写进主 config 会让用户手编文件被机器持续改写（§5.4 末节）。请确认。
 2. **是否做成通用内建命令层**（§7）：我**建议做层、首版只实现 `$route`**，并接受「只操作代理自身路由/观测状态、纯本地」的边界约束。
 3. **是否支持 codex 侧**：建议首版不支持（成本翻倍、流量极低，且 fail-open 无害）。
-4. **僵尸条目治理力度**（§5.4）：只记时间戳供人工识别 / 另加 CLI 清理命令 / 都不做。原设计拒绝 TTL 的取向保持不变。
+4. **`last_seen` 内存记账的重启丢失是否可接受**（§5.4 代价一节）：建议接受（丢失只导致 `last_seen` 偏旧，最坏一次误删，而误删已被接受且可恢复）。若不接受，替代方案是每次命中即写盘（IO 放大，不推荐）或后台定时刷盘（重新引入定时器复杂度）。
 
 ---
 
