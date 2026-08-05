@@ -1,6 +1,6 @@
 ---
 type: design-decision
-status: draft
+status: confirmed
 target: "[[tools/model_proxy]]"
 tags: [architect, model_proxy, session-routing, in-band-command, topic-routing]
 ---
@@ -10,9 +10,23 @@ tags: [architect, model_proxy, session-routing, in-band-command, topic-routing]
 > [理想] 路径产出：先问「架构上正确的做法是什么」，再评估落地代价。
 > 本文只做设计，不含实现代码，未改动任何实现文件。
 >
+> **状态：方案已定稿（六项决策全部拍板，见 §10），无剩余开放问题，可进入实施。**
+> 实施前仍须先跑通 V1/V2（前缀在 CLI 与 Claudian 双侧可达，属地基）与 V10（旧式 override 不被误删），见 §8/§10。
+>
 > 前置：[[2026-08-04-topic-based-route-dispatch-feasibility]]（上一轮「按主题自动路由」调研，结论不建议做）、
 > [[2026-07-28-session-route-dispatch-design]]（现状 route_pool / session_overrides / 一致性哈希机制）、
 > [[2026-07-28-session-load-balancing-feasibility]]（更早的可行性调研，已 superseded）。
+
+## 决策速览
+
+| 维度 | 结论 |
+|---|---|
+| 语法 | `$route <id>` / `$route`（查询）/ `$route reset`；整条单行 + 首 token 精确匹配 + fail-open |
+| 响应 | 代理拦截、不转发上游、自造 anthropic SSE 回执（复用 `anthropic_sse_bytes`） |
+| 落盘 | 独立 sidecar `config/session_overrides.json`，代理独占写；主 config 永不被代理触碰 |
+| 清理 | 静默超 7 天自动清理，随 `$route` 写操作触发；只清 sidecar，回执告知不静默删 |
+| 形态 | 通用内建命令层，首版只实现 `$route`；边界约束落到代码注释 |
+| 范围 | 仅 `source == "anthropic"`；codex 侧首版不支持（fail-open 无害） |
 
 ## 背景：本方案与上一轮调研的关系
 
@@ -395,7 +409,7 @@ with self._lock:
 
 本方案的写入落在 `session_overrides`，而 `extract_route_candidates` 对 override 的既有处理是：**命中的 route 放第一位，其余候选按哈希顺序跟在后面作兜底**（前置设计 §4b + `server.py` 内 override 分支实现）。**因此本方案天然沿用既有结构，不新增「只返回单个 route」的代码路径。** 实现时不得为了「切换要绝对生效」而改成只返回目标 route。
 
-**codex 侧**：语法、响应格式（responses 协议 SSE）、拦截点全部不同，成本约翻倍，而 codex 流量占比极低。**建议首版只支持 anthropic**；codex 客户端发 `$route` 会被当普通文本转发上游（fail-open，无害）。列入开放问题。
+**codex 侧（已定：首版不支持）**：语法、响应格式（responses 协议 SSE）、拦截点全部不同，成本约翻倍，而 codex 流量占比极低。**首版只对 `source == "anthropic"` 生效**；codex 客户端发 `$route` 会被当普通文本转发上游（fail-open，无害）。见 §10 决策 6。
 
 ---
 
@@ -481,10 +495,10 @@ env ANTHROPIC_BASE_URL="http://127.0.0.1:18899/" ANTHROPIC_AUTH_TOKEN="cc" \
 | 文件/模块 | 改动 |
 |---|---|
 | `core/server.py` | 新增指令解析（取最后一条 user 文本 + 严格匹配）、命令 handler（切换/查询/reset）、自造响应写回（流式复用 `anthropic_sse_bytes` + `AnthropicStreamAdapter` helper；非流式构造 JSON）、override 写入（**deepcopy 后改，见 §4.2**）；`_forward` 在 987↔997 之间插入一次分流判定；ACCESS 加 `builtin=` 字段；**`last_seen` 内存记账（命中时更新，不写盘）+ 7 天清理（随写操作触发，与变更同一次原子写）+ 新旧两种 override 条目形态兼容读取**（§5.4） |
-| `_config_ops.py` | 若走 sidecar：新增 sidecar 读写与合并；若走主 config：`atomic_write` 加 `fcntl.flock` 并**同步改造 CLI 侧**取锁 |
-| `ConfigStore`（`core/server.py`） | 若走 sidecar：加一份 mtime 监听与合并逻辑 |
-| `model_proxy_cli.sh` | 主 config 方案下需加锁；建议补 `prune-overrides` 清理命令 |
-| `README.md` | 补内建命令章节、语法、生效语义、可用 route 查询方式 |
+| `_config_ops.py` | 新增 sidecar（`config/session_overrides.json`）读写；复用既有 `atomic_write`。**不需要** `fcntl.flock`、**不需要**改造 CLI 侧——sidecar 由代理独占写，与 CLI 无写冲突（§4.5） |
+| `ConfigStore`（`core/server.py`） | 加一份 sidecar 的 mtime 监听 + 与主 config 内 `session_overrides` 的合并（sidecar 优先）；文件缺失视为 `{}`、非法 JSON 保留上次值 + warning |
+| `model_proxy_cli.sh` | 无需加锁。可选：补 `prune-overrides` 供人工查看/清理 sidecar（自动清理已覆盖主要场景，此项非必需） |
+| `README.md` | 补内建命令层章节（语法、生效语义、查询方式、7 天清理行为）、sidecar 文件说明、**§1.0 的「前缀可达性属持续性外部依赖」提示** |
 | `tests/` | 匹配规则单测（含 §8 V9 的 fail-open 反例集）、别名污染单测（V5）、SSE 序列断言（V4）、**清理逻辑单测（V10-V13，其中 V10 旧格式兼容为必测）** |
 
 **耦合性质**：**有正确性耦合**。四处敏感点：
@@ -501,18 +515,26 @@ env ANTHROPIC_BASE_URL="http://127.0.0.1:18899/" ANTHROPIC_AUTH_TOKEN="cc" \
 
 ---
 
-## 10. 开放问题（需用户拍板，不替选）
+## 10. 决策记录（全部已拍板，无剩余开放项）
 
-> **已关闭的两项**：
-> - 语法选型 → 用户拍板 `$`，已通过双客户端拦截检查与历史碰撞检查（§1.3）。
-> - 僵尸条目治理 → 用户拍板**做自动清理、阈值 7 天、随 `$route` 写操作触发**，并明示接受误删风险（「被误删也没关系，可以再切过去」）。这是对前置设计「不做 TTL」取向的有意反转，理由见 §5.4。
+**本方案已无待决问题，可进入实施。** 六项决策及其依据：
 
-剩余开放项：
+| # | 决策 | 结论 | 依据 / 章节 |
+|---|---|---|---|
+| 1 | 指令语法 | **`$route`**（整条单行 + 首 token 精确匹配 + fail-open） | 双客户端拦截实测 + 6038 条历史零碰撞，§1.3/§1.4 |
+| 2 | 响应方式 | **代理拦截、不转发上游、自造 SSE 回执** | 零上游配额、指令不进对话历史污染 cache，§3 |
+| 3 | 状态落盘 | **独立 sidecar** `config/session_overrides.json`，代理独占写，主 config 永不被代理触碰 | 消除与 CLI 的并发写冲突（现状全项目无文件锁），且 `last_seen` 属运行时状态不宜写进手编声明，§4.5 |
+| 4 | 僵尸条目 | **自动清理，7 天阈值，随 `$route` 写操作触发**；只清 sidecar，不动主 config 人工条目 | 48h 经实测会误删活跃会话（现网 5 条中 3 条中招）；7 天下候选仅 3 个，且误删可恢复、用户已明示接受，§5.4 |
+| 5 | 架构形态 | **做成通用内建命令层，首版只实现 `$route`**；边界约束落到代码注释 | 控制面显式分层优于散落在 `_forward`；成本差异小；约束防止长成 mini-shell，§7.3 |
+| 6 | codex 侧 | **首版不支持**，只对 `source == "anthropic"` 生效 | 语法/响应格式/拦截点全不同，成本翻倍而 codex 流量占比极低；codex 发 `$route` 会 fail-open 当普通文本转发，无害，§6 |
 
-1. **主 config vs sidecar**（§4.5）：我**建议 sidecar**（代理独占写，消除与 CLI 的并发写冲突，且不必改造 CLI 侧）。**7 天清理功能进一步强化了这个建议**——`last_seen` 是高频变动的运行时状态，写进主 config 会让用户手编文件被机器持续改写（§5.4 末节）。请确认。
-2. **是否做成通用内建命令层**（§7）：我**建议做层、首版只实现 `$route`**，并接受「只操作代理自身路由/观测状态、纯本地」的边界约束。
-3. **是否支持 codex 侧**：建议首版不支持（成本翻倍、流量极低，且 fail-open 无害）。
-4. **`last_seen` 内存记账的重启丢失是否可接受**（§5.4 代价一节）：建议接受（丢失只导致 `last_seen` 偏旧，最坏一次误删，而误删已被接受且可恢复）。若不接受，替代方案是每次命中即写盘（IO 放大，不推荐）或后台定时刷盘（重新引入定时器复杂度）。
+**附带确认（属实现取向，不单列决策）**：`last_seen` 采用**内存记账 + 随写操作落盘**，接受进程重启丢失部分活跃记录——丢失只导致 `last_seen` 偏旧、最坏一次误删，而误删已被接受且可恢复（§5.4 代价一节）。不采用「每次命中即写盘」（IO 放大）或「后台定时刷盘」（重新引入定时器复杂度）。
+
+### 实施前仍需完成的事（不是开放问题，是前置动作）
+
+1. **V1/V2 必须先跑通**（§8）：`$route nation` 在 **CLI 与 Claudian 双侧**都能原样到达 API。这是地基，不通则方案作废、需另找前缀。可与 V2b 用同一次 dump 一并覆盖。
+2. **V10 为必测项**：现网 5 条旧式纯字符串 override **不得被清理逻辑删除**。这是唯一会造成「上线即清空现网配置」的回归。
+3. 派 **implementer 落地 + reviewer 复核**（§9），不适合 runner。
 
 ---
 
@@ -524,9 +546,11 @@ env ANTHROPIC_BASE_URL="http://127.0.0.1:18899/" ANTHROPIC_AUTH_TOKEN="cc" \
 
 **这一过程留下的最重要教训已写进 §1.0**：in-band 语法的可达性必须在**全部在用客户端**上验证。只验证一个客户端就下结论，是 `#` 方案翻车的直接原因。
 
-**主要风险三条**：
-1. **前缀可达性依赖客户端行为**，属外部依赖，可能随任一客户端升级新增拦截而失效（V1/V2 + §1.0 的持续性约束）
-2. **误识别会吞掉用户真实消息**并返回假响应——靠「单行 + 严格 token 匹配 + fail-open」三重约束压制，需反例集覆盖（V9）；`$` 的历史零碰撞使该风险实质为零
-3. **代理首次获得配置写权限**是架构性变化，现状无任何文件锁；建议用 sidecar 规避（§4.5）
+**六项决策已全部拍板**（§10），无剩余开放问题，可进入实施。
+
+**主要风险三条及其处置**：
+1. **前缀可达性依赖客户端行为**，属外部依赖，可能随任一客户端升级新增拦截而失效（V1/V2 + §1.0 的持续性约束）。已知条件性风险：Claudian 的 codex provider 把 `$` 作技能触发符，当前因 codex 未启用而无影响（§1.3 注）。
+2. **误识别会吞掉用户真实消息**并返回假响应——靠「单行 + 严格 token 匹配 + fail-open」三重约束压制，需反例集覆盖（V9）；`$` 的历史零碰撞使该风险实质为零。
+3. **代理首次获得写权限**是架构性变化，现状无任何文件锁——**已由 sidecar 决策规避**（代理独占写 sidecar，主 config 保持 CLI/人工领域，两者无交集，§4.5）。剩余的清理误删风险已被用户明示接受且可恢复。
 
 **价值上限要诚实**：它自动化的是「抄 id 粘配置」这个动作，而上一轮调研已指出这是投入产出比最不成立的一点。**真正值得同时做的是 `$route`（查询）**——用户当前完全看不到自己被分到哪个 route，这个纯读、零风险的命令可用性收益可能比切换本身更高。另外，上一轮指出的更高性价比投入（把 `route_pool` 填实、补 `nation/opus` 供给消掉 503、ACCESS 补 cache 字段）依然成立，本方案不替代它们。
