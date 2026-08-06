@@ -92,8 +92,9 @@ tiers_source_                   opus:   [id, ...]  --------->  appkey / target_m
 [strategies]
 client_token: "cc"
 route_pool: [{route_id:"claude",weight:2}, {route_id:"nation",weight:1}]  --▶ 按 session 分配到其中一个 route
-dispatch.session_overrides: {"<session_id>": "<route_id>"}                --▶ 手动覆盖，优先级最高
 ```
+session override 的唯一来源是独立 sidecar 文件 `config/session_overrides.json`，通过 `$route` 命令
+或直接编辑该文件维护，不再是 strategy 的字段（详见 3.4 节）。
 
 - **supplies**：每条 = 一个上游端点（url + 协议 + appkey + target_model + 可选能力）。
 - **routes**：家族模板，固定 opus/sonnet/haiku 三档，每档一个按优先级排列的 supply id 列表，
@@ -245,15 +246,14 @@ route），按 Claude Code 会话 session_id 做一致性哈希分配——同�
   "route_pool": [
     {"route_id": "claude", "weight": 1}
   ],
-  "dispatch": {
-    "session_overrides": {
-      "c2e29916-326e-443f-91bf-72e5311b514a": "nation"
-    }
-  },
   "note": "默认 Claude 家族（Claude Code SDK）"
 }
 ```
 （以上结构改写自生产真实配置，appkey/admin_token 等凭证字段已脱敏省略。）
+
+session override 不再写在 strategy 里，而是存放在独立 sidecar 文件
+`config/session_overrides.json`，结构为 `{"<client_token>": {"<session_id>": {"route_id": "...", "last_seen": "...", "created": "..."}}}`，
+通过 `$route` 命令或直接编辑该文件维护。
 
 - **`route_pool`**（数组，`{route_id, weight}`）：与 `route_id` 二选一、互斥。同时配置两者会被
   `_config_ops.py` 的 `strategy add`/`edit` 拒绝写入；若绕过 CLI 直接改配置文件导致两者同时
@@ -263,10 +263,11 @@ route），按 Claude Code 会话 session_id 做一致性哈希分配——同�
     route 排除在外）。
   - `route_pool` 里引用了不存在的 `route_id` 会被跳过并打 warning 日志，不拖垒整条 strategy；
     若全部条目都非法，该 strategy 无可用候选，请求 401（no strategy/route matched）。
-- **`dispatch.session_overrides`**（对象，`session_id字符串 → route_id字符串`）：手动把指定
-  session_id 固定路由到某个 route，优先级高于自动哈希分配。**该 route_id 只需存在于顶层
-  `routes` 定义里，不要求也出现在这条 strategy 的 `route_pool` 列表内**——这是有意允许的
-  「例外指定」，用于临时把某个会话导到 route_pool 之外的 route 做调试/隔离。
+- **`dispatch.session_overrides`**（已移除）：session override 的存储已迁移到独立 sidecar 文件
+  `config/session_overrides.json`，不再作为 strategy 的字段。通过 `$route` 命令或直接编辑
+  sidecar 文件维护，优先级高于自动哈希分配。**override 的 route_id 只需存在于顶层 `routes`
+  定义里，不要求也出现在这条 strategy 的 `route_pool` 列表内**——这是有意允许的「例外指定」，
+  用于临时把某个会话导到 route_pool 之外的 route 做调试/隔离。
 - **session_key 怎么来的**：从 CC 请求体 `metadata.user_id` 字段（一个 JSON 字符串）里解析出
   `session_id`（`extract_session_key`）。同一个 CC 会话（含它派生的 Task 子agent 请求，子agent
   复用父会话 session_id）全程稳定不变，不同会话不同。
@@ -367,7 +368,7 @@ route），按 Claude Code 会话 session_id 做一致性哈希分配——同�
 
 1. 用 `client_token` 查 strategies 拿到该 strategy 的 route 候选列表（`extract_route_candidates`）：
    - 旧写法 `route_id`（单值）：候选列表只有这一个 route（或该 id 不存在则候选为空）。
-   - 新写法 `route_pool`（多值）：按 `dispatch.session_overrides` 优先匹配、否则按
+   - 新写法 `route_pool`（多值）：按 sidecar 的 session override 优先匹配、否则按
      session_key 一致性哈希，排出一个有序候选列表（详见 3.4 节「按 session 分配到多个
      route（route_pool）」）。
    - 候选列表为空 → 401（no strategy/route matched）。
@@ -390,6 +391,102 @@ route），按 Claude Code 会话 session_id 做一致性哈希分配——同�
 把档名钉死在全局绝对值上。
 
 完整公式、边界条件与单调性详见「reasoning 强度映射（深入）」§ 6.3。
+
+### 4.6 内建命令层：`$route` in-band 指令
+
+设计文档：[[docs/designs/2026-08-04-in-band-route-command-design]]（已 confirmed）。
+
+代理在对话内识别一种特殊「指令消息」，拦截后不转发上游，自己合成响应——把「翻
+ACCESS 日志抄 session_id → 改配置 → 存盘」这个手工流程变成对话里打一行指令。
+
+#### 语法
+
+```
+$route <id>     把当前 session 钉到 <id>，下一条消息起生效
+$route          查询当前 session 生效的 route 及其来源
+$route reset    清除 override，落回自动哈希分配
+```
+
+**匹配规则很严格（宁可漏识别，也不可误识别）**：取最后一条 `role=user` 消息的
+最后一个 text 块，剥离 Claudian 追加的 `<current_note>` 等六种上下文标签后，必须
+**单行** + 首 token **精确等于** `$route`（大小写敏感）+ **token 数 ≤ 2**。任一条件
+不满足，一律照常转发（fail-open），绝不吞用户消息、绝不误判。
+
+**前缀可达性属持续性外部依赖**：`$` 前缀经实测在 Claude Code CLI 与 Claudian 两个
+客户端均无拦截（`!`/`#` 均被证伪，见设计文档 §1）。但客户端后续升级可能新增拦截逻辑，
+或 Claudian 若启用 codex provider 且技能名/描述含 `route` 子串，会导致 `$route` 的
+Enter 被下拉框吞掉（当前因 codex provider 未启用而无风险，见设计文档 §1.3 注）。这条
+可达性不是一次性验证完就永久成立，日后语法失效时先检查客户端是否有变化。
+
+#### 生效语义与作用范围
+
+- 只对 `source == "anthropic"` 生效；codex 侧（Responses 协议）首版不支持，发送
+  `$route` 会被当普通文本转发上游（无害）。
+- 当前请求本身被拦截、不打上游，因此**「下一条消息起生效」是唯一语义**——回执会
+  明确写这一点。
+- `<id>` 允许指向 `route_pool` 之外的顶层 `routes` 定义（沿用既有 session override
+  的「例外指定」语义，见 §3.4）；`<id>` 不存在时报错并列出全部可用 id。
+- **`client_token` 对应的 strategy 若仍是旧式单值 `route_id` 写法（无 `route_pool`）**，
+  `$route <id>`/`reset` 会被拒绝（不写盘）：这种旧写法的路由选择不读取
+  session override，写入 override 不会产生任何效果，若允许写入会造成「回执说
+  切换成功、实际路由纹丝不动」的假成功。需先把该 strategy 迁移到 `route_pool`
+  写法才能使用 `$route` 切换/reset（查询命令不受此限制）。
+- 命令的匹配、写盘、清理都只作用于**代理自身路由/观测状态的本地文件**——命令层
+  明确禁止执行外部命令、读写 sidecar/主 config 以外的文件、代理请求转发、任何网络
+  动作（`core/commands.py`/`core/server.py` 内有对应代码注释）。
+
+#### 落盘：sidecar 文件
+
+override 写入独立文件 `config/session_overrides.json`（与主 config 同目录，600
+权限，已加入 `.gitignore`，不被 git 跟踪），**代理独占写**，主 config 不含
+session override 字段：
+
+```jsonc
+{
+  "cc": {
+    "3f2a9c1e-...": {"route_id": "nation", "last_seen": "2026-08-06T10:00:00Z", "created": "2026-08-05T19:00:00Z"}
+  }
+}
+```
+
+顶层按 `client_token` 分组，与每条 strategy 一一对应。session override 的唯一来源
+就是 sidecar 文件，不再有主 config 基线 + sidecar 合并的双来源机制。人工可直接编辑
+该 sidecar 文件（支持旧式纯字符串和新式 dict 两种写法，代理读取时均兼容）。
+
+sidecar 文件缺失视为 `{}`（首次运行的正常状态，不报错）；内容非法 JSON 时保留上一次
+成功加载的内存值并打 warning，不中断请求（与主 config 的既有容错口径一致）。
+
+#### 7 天静默清理
+
+sidecar 里的 override 若连续 **7 天**没有被任何请求命中（`last_seen` 判据），会在
+下一次 `$route <id>` 或 `$route reset` 执行成功时被顺带清理（清理与本次变更是同一次
+原子写，不产生中间态）。要点：
+
+- **只清 sidecar，绝不触碰主 config 内的人工条目**——那是用户手写的声明，不属代理
+  管辖。
+- **无 `last_seen` 的条目不参与清理**（含主 config 里的旧式纯字符串 value、以及手工
+  塞进 sidecar 的条目）——不能把「没有时间戳」当作「已过期」。
+- **当前正在执行命令的 session 永不被清理**。
+- **不静默删除**：清理了哪些条目会在 `$route` 的回执里列出（数量 + session 短 id），
+  发现误删可立刻 `$route <id>` 恢复（代价有界且可逆，这是采用较宽松阈值的前提）。
+- 阈值曾评估过 48 小时，但实测现网 5 条手工 override 里有 3 条内部最大空档超过 48
+  小时（仍在活跃使用），会被误删；改用 7 天后候选仅剩 3 个，风险可控。
+- `last_seen` 采用**内存记账 + 随写操作落盘**：命中 override 的普通请求只更新内存
+  （无写盘 IO），只有 `$route` 写操作才会把内存值刷入 sidecar 并落盘。代价是进程
+  重启会丢失「上次重启以来的活跃记录」，最坏导致一次可恢复的误删。
+
+#### 查询命令的价值
+
+`$route`（无参）是纯读命令，不触发清理，零副作用。用户平时完全看不到自己被分到
+哪个 route（哈希分配是静默的），这条命令是排查「为什么消息打到了某个奇怪的后端」
+的主要手段，回执包含当前生效 route、来源（sidecar / 主 config 手工 / 自动哈希）、
+可用 route id 列表、该 strategy 下 override 总条数。
+
+#### 扩展性
+
+代理内部是一层通用「命令名 → handler」注册表（`core/commands.py::COMMAND_HANDLERS`），
+首版只注册 `$route` 一个命令。日后若要加 `$status`（查看 supply/冷却状态）等命令，
+只需注册一个新 handler，不需要改动拦截点/响应合成/ACCESS 记录的骨架逻辑。
 
 ## 5. 运维与控制
 
@@ -426,10 +523,12 @@ v1 代理（18888）已于 2026-07-24 下线归档，不再涉及并行关系。
 日志除 WARNING 级别（异常/降级路径，如 no route、cooldown+failover、stream interrupted 等）外，
 还有一条 INFO 级别的 `ACCESS` 访问日志：每个转发请求（不含 `/model_proxy/*` 控制端点）结束时
 记一条，覆盖整个请求生命周期，字段为
-`ms status source route tier supply failover attempts usage_in usage_out token session route_failover`
+`ms status source route tier supply failover attempts usage_in usage_out token session route_failover builtin`
 （`ms` 为端到端耗时毫秒，`token` 为客户端 token 尾4位，`session` 为该请求解析出的 session_id
 取不到为空串，`route_failover` 为 0/1 标记本次请求是否发生了「pin route 全挂后跨 route 兜底」，
-区别于同 route 内换 supply 的 `failover`）。两者共用同一文件，用固定前缀 `ACCESS` 区分。
+区别于同 route 内换 supply 的 `failover`；`builtin` 为空表示普通转发请求，非空（当前只有
+`route`）表示该请求被内建命令层拦截、未打上游，此时 `supply=(builtin)`、`route=` 记录命令
+操作/查询后的生效 route，见「内建命令层」一节）。两者共用同一文件，用固定前缀 `ACCESS` 区分。
 
 token 用量统计：转换模式（Anthropic↔Chat/Responses，流式+非流式）、PASSTHROUGH 非流式、
 以及 PASSTHROUGH 流式（anthropic→anthropic、responses→responses 的流式请求）均会提取
@@ -710,7 +809,7 @@ token 里选定）过滤候选 client_token；无匹配协议的 token 时提示
 | `client_token` | string | 必填 | 客户端鉴权 token，代理据此查找 strategy | — |
 | `route_id` | string | 与 `route_pool` 二选一 | 绑定的单个 route 家族 id；与 `route_pool` 互斥（同时出现写入侧拒绝，运行时容错按 route_pool 处理并打 warning） | — |
 | `route_pool` | `{route_id, weight}[]` | 与 `route_id` 二选一 | 按 session 一致性哈希分配的候选 route 列表；`weight` 可选，默认 1，非正整数静默视为 1 | — |
-| `dispatch.session_overrides` | `{session_id: route_id}` | 可选 | 手动把指定 session_id 固定路由到某个 route，优先级高于哈希分配；该 route_id 允许不在本 strategy 的 route_pool 内 | `{}` |
+| `dispatch.session_overrides` | — | 已移除 | session override 已迁移到独立 sidecar 文件 `config/session_overrides.json`，不再是 strategy 字段。通过 `$route` 命令或直接编辑 sidecar 维护 | — |
 | `dispatch.type` | string | 可选 | 预留分配策略扩展位，当前代码不读取该字段，只有一种哈希分配算法 | 不生效 |
 | `dispatch.fallback` | string | 可选 | 预留字段，当前代码不读取，session_key 缺失时行为固定为「route_pool 首项」，写该字段不改变实际行为 | 不生效 |
 | `tiers_source_capability.<opus\|sonnet\|haiku>.effort_enum` | string[] | 可选 | 该 tier 的 source 侧 effort 档位有序列表 | 默认 5 档 |

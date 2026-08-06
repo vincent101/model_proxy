@@ -4,3 +4,5 @@
 __pycache__/
 config/model_proxy_config.json
 config/model_proxy_config.json.bak.*
+config/session_overrides.json
+config/session_overrides.json.tmp*

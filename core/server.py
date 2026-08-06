@@ -29,6 +29,15 @@ from typing import Any, Callable
 
 # 合并后的双向协议转换器（core 包内相对导入）
 from . import translate as pt
+from .commands import (
+    CMD_PREFIX,
+    COMMAND_HANDLERS,
+    CommandContext,
+    SessionOverridesSidecar,
+    build_merged_strategy,
+    extract_last_user_message_content,
+    parse_route_command,
+)
 from .reasoning.capability import ModelReasoningCapability, abstract_encode, remap
 from .reasoning.ladder import CanonicalEffort
 from .reasoning.registry import apply_fields, get_codec, resolve_protocol
@@ -935,6 +944,7 @@ class ModelProxyHandler(BaseHTTPRequestHandler):
             "supply": "", "failover": 0, "attempts": 0, "token": "",
             "usage_in": 0, "usage_out": 0,
             "strategy": "", "session": "", "route_failover": 0,
+            "builtin": "",
         }
         t0 = time.monotonic()
         try:
@@ -945,11 +955,11 @@ class ModelProxyHandler(BaseHTTPRequestHandler):
             access_log.info(
                 "ACCESS ms=%d status=%s source=%s route=%s tier=%s supply=%s "
                 "failover=%s attempts=%s usage_in=%s usage_out=%s token=%s session=%s "
-                "route_failover=%s",
+                "route_failover=%s builtin=%s",
                 ms, a["status"], a["source"],
                 a["route"], a["tier"], a["supply"], a["failover"], a["attempts"],
                 a["usage_in"], a["usage_out"], a["token"], a["session"],
-                a["route_failover"])
+                a["route_failover"], a["builtin"])
             try:
                 usage_totals.record(a, ms)
             except Exception:
@@ -994,7 +1004,44 @@ class ModelProxyHandler(BaseHTTPRequestHandler):
         strategy = resolve_strategy(strategies, token)
         self._acc["strategy"] = strategy.get("client_token", "") if strategy else ""
         session_key = self._acc["session"] or None
-        route_candidates = extract_route_candidates(strategy, session_key, routes_map)
+
+        # ---- 内建命令层拦截点（docs/designs/2026-08-04-in-band-route-command-design.md）----
+        # 插在 source 判定之后、route 选择之前：body_json/session_key/source 均已就绪，
+        # 尚未产生任何转发副作用。门控（§2.1，全部满足才进入识别，任一不满足 fail-open
+        # 照常转发）：source == "anthropic" + session_key 非空 + body_json 是 dict 且含
+        # messages 列表 + 有匹配的 strategy（strategy 为 None 时无处落 override，不识别为
+        # 命令，回退原逻辑，最终按现状 401，行为不变）。
+        sidecar: SessionOverridesSidecar = self.server.sidecar_store
+        sidecar.maybe_reload()
+        if (source == "anthropic" and session_key and strategy is not None
+                and isinstance(body_json, dict) and isinstance(body_json.get("messages"), list)):
+            last_user_content = extract_last_user_message_content(body_json)
+            is_cmd, cmd_arg = ((False, None) if last_user_content is None
+                                else parse_route_command(last_user_content))
+            if is_cmd:
+                self._handle_builtin_command(cmd_arg, token, session_key, strategy,
+                                              routes_map, sidecar, request_model, body_json)
+                return
+
+        # 命中 override 的普通请求：合并 sidecar（优先）与主 config 基线后再选 route，
+        # 确保 $route 写入 sidecar 的最新值立刻对后续请求生效（不等 ConfigStore 重载）。
+        # build_merged_strategy 只浅拷贝 strategy 与 dispatch 两层，不 deepcopy、不改
+        # ConfigStore 内部对象引用（§4.2 别名污染要求），merged_strategy 只是这次调用
+        # 的局部变量。
+        if strategy is not None:
+            merged_strategy = build_merged_strategy(strategy, sidecar)
+            merged_overrides = merged_strategy["dispatch"]["session_overrides"]
+        else:
+            merged_overrides = {}
+            merged_strategy = strategy
+
+        route_candidates = extract_route_candidates(merged_strategy, session_key, routes_map)
+        if (strategy is not None and session_key
+                and merged_overrides.get(session_key) in routes_map
+                and route_candidates and route_candidates[0].get("id") == merged_overrides.get(session_key)):
+            # 命中 override：只更新内存 last_seen，不写盘（热路径无 IO，见 §5.4 / V13）。
+            sidecar.touch(strategy.get("client_token", ""), session_key)
+
         if not route_candidates:
             log.warning("no strategy/route matched: token_tail4=%s source=%s",
                         token[-4:] if token else "", source)
@@ -1421,6 +1468,112 @@ class ModelProxyHandler(BaseHTTPRequestHandler):
                 return
 
     # ------------------------------------------------------------------
+    # 内建命令层（docs/designs/2026-08-04-in-band-route-command-design.md §7.3）
+    #
+    # 边界约束（必须遵守，不是建议）：本层及其分发到的 handler 只允许操作代理
+    # 自身的路由/观测状态，且只允许纯本地操作。禁止执行外部命令、读写代理配置/
+    # sidecar 以外的文件、代理请求转发、任何需要网络的动作。首版只有 $route 一个
+    # 命令（core/commands.py::COMMAND_HANDLERS），新增命令前必须重新确认这条边界。
+    # ------------------------------------------------------------------
+
+    def _handle_builtin_command(self, cmd_arg, client_token, session_key, strategy,
+                                 routes_map, sidecar, request_model, body_json) -> None:
+        """命令层统一入口：分发 → 统一响应合成 → 统一 ACCESS 记录。
+
+        目前唯一命令 $route 的匹配已在调用方 `_forward` 完成（parse_route_command
+        返回 is_cmd=True 才会走到这里），本方法固定分发到 COMMAND_HANDLERS["$route"]，
+        分发表的存在是为未来扩展命令预留（届时按首 token 查表即可，不改这里的骨架）。
+        """
+        self._acc["builtin"] = "route"
+        self._acc["supply"] = "(builtin)"
+
+        # 查询命令需要"若无 override 会落到哪个候选 route"，复用既有一致性哈希算法，
+        # 不在 commands.py 里重复实现（避免与 server.py 侧算法出现第二份漂移）。
+        merged_strategy = build_merged_strategy(strategy, sidecar)
+        resolved_candidates = extract_route_candidates(merged_strategy, session_key, routes_map)
+        resolved_route_id = resolved_candidates[0].get("id") if resolved_candidates else None
+
+        ctx = CommandContext(
+            arg=cmd_arg,
+            client_token=client_token,
+            session_key=session_key,
+            strategy=strategy,
+            routes_map=routes_map,
+            sidecar=sidecar,
+            resolved_route_id=resolved_route_id,
+        )
+        handler = COMMAND_HANDLERS[CMD_PREFIX]
+        result = handler(ctx)
+
+        # ACCESS route= 记「本次命令操作/查询后的生效 route」以便核对（§3.3）：
+        # 切换成功后就是目标 route；reset 成功后重新算一次候选（写操作已完成，
+        # sidecar 已更新）；查询/切换失败（如 route 不存在）则用查询时算好的候选。
+        if result.wrote and cmd_arg not in (None, "reset"):
+            self._acc["route"] = cmd_arg
+        elif result.wrote and cmd_arg == "reset":
+            post_reset_strategy = build_merged_strategy(strategy, sidecar)
+            post_candidates = extract_route_candidates(post_reset_strategy, session_key, routes_map)
+            self._acc["route"] = post_candidates[0].get("id") if post_candidates else ""
+        else:
+            self._acc["route"] = resolved_route_id or ""
+
+        is_stream = isinstance(body_json, dict) and body_json.get("stream") is True
+        if is_stream:
+            self._write_builtin_stream_response(result.receipt_text, request_model)
+        else:
+            self._write_builtin_buffered_response(result.receipt_text, request_model)
+
+    def _write_builtin_stream_response(self, receipt_text: str, request_model) -> None:
+        """自造 anthropic 流式回执（§3.2 事件序列），复用 translate.py 既有事件构造
+        helper（OpenAIToAnthropicStreamAdapter 的实例方法），不另写事件字典。
+        usage 全填 0（§3.3 决策：零上游消耗如实反映）。
+        """
+        adapter = pt.OpenAIToAnthropicStreamAdapter(ctx={}, model=request_model or "")
+        adapter.input_tokens = 0
+        adapter.output_tokens = 0
+        adapter.final_stop_reason = "end_turn"
+
+        events = [
+            adapter._message_start_event(),
+            adapter._ping_event(),
+            adapter._content_block_start_text(0),
+            adapter._content_block_delta_text(0, receipt_text),
+            adapter._content_block_stop(0),
+            adapter._message_delta_event(),
+            adapter._message_stop_event(),
+        ]
+
+        self._begin_sse_chunked()
+        try:
+            for ev in events:
+                self._write_sse_chunk(pt.anthropic_sse_bytes(ev))
+            self.wfile.write(b"0\r\n\r\n")
+            self.wfile.flush()
+        except (BrokenPipeError, ConnectionResetError):
+            pass
+
+    def _write_builtin_buffered_response(self, receipt_text: str, request_model) -> None:
+        """自造 anthropic 非流式回执（§3.4）。"""
+        resp = {
+            "id": pt.gen_msg_id(),
+            "type": "message",
+            "role": "assistant",
+            "model": request_model or "",
+            "content": [{"type": "text", "text": receipt_text}],
+            "stop_reason": "end_turn",
+            "stop_sequence": None,
+            "usage": {
+                "input_tokens": 0,
+                "output_tokens": 0,
+                "cache_creation_input_tokens": 0,
+                "cache_read_input_tokens": 0,
+            },
+        }
+        self._write_buffered_response(
+            200, [("Content-Type", "application/json")],
+            json.dumps(resp, ensure_ascii=False).encode("utf-8"))
+
+    # ------------------------------------------------------------------
     # control API dispatch
     # ------------------------------------------------------------------
 
@@ -1460,6 +1613,8 @@ class ModelProxyHandler(BaseHTTPRequestHandler):
         """回显 supplies/routes + cooldown 剩余秒。
 
         supplies 屏蔽 appkey（只留尾4位），避免明文暴露。
+        每条 strategy 额外补 sidecar_overrides_count（session override 迁移到 sidecar
+        单一存储后，dispatch.session_overrides 恒为空，CLI 需读此字段展示覆盖数）。
         """
         supplies = cs.get_supplies()
         safe_supplies: list[dict] = []
@@ -1469,10 +1624,19 @@ class ModelProxyHandler(BaseHTTPRequestHandler):
             item["appkey_tail4"] = appkey[-4:] if appkey else ""
             safe_supplies.append(item)
 
+        strategies = cs.get_strategies()
+        sidecar: SessionOverridesSidecar = self.server.sidecar_store
+        strategies_out = []
+        for st in strategies:
+            st_copy = dict(st) if isinstance(st, dict) else {}
+            ct = st_copy.get("client_token", "")
+            st_copy["sidecar_overrides_count"] = sidecar.count_overrides_for(ct)
+            strategies_out.append(st_copy)
+
         self._send_json(200, {
             "supplies": safe_supplies,
             "routes": cs.get_routes(),
-            "strategies": cs.get_strategies(),
+            "strategies": strategies_out,
             "cooldown": cd.snapshot(),
             "default_cooldown_seconds": cs.get_default_cooldown(),
         })
@@ -1844,11 +2008,16 @@ def main():
     # 2.5 实例化 SyntaxPreferenceStore（reasoning 语法偏好，取代旧 _THINKING_FMT_CACHE）
     pref_store = SyntaxPreferenceStore()
 
+    # 2.6 实例化 SessionOverridesSidecar（$route in-band 指令的 override 落盘，
+    # 与主 config 同目录，代理独占写，见 docs/designs/2026-08-04-in-band-route-command-design.md §4.5）
+    sidecar_store = SessionOverridesSidecar(config_path.parent / "session_overrides.json")
+
     # 3. 启动 ThreadingHTTPServer
     server = ThreadingHTTPServer(("127.0.0.1", port), ModelProxyHandler)
     server.config_store = config_store    # type: ignore[attr-defined]
     server.cooldown_store = cooldown_store  # type: ignore[attr-defined]
     server.pref_store = pref_store        # type: ignore[attr-defined]
+    server.sidecar_store = sidecar_store  # type: ignore[attr-defined]
 
     print(f"model_proxy listening on 127.0.0.1:{port}", flush=True)
     try:

@@ -1,89 +1,22 @@
 #!/usr/bin/env python3
-"""$route in-band 指令匹配规则的参考实现与回归测试。
+"""$route in-band 指令匹配规则的回归测试。
 
 对应设计文档 §2.2（两级提取）+ §1.4（四条判定规则）+ §8 的 V2c / V9。
 
-本文件的 `parse_route_command` 是**参考实现**：实施时 core/server.py 侧应与此保持
-同一口径（或直接复用），任何一方改动都必须让本测试仍然通过。
+`parse_route_command` 等匹配规则的实现已落到产品代码 `core/commands.py`，本文件
+只 import 复用，不再自持第二份实现（避免两份逻辑漂移）。
 
 跑法：
     python3 tests/test_command_match_rules.py          # 合成用例
     python3 tests/test_command_match_rules.py --replay # 附带真实 transcript 全量回归
 """
 
-import re
+import os
 import sys
 
-# ---------------------------------------------------------------------------
-# 参考实现
-# ---------------------------------------------------------------------------
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-CMD_PREFIX = "$route"
-
-# 与 Claudian src/utils/context.ts 的 XML_CONTEXT_PATTERN 完全同源。
-# 六个标签名必须完整覆盖，缺一个即在该场景失效。
-# 锚定 "\n\n<tag" + [\s>] 结尾，用于区分 <current_note> 与 <current_note_foo>。
-XML_CONTEXT_PATTERN = re.compile(
-    r"\n\n<(?:current_note|editor_selection|editor_cursor"
-    r"|context_files|canvas_selection|browser_selection)[\s>]"
-)
-
-
-def last_text_block(content):
-    """级1：定位用户这一轮实际打的那句话。
-
-    只取最后一个 type=="text" 块，**不拼接**。
-    理由（实测）：CLI 会把 <system-reminder> 作为独立的前置 text block 注入；
-    拼接会让首 token 变成 <system-reminder> 且引入换行，判定必然失败。
-
-    注意：与 core/translate.py 内「拼接全部 text 块」的口径**故意不同**——
-    那边要的是「这条消息的全部文本」（传给上游），这边要的是「用户这轮打的话」。
-    """
-    if isinstance(content, str):
-        return content
-    if isinstance(content, list):
-        texts = [
-            b.get("text", "")
-            for b in content
-            if isinstance(b, dict) and b.get("type") == "text"
-        ]
-        return texts[-1] if texts else None
-    return None
-
-
-def strip_trailing_context(text):
-    """级2：剥离 Claudian 追加在用户输入之后的 XML 上下文标签。
-
-    只截首个匹配之前的内容，**不做全局替换**——用户正文里若本就含这些标签字样，
-    全局替换会改变正文语义、放大误判面。
-    """
-    m = XML_CONTEXT_PATTERN.search(text)
-    return text[: m.start()].strip() if m else text.strip()
-
-
-def parse_route_command(content):
-    """返回 (是否为指令, 参数 or None)。
-
-    参数语义：None=查询当前 route；"reset"=清除 override；其他=目标 route id。
-
-    判定规则（§1.4）：整条消息单行 + 首 token 精确等于 $route + token 数 <= 2。
-    任一不满足即 fail-open（照常转发，绝不吞用户消息）。
-    """
-    text = last_text_block(content)
-    if text is None:
-        return False, None
-    text = strip_trailing_context(text)
-
-    if "\n" in text:                      # 规则2：单行
-        return False, None
-    tokens = text.split()
-    if not tokens:
-        return False, None
-    if tokens[0] != CMD_PREFIX:           # 规则3：首 token 精确匹配（大小写敏感）
-        return False, None
-    if len(tokens) > 2:                   # 规则4：token 数 <= 2
-        return False, None
-    return True, (tokens[1] if len(tokens) == 2 else None)
+from core.commands import parse_route_command  # noqa: E402
 
 
 # ---------------------------------------------------------------------------
@@ -144,7 +77,6 @@ def run_replay():
     """真实 transcript 全量回归：确认历史消息不会被误命中。"""
     import glob
     import json
-    import os
 
     d = os.path.expanduser("~/.claude/projects/-Users-vincentwang-Documents-NoteVault")
     if not os.path.isdir(d):
