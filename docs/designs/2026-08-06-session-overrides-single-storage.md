@@ -31,7 +31,7 @@ tags: [architect, model_proxy, session-routing, in-band-command, sidecar]
 ```
 tools/model_proxy/config/model_proxy_config.json（主工作区，gitignored，权限 600）
 strategies[0].client_token = "cc"
-strategies[0].route_pool = [{"route_id": "claude", "weight": 1}]
+strategies[0].route_pool = [{"route_id": "nation", "weight": 1}]   ← 只有 nation 一个
 strategies[0].dispatch.session_overrides = {
   "7b4cb865-c308-42e3-9fe6-1d61ca48e90a": "nation",
   "6ad2e1b5-8ae4-41f5-b97f-dbb45beb71fb": "nation",
@@ -41,6 +41,8 @@ strategies[0].dispatch.session_overrides = {
 }
 ```
 5 条全部指向 `nation`，全部是旧式纯字符串值（`session_id: route_id`），无 `last_seen`/`created`。`codex` strategy 的 `dispatch` 为空。
+
+> ⚠️ **关键事实（影响迁移后果判断）**：`cc` 的 `route_pool` 当前**只有 `nation` 一个 route**（weight=1），不是多 route 池。这 5 条 override 指向的 `nation` 与 pool 唯一选项重合——**override 存不存在，对这 5 个 session 的实际路由结果没有任何影响**（命中 override 选 nation，不命中走哈希分配池里也只有 nation，结果相同）。这正是此前 reviewer 复核时"5 条命中 0 次的僵尸条目"判断成立的根因。此事实直接简化了"瞬间消失"的后果评估，见 §2.2。
 
 ### 1.2 迁移后清理判据是否成立（用户已拍板：无 last_seen 就填今天日期，正常纳入 7 天清理）
 
@@ -112,22 +114,32 @@ merged_strategy = strategy  # 不再需要构造浅拷贝
 - **功能尚未上线**（见 §0），当前生产代码不认识 sidecar，仍直接读 `dispatch.session_overrides`。
 - `ConfigStore`（主 config）与 `SessionOverridesSidecar`（sidecar）都有基于 mtime 的自动热重载（`maybe_reload`，每请求触发一次比对）。
 
-### 2.2 关键顺序：先上线新代码，再删主 config 字段——不能颠倒
+### 2.2 排期：删字段可与功能上线+数据迁移合并成一步
 
-这是本方案唯一的强约束，原因：
+**原方案曾主张"必须先上线新代码、再删字段，不能颠倒"——该主张基于一个错误前提（`cc` 的 route_pool 含 `claude`），现已推翻。** 重新核算如下：
 
-- 若**先删除**主 config 的 `dispatch.session_overrides` 字段、**后上线**新代码：在两步之间的空窗期，生产仍跑旧代码（直接读该字段），5 条记录会立即从生产逻辑里消失，`cc` strategy 的这 5 个 session 会瞬间跌回默认哈希分配。这是真实的服务行为退化，即便时间窗口很短也不可接受（用户明确说过"针对活跃 session 悄悄换路由"是最担心的失败场景之一，参见 in-band 设计文档 §5.4 讨论 48h 阈值时的原话）。
-- 若**先上线**新代码（读 sidecar + 合并）、**再删**主 config 字段：上线后的间隔期里，新代码同时兼容"主 config 有该字段"与"sidecar 有对应记录"两种情况（`effective_overrides` 的合并语义本就是为此设计的），不会有任何行为退化。此时再执行"写入 sidecar + 删除主 config 字段"是纯粹的数据搬迁，旧代码路径此时已经不再运行，不存在读到"半迁移"状态的风险。
+**"瞬间消失"的真实后果（已核实）**：`cc` 的 `route_pool` 当前只有 `nation` 一个 route（§1.1 已纠正）。这 5 个 session 命中 override 选 `nation`、不命中走哈希分配池里也只有 `nation`——**override 删不删，路由结果都是 `nation`，不会换模型**。所以"删字段导致瞬间跌回哈希分配"这件事在本配置下**不构成服务退化**，用户已明确接受这一后果（"可以接受 5 条记录从生产逻辑里瞬间消失"）。
 
-**结论：迁移动作必须放在 `$route` 功能（worktree `exp/route-cmd-v1` 当前实现，含 reviewer 已确认修复的死锁与查询语义 bug）合并上线**之后**执行，不能和功能上线合并成一步，也不能提前做。**
+**合并成一步的可行性**：把"$route 功能上线 + 迁移脚本写 sidecar + 删主 config 字段"放进同一次发布。脚本内部仍按 §2.3 的"先写 sidecar、再写主 config"顺序执行（这一层顺序是为了迁移脚本自身的幂等与可重跑，与发布排期无关）。
 
-### 2.3 迁移步骤（上线新代码之后执行）
+**合并方案的真实风险（已重新评估，均可控）**：
 
-**前置条件检查**（迁移脚本/人工操作前必须确认）：
-1. 新代码（含 `commands.py`、sidecar 合并逻辑）已合并到主分支并部署，生产进程已重启为新代码。
-2. 用 `$route`（查询模式，无参）对现网 5 个 session 之一发起查询，确认能正确读到 `nation`（证明新代码的合并链路工作正常，且此时数据源还是主 config，因为 sidecar 还没写入）。
+| 风险 | 评估 |
+|---|---|
+| 迁移瞬间 5 个 session 换模型 | **不成立**。pool 只有 nation，override 冗余，删不删都走 nation |
+| 脚本中途失败留下"半迁移"状态 | "sidecar 已写、主 config 未删"是安全中间态（新代码 sidecar 优先），可重跑（幂等）；"主 config 已删、sidecar 未写"则这 5 条暂时消失——但如前所述，消失不改变路由结果。脚本按"先 sidecar 后主 config"顺序可规避后者 |
+| 回滚复杂度 | 备份主 config 后，回滚 = 还原主 config 备份 + 清空 sidecar 对应条目（或直接删 sidecar 文件，反正它本来就不存在）。比两步方案稍复杂但仍是确定性操作 |
+| 新代码首次上线本身的风险 | **这是合并方案唯一真正放大的风险**——若新代码（含 sidecar 合并、命令层、死锁修复）有未发现的 bug，和数据迁移同次发布会增加排查难度。但该代码已通过 reviewer 复核 + 452 个单测，且合并方案不影响"上线后立刻验证 `$route` 查询能正确读到 nation"这个检查点 |
 
-**迁移动作（单次操作，建议写成一次性脚本而非手工编辑，降低出错概率）**：
+**结论：可以合并，且比两步分开更简单**（少一次发布窗口、少一次中间验证发布）。§2.4 的"代码简化延后到第二次发布"建议仍然成立——简化 `effective_overrides`/`build_merged_strategy` 这一步不要和数据迁移揉在一起。
+
+### 2.3 迁移脚本（与功能上线同次发布时执行）
+
+**前置条件检查**（脚本执行前必须确认）：
+1. 新代码（含 `commands.py`、sidecar 合并逻辑）已部署、生产进程已重启为新代码。
+2. 用 `$route`（查询模式，无参）对现网 5 个 session 之一发起查询，确认能正确读到 `nation`（证明新代码的合并链路工作正常；此时数据源仍是主 config，因为 sidecar 还没写入）。
+
+**迁移动作（单次操作，写成一次性脚本而非手工编辑，降低出错概率）**：
 
 ```python
 # 伪代码，实际实现由 implementer 写成脚本，放 tools/model_proxy/ 下临时用一次即可
@@ -204,13 +216,12 @@ for strategy in cfg["strategies"]:
 
 ## 5. 分步实施计划（供派 implementer 执行）
 
-1. **（若尚未做）合并 `$route` 功能本身**：worktree `exp/route-cmd-v1` 的实现已通过 reviewer 复核（含死锁修复），可以先独立上线，不依赖本次单一存储改动。
-2. **验证新代码在生产环境工作正常**：至少跑一次 `$route`（查询）确认现网某个已知 override session 能正确解析（此时数据源仍是主 config，验证的是合并链路本身没问题）。
-3. **实现迁移脚本**（§2.3 伪代码 → 实际代码），本地用临时目录跑通单测（幂等性、sidecar 优先、dispatch 清空移除）。
-4. **在生产环境执行迁移**：备份主 config → 跑脚本 → 校验 sidecar 内容正确、主 config 字段已移除 → 重启代理进程或等待 mtime 热重载 → 用 `$route` 查询 5 个已知 session 之一，确认结果不变（数据来源已从主 config 切到 sidecar，但对外行为应完全一致）。
-5. **补 `_handle_status`/CLI 改动**：新增 sidecar 条目数展示，跑 `model_proxy_cli.sh status` 确认展示正常。
-6. **同步 README 五处引用**。
-7. **（可选，建议延后）第二次发布**：删除 `effective_overrides`/`build_merged_strategy`，简化为"sidecar 是唯一来源"，跑全量测试确认无回归。
-8. **删除或归档一次性迁移脚本**（迁移只做一次，不需要作为长期维护的产品代码保留）。
+1. **实现迁移脚本**（§2.3 伪代码 → 实际代码），本地用临时目录跑通单测（幂等性、sidecar 优先、dispatch 清空移除）。
+2. **同一次发布合并三件事**：`$route` 功能（worktree `exp/route-cmd-v1`，已通过 reviewer 复核含死锁修复）+ 迁移脚本写 sidecar + 删主 config 字段。三者进同一批改动。
+3. **部署后立刻验证**：跑 `$route`（查询）确认 5 个已知 session 之一能正确读到 `nation`（此时数据源已是 sidecar）。因 `route_pool` 只有 nation，即使迁移有偏差也不改变路由结果，验证点只在于"sidecar 记录存在且格式正确"。
+4. **补 `_handle_status`/CLI 改动**：新增 sidecar 条目数展示，跑 `model_proxy_cli.sh status` 确认展示正常（§1.3 唯一会断的现有功能，必须与本次发布同步修，否则 CLI 展示会显示"无覆盖"）。
+5. **同步 README 五处引用**。
+6. **（可选，建议延后）第二次发布**：删除 `effective_overrides`/`build_merged_strategy`，简化为"sidecar 是唯一来源"，跑全量测试确认无回归。
+7. **删除或归档一次性迁移脚本**（迁移只做一次，不需要作为长期维护的产品代码保留）。
 
-每一步都建议派 implementer 执行、reviewer 复核第 3/4/7 步（涉及数据正确性与生产配置改动），与此前 `$route` 功能的复核方式一致。
+每一步都建议派 implementer 执行、reviewer 复核第 1/2/6 步（涉及数据正确性与生产配置改动），与此前 `$route` 功能的复核方式一致。
