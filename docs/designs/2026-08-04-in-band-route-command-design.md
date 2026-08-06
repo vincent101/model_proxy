@@ -144,11 +144,93 @@ $route reset    清除 override，落回自动哈希分配
 
 **必须只看 `messages` 数组中最后一个 `role == "user"` 的元素。** 理由：CC 每轮请求携带完整历史，若全量扫描，会话里一旦出现过指令，后续每轮都会重复命中——更糟的是，用户之后若切到别的 route，历史里的旧指令会反复覆盖新决定，造成「切不动」的诡异现象。
 
-`content` 有两种形态，需都正确处理：
-- `str`：直接用
-- `list`（content blocks）：只取 `type == "text"` 的块的 `text` 字段拼接；**忽略 `tool_result`、`image` 等其他块类型**
+**提取分两级，两级都是实测得出的必需项**（2026-08-06 沙箱实测 + 真实 transcript 回归）：
 
-> `core/translate.py` 内已有 content blocks 取文本的既有处理逻辑，实现时应复用同一套取文本口径，不要另写一份（避免两处口径漂移）。
+```
+级1：定位 text — 取最后一个 type=="text" 块（不拼接）
+级2：剥上下文 — 截取首个尾部 XML 上下文标签之前的内容
+之后才做 §1.4 的四条规则判定
+```
+
+**级1：只取最后一个 text block，不拼接。**
+- `str` 形态：直接用
+- `list`（content blocks）形态：只取最后一个 `type == "text"` 块的 `text`；忽略 `image`、`tool_result` 等其他块类型
+
+> ⚠️ **原写法「取所有 text 块拼接」已被实测证伪**（会导致指令永不匹配）。
+>
+> CC（CLI 侧）把 `<system-reminder>` 作为**独立的前置 text block** 注入同一条 user 消息：
+>
+> ```
+> block[0]  type=text  长度 306  "<system-reminder>\nAs you answer...\n</system-reminder>"
+> block[1]  type=text  长度 13   "$route nation"        ← 带 cache_control，这才是用户输入
+> ```
+>
+> 拼接两块会得到含换行的文本、首 token 变成 `<system-reminder>`，§1.4 规则 2/3/4 **全部失败**。
+>
+> 改为「取最后一个 text 块」后实测通过，且对两种形态都正确——**`<system-reminder>` 并非每轮都注入**（实测多轮会话第二轮只有 1 个 block，无 reminder）。实测样本中也存在 `[image, image, ..., text]` 形态（用户贴图 + 文字），取最后 text 块同样正确。
+
+**级2：剥离尾部 XML 上下文标签（Claudian 侧必需）。**
+
+> ⚠️ **这是 2026-08-06 新发现的正确性缺口，仅靠级1 不足以覆盖 Claudian。**
+>
+> Claudian 把上下文标签**追加在用户输入之后，且拼进同一个字符串**（不是独立 block）。源码实证（`main.js` / `src/utils/context.ts`）：
+>
+> ```js
+> appendCurrentNote(prompt, notePath)  { return `${prompt}\n\n${formatCurrentNote(notePath)}`; }
+> appendContextFiles(prompt, files)    { return `${prompt}\n\n${formatContextFilesLine(files)}`; }
+> ```
+>
+> 所以用户开着笔记打 `$route nation` 时，实际到达代理的字符串是：
+>
+> ```
+> $route nation
+>
+> <current_note>
+> tools/model_proxy/docs/designs/xxx.md
+> </current_note>
+> ```
+>
+> 这同时违反 §1.4 的**规则 2（单行）**与**规则 4（token ≤ 2）**→ **指令不被识别**。
+>
+> 2026-08-05 那次 Claudian 实测之所以拿到纯 13 字符，是因为当时无活动笔记上下文，**属偶然，不能作为通过依据**。真实 transcript 中已找到 9 条含此类标签的 user 消息，形态覆盖 `str` 与 `list`（含 image 混排）。
+
+**剥离口径直接照搬 Claudian 自身实现**（避免自行发明导致与客户端不一致）：
+
+```python
+# 与 Claudian src/utils/context.ts 的 XML_CONTEXT_PATTERN 完全同源
+XML_CONTEXT_PATTERN = re.compile(
+    r'\n\n<(?:current_note|editor_selection|editor_cursor'
+    r'|context_files|canvas_selection|browser_selection)[\s>]')
+
+m = XML_CONTEXT_PATTERN.search(text)
+text = text[:m.start()].strip() if m else text.strip()
+```
+
+要点：
+- 六个标签名必须完整覆盖，缺一个即在该场景失效
+- 锚定 `\n\n<tag` 前缀 + `[\s>]` 结尾（区分 `<current_note>` 与 `<current_note_foo>`），**不是**宽松的 `<tag` 匹配
+- 只截首个匹配之前的内容，**不做全局替换**——用户正文里若本就含这些标签字样，全局替换会改变正文语义、放大误判面
+- Claudian 另有 `<query>...</query>` 解析分支，但**仅存在于解析侧、无生成侧**（已核实源码），故无需处理
+- 剥离只用于**指令识别判定**，转发给上游的 body 一律保持原样（fail-open 时不得改写用户内容）
+
+**两级规则的回归验证（已跑通）**：
+
+| 验证集 | 规模 | 结果 |
+|---|---|---|
+| 真实 transcript 全量回归 | **32224 条** 真实 user 消息 | 误命中 **0**（唯一 2 条命中是 2026-08-06 测试时用户亲手发的 `$route nation`，属正确命中） |
+| 合成用例（含 Claudian 六种标签追加、image 混排、CLI reminder、句中提及、多行、参数过多、代码块内） | 14 例 | **14/14 通过** |
+
+关键用例摘录：
+
+| 用例 | 剥离后 | 判定 |
+|---|---|---|
+| `$route nation\n\n<current_note>…` | `$route nation` | ✓ 识别 |
+| `[image,…,text:"$route nation\n\n<current_note>…"]` | `$route nation` | ✓ 识别 |
+| `[text:"<system-reminder>…", text:"$route nation"]` | `$route nation` | ✓ 识别 |
+| `请解释 $route nation 是什么\n\n<current_note>…` | `请解释 $route nation 是什么` | ✗ 不识别（fail-open 正确） |
+| `` ```\n$route nation\n``` `` | 原样（多行） | ✗ 不识别 ✓ |
+
+> `core/translate.py` 内已有 content blocks 取文本的既有处理逻辑，但其口径是**拼接全部 text 块**（用于把完整用户内容传给上游），与本处需求不同。**本处不能直接复用**——指令识别要的是「用户这一轮实际打的那句话」，而非「这条消息的全部文本」。实现时应单独写一个取最后 text 块的小函数并注明与 translate 侧口径不同的原因。
 
 ### 2.3 必须排除的误触发面
 
@@ -171,7 +253,14 @@ CC 会发 `/v1/messages/count_tokens` 请求，**携带完整对话历史**。�
 
 **残余风险（诚实标注）**：用户若真的单独发一行 `$route nation` 只是想「讨论这个语法」而非执行，会被执行。缓解：切换本身可逆（`$route reset`）、有明确回执、且这是用户主动打出的确定字符串——相比自然语言匹配的误切风险，这已是可接受的最小面。**本文档讨论中反复出现的该字样均为多行上下文内的一部分，不会触发。**
 
-> ⚠️ **未验证项**：CC 可能把 `<system-reminder>` 块追加进 user 消息内容。若追加发生在**同一个 text 块内**且带换行，「单行」约束会使指令**永不匹配**（方案失效，非误触发）；若追加为**独立 block**，则 §2.2 的「只取 text 块拼接」需改为「只取第一个 text 块」或做 system-reminder 剥离。**这是必须实测的项，见 §8 V2。**
+> ✅ **原「未验证项」已于 2026-08-06 实测关闭**，结论是**两个客户端各有一种注入形态，且都会破坏匹配**：
+>
+> | 客户端 | 注入内容 | 注入形态 | 位置 | 对匹配的影响 |
+> |---|---|---|---|---|
+> | Claude Code CLI | `<system-reminder>` | **独立 text block** | 用户输入**之前** | 拼接则失效 → 级1 解决 |
+> | Claudian | `<current_note>` 等 6 种标签 | **同一字符串内拼接** | 用户输入**之后** | 违反单行/token≤2 → 级2 解决 |
+>
+> 处理规则见 §2.2 两级提取。两级缺任一级，对应客户端上指令均**永不匹配**（方案失效，非误触发）。
 
 ---
 
@@ -469,15 +558,34 @@ env ANTHROPIC_BASE_URL="http://127.0.0.1:18899/" ANTHROPIC_AUTH_TOKEN="cc" \
 
 **已完成的静态验证（§1.3，无需重跑）**：`$` 在 Claudian（`main.js` 无 `key === "$"` 拦截）与 CLI（反编译无 `$` 输入模式判定）双侧均无拦截；6038 条历史消息 `$` 开头 0 条。以下 V1 是对该静态结论的**端到端确认**，仍需实跑。
 
+**沙箱实测记录（2026-08-06，worktree `exp/route-cmd-v1`，stub `tests/v1_probe_stub.py` 端口 18899）**
+
+| # | 验证项 | 状态 | 实测结果 |
+|---|---|---|---|
+| **V1** | `$route nation` 原样到达 API | **✅ CLI 侧通过**<br>⚠️ Claudian 侧未端到端实测 | CLI：`messages[-1]` 最后 text block 精确等于 `$route nation`（长度 13、带 `cache_control`）。**Claudian 侧因重定向受阻未实跑，见下方「Claudian 侧实测受阻」** |
+| **V2** | user 消息注入形态 | **✅ 通过（结论已推翻原假设）** | CLI 注入 `<system-reminder>` 为**独立前置 block**；Claudian 追加 6 种上下文标签于**同一字符串之后**（源码 + 9 条真实 transcript 实证）。两级提取规则见 §2.2 |
+| **V2c** | **两级规则回归（新增项）** | **✅ 通过** | 32224 条真实 user 消息误命中 **0**；14 例合成用例（含六种标签追加、image 混排、CLI reminder、句中提及、多行、参数过多、代码块内）**14/14 通过** |
+| V2b | `system` 字段线格式 | **✅ 通过** | 3 个 text block 的数组，其中 **2 个带 `cache_control`** —— 佐证 §7 所述「改 system 提示词会击穿 prefix cache」为真 |
+| V4 | 自造 SSE 客户端可消费 | **✅ CLI 侧通过**<br>⚠️ Claudian 侧待验 | CLI 正常显示 stub 自造的流式回复，无卡住/报错。Claudian 侧 SSE 消费实现不同，仍需各验一次 |
+
+> **Claudian 侧实测受阻（根因已定位，非配置错误）**
+>
+> 三种重定向方式实测：
+>
+> | 方式 | 结果 |
+> |---|---|
+> | Claudian `providerConfigs.claude.environmentVariables` | ✗ 被 user 层覆盖 |
+> | `.claude/settings.local.json` 加 `env` | ✗ 也压不过 user 层 |
+> | 临时改 `~/.claude/settings.json` | ✓ 通（dump=1），但**期间所有会话都会打到 stub**，已立即还原 |
+>
+> 根因：**CC 的 `settings.json` `env` 块优先级高于进程继承的环境变量**，而 Claudian 传 `settingSources: ["user","project","local"]`（因 `loadUserSettings: true`），user 层的 `18889` 永远赢。CLI 侧测试之所以成功，是因为显式带了 `--setting-sources project,local` 绕过 user 层——**Claudian 无此开关**。
+>
+> 实施期若要补 Claudian 端到端实测，唯一路径是临时改 user 层 settings（约 1 分钟窗口内全局生效），需用户接受该中断。**但 V2/V2c 已通过源码 + 真实 transcript + 回归用例间接覆盖了 Claudian 的注入形态**，剩余未覆盖项只有 V1 端到端可达性与 V4 的 SSE 消费。
+
 | # | 验证项 | 方法 | 不通的后果 |
 |---|---|---|---|
-| **V1** | **`$route nation` 在两个客户端都能原样到达 API** | 沙箱起只 dump body 的 stub；**CLI 与 Claudian 各发一次**，检查 `messages[-1]` 文本是否精确等于输入 | **方案作废**（通道不存在），需另找可达前缀。**必须两个客户端都测**——这正是 `#` 方案翻车的原因（见 §1.0/§1.2） |
-| **V2** | user 消息是否被追加 `<system-reminder>` | 同 V1，检查 content 形态：是否多 block、text 内是否含换行 | 「单行」约束需调整（否则指令永不匹配） |
-| V2b | `system` 字段的线格式 | 同一次 dump 一并看：`body["system"]` 是 `str` 还是 `list`、blocks 形态下是否带 `cache_control` | 仅影响日后若要读 system（本方案不读，属信息补全） |
-
-> **V1/V2/V2b 可用同一次 dump 一次性覆盖**，无需分三次跑。若同时想验证 Claudian 自定义系统提示词的落点，可临时把该设置设为唯一 token（如 `ZZPROBE_7f3a`）后发一条消息，测完改回空串。
+| **V1b** | **Claudian 端到端可达 + SSE 可消费** | 临时改 user 层 settings 指向沙箱 → Claudian 新开 tab 发 `$route nation` → 立即还原 | **Claudian 侧方案作废**（CLI 侧仍可用）。属 §1.0 「必须在所有在用客户端验证」的未闭合项 |
 | V3 | usage 填 0 是否让客户端显示异常 | 自造响应后观察客户端用量显示 | 改为填合理估算值 |
-| V4 | 自造 SSE 序列客户端能否正常消费 | 对比 `samples/anthropic_stream_samples.txt`，观察客户端是否卡住/报错；**Claudian 与 CLI 各验一次**（两者 SSE 消费实现不同） | 补齐缺失事件 |
 | V5 | 写路径无别名污染 | 单测：写入后断言 `ConfigStore._config` 未被就地改动（deepcopy 生效） | 修实现（§4.2） |
 | V6 | 并发写不丢失 | 并行跑「代理写 override」+「CLI 改配置」，校验两者都不丢 | 落 sidecar 或加锁（§4.5） |
 | V7 | 兼容性回归 | 现网 `cc`/`codex` 配置不变时行为完全一致；不含指令的消息一律照常转发 | 阻断上线 |
@@ -499,7 +607,8 @@ env ANTHROPIC_BASE_URL="http://127.0.0.1:18899/" ANTHROPIC_AUTH_TOKEN="cc" \
 | `ConfigStore`（`core/server.py`） | 加一份 sidecar 的 mtime 监听 + 与主 config 内 `session_overrides` 的合并（sidecar 优先）；文件缺失视为 `{}`、非法 JSON 保留上次值 + warning |
 | `model_proxy_cli.sh` | 无需加锁。可选：补 `prune-overrides` 供人工查看/清理 sidecar（自动清理已覆盖主要场景，此项非必需） |
 | `README.md` | 补内建命令层章节（语法、生效语义、查询方式、7 天清理行为）、sidecar 文件说明、**§1.0 的「前缀可达性属持续性外部依赖」提示** |
-| `tests/` | 匹配规则单测（含 §8 V9 的 fail-open 反例集）、别名污染单测（V5）、SSE 序列断言（V4）、**清理逻辑单测（V10-V13，其中 V10 旧格式兼容为必测）** |
+| `tests/` | **`test_command_match_rules.py` 已写好并通过**（24 合成用例 + 32245 条真实 transcript 回归，含参考实现 `parse_route_command`；实施时 server 侧须与其同口径或直接复用）。待补：别名污染单测（V5）、SSE 序列断言（V4）、**清理逻辑单测（V10-V13，其中 V10 旧格式兼容为必测）** |
+| `tests/v1_probe_stub.py` | 沙箱探针（**一次性验证工具，非产品代码**）。已完成 V1/V2/V2b/V4 的 CLI 侧验证；保留供实施期补 Claudian 侧 V1b |
 
 **耦合性质**：**有正确性耦合**。四处敏感点：
 1. 匹配规则放宽会**吞掉用户真实消息并返回假响应**（最坏后果，需 fail-open 反例集覆盖）
