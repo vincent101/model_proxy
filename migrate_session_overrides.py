@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import datetime
 import json
+import logging
 import sys
 from pathlib import Path
 from typing import Any
@@ -30,6 +31,8 @@ from typing import Any
 # 复用产品代码里的原子写函数
 from core.commands import _atomic_write_json as _sidecar_atomic_write
 from _config_ops import atomic_write as _config_atomic_write
+
+log = logging.getLogger(__name__)
 
 
 def _backup_config(config_path: Path, ts: str) -> Path:
@@ -63,10 +66,16 @@ def migrate(config_path: Path, sidecar_path: Path, now_iso: str | None = None) -
     cfg = json.loads(config_path.read_text(encoding="utf-8"))
     strategies = cfg.get("strategies") or []
 
-    # 读现有 sidecar（缺失视为空）
+    # 读现有 sidecar（缺失或非法 JSON 均视为空，与 core/commands.py
+    # _reload_locked 的降级口径一致——sidecar 允许人工手改，碰到非法内容
+    # 应降级继续迁移而非崩溃）
     if sidecar_path.exists():
-        sidecar_data = json.loads(sidecar_path.read_text(encoding="utf-8"))
-        if not isinstance(sidecar_data, dict):
+        try:
+            sidecar_data = json.loads(sidecar_path.read_text(encoding="utf-8"))
+            if not isinstance(sidecar_data, dict):
+                sidecar_data = {}
+        except (json.JSONDecodeError, ValueError, OSError) as e:
+            log.warning("session_overrides sidecar corrupt, treating as empty: %s", e)
             sidecar_data = {}
     else:
         sidecar_data = {}
@@ -117,6 +126,9 @@ def migrate(config_path: Path, sidecar_path: Path, now_iso: str | None = None) -
         }
 
     # 备份主 config（先备份，再写）
+    # 备份文件名时间戳用本地时间（非 UTC）：与 _install_ops.py:172 约定一致，
+    # 文件名供人读，本地时间直观。而 now_iso 用 UTC——它是数据字段（写入 sidecar
+    # 的 last_seen/created），需时区明确，与 core/commands.py 的 _utc_now_iso() 口径一致。
     ts = datetime.datetime.now().strftime("%Y%m%d%H%M%S")
     backup_path = _backup_config(config_path, ts)
 

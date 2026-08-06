@@ -302,5 +302,42 @@ class TestMigrateMultipleStrategies(unittest.TestCase):
             self.assertNotIn("dispatch", cfg_after["strategies"][1])
 
 
+class TestMigrateCorruptSidecar(unittest.TestCase):
+    """sidecar 文件为非法 JSON 时，迁移脚本降级为空 dict 继续迁移，不崩溃。
+
+    与 core/commands.py _reload_locked 的降级口径一致：sidecar 允许人工手改，
+    碰到非法内容应视为空而非崩溃。
+    """
+
+    def test_corrupt_sidecar_treated_as_empty(self):
+        with tempfile.TemporaryDirectory() as d:
+            cfg_path = Path(d) / "model_proxy_config.json"
+            sidecar_path = Path(d) / "session_overrides.json"
+            legacy = {"sess-a": "nation", "sess-b": "nation"}
+            cfg_path.write_text(json.dumps(_make_config(legacy)), encoding="utf-8")
+
+            # sidecar 文件内容为非法 JSON
+            sidecar_path.write_text('"{not valid json"', encoding="utf-8")
+
+            r = migrate(cfg_path, sidecar_path, now_iso="2026-08-06T10:00:00Z")
+
+            # 脚本不崩溃，两条记录都被迁入（sidecar 被视为空）
+            self.assertEqual(r["migrated"], 2)
+            self.assertEqual(r["skipped"], 0)
+
+            # sidecar 被重写为合法新内容，不再含非法 JSON
+            sidecar_data = json.loads(sidecar_path.read_text(encoding="utf-8"))
+            self.assertIn("cc", sidecar_data)
+            self.assertIn("sess-a", sidecar_data["cc"])
+            self.assertIn("sess-b", sidecar_data["cc"])
+            self.assertEqual(sidecar_data["cc"]["sess-a"]["route_id"], "nation")
+            self.assertEqual(sidecar_data["cc"]["sess-b"]["route_id"], "nation")
+            self.assertEqual(sidecar_data["cc"]["sess-a"]["created"], "2026-08-06T10:00:00Z")
+
+            # 主 config 的 session_overrides 字段被删除
+            cfg_after = json.loads(cfg_path.read_text(encoding="utf-8"))
+            self.assertNotIn("dispatch", cfg_after["strategies"][0])
+
+
 if __name__ == "__main__":
     unittest.main()
