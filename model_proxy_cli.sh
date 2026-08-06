@@ -165,10 +165,10 @@ for st in data.get('strategies', []):
         pool_desc = ','.join(
             f\"{p.get('route_id', '?')}:{p.get('weight', 1)}\" for p in route_pool
         )
-        overrides = ((st.get('dispatch') or {}).get('session_overrides')) or {}
+        sidecar_count = st.get('sidecar_overrides_count', 0) or 0
         rid_desc = f'pool[{pool_desc}]'
-        if overrides:
-            rid_desc += f' +{len(overrides)}个session覆盖'
+        if sidecar_count:
+            rid_desc += f' +{sidecar_count}个session覆盖'
     else:
         rid_desc = '?'
     print(f'  {tok:16} -> {rid_desc:12}')
