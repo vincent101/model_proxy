@@ -49,15 +49,15 @@ tags: [architect, model_proxy, config, formatting]
 ### 1.2 用户**没改**什么（保持多行，不要纳入紧凑化）
 
 已核实现网 config：以下多元素结构用户保持 `indent=2` 多行展开，方案**不动这些**：
-- `supplies`（12 元素，每条是大对象）— 多行
 - `routes`（5 元素，每条是大对象）— 多行
 - `strategies`（2 元素）— 多行
 - `route_pool`（现网单元素，但即便多元素也应多行，每条是 `{route_id, weight}` 小对象）— 多行
-- `routes.tiers.<tier>`（单元素数组 `["claude-opus-sankuai-0956"]`，`json.dumps` 默认就是单行，无需处理）
 
-**结论：紧凑化只针对两类**：
+**结论：紧凑化针对四类**：
 1. 任何 `effort_enum` 键下的字符串数组（不管在哪层、几个元素，都压单行）
 2. `tiers_source_capability` 下的每个 tier 对象（`{"opus": {...}}` 这种"单键 dict 值是含 effort_enum 的 dict"，整体压单行）
+3. `routes.tiers.<tier>` 的 supply id 数组（含多元素，也压单行；单元素 `json.dumps` 默认就是单行，正则3 不崩）
+4. `supplies` 数组里的每条 supply 对象（含嵌套 `reasoning_capability`，整体压单行；见正则4）
 
 ### 1.3 代码怎么写配置（已核实）
 
@@ -104,36 +104,70 @@ tags: [architect, model_proxy, config, formatting]
 import json, re
 
 # 正则1：把 "effort_enum": [ 多行 ] 压成 "effort_enum": ["a","b","c"]
-# 匹配 effort_enum 键后、跨行的数组，捕获数组内容
 _EFFORT_ENUM_ARRAY = re.compile(
     r'("effort_enum":\s*)\[\s*\n([^\]]*?)\n\s*\]',
-    re.DOTALL
+    re.DOTALL,
 )
 
 # 正则2：把 tiers_source_capability 下的 "tier": {\n ... \n} 压成 "tier": {...}
-# 仅匹配紧邻 effort_enum 的单键 dict（tier 对象只有 effort_enum 一个键）
 _TIER_OBJECT = re.compile(
     r'("(?:opus|sonnet|haiku)":\s*)\{\s*\n\s*("effort_enum":\s*\[[^\]]*\])\s*\n\s*\}',
-    re.DOTALL
+    re.DOTALL,
+)
+
+# 正则3：把 routes.tiers 下的 "tier": [ 多行 ] 压成 "tier": ["id1","id2",...]
+# 多元素也压单行；tier 名限定 opus|sonnet|haiku（与正则2 一致）
+_ROUTES_TIERS_ARRAY = re.compile(
+    r'("(?:opus|sonnet|haiku)":\s*)\[\s*\n([^\]]*?)\n\s*\]',
+    re.DOTALL,
+)
+
+# 正则4：把 supplies 数组里的每条 supply 对象压成单行（含嵌套 reasoning_capability）
+# 匹配完整 supply 对象结构（id/url/protocol/appkey/target_model/reasoning_capability）。
+# 必须在正则1 之后执行——先压 effort_enum 数组，才能匹配到完整 supply 对象单行。
+# 脆性：supply 结构扩展（加 priority 等字段）会失配、回退多行（不报错不丢数据）。
+_SUPPLY_OBJECT = re.compile(
+    r'\{\s*\n\s*"id":\s*"[^"]+",\s*\n\s*"url":\s*"[^"]+",\s*\n\s*"protocol":\s*"[^"]+",'
+    r'\s*\n\s*"appkey":\s*"[^"]+",\s*\n\s*"target_model":\s*"[^"]+",'
+    r'\s*\n\s*"reasoning_capability":\s*\{[^}]*\}\s*\n\s*\}',
+    re.DOTALL,
 )
 
 def compact_config_json(obj) -> str:
-    """生成 config 文本：indent=2 多行，但 effort_enum 数组与
-    tiers_source_capability 下的 tier 对象压成单行（与用户手改格式一致）。
+    """生成 config 文本：indent=2 多行，但以下结构压成单行：
+    1. effort_enum 数组（正则1）
+    2. tiers_source_capability 下的 tier 对象（正则2）
+    3. routes.tiers 下的 supply id 数组，含多元素（正则3）
+    4. supplies 数组里的每条 supply 对象，含嵌套 reasoning_capability（正则4）
+
+    顺序敏感：正则1 → 正则2 → 正则3 → 正则4。
+    正则4 必须在正则1 后执行（effort_enum 先单行才能匹配到完整 supply 对象）。
 
     读取侧用 json.load 无感知，本函数只影响文本外观。
     请求体序列化（转发上游）不得用本函数。
     """
     text = json.dumps(obj, indent=2, ensure_ascii=False)
-    # 先压 effort_enum 数组
+    # 正则1：压 effort_enum 数组
     def _compact_array(m):
         vals = [s.strip().strip('"') for s in m.group(2).split(',') if s.strip()]
-        return m.group(1) + '[' + ','.join('"'+v+'"' for v in vals) + ']'
+        return m.group(1) + '[' + ','.join('"' + v + '"' for v in vals) + ']'
     text = _EFFORT_ENUM_ARRAY.sub(_compact_array, text)
-    # 再压 tier 对象（此时其内 effort_enum 已是单行）
+    # 正则2：压 tier 对象（此时其内 effort_enum 已是单行）
     text = _TIER_OBJECT.sub(lambda m: m.group(1) + '{' + m.group(2) + '}', text)
+    # 正则3：压 routes.tiers 下的 supply id 数组（多元素也压单行）
+    text = _ROUTES_TIERS_ARRAY.sub(_compact_array, text)
+    # 正则4：压 supplies 数组里的每条 supply 对象（含嵌套 reasoning_capability）
+    text = _SUPPLY_OBJECT.sub(lambda m: m.group(0)
+                              .replace('\n', '').replace('  ', ''), text)
     return text
 ```
+
+**四个正则的顺序**：正则1 → 正则2 → 正则3 → 正则4。
+- 正则1 先压 effort_enum 数组，这样正则4 匹配 supply 对象时其内 `effort_enum` 已是单行，能匹配到完整对象
+- 正则2/3 互不冲突（一个匹配 tier 对象、一个匹配 tier 数组）
+- 正则4 最后，等 effort_enum 已单行后再压整个 supply 对象
+
+**正则4 的脆性**：supply 对象含嵌套 `reasoning_capability`，正则要在 `reasoning_capability` 已压行后匹配完整对象。如果 supply 结构未来加字段（如 `priority`、`weight`），正则4 会失配、回退多行（不报错、不丢数据）。这是可接受脆性——格式不一致只会导致该条多行展开，功能正常。
 
 ### 3.2 改动点（5 处，全部替换 json.dumps 调用）
 
@@ -149,9 +183,10 @@ def compact_config_json(obj) -> str:
 
 ### 3.3 实现要点
 
-1. **两个正则的顺序**：先压 `effort_enum` 数组（正则1），再压 tier 对象（正则2）。因为正则2匹配的 tier 对象内部含 effort_enum，必须等 effort_enum 先变成单行后，正则2才能匹配到"`"effort_enum": [...]` 紧邻 `}`"的完整模式。
-2. **正则2的 tier 名限定**：`opus|sonnet|haiku`，避免误匹配其他单键 dict。如果未来新增 tier 名，正则会不匹配该 tier（回退多行，不报错），需同步更新正则——这个约束写进函数 docstring。
-3. **解析回 dict 验证**：`json.loads(compact_config_json(obj)) == obj` 必须成立，这是数据无损的强保证。
+1. **四个正则的顺序**：正则1（effort_enum 数组）→ 正则2（tier 对象）→ 正则3（routes.tiers 数组）→ 正则4（supply 对象）。正则4 必须在正则1 后执行——先压 effort_enum 数组，才能匹配到含单行 `reasoning_capability` 的完整 supply 对象。
+2. **正则2/3 的 tier 名限定**：`opus|sonnet|haiku`，避免误匹配其他单键 dict 或数组。如果未来新增 tier 名，正则会不匹配该 tier（回退多行，不报错），需同步更新正则——这个约束写进函数 docstring。
+3. **正则4 的 supply 结构限定**：匹配 `id/url/protocol/appkey/target_model/reasoning_capability` 完整字段结构。supply 加字段（如 `priority`）会导致失配、回退多行（不报错不丢数据），这是可接受脆性。
+4. **解析回 dict 验证**：`json.loads(compact_config_json(obj)) == obj` 必须成立，这是数据无损的强保证。
 
 ## 4. 风险与测试
 
@@ -171,12 +206,17 @@ def compact_config_json(obj) -> str:
 1. **格式断言**：生成含 effort_enum 的 config 文本，断言：
    - `"effort_enum": ["low","medium",...]` 单行出现（无跨行数组）
    - `"opus": {"effort_enum": [...]}` 单行出现（tier 对象不跨行）
-   - 其他多元素数组（`supplies`/`routes`/`strategies`）仍多行
-2. **数据无损**：`json.loads(compact_config_json(cfg)) == cfg`（深相等）
+   - supply 对象单行出现（含嵌套 reasoning_capability）
+   - `routes.tiers.<tier>` 多元素数组单行出现
+   - `routes` 数组本身仍多行展开
+2. **数据无损**：`json.loads(compact_config_json(cfg)) == cfg`（深相等，含 supplies + routes + strategies 全结构）
 3. **无 effort_enum 时正常多行**：构造不含 effort_enum 的 config，断言输出 == `json.dumps(indent=2)`
 4. **note 字段含 effort_enum 文字不误伤**：构造 `note` 值含 "effort_enum" 字样的 config，断言 note 值不变
 5. **多 tier 名覆盖**：opus/sonnet/haiku 三个都压成单行
 6. **空数组边界**：`effort_enum: []` 不崩（生成 `[]`）
+7. **routes.tiers 单元素/多元素/空数组**：单元素也单行（不崩）、多元素压单行、空数组不崩
+8. **混合场景**：一个 config 同时含 supplies（多行对象）、routes.tiers（多元素/单元素）、effort_enum，全部正确压行
+9. **supply 结构扩展回退**：supply 加 priority 字段时正则4 失配、回退多行（不报错不丢数据）
 
 ## 5. 实施建议
 
