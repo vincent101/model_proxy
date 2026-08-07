@@ -31,6 +31,50 @@ TIER_NAMES = ("opus", "sonnet", "haiku")
 
 
 # ---------------------------------------------------------------------------
+# 配置文件紧凑格式：effort_enum 数组 + tier 对象单行化
+# ---------------------------------------------------------------------------
+
+# 正则1：把 "effort_enum": [ 多行 ] 压成 "effort_enum": ["a","b","c"]
+# 匹配 effort_enum 键后、跨行的数组，捕获数组内容
+_EFFORT_ENUM_ARRAY = re.compile(
+    r'("effort_enum":\s*)\[\s*\n([^\]]*?)\n\s*\]',
+    re.DOTALL,
+)
+
+# 正则2：把 tiers_source_capability 下的 "tier": {\n ... \n} 压成 "tier": {...}
+# 仅匹配紧邻 effort_enum 的单键 dict（tier 对象只有 effort_enum 一个键）
+_TIER_OBJECT = re.compile(
+    r'("(?:opus|sonnet|haiku)":\s*)\{\s*\n\s*("effort_enum":\s*\[[^\]]*\])\s*\n\s*\}',
+    re.DOTALL,
+)
+
+
+def compact_config_json(obj) -> str:
+    """生成 config 文本：indent=2 多行，但 effort_enum 数组与
+    tiers_source_capability 下的 tier 对象压成单行（与用户手改格式一致）。
+
+    读取侧用 json.load 无感知，本函数只影响文本外观。
+
+    约束：
+    - 请求体序列化（转发上游）不得用本函数。
+    - 新增 tier 名需更新正则2 的 tier 名白名单（opus|sonnet|haiku）。
+    """
+    text = json.dumps(obj, indent=2, ensure_ascii=False)
+
+    # 先压 effort_enum 数组（正则1）
+    def _compact_array(m):
+        vals = [s.strip().strip('"') for s in m.group(2).split(',') if s.strip()]
+        return m.group(1) + '[' + ','.join('"' + v + '"' for v in vals) + ']'
+
+    text = _EFFORT_ENUM_ARRAY.sub(_compact_array, text)
+
+    # 再压 tier 对象（正则2，此时其内 effort_enum 已是单行）
+    text = _TIER_OBJECT.sub(lambda m: m.group(1) + '{' + m.group(2) + '}', text)
+
+    return text
+
+
+# ---------------------------------------------------------------------------
 # 基础：读/写
 # ---------------------------------------------------------------------------
 
@@ -44,7 +88,7 @@ def atomic_write(path: str, cfg: dict) -> None:
     fd, tmp = tempfile.mkstemp(dir=_dir, suffix=".tmp")
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as f:
-            json.dump(cfg, f, indent=2, ensure_ascii=False)
+            f.write(compact_config_json(cfg) + "\n")
         os.replace(tmp, path)
     except Exception:
         try:

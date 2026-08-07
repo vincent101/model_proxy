@@ -18,7 +18,7 @@ import re
 import sys
 from pathlib import Path
 
-from _config_ops import confirm
+from _config_ops import compact_config_json, confirm
 from core.reasoning.registry import resolve_protocol
 
 # ---------------------------------------------------------------------------
@@ -332,7 +332,7 @@ def ensure_session_hook(settings_path: "Path | None" = None) -> None:
     print(f"  - 将删除上述条目，并确保末尾存在 1 条指向 {expected_path} 的 hook")
 
     cfg.setdefault("hooks", {})["SessionStart"] = new_session_start
-    new_text = json.dumps(cfg, indent=2, ensure_ascii=False) + "\n"
+    new_text = compact_config_json(cfg) + "\n"
     preview_confirm_write(settings_path, old_text, new_text, "model_proxy hook", [
         "SessionStart 已确保存在正确的 model_proxy 自启 hook。",
     ])
@@ -367,7 +367,7 @@ def install_claude(token: str, port: str) -> None:
     env.setdefault("ANTHROPIC_DEFAULT_HAIKU_MODEL", "claude-haiku")
     env.setdefault("ANTHROPIC_DEFAULT_SONNET_MODEL", "claude-sonnet")
     env.setdefault("ANTHROPIC_DEFAULT_OPUS_MODEL", "claude-opus")
-    new_text = json.dumps(cfg, indent=2, ensure_ascii=False) + "\n"
+    new_text = compact_config_json(cfg) + "\n"
     preview_confirm_write(cfg_path, old_text, new_text, "claude", [
         f"已写入：ANTHROPIC_BASE_URL={base_url} ANTHROPIC_AUTH_TOKEN={token}",
         "请重启 Claude Code 生效。",
@@ -511,7 +511,7 @@ def install_openclaw(token: str, port: str) -> None:
         "apiKey": token,
         "api": api_mode,
     }
-    new_text = json.dumps(cfg, indent=2, ensure_ascii=False) + "\n"
+    new_text = compact_config_json(cfg) + "\n"
     preview_confirm_write(cfg_path, old_text, new_text, "openclaw", [
         f"已写入：providers.{provider_name}.baseUrl={base_url}",
     ])
