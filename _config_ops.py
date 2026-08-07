@@ -31,7 +31,7 @@ TIER_NAMES = ("opus", "sonnet", "haiku")
 
 
 # ---------------------------------------------------------------------------
-# 配置文件紧凑格式：effort_enum 数组 + tier 对象 + routes.tiers 数组 + supply 对象单行化
+# 配置文件紧凑格式：effort_enum 数组 + tier 对象 + routes.tiers 数组 + supply 对象 + route_pool 对象单行化
 # ---------------------------------------------------------------------------
 
 # 正则1：把 "effort_enum": [ 多行 ] 压成 "effort_enum": ["a","b","c"]
@@ -66,6 +66,16 @@ _SUPPLY_OBJECT = re.compile(
     re.DOTALL,
 )
 
+# 正则5：压 strategies.route_pool 下的 {route_id, weight} 对象
+# 匹配 route_pool 数组里的每个 {route_id, weight} 两字段对象，压成单行 {"route_id":"x","weight":1}。
+# 不锚定 "route_pool": [ 前缀（该前缀只出现在数组第一个对象前，后续对象前是逗号+空白），
+# 改为匹配对象本身——config 里 {route_id, weight} 两字段对象只出现在 route_pool 下，不会误伤其他结构。
+# 脆性：route_pool 对象加字段（如 fallback）会失配、回退多行（不报错不丢数据）。
+_ROUTE_POOL_OBJECT = re.compile(
+    r'\{\s*\n\s*"route_id":\s*"([^"]+)",\s*\n\s*"weight":\s*(\d+)\s*\n\s*\}',
+    re.DOTALL,
+)
+
 
 def compact_config_json(obj) -> str:
     """生成 config 文本：indent=2 多行，但以下结构压成单行（与用户手改格式一致）：
@@ -73,9 +83,11 @@ def compact_config_json(obj) -> str:
     2. tiers_source_capability 下的 tier 对象（正则2）
     3. routes.tiers 下的 supply id 数组，含多元素（正则3）
     4. supplies 数组里的每条 supply 对象，含嵌套 reasoning_capability（正则4）
+    5. strategies.route_pool 下的 {route_id, weight} 对象（正则5）
 
-    顺序敏感：正则1 → 正则2 → 正则3 → 正则4。
+    顺序敏感：正则1 → 正则2 → 正则3 → 正则4 → 正则5。
     正则4 必须在正则1 后执行（effort_enum 先单行才能匹配到完整 supply 对象）。
+    正则5 独立，不依赖前面正则的结果。
 
     读取侧用 json.load 无感知，本函数只影响文本外观。
 
@@ -83,6 +95,7 @@ def compact_config_json(obj) -> str:
     - 请求体序列化（转发上游）不得用本函数。
     - 新增 tier 名需更新正则2/正则3 的 tier 名白名单（opus|sonnet|haiku）。
     - supply 对象结构扩展（加字段）会导致正则4 失配、回退多行（不报错不丢数据）。
+    - route_pool 对象结构扩展（加 fallback 等字段）会导致正则5 失配、回退多行（不报错不丢数据）。
     """
     text = json.dumps(obj, indent=2, ensure_ascii=False)
 
@@ -108,6 +121,13 @@ def compact_config_json(obj) -> str:
     # 正则4 可匹配到完整对象并压成单行
     text = _SUPPLY_OBJECT.sub(lambda m: m.group(0)
                               .replace('\n', '').replace('  ', ''), text)
+
+    # 正则5：压 route_pool 下的 {route_id, weight} 对象
+    # 匹配每个对象（不锚定 route_pool 数组前缀，靠 {route_id, weight} 两字段结构识别）
+    text = _ROUTE_POOL_OBJECT.sub(
+        lambda m: '{"route_id":"' + m.group(1) + '","weight":' + m.group(2) + '}',
+        text
+    )
 
     return text
 

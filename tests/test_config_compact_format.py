@@ -1,7 +1,8 @@
 """compact_config_json 紧凑格式单测。
 
 验证 effort_enum 数组、tiers_source_capability 下的 tier 对象、
-routes.tiers 下的 supply id 数组、supplies 里的 supply 对象被压成单行，
+routes.tiers 下的 supply id 数组、supplies 里的 supply 对象、
+strategies.route_pool 下的 {route_id, weight} 对象被压成单行，
 其余结构保持 indent=2 多行，且数据无损。
 
 运行：cd tools/model_proxy && python3 -m unittest tests.test_config_compact_format -v
@@ -49,6 +50,25 @@ def _make_full_cfg():
             },
         ],
     }
+
+
+def _make_full_cfg_with_route_pool():
+    """构造一个含 route_pool（多 route）的完整 config 样本，用于 route_pool 紧凑格式测试。
+
+    在 _make_full_cfg 基础上加一个 route r2，strategy tok1 改用 route_pool（含 r1 + r2 两条）。
+    """
+    cfg = _make_full_cfg()
+    cfg["routes"].append(
+        {"id": "r2", "tiers": {"opus": ["s2"], "sonnet": ["s1"], "haiku": ["s1"]},
+         "failover": "off"}
+    )
+    tok1 = cfg["strategies"][0]
+    tok1.pop("route_id")
+    tok1["route_pool"] = [
+        {"route_id": "r1", "weight": 1},
+        {"route_id": "r2", "weight": 2},
+    ]
+    return cfg
 
 
 class TestCompactFormat(unittest.TestCase):
@@ -237,6 +257,81 @@ class TestCompactFormat(unittest.TestCase):
         self.assertIn('"priority": 1', text)
         # effort_enum 仍被正则1 压成单行
         self.assertIn('"effort_enum": ["low","high"]', text)
+
+    # 9. route_pool 多行对象压单行（2 个 route 的场景，如 cc 的 [nation1, nation2]）
+    def test_route_pool_multi_element_single_line(self):
+        """strategies.route_pool 下含多个 {route_id, weight} 对象时，
+        每个对象都应被压成单行（不是只压第一个）。
+        """
+        cfg = {
+            "strategies": [
+                {
+                    "client_token": "cc",
+                    "route_pool": [
+                        {"route_id": "nation1", "weight": 1},
+                        {"route_id": "nation2", "weight": 1},
+                    ],
+                },
+            ],
+        }
+        text = compact_config_json(cfg)
+        # 两个对象都应单行出现
+        self.assertIn('{"route_id":"nation1","weight":1}', text)
+        self.assertIn('{"route_id":"nation2","weight":1}', text)
+        # 不应出现跨行的 route_id/weight 对象（多行对象里 route_id 后会换行接 weight）
+        self.assertNotRegex(text, r'"route_id":\s*"[^"]+",\s*\n\s*"weight"')
+        # 数据无损
+        self.assertEqual(json.loads(text), cfg)
+
+    # 10. route_pool 单元素也压单行（不崩）
+    def test_route_pool_single_element_single_line(self):
+        """route_pool 只有 1 个 {route_id, weight} 对象时，也应压成单行（不崩）。"""
+        cfg = {
+            "strategies": [
+                {
+                    "client_token": "codex",
+                    "route_pool": [
+                        {"route_id": "openai", "weight": 1},
+                    ],
+                },
+            ],
+        }
+        text = compact_config_json(cfg)
+        self.assertIn('{"route_id":"openai","weight":1}', text)
+        # 数据无损
+        self.assertEqual(json.loads(text), cfg)
+
+    # 11. 含 route_pool 的完整 config roundtrip：json.loads(compact_config_json(cfg)) == cfg
+    def test_full_config_with_route_pool_roundtrip(self):
+        """含 route_pool 的完整 config（supplies + routes + strategies 全结构）
+        经 compact_config_json 后 json.loads 必须深等于原 config。
+        """
+        cfg = _make_full_cfg_with_route_pool()
+        text = compact_config_json(cfg)
+        self.assertEqual(json.loads(text), cfg)
+
+    # 12. route_pool 加字段（如 fallback）时正则5 失配回退多行，不报错不丢数据
+    def test_route_pool_with_extra_field_falls_back_to_multiline(self):
+        """route_pool 对象加了正则5 不识别的字段（如 fallback）时，正则5 失配，
+        该对象回退多行展开（不报错不丢数据）。
+        """
+        cfg = {
+            "strategies": [
+                {
+                    "client_token": "x",
+                    "route_pool": [
+                        {"route_id": "r1", "weight": 1, "fallback": "r2"},
+                    ],
+                },
+            ],
+        }
+        text = compact_config_json(cfg)
+        # 数据无损（回退多行不影响 json.load）
+        self.assertEqual(json.loads(text), cfg)
+        # fallback 字段仍在（没丢数据）
+        self.assertIn('"fallback": "r2"', text)
+        # 对象应未被压成单行（含 fallback 字段，正则5 不匹配）
+        self.assertNotIn('{"route_id":"r1","weight":1}', text)
 
 
 if __name__ == "__main__":
