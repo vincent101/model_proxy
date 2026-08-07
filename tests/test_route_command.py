@@ -387,7 +387,6 @@ class TestRouteCommandHandler(unittest.TestCase):
         return {
             "client_token": "cc",
             "route_pool": [{"route_id": "claude", "weight": 1}],
-            "dispatch": {"session_overrides": {"sess-legacy": "nation"}},
         }
 
     def test_legacy_route_id_strategy_rejects_switch_no_write(self):
@@ -465,29 +464,9 @@ class TestRouteCommandHandler(unittest.TestCase):
             self.assertFalse(result.wrote)
             self.assertFalse(path.exists())  # 纯读零副作用，不触发清理/落盘
 
-    def test_query_reports_main_config_override_source(self):
-        with tempfile.TemporaryDirectory() as d:
-            sidecar = SessionOverridesSidecar(Path(d) / "session_overrides.json")
-            ctx = CommandContext(
-                arg=None, client_token="cc", session_key="sess-legacy",
-                strategy=self._strategy(), routes_map=_routes_map(), sidecar=sidecar,
-                resolved_route_id="claude",
-            )
-            result = handle_route_command(ctx)
-            self.assertIn("nation", result.receipt_text)
-            self.assertIn("主 config", result.receipt_text)
-
-    def test_sidecar_overrides_main_config_on_conflict(self):
-        strategy = self._strategy()  # sess-legacy -> nation (主config)
-        with tempfile.TemporaryDirectory() as d:
-            sidecar = SessionOverridesSidecar(Path(d) / "session_overrides.json")
-            sidecar.apply_command("cc", "sess-legacy", "set", target_route_id="deepseek")
-            merged = effective_overrides(strategy, sidecar)
-            self.assertEqual(merged["sess-legacy"], "deepseek")  # sidecar 优先
-
     def test_query_on_legacy_route_id_strategy_does_not_show_misleading_route(self):
-        """回归：strategy 无 route_pool（旧式单值 route_id）时，即便 sidecar/主
-        config 里有该 session 的残留 override 记录，查询也不能展示为"生效
+        """回归：strategy 无 route_pool（旧式单值 route_id）时，即便 sidecar
+        里有该 session 的残留 override 记录，查询也不能展示为"生效
         route"——extract_route_candidates 对这种 strategy 完全不读取
         session_overrides，真实生效路由永远是 strategy["route_id"]。
         """
@@ -508,21 +487,19 @@ class TestRouteCommandHandler(unittest.TestCase):
             self.assertIn("claude", result.receipt_text)
             self.assertIn("不生效", result.receipt_text)
 
-    def test_query_total_overrides_deduplicates_same_session_in_both_sources(self):
-        """回归：同一 session_id 同时存在于主 config（旧手工条目）与 sidecar
-        （被 $route 覆盖过）时，总条数应去重只计一次，不是两个来源长度相加。
-        """
+    def test_query_total_overrides_counts_sidecar_only(self):
+        """sidecar 是唯一来源，总条数即 sidecar 条数。"""
         with tempfile.TemporaryDirectory() as d:
             sidecar = SessionOverridesSidecar(Path(d) / "session_overrides.json")
-            # sess-legacy 同时存在于主 config（self._strategy() 内置）与 sidecar
             sidecar.apply_command("cc", "sess-legacy", "set", target_route_id="deepseek")
+            sidecar.apply_command("cc", "sess-other", "set", target_route_id="nation")
             ctx = CommandContext(
                 arg=None, client_token="cc", session_key="sess-legacy",
                 strategy=self._strategy(), routes_map=_routes_map(), sidecar=sidecar,
                 resolved_route_id="claude",
             )
             result = handle_route_command(ctx)
-            self.assertIn("总条数: 1", result.receipt_text)
+            self.assertIn("总条数: 2", result.receipt_text)
 
 
 # ---------------------------------------------------------------------------
@@ -578,7 +555,6 @@ class TestForwardInterceptEndToEnd(unittest.TestCase):
             "strategies": [{
                 "client_token": "cc",
                 "route_pool": [{"route_id": "claude", "weight": 1}],
-                "dispatch": {"session_overrides": {}},
             }],
         }
         cfg_path.write_text(json.dumps(cfg), encoding="utf-8")
