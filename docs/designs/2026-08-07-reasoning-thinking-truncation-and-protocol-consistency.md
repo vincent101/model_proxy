@@ -216,3 +216,42 @@ anthropic 统一（一致性，可选）：
 - [[tools/model_eval/reports/ds-flash-sankuai-3339-max-20260807.md]]（现象 1 证据：max_tokens=16000 截断）
 - [[tools/model_eval/calibration.md]]（2026-07-27 补测：glm 4096 截断记录）
 - [[tools/model_proxy/docs/designs/2026-07-24-model-proxy-reasoning统计移除安全上线.md]]（⑤a 不重启 reasoning 记账的边界）
+
+---
+
+## 审核意见（architect-max 独立复核，[理想] 路径，2026-08-07）
+
+复核范围：通读 codecs.py / capability.py / ladder.py 全文，translate.py 正反向流式状态机与非流式转换（1255-1520、1700-1998），server.py reasoning 链路与 max_tokens 调用点（699-717、1068-1298），推演脚本 /tmp/trace_combos.py。以下论断均经代码实证。
+
+### 总体判定
+
+方案抓住了根本（supply 配置是上游能力权威 + 协议双向对称不变量），方向是体系化的，不是打补丁。但按理想路径标准，**①a 只走了一半**：同物种的"写死字典 + 静默 medium 兜底"在 anthropic 域和 decode 侧还有三处残留，方案把 anthropic 统一标为"可选"是降级思维残留。推到终态（三域零词表字典）才是体系化完成态；停在现状等于"把补丁打在了对的层"。
+
+### 已验证成立的关键论断（不需要改）
+
+1. **①a 的 `level.name.lower()` 安全性成立**。通读 remap() 全部返回路径：THINKING 产出的 level 只有三个来源——`tgt_think[j]`（enum 元素）、`clamp_absolute`（返回 enum 元素）、OFF clause 的 `off_alias`（from_config 保证 ∈ enum，且为 OFF 时经 abstract_encode 转 DISABLED 不进 THINKING 分支）。即 kind=THINKING 时 level 恒 ∈ tgt_cap.enum。syntax_adapt 全代码库唯一调用点在 server.py:1172，只消费 remap 链产物（缓存复用限于同 supply 重试）。codecs.py 头注释（line 16-17）本就声明了该不变量。clamp 逻辑覆盖所有 path，无遗漏。
+2. **decode 用全表 `_NAME_TO_CANONICAL` 而非 source capability，选择正确**，且理由可比原方案更强：若 decode 按 source capability 钳位，"max 意图"会在观测层被改写成 xhigh，⑤b 的 effort 生效性指标（intent vs wire 比对）直接失效；decode 保真识别 + remap 的 rank_of 内部 clamp，功能等价且观测保真。职责分离论证成立。
+3. **Defect B 定位准确**。正向镜像蓝本在 translate.py:1300-1310（thinking_delta→reasoning_summary_text.delta），反向 1752 的 `pass` 与 1906-1926 的缺失分支确认无误。
+4. **②-⑥ 与 ① 体系一致、无重复**：⑥a 是不变量陈述，①a/①b 是恢复不变量的两处修复，⑥b 是回归检测工具，层次清楚。①c 与 ⑥ 的轻微重叠可接受（一个是代码内注释+单测，一个是运行时自检）。
+
+### 硬伤与必须修正（按理想路径）
+
+1. **①a 不彻底：三处同物种写死残留必须一并清除**。
+   - **anthropic 统一不是"可选"**。`_CANONICAL_TO_ANTHROPIC_NAME.get(level, "medium")`（codecs.py:143）与 Defect A 是同一物种：写死字典 + 静默 medium 兜底。今天不爆只因字典恰好含全档；未来新增档（MAX+1）时 Defect A 在 anthropic 域原样复发。anthropic encode 同改 `level.name.lower()`（MINIMAL→"minimal"…MAX→"max" 全部命中现字典值域，行为零变化），随后 `_ANTHROPIC_NAME_TO_CANONICAL` / `_CANONICAL_TO_ANTHROPIC_NAME` / `_CHAT_NAME_TO_CANONICAL` / `_CANONICAL_TO_CHAT_NAME` 四表整体删除，codec 层零词表——词表唯一权威收在 ladder。
+   - **anthropic decode 的"未识别→静默 MEDIUM"（codecs.py:117-122）是 decode 侧降级残留**。方案只修了 chat/responses decode 的"不认 max"，没修 anthropic decode 的"不认则静默 medium"。须区分：absent（effort 缺失 → 维持现状 MEDIUM 默认）与 unrecognized（非空但未识别 → warning + present=False 或进观测），不能继续静默改写客户端意图。
+   - **DISABLED 硬编码 "none"（codecs.py:215/246）是唯一可保留的协议域常量**（OpenAI 域关闭词确为 "none"，是域事实不是配置事实），但须在 codec 注释显式声明"唯一保留常量及其理由"。要消除的是"静默"，不是这个常量本身。
+2. **隐含约定必须显式化、可执行化**。①a 之后，"canonical 枚举名小写 == wire 档名字符串"成为全局唯一映射规则，其成立依赖 `_NAME_TO_CANONICAL` 键 ⊇ 枚举名小写且自映射（off/none 双拼是唯一例外，只影响 OFF）。应在 ladder 加单测不变量：对 CanonicalEffort 每个成员断言 `name_to_canonical(e.name.lower()) == e`（OFF 断言 off/none 双键均映射 OFF），未来新增枚举值时强制同步词表。①c 的"codec 词表注释"在域字典全删后应改写为"codec 不持有词表，唯一权威在 ladder"。
+3. **①b 流式镜像的事件词表需实测补全，不能只按 summary 单通道实现**。方案只提 `reasoning_summary_text.delta`——与正向对称没错，但真实 responses 上游还可能发 `response.reasoning_summary_part.added/done`（多段 summary）及新版 `response.reasoning_text.delta`（原始 reasoning 通道）。落地前必须先抓 glm/kimi 网关真实 SSE 事件流定词表，否则存在"修完仍 th_chars=0"的风险。非流式多 part 拼接的连接符需定死（建议 "\n\n"）。另须声明已知限制：anthropic thinking block 的 signature 在转换侧无来源（正向 1311 行丢 signature_delta，反向永远无 signature）——对只读评估无影响，对会把 thinking 回传上游的多轮客户端（Claude Code）是限制。
+4. **②a 与 ④b 职责边界需在文中点明**（两者都改 max_tokens）：②a = 发送前预防性地板（读 ③ 表）；④b = 截断后反应式阶梯，从 ②a 放大后的有效值起算、封顶 supply 上限，时序串联不重叠。且理想路径下 ④b 的定位是**补偿控制**，不是根因治理——③ 标定准确时 ④b 应近似零触发，其触发频率本身应进 ⑤ 作为"标定失准"信号。方案已隐含此意但未点破。
+5. **设计记录两处 stale 引用（订正级，不影响方向）**：⑤b"①a 的 overflow warning 之外"与风险节"①a 只动 overflow 兜底，不动 remap 本体"是修订前"钳到 xhigh"方案的残留，新 ①a 已无 overflow 概念，需订正。
+
+### 理想路径下的兜底思维裁决
+
+- ②a"只升不降"**不是兜底**，是"客户端预算权威性"不变量，保留。
+- "无配置退保守全局值"可接受，但须响亮（log + metric），不静默。
+- ④b 重试保留，定位为补偿控制 + 标定失准信号源，可整体关闭。
+- 必须清除的三处兜底残留：anthropic encode 的 `.get(...,"medium")`、anthropic decode 的未识别静默 MEDIUM、以及把 anthropic 统一标为"可选"这一决策本身。
+
+### 结论
+
+**体系化方向确认，方案可执行，但需按上述硬伤 1/2/3 把 ① 推到终态后再实施**：三域零写死字典（codec 零词表）、词表不变量单测固化、①b 事件词表先实测。做到这三点，本方案从"修对了地方"升级为"同类问题在架构上不可能复发"；不做，则 anthropic 域与 decode 侧仍各埋着一颗与 Defect A 同种的雷。
