@@ -166,6 +166,28 @@ class TestSidecarBasics(unittest.TestCase):
             # 内存数据必须清空
             self.assertEqual(sc.get_overrides_for("cc"), {})
 
+    def test_persistent_missing_file_no_repeated_clear(self):
+        """文件持续不存在时，连续调 maybe_reload 不会反复清空（守卫生效）。
+        _maybe_reload_locked 内的 `if self._data or self._mtime` 守卫确保
+        只有"内存非空且文件消失"时才清一次，后续调用内存已空、守卫短路。
+        """
+        with tempfile.TemporaryDirectory() as d:
+            path = Path(d) / "session_overrides.json"
+            sc = SessionOverridesSidecar(path)
+            sc.apply_command("cc", "sess-1", "set", target_route_id="nation")
+            path.unlink()
+
+            # 第一次清空
+            sc.maybe_reload()
+            self.assertEqual(sc.get_overrides_for("cc"), {})
+            self.assertEqual(sc._mtime, 0.0)
+
+            # 连续调多次，守卫应短路，不做无意义重置
+            for _ in range(5):
+                sc.maybe_reload()
+            self.assertEqual(sc._data, {})
+            self.assertEqual(sc._mtime, 0.0)
+
 
 # ---------------------------------------------------------------------------
 # 回归：apply_command 不得在外部改动 sidecar mtime 后死锁（bug 报告见

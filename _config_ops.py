@@ -31,7 +31,7 @@ TIER_NAMES = ("opus", "sonnet", "haiku")
 
 
 # ---------------------------------------------------------------------------
-# 配置文件紧凑格式：effort_enum 数组 + tier 对象单行化
+# 配置文件紧凑格式：effort_enum 数组 + tier 对象 + routes.tiers 数组 + supply 对象单行化
 # ---------------------------------------------------------------------------
 
 # 正则1：把 "effort_enum": [ 多行 ] 压成 "effort_enum": ["a","b","c"]
@@ -48,28 +48,66 @@ _TIER_OBJECT = re.compile(
     re.DOTALL,
 )
 
+# 正则3：把 routes.tiers 下的 "tier": [ 多行 ] 压成 "tier": ["id1","id2",...]
+# 匹配 tier 键后、跨行的 supply id 数组（多元素也压单行）
+_ROUTES_TIERS_ARRAY = re.compile(
+    r'("(?:opus|sonnet|haiku)":\s*)\[\s*\n([^\]]*?)\n\s*\]',
+    re.DOTALL,
+)
+
+# 正则4：把 supplies 数组里的每条 supply 对象压成单行（含嵌套 reasoning_capability）
+# 匹配完整的 supply 对象结构（id/url/protocol/appkey/target_model/reasoning_capability）。
+# 注意：必须在正则1 之后执行——先压 effort_enum 数组，才能匹配到完整 supply 对象单行。
+# 脆性：supply 结构扩展（加 priority 等字段）会失配、回退多行（不报错不丢数据）。
+_SUPPLY_OBJECT = re.compile(
+    r'\{\s*\n\s*"id":\s*"[^"]+",\s*\n\s*"url":\s*"[^"]+",\s*\n\s*"protocol":\s*"[^"]+",'
+    r'\s*\n\s*"appkey":\s*"[^"]+",\s*\n\s*"target_model":\s*"[^"]+",'
+    r'\s*\n\s*"reasoning_capability":\s*\{[^}]*\}\s*\n\s*\}',
+    re.DOTALL,
+)
+
 
 def compact_config_json(obj) -> str:
-    """生成 config 文本：indent=2 多行，但 effort_enum 数组与
-    tiers_source_capability 下的 tier 对象压成单行（与用户手改格式一致）。
+    """生成 config 文本：indent=2 多行，但以下结构压成单行（与用户手改格式一致）：
+    1. effort_enum 数组（正则1）
+    2. tiers_source_capability 下的 tier 对象（正则2）
+    3. routes.tiers 下的 supply id 数组，含多元素（正则3）
+    4. supplies 数组里的每条 supply 对象，含嵌套 reasoning_capability（正则4）
+
+    顺序敏感：正则1 → 正则2 → 正则3 → 正则4。
+    正则4 必须在正则1 后执行（effort_enum 先单行才能匹配到完整 supply 对象）。
 
     读取侧用 json.load 无感知，本函数只影响文本外观。
 
     约束：
     - 请求体序列化（转发上游）不得用本函数。
-    - 新增 tier 名需更新正则2 的 tier 名白名单（opus|sonnet|haiku）。
+    - 新增 tier 名需更新正则2/正则3 的 tier 名白名单（opus|sonnet|haiku）。
+    - supply 对象结构扩展（加字段）会导致正则4 失配、回退多行（不报错不丢数据）。
     """
     text = json.dumps(obj, indent=2, ensure_ascii=False)
 
-    # 先压 effort_enum 数组（正则1）
+    # 正则1：压 effort_enum 数组
     def _compact_array(m):
         vals = [s.strip().strip('"') for s in m.group(2).split(',') if s.strip()]
         return m.group(1) + '[' + ','.join('"' + v + '"' for v in vals) + ']'
 
     text = _EFFORT_ENUM_ARRAY.sub(_compact_array, text)
 
-    # 再压 tier 对象（正则2，此时其内 effort_enum 已是单行）
+    # 正则2：压 tier 对象（此时其内 effort_enum 已是单行）
     text = _TIER_OBJECT.sub(lambda m: m.group(1) + '{' + m.group(2) + '}', text)
+
+    # 正则3：压 routes.tiers 下的 supply id 数组（多元素也压单行）
+    def _compact_tiers_array(m):
+        vals = [s.strip().strip('"') for s in m.group(2).split(',') if s.strip()]
+        return m.group(1) + '[' + ','.join('"' + v + '"' for v in vals) + ']'
+
+    text = _ROUTES_TIERS_ARRAY.sub(_compact_tiers_array, text)
+
+    # 正则4：压 supplies 数组里的每条 supply 对象（含嵌套 reasoning_capability）
+    # effort_enum 已在正则1 压成单行，reasoning_capability 内部已是单行，
+    # 正则4 可匹配到完整对象并压成单行
+    text = _SUPPLY_OBJECT.sub(lambda m: m.group(0)
+                              .replace('\n', '').replace('  ', ''), text)
 
     return text
 

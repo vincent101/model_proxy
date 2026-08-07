@@ -3,7 +3,7 @@ type: design-decision
 status: draft
 target: "[[tools/model_proxy]]"
 tags: [architect, model_proxy, reasoning, max_tokens, truncation, protocol-consistency, effort-mapping]
-updated: 2026-08-07（基于实测+全档推演，修正 Defect A 根因与方案方向：原"钳到 xhigh"→"去掉写死字典、信 supply 配置"；新增 decode 对称修复）
+updated: 2026-08-07（二轮修订：按 architect-max 复核 5 条硬伤推至终态——anthropic 统一改强制三域零写死字典、词表不变量单测、①b 事件词表实测前置+signature 已知限制、②a/④b 职责边界显式化、2 处 stale 引用订正）
 ---
 
 # reasoning 模型经 model_proxy 的 thinking 截断与协议不一致：根因与理想治理方案
@@ -120,15 +120,26 @@ decode（入站，source 侧，对称修复）：
 - **现状 bug**：responses/chat SDK 发 `effort=max` → decode 查窄字典不认 → present=False → max 意图被丢（推演组合 C/D 的 max，见验证）。
 - **为什么用全表而非 source capability**：decode 职责是"识别客户端档名字符串→canonical"，这是固定映射（档名=canonical 枚举小写），协议无关；source capability（`tiers_source_capability`）约束（SDK 能发哪些档）在 remap 阶段 clamp，不在 decode。decode 用全表识别所有合法档名，remap 信 source/target capability 映射——职责分离。
 
-anthropic 统一（一致性，可选）：
-- anthropic encode/decode 本就含 max、无 bug（`_ANTHROPIC_NAME_TO_CANONICAL` 含全档）。但为未来加新档不再改字典，可统一 encode 用 `level.name.lower()`、decode 用全表 `_NAME_TO_CANONICAL`。不改也无 bug，改了更一致。
+anthropic 统一（终态，非可选——审核硬伤 1）：
+- anthropic encode 的 `_CANONICAL_TO_ANTHROPIC_NAME.get(level, "medium")`（codecs.py:143）与 Defect A 同种（写死字典+静默 medium 兜底），今天不爆是因为字典恰好含全档，下次新增档（如 MAX+1）Defect A 在 anthropic 域原样复发。**anthropic encode 同改 `level.name.lower()`**（MINIMAL→"minimal"…MAX→"max"，全部命中现字典值域，行为零变化）。
+- anthropic decode 的"未识别→静默 MEDIUM"（codecs.py:117-122）须区分 absent 与 unrecognized：effort_str 缺失（absent）→ 维持现状默认 MEDIUM；非空但未识别（unrecognized）→ `logger.warning` + 进 ⑤ 观测，不再静默降级为 MEDIUM。
+- 终态：四张域字典（`_ANTHROPIC_*` / `_CHAT_*` 双向共 4 张）整体删除，**codec 层零词表**，词表唯一权威在 ladder 的 `_NAME_TO_CANONICAL`。DISABLED 的 `"none"` 硬编码是协议域事实（openai 域关闭词），保留但注释显式声明理由。
 
 **1b. 修复 Defect B——补齐 responses→anthropic 的 reasoning→thinking 回传，实现双向对称。**
-- `ResponsesToAnthropicStreamAdapter.feed` 增加 reasoning item 分支：`response.output_item.added` 遇 `item.type=="reasoning"` 开一个 anthropic `thinking` block；`response.reasoning_summary_text.delta` → `thinking_delta`；对应 `.done` → `content_block_stop`。产出与 anthropic 原生 thinking 块同构，使 anthropic 客户端经 responses 上游也能看到 thinking。
-- 非流式 `responses_to_anthropic_response`：把 `it=="reasoning"` 的 `summary[].text` 拼成 `{"type":"thinking","thinking":...}` block 放进 content（而非 `pass`）。
+- **前置（审核硬伤 3）：先抓网关真实 SSE 事件流定词表再实现**。方案按正向镜像（translate.py:1300-1310 的 summary 通道）对称，但真实 responses 上游还可能发 `response.reasoning_summary_part.added/done`（多段 summary）与新版 `response.reasoning_text.delta`（非 summary 的原始 reasoning）。**只按 `reasoning_summary_text.delta` 实现有"修完仍 th_chars=0"的风险**。落地前必须对 glm/kimi 的 responses 端点抓真实事件流，确认事件词表后再写状态机。
+- 流式 `ResponsesToAnthropicStreamAdapter.feed`：增加 reasoning item 分支——`response.output_item.added` 遇 `item.type=="reasoning"` 开 anthropic `thinking` block；summary/reasoning delta 事件 → `thinking_delta`；对应 `.done` → `content_block_stop`。产出与 anthropic 原生 thinking 块同构，使 anthropic 客户端经 responses 上游也能看到 thinking。
+- 非流式 `responses_to_anthropic_response`：把 `it=="reasoning"` 的 `summary[].text` 拼成 `{"type":"thinking","thinking":...}` block 放进 content（而非 `pass`）；多 part 用 `\n\n` 连接（与正向单 part 缓冲一致）。
+- **已知限制声明**：anthropic thinking block 的 `signature` 字段在转换侧无来源（正向丢 signature_delta，反向永远无 signature）。对只读评估无影响；对会把 thinking 回传的多轮客户端（Claude Code），须声明为已知限制。
 - 对称性原则：anthropic→responses 已有 reasoning 回传（`_start_reasoning_item`），responses→anthropic 必须补齐镜像，消除"同模型不同协议接入 thinking 可见性不同"。
 
-**1c. 抽象层补强**：`ladder.py` 的 canonical 全序已是跨协议统一表示，但 chat/responses 域词表是其真子集。在各 codec 顶部用注释 + 单测固化"该 codec 域词表 = canonical 的哪个子集、溢出如何处理"，避免后续新增档（如未来 MAX+1）再次落到静默兜底。
+**1c. 抽象层补强——词表不变量单测（审核硬伤 2）**：`ladder.py` 的 canonical 全序已是跨协议统一表示；①a 终态后 codec 层零词表，"canonical 枚举名小写 == 协议 wire 档名字符串"成为全局唯一映射约定。加单测不变量固化：
+
+```python
+for e in CanonicalEffort:
+    assert name_to_canonical(e.name.lower()) == e  # OFF 双拼 off/none 都断言映射 OFF
+```
+
+未来新增枚举值时该单测强制同步词表，杜绝"新增档名 → 某域字典漏加 → 静默降级"的 Defect A 复发路径。
 
 ### ② 入站参数处理（server.py 对 max_tokens 的解析与钳位、effort 映射）
 
@@ -158,6 +169,7 @@ anthropic 统一（一致性，可选）：
 **4a. 响应侧截断检测**：非流式 anthropic 响应转换/透传收口处，检测 `stop_reason=="max_tokens"` 且 content 中无 text block（只有 thinking 或全空）→ 判定"预算被 thinking 耗尽、正文缺失"。流式在 message_delta 的 stop_reason=max_tokens 且全程未产出 text block 时同理。
 
 **4b. 自动放大重试（有限次、不rotate supply、不计 failover）**：命中 4a 且 thinking 仍在持续产出（说明正文本可有、只是预算不够）时，自动把 max_tokens 按阶梯放大（如 ×2，封顶 supply 配置上限）重发一次。语义对齐现有 reasoning 语法自适应重试（server.py:1290-1298，单次、不 cooldown、不进 tried_set），新增一条独立的 `_budget_retried` 位，与语法重试互不干扰。重试仍失败才返回截断响应（如实 stop_reason=max_tokens），并在 ACCESS 记 `budget_truncated=1`。
+- **与 ②a 的职责边界（审核硬伤 4，显式化）**：两者都改 max_tokens，但时序先后串联不重叠——②a 是发送前预防性地板（读 ③ 表 `min_for_thinking`/`by_effort`），④b 是截断后反应式阶梯（从 ②a 放大后的有效值起算、封顶 supply 上限）。④b 是**补偿控制而非根因治理**：③标定准确时 ④b 应近似零触发，其触发频率本身进 ⑤ 作为"③ 标定失准"信号。
 - 与现有 chat `_ENABLE_REASONING_FALLBACK` 的关系：④处理的是"请求侧预算不足"（根因），fallback 处理的是"已有 reasoning 但无 text"（症状）。两者正交，保留 fallback 作为 chat 协议的最后兜底，但有了 ③④后 chat 场景的 4096 级截断应先被预算放大防住。
 
 ### ⑤ 监控告警（thinking/output 占比、effort 生效性）
@@ -166,7 +178,7 @@ anthropic 统一（一致性，可选）：
   - `budget_raised`（②a 触发时）、`budget_truncated`（④b 失败时）、`budget_retried`（④b 重试时）三个事件字段，能让"thinking 占满"从"事后看原始回答才发现"变成"日志可直接 grep"。
   - 可选：`stop_reason` 字段（end_turn/max_tokens/...）进 ACCESS，占比统计 max_tokens 出现频率作为"预算是否普遍偏小"的信号。
 
-**5b. effort 生效性指标**：Defect A 这类"wire 层降级"要有可见性。①a 的 overflow warning 之外，可在 reasoning debug 旁路日志（server.py:809-856）的 wire dump 里**固定记录最终发给上游的档名字符串**，并使 `MODEL_PROXY_REASONING_DEBUG=1` 时能一眼看到"intent=max → wire effort 实际值"。更进一步：smoke test / 评估 SOP 增加一条"读模型自述档位 ≠ 请求档位则告警"的校验（本轮正是靠模型自述"中等"发现的）。
+**5b. effort 生效性指标**：Defect A 这类"wire 层降级"要有可见性。①a 终态后 wire 档名恒等于配置档名（不再有降级兜底），观测点是"intent → wire 档名"保真度：在 reasoning debug 旁路日志（server.py:809-856）的 wire dump 里**固定记录最终发给上游的档名字符串**，并使 `MODEL_PROXY_REASONING_DEBUG=1` 时能一眼看到"intent=max → wire effort 实际值"。更进一步：smoke test / 评估 SOP 增加一条"读模型自述档位 ≠ 请求档位则告警"的校验（本轮正是靠模型自述"中等"发现的）。
 
 ### ⑥ 协议一致性（确保同模型不同协议接入行为一致）
 
@@ -182,7 +194,7 @@ anthropic 统一（一致性，可选）：
   - ①b（responses→anthropic 补 reasoning 回传）是真实功能开发，要在流式状态机里正确管理 thinking block 的开/合/index 时序，需补脱网络单测覆盖 reasoning item 的开合、thinking_delta 增量、与 text/tool_use 交错；评估面改动中等。
   - ②/③（出站预算治理 + per-supply 预算档）改动 server.py 出站热路径与 config schema，引入"代理主动改客户端 max_tokens"这一此前没有的行为，需谨慎设计为**只向上放大、绝不向下钳、且可整体关闭**，避免误伤客户端刻意给的小预算（如省成本场景）。建议配 `output_budget.enforce: on/off` 开关，默认对"会产生 thinking 且预算低于安全下限"才介入。
   - ④b 自动放大重试会让"原本一次失败的请求"变成"放大后多花 token 的重试"，对有成本敏感的上游要可关；且重试放大可能加剧延迟（ds-flash Q5 已 499s）。
-- **不影响既有正确性**：所有修复都应是"增量补齐"（补回传、补 overflow 钳位、补预算治理），不改变 remap 主算法的相对映射语义（①a 只动 overflow 兜底，不动 remap 本体；MAX 在主路径仍走查表，无特殊分支，符合 codes/capability 的决策2约束）。
+- **不影响既有正确性**：所有修复都应是"增量补齐"（补回传、去写死字典、补预算治理），不改变 remap 主算法的相对映射语义（①a 只动档名映射函数/字典引用，不动 remap 本体；MAX 在主路径仍走正常映射路径，无特殊分支，符合 codes/capability 的决策2约束）。
 - **需用户确认**：
   1. ①a 方向已从原"钳到 xhigh"修正为"去掉写死字典、信 supply 配置直接发档名"（依据：实测 responses/chat 网关都接受 max，supply 配置是上游真实能力权威）。是否认可？上游不认该档则 400 暴露配置错误，代理不偷偷降级。
   2. decode 改用全表 `_NAME_TO_CANONICAL`（含 max）替代窄字典——是否认可？（source capability 约束仍在 remap。）
@@ -193,7 +205,7 @@ anthropic 统一（一致性，可选）：
 ## 验证方式
 
 - **Defect A 修复验证（encode）**：构造 anthropic 请求 `output_config.effort=max` → responses/chat 上游，断言发出的 wire 为 `reasoning.effort=="max"`（修复前为 `'medium'`）。单测覆盖全档 low/medium/high/xhigh/max，断言均发 `level.name.lower()`。
-- **Defect A 修复验证（decode）**：构造 responses/chat 入站请求 `reasoning.effort=max`，断言 decode 产出 `RawIntent(level=MAX, present=True)`（修复前 `present=False`）；anthropic 入站 decode 不回归。
+- **Defect A 修复验证（decode）**：构造 responses/chat 入站请求 `reasoning.effort=max`，断言 decode 产出 `RawIntent(level=MAX, present=True)`（修复前 `present=False`）；anthropic 入站 decode 断言未识别档名 → warning + 不静默 MEDIUM，absent（effort_str 缺失）→ 维持 MEDIUM 默认。
 - **Defect A 实测证据（网关真实接受 max，绕开 model_proxy 直 curl 上游）**：
   - responses 端点（glm-52-sankuai-openai-3339）：`reasoning.effort=max` → HTTP 200 + 模型自述"最高档" + reasoning_tokens=578
   - chat 端点（kimi-k3-sankuai-openai-3339）：`reasoning_effort=max` → HTTP 200 + 模型自述"max(最高档)" + reasoning_content 756 字符

@@ -67,70 +67,86 @@ def _maybe_reload_locked(self) -> None:
 
 ---
 
-## 任务2:扩展 `compact_config_json` 覆盖 `routes.tiers.<tier>` 数组
+## 任务2:统一 config 紧凑格式（supplies 对象 + routes.tiers 数组 + tier 对象）
 
-### 现状(已确认)
+### 现状（已确认）
 
-用户手编的 `routes.tiers.<tier>` 数组是单行紧凑:
-```json
-"tiers": {
-  "opus": ["kimi-k3-sankuai-3339","kimi-k3-sankuai-8101","kimi-k3-sankuai-9907"],
-  ...
-}
-```
+用户手编的 config 里，三类结构都用了单行紧凑格式：
+- `supplies` 数组里每条 supply 对象（整个 `{"id":...,"reasoning_capability":{...}}` 单行）——**新增 15 条是单行，原有 12 条是多行，格式不统一**
+- `routes.tiers.<tier>` 的 supply id 数组（多元素，如 `["kimi-k3-sankuai-3339","kimi-k3-sankuai-8101","kimi-k3-sankuai-9907"]` 单行）
+- `tiers_source_capability` 下的 tier 对象（`"opus": {"effort_enum": [...]}` 单行）
 
-但 `compact_config_json`(`_config_ops.py`)只压 `effort_enum` 数组和 `tiers_source_capability` 下的 tier 对象,**不压 `routes.tiers` 数组**。代码生成(如 `strategy add`)会输出多行:
-```json
-"tiers": {
-  "opus": [
-    "kimi-k3-sankuai-3339",
-    "kimi-k3-sankuai-8101",
-    "kimi-k3-sankuai-9907"
-  ],
-  ...
-}
-```
+但 `compact_config_json`（`_config_ops.py`）只压 `effort_enum` 数组和 tier 对象，**不压 supplies 对象、不压 routes.tiers 数组**。代码生成（如 `strategy add`、CLI）会把用户手编的紧凑格式展开成多行——格式不一致 + 手改被覆盖。
 
-**导致**:手编格式与代码生成格式不一致,下次代码写 config 会把单行展开成多行(git diff 噪音 + 用户手改被覆盖)。
+**用户拍板：方向 A，统一单行紧凑**。即：把 12 个旧 supply 也改成单行，同时扩展 `compact_config_json` 让代码生成也压 supply 对象 + routes.tiers 数组。
 
-之前的 compact 方案(`2026-08-07-config-compact-format.md`)§1.2 明确说"routes.tiers 单元素数组 json.dumps 默认就是单行,无需处理"——**当时现网只有单元素,没考虑多元素**。现在 nation1/nation2 三档都是 3 元素,需要纳入。
+### 改动范围
 
-### 修法
+`compact_config_json` 现在要压三类结构（在原有两类基础上扩展）：
 
-`compact_config_json` 加第三个正则,压 `routes` 下 `tiers.<tier>` 的数组(含多元素)。目标输出:三个 tier 的数组都单行。
+1. **`supplies` 数组里的每条 supply 对象**（新增）：整个对象压单行，包括嵌套的 `reasoning_capability:{"effort_enum":[...]}`。
+   目标：`{"id":"kimi-k3-sankuai-8101","url":"...","protocol":"anthropic","appkey":"...","target_model":"kimi-k3","reasoning_capability":{"effort_enum":["low","high","max"]}}` 单行。
+2. **`routes.tiers.<tier>` 的 supply id 数组**（新增）：多元素也压单行（原只压单元素，因单元素 `json.dumps` 默认就是单行）。
+3. **`effort_enum` 数组**（已有）：保持。
+4. **`tiers_source_capability` 下的 tier 对象**（已有）：保持。
 
-**正则设计**:
+### 正则设计（四个正则，顺序敏感）
+
 ```python
-# 正则3:把 routes.tiers 下的 "tier": [ 多行 ] 压成单行
-# tier 名限定 opus|sonnet|haiku(与现有 _TIER_OBJECT 一致)
-# 注意:这个正则匹配的是"tier 键后跟数组",和 _TIER_OBJECT(匹配 tier 键后跟对象)不同
+# 正则1（已有）：压 effort_enum 数组
+_EFFORT_ENUM_ARRAY = re.compile(
+    r'("effort_enum":\s*)\[\s*\n([^\]]*?)\n\s*\]',
+    re.DOTALL
+)
+
+# 正则2（已有）：压 tiers_source_capability 下的 tier 对象
+_TIER_OBJECT = re.compile(
+    r'("(?:opus|sonnet|haiku)":\s*)\{\s*\n\s*("effort_enum":\s*\[[^\]]*\])\s*\n\s*\}',
+    re.DOTALL
+)
+
+# 正则3（新增）：压 routes.tiers 下的 supply id 数组
 _ROUTES_TIERS_ARRAY = re.compile(
     r'("(?:opus|sonnet|haiku)":\s*)\[\s*\n([^\]]*?)\n\s*\]',
     re.DOTALL
 )
+
+# 正则4（新增）：压 supplies 数组里的每条 supply 对象（含嵌套 reasoning_capability）
+# 注意：必须在正则1之后执行——先压 effort_enum 数组，才能匹配到整个 supply 对象单行
+_SUPPLY_OBJECT = re.compile(
+    r'\{\s*\n\s*"id":\s*"[^"]+",\s*\n\s*"url":\s*"[^"]+",\s*\n\s*"protocol":\s*"[^"]+",\s*\n\s*"appkey":\s*"[^"]+",\s*\n\s*"target_model":\s*"[^"]+",\s*\n\s*"reasoning_capability":\s*\{[^}]*\}\s*\n\s*\}',
+    re.DOTALL
+)
 ```
 
-**但这里有个重叠风险**:`_TIER_OBJECT` 匹配 `"opus": {\n "effort_enum": ...\n}`,`_ROUTES_TIERS_ARRAY` 匹配 `"opus": [\n ...\n]`。一个匹配对象、一个匹配数组,模式不冲突( `{` vs `[`),可以共存。
+**顺序**：正则1 → 正则2 → 正则3 → 正则4。
+- 正则1 先压 effort_enum 数组，这样正则4 匹配 supply 对象时其内 `effort_enum` 已是单行，能匹配到完整对象
+- 正则2/3 互不冲突（一个匹配对象、一个匹配数组）
+- 正则4 最后，等 effort_enum 已单行后再压整个 supply 对象
 
-**顺序**:加在现有两个 sub 之后(先 effort_enum 数组、再 tier 对象、最后 routes.tiers 数组)。三个正则的匹配域不重叠:
-- 正则1: `"effort_enum": [ ... ]` — 只匹配 effort_enum 键的数组
-- 正则2: `"opus": { "effort_enum": [...] }` — 匹配 tiers_source_capability 下的单键对象
-- 正则3: `"opus": [ ... ]` — 匹配 routes.tiers 下的数组
+**正则4 的风险**：supply 对象含嵌套 `reasoning_capability`，正则要在 `reasoning_capability` 已压行后匹配完整对象。如果 supply 结构未来加字段（如 `priority`、`weight`），正则4 会失配、回退多行（不报错、不丢数据）。这是可接受的脆性——格式不一致只会导致该条多行展开，功能正常。
+
+### 同时改 config 文件本身
+
+把 12 个旧 supply 的多行格式改成单行紧凑（与新加的 15 条统一）。这是一次性手动编辑，用 Edit 工具改 `config/model_proxy_config.json`。
 
 ### 测试
 
-`tests/test_config_compact_format.py` 新增:
-1. `routes.tiers.<tier>` 多元素数组压单行(nation1 的 3 元素)
-2. 单元素数组也单行(不崩,claude route 的单元素)
-3. 数据无损:`json.loads(compact_config_json(cfg)) == cfg`(含 routes)
-4. 与 effort_enum 混合:一个 config 同时含 routes.tiers 和 effort_enum,两者都正确压行
+`tests/test_config_compact_format.py` 新增/扩展：
+1. supplies 数组每条对象压单行（含嵌套 reasoning_capability）
+2. routes.tiers.<tier> 多元素数组压单行（nation1 的 3 元素）
+3. routes.tiers.<tier> 单元素数组也单行（不崩，claude route 的单元素）
+4. 数据无损：`json.loads(compact_config_json(cfg)) == cfg`（含 supplies + routes + strategies 全结构）
+5. 混合场景：一个 config 同时含 supplies 多行/单行、routes.tiers 多元素/单元素、effort_enum，全部正确压行
+6. 未来 supply 结构扩展（加 priority 字段）时正则4 失配回退多行，不报错不丢数据
 
 ### 文档更新
 
-`docs/designs/2026-08-07-config-compact-format.md`:
-- §1.2:"routes.tiers 单元素无需处理" → "routes.tiers.<tier> 数组也纳入紧凑化(含多元素)"
-- "紧凑化只针对两类" → "三类"(加 routes.tiers 数组)
-- §3.1:加正则3 的代码骨架和顺序说明
+`docs/designs/2026-08-07-config-compact-format.md`：
+- §1.2："routes.tiers 单元素无需处理" → "routes.tiers.<tier> 数组纳入紧凑化（含多元素）"
+- "紧凑化只针对两类" → "三类"（加 routes.tiers 数组）
+- §3.1：加正则3/正则4 的代码骨架和顺序说明
+- 补一句：supplies 对象也纳入紧凑化（含嵌套 reasoning_capability），见正则4
 
 ---
 
@@ -138,17 +154,21 @@ _ROUTES_TIERS_ARRAY = re.compile(
 
 | 文件 | 改动 |
 |---|---|
-| `core/commands.py` | 任务1:修 `_maybe_reload_locked` |
-| `tests/test_route_command.py` | 任务1:加 sidecar 删除清空测试 |
-| `_config_ops.py` | 任务2:加第三个正则到 `compact_config_json` |
-| `tests/test_config_compact_format.py` | 任务2:加 routes.tiers 测试 |
-| `docs/designs/2026-08-07-config-compact-format.md` | 任务2:更新 §1.2/§3.1 |
+| `core/commands.py` | 任务1：修 `_maybe_reload_locked` |
+| `tests/test_route_command.py` | 任务1：加 sidecar 删除清空测试 |
+| `_config_ops.py` | 任务2：加正则3/正则4 到 `compact_config_json` |
+| `tests/test_config_compact_format.py` | 任务2：加 supplies/routes.tiers 测试 |
+| `config/model_proxy_config.json` | 任务2：12 个旧 supply 改成单行（手动编辑，不进 git） |
+| `docs/designs/2026-08-07-config-compact-format.md` | 任务2：更新 §1.2/§3.1 |
 
-**不动**:请求体序列化、读取侧、sidecar 写、`_reload_locked` 的非法 JSON 兜底逻辑。
+**不动**：请求体序列化、读取侧、sidecar 写、`_reload_locked` 的非法 JSON 兜底逻辑。
 
 ## 风险
 
-- 任务1:修法明确,守卫避免无意义重复清空,无正确性风险
-- 任务2:三个正则匹配域不冲突(已分析),数据无损有测试强保证;未来新增 tier 名需更新正则(已在 docstring 标注)
+- 任务1：修法明确，守卫避免无意义重复清空，无正确性风险
+- 任务2：
+  - 四个正则匹配域互不冲突（已分析），数据无损有测试强保证
+  - 正则4 对 supply 结构扩展有脆性（加字段即失配回退多行），但失配不报错不丢数据，可接受
+  - 顺序敏感（正则1 必须先于正则4），docstring 和测试要覆盖顺序错误的情况
 
 ## 请确认后派 implementer 执行

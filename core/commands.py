@@ -246,10 +246,16 @@ class SessionOverridesSidecar:
         确认可能需要 reload 才获取锁，在锁内交给 `_maybe_reload_locked` 二次确认后
         执行。已持锁的调用方（如 `apply_command`）不得调用本方法，应直接调用
         `_maybe_reload_locked`。
+
+        文件不存在时也必须进锁调 `_maybe_reload_locked`（由其负责清空内存），
+        不能在无锁快速路径直接 return——否则已删除的 sidecar 数据会残留在内存里
+        （曾导致 status 误报 +6）。
         """
         try:
             mtime = self._path.stat().st_mtime
         except FileNotFoundError:
+            with self._lock:
+                self._maybe_reload_locked()
             return
         if mtime <= self._mtime:
             return
