@@ -53,11 +53,12 @@ tags: [architect, model_proxy, config, formatting]
 - `strategies`（2 元素）— 多行
 - `route_pool`（现网单元素，但即便多元素也应多行，每条是 `{route_id, weight}` 小对象）— 多行
 
-**结论：紧凑化针对四类**：
+**结论：紧凑化针对五类**：
 1. 任何 `effort_enum` 键下的字符串数组（不管在哪层、几个元素，都压单行）
 2. `tiers_source_capability` 下的每个 tier 对象（`{"opus": {...}}` 这种"单键 dict 值是含 effort_enum 的 dict"，整体压单行）
 3. `routes.tiers.<tier>` 的 supply id 数组（含多元素，也压单行；单元素 `json.dumps` 默认就是单行，正则3 不崩）
 4. `supplies` 数组里的每条 supply 对象（含嵌套 `reasoning_capability`，整体压单行；见正则4）
+5. **`strategies[*].route_pool` 下的 `{route_id, weight}` 对象**（新增，见正则5）：用户手编为单行 `{"route_id":"nation1","weight":1}`，代码生成会展开成多行，纳入紧凑化保持格式一致。
 
 ### 1.3 代码怎么写配置（已核实）
 
@@ -133,14 +134,22 @@ _SUPPLY_OBJECT = re.compile(
     re.DOTALL,
 )
 
+# 正则5（新增）：压 strategies.route_pool 下的 {route_id, weight} 对象
+# 匹配 route_pool 键下的多行对象，压成单行 {"route_id":"nation1","weight":1}
+_ROUTE_POOL_OBJECT = re.compile(
+    r'("route_pool":\s*\[\s*)\{\s*\n\s*"route_id":\s*"([^"]+)",\s*\n\s*"weight":\s*(\d+)\s*\n\s*\}',
+    re.DOTALL
+)
+
 def compact_config_json(obj) -> str:
     """生成 config 文本：indent=2 多行，但以下结构压成单行：
     1. effort_enum 数组（正则1）
     2. tiers_source_capability 下的 tier 对象（正则2）
     3. routes.tiers 下的 supply id 数组，含多元素（正则3）
     4. supplies 数组里的每条 supply 对象，含嵌套 reasoning_capability（正则4）
+    5. strategies.route_pool 下的 {route_id, weight} 对象（正则5）
 
-    顺序敏感：正则1 → 正则2 → 正则3 → 正则4。
+    顺序敏感：正则1 → 正则2 → 正则3 → 正则4 → 正则5。
     正则4 必须在正则1 后执行（effort_enum 先单行才能匹配到完整 supply 对象）。
 
     读取侧用 json.load 无感知，本函数只影响文本外观。
@@ -159,6 +168,11 @@ def compact_config_json(obj) -> str:
     # 正则4：压 supplies 数组里的每条 supply 对象（含嵌套 reasoning_capability）
     text = _SUPPLY_OBJECT.sub(lambda m: m.group(0)
                               .replace('\n', '').replace('  ', ''), text)
+    # 正则5：压 route_pool 下的 {route_id, weight} 对象
+    text = _ROUTE_POOL_OBJECT.sub(
+        lambda m: m.group(1) + '{"route_id":"' + m.group(2) + '","weight":' + m.group(3) + '}',
+        text
+    )
     return text
 ```
 

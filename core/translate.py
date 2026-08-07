@@ -1718,6 +1718,30 @@ def anthropic_to_responses_request(body: dict, reasoning_fields: "dict | None" =
 # 模块 B''：非流式响应转换 Responses → Anthropic（§3.1）
 # ============================================================================
 
+def _extract_reasoning_thinking_text(item: dict) -> str:
+    """从 Responses reasoning item 提取 thinking 文本（①b reasoning→thinking 回传）。
+
+    双通道兼容（以 glm 真实样本为准 + openai 官方结构）：
+    - glm 通道：item.content[] 中 type=="reasoning_text" 的 text
+    - openai 官方通道：item.summary[] 中 type=="summary_text" 的 text
+    多 part 用 "\\n\\n" 连接。
+    已知限制：anthropic thinking block 的 signature 在转换侧无来源
+    （正向丢 signature_delta），故不产出 signature 字段。
+    """
+    parts: list = []
+    for part in item.get("content") or []:
+        if isinstance(part, dict) and part.get("type") == "reasoning_text":
+            t = part.get("text") or ""
+            if t:
+                parts.append(t)
+    for part in item.get("summary") or []:
+        if isinstance(part, dict) and part.get("type") == "summary_text":
+            t = part.get("text") or ""
+            if t:
+                parts.append(t)
+    return "\n\n".join(parts)
+
+
 def responses_to_anthropic_response(resp: dict, ctx: dict = None) -> dict:
     """Responses 非流式响应 → Anthropic 响应 dict（缺失字段容错）。"""
     ctx = ctx or {}
@@ -1750,7 +1774,10 @@ def responses_to_anthropic_response(resp: dict, ctx: dict = None) -> dict:
                 "input": parsed if isinstance(parsed, dict) else {},
             })
         elif it == "reasoning":
-            pass                                     # 丢弃，对称反向丢 thinking
+            # ①b：reasoning→thinking 回传（glm content 通道 + openai summary 通道）
+            thinking = _extract_reasoning_thinking_text(item)
+            if thinking:
+                content_blocks.append({"type": "thinking", "thinking": thinking})
         # 其他 type 忽略
 
     stop_reason = "tool_use" if has_tool_use else "end_turn"
