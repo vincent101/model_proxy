@@ -671,6 +671,24 @@ class OpenAIToAnthropicStreamAdapter:
         }
 
     @staticmethod
+    def _content_block_start_thinking(index: int) -> dict:
+        # ①b-chat：reasoning_content→thinking 回传。signature 无来源（与 ①b 一致），
+        # 不产出 signature 字段——已知限制。
+        return {
+            "type": "content_block_start",
+            "index": index,
+            "content_block": {"type": "thinking", "thinking": ""},
+        }
+
+    @staticmethod
+    def _content_block_delta_thinking(index: int, thinking: str) -> dict:
+        return {
+            "type": "content_block_delta",
+            "index": index,
+            "delta": {"type": "thinking_delta", "thinking": thinking},
+        }
+
+    @staticmethod
     def _content_block_stop(index: int) -> dict:
         return {"type": "content_block_stop", "index": index}
 
@@ -733,6 +751,7 @@ class OpenAIToAnthropicStreamAdapter:
         # (B) 文本增量
         if delta.get("content"):
             self.produced_content_block = True
+            self._flush_thinking_block(events)   # ①b-chat：thinking 置前于 text
             if self.cur_type != "text":
                 if self.block_open:
                     events.append(self._content_block_stop(self.cur_index))
@@ -745,6 +764,7 @@ class OpenAIToAnthropicStreamAdapter:
         # (C) 工具增量（§4）
         if delta.get("tool_calls"):
             self.produced_content_block = True
+            self._flush_thinking_block(events)   # ①b-chat：thinking 置前于 tool_use
             events.extend(self._handle_tool_calls_delta(delta["tool_calls"]))
 
         # (C.5) 思考增量：仅累积，不实时透传（finalize 时若从未产出内容才补块）
@@ -759,6 +779,31 @@ class OpenAIToAnthropicStreamAdapter:
         self._absorb_usage(openai_chunk.get("usage"))
 
         return events
+
+    def _flush_thinking_block(self, events: list) -> None:
+        """①b-chat 镜像：首个正文/工具块之前，把累积的 reasoning_buf 以 thinking block 产出
+        （index 在 text/tool 之前，对齐 anthropic 原生"thinking 在前"约定）。
+
+        只在有正文/工具块（content 非空场景）时被调用；content 空场景由 finalize 兜底把
+        reasoning_buf 填成 text，两条路径互斥不双写。流内 reasoning_content 分片先于
+        content 到达（kimi/glm 实测序列），故在首个 content/tool 增量处一次性镜像；
+        已产出正文块后再到的 reasoning_content 分片不再镜像（非标准交错，留在 buf 不双写）。
+        """
+        if self.thinking_emitted or not self.reasoning_buf.strip():
+            return
+        if self.block_open:
+            events.append(self._content_block_stop(self.cur_index))
+            self.block_open = False
+        self.cur_index += 1
+        self.cur_type = "thinking"
+        self.block_open = True
+        events.append(self._content_block_start_thinking(self.cur_index))
+        events.append(self._content_block_delta_thinking(self.cur_index, self.reasoning_buf))
+        events.append(self._content_block_stop(self.cur_index))
+        self.block_open = False
+        self.cur_type = None
+        self.thinking_emitted = True
+        self.reasoning_buf = ""   # 已镜像为 thinking，清空避免 finalize 兜底重复
 
     # ---- 工具分片重组（§4.2） ----
 

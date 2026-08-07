@@ -312,3 +312,30 @@ for e in CanonicalEffort:
 ### 终审结论
 
 方向级无硬伤，第一轮 5 条硬伤全部妥善解决，方案整体自洽、前提经实证成立。但新增问题 1（3 处既有单测断言反转）是回归阶段必然爆红的实质遗漏，新增问题 2/4 属落地正确性所需。**判定：需再修订（小订正级，非方向修订）**——把上述 5 点并入文档（验证方式节加"既有单测改动清单"、①a decode 段落定死 unrecognized 返回值与 none/off 行为变化、方案设计补"README/注释同步"条目、③ schema 补封顶键约定、①b 补抓取方法一句话）后，即可交 implementer 落地。
+
+---
+
+## ①b-chat 扩展（第三批落地记录，2026-08-07）
+
+**背景**：端到端验证发现 chat target（kimi-k3-sankuai-openai-3339）经 anthropic 客户端请求时 wire 档名正确但 th_chars=0——①b 只补了 responses→anthropic 的 reasoning→thinking 回传，chat→anthropic 反向是同种缺陷的另一处（原仅在"空回答兜底"时把 reasoning_content 填成 text，从不映射 thinking block）。按 ⑥a 对称不变量补齐。
+
+**SSE 样本词表（以真实样本为准）**：openai chat 流式中 reasoning 经 `choices[].delta.reasoning_content` 增量下发（非流式在 `choices[0].message.reasoning_content`），无独立"开块"事件；kimi 实测序列为"全部 reasoning_content 分片 → 一个空 reasoning_content → 全部 content 分片"。样本落盘 `tests/samples/kimi_chat_reasoning_high.sse`（流式）/ `kimi_chat_reasoning_high_nonstream.json`（非流式）。
+
+**落地实现**（`core/translate.py`，不动 responses→anthropic / codecs / server / config）：
+
+- **非流式 `openai_to_anthropic_response`**：`message.reasoning_content` 非空且已有正文/工具块时，`insert(0, {"type":"thinking","thinking":...})` 置前于 text/tool_use；空 reasoning_content 不产 block；signature 无来源不产出（与 ①b 一致）。
+- **流式 `OpenAIToAnthropicStreamAdapter`**：新增 `_content_block_start_thinking` / `_content_block_delta_thinking` helper 与 `_flush_thinking_block`——`delta.reasoning_content` 仍先累积进 `reasoning_buf`，在**首个 content/tool 增量处**把累积思考一次性镜像为 thinking block（开 index 在 text/tool 前、thinking_delta、合块），`thinking_emitted` 标记防重。
+- **与现有兜底的关系（关键边界，互斥不双写）**：
+  - content 非空（有 text 或 tool_calls）→ 走镜像：reasoning_content 变 thinking block + content 是 text/tool block；`produced_content_block=True` 使 finalize 兜底自然不触发，且 flush 清空 reasoning_buf 双保险。
+  - content 空 → 走既有兜底：finalize 把 reasoning_buf 填成 text block（不产 thinking block）。`test_reasoning_only_finalize_adds_text_block` 等空回答兜底单测保持绿。
+- **为何流式用 buffer-flush 而非逐 delta 实时开块**：chat 流无独立 reasoning 开块事件，收到 reasoning_content 时无法预知 content 是否为空；而 ⑥a 边界要求"content 空时仍走兜底填 text（产 text block、不产 thinking）"。逐 delta 实时开 thinking 块会让空回答场景产出 thinking block、与兜底断言冲突或双写。buffer-flush 在 content 首次到达时才镜像，既保证 thinking index 在 text 前，又保证空回答仍走兜底。已知限制：正文块产出后再到的 reasoning_content 分片（非标准交错）不镜像，留在 buf 不双写。
+
+**既有单测改动清单（本批翻转，对齐 ①b "dropped→backfilled" 反转先例）**：
+- `test_reasoning_fallback_not_triggered_with_real_content` → `test_reasoning_mirror_with_real_content`（断言由"reasoning 被忽略"反转为 `[thinking, text]`）。
+- `test_reasoning_fallback_not_triggered_with_tool_calls` → `test_reasoning_mirror_with_tool_calls`（反转为 `[thinking, tool_use]`）。
+- 流式 `test_reasoning_then_real_content_no_extra_block` → `test_reasoning_then_real_content_mirror_thinking`（反转为 thinking 在 text 前、finalize 不兜底）。
+- 空回答兜底单测（`test_reasoning_fallback_length` / `_finish_reason_stop` / `_no_reasoning_keeps_old_behavior` / 流式 `test_reasoning_only_finalize_adds_text_block` / `test_reasoning_empty_no_fallback_block`）**未改、保持绿**。
+
+**新增单测**：`TestChatReasoningMirror` 4 个——非流式 kimi 样本（thinking 在 text 前、无 signature）、流式 kimi SSE 样本（thinking/text index 0/1、thinking_delta 拼接==样本 reasoning_content 全文、text_delta 拼接==样本 content 全文、start/stop 配对）、两条 content 空走兜底边界。
+
+**验证结果**：`python3 -m unittest discover -s tests -q` 482 全绿（478+新增4）；样本验证 th_chars 非流式 0→96、流式 0→92。

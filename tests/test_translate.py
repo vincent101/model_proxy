@@ -450,17 +450,20 @@ class TestResponseTranslate(unittest.TestCase):
         self.assertEqual(len(out["content"]), 1)
         self.assertTrue(out["content"][0]["text"].startswith(pt._REASONING_FALLBACK_PREFIX))
 
-    def test_reasoning_fallback_not_triggered_with_real_content(self):
-        """有正式回答时不兜底，reasoning_content 被忽略。"""
+    def test_reasoning_mirror_with_real_content(self):
+        """①b-chat 镜像：content 非空时 reasoning_content → thinking block（置前），不兜底。"""
         resp = {"choices": [{
             "message": {"content": "正式答案", "reasoning_content": "思考"},
             "finish_reason": "stop",
         }]}
         out = pt.openai_to_anthropic_response(resp, {})
-        self.assertEqual(out["content"], [{"type": "text", "text": "正式答案"}])
+        self.assertEqual(out["content"], [
+            {"type": "thinking", "thinking": "思考"},
+            {"type": "text", "text": "正式答案"},
+        ])
 
-    def test_reasoning_fallback_not_triggered_with_tool_calls(self):
-        """有 tool_calls 时不兜底，即便 content 空、reasoning_content 非空。"""
+    def test_reasoning_mirror_with_tool_calls(self):
+        """①b-chat 镜像：content 空但有 tool_calls 时，reasoning_content → thinking block（置前）。"""
         resp = {"choices": [{
             "message": {
                 "content": "",
@@ -470,8 +473,9 @@ class TestResponseTranslate(unittest.TestCase):
             "finish_reason": "tool_calls",
         }]}
         out = pt.openai_to_anthropic_response(resp, {})
-        self.assertEqual(len(out["content"]), 1)
-        self.assertEqual(out["content"][0]["type"], "tool_use")
+        self.assertEqual(len(out["content"]), 2)
+        self.assertEqual(out["content"][0], {"type": "thinking", "thinking": "思考"})
+        self.assertEqual(out["content"][1]["type"], "tool_use")
 
     def test_reasoning_fallback_no_reasoning_keeps_old_behavior(self):
         """content 空且无 reasoning_content -> 保持老行为，content 为空数组。"""
@@ -785,8 +789,8 @@ class TestStreamReasoningFallback(unittest.TestCase):
         md = events[5]
         self.assertEqual(md["delta"]["stop_reason"], "max_tokens")
 
-    def test_reasoning_then_real_content_no_extra_block(self):
-        """先思考分片再正式回答分片 -> 只产出正式回答 text block，finalize 不补额外块。"""
+    def test_reasoning_then_real_content_mirror_thinking(self):
+        """①b-chat 流式镜像：先思考分片再正式回答 → thinking block 在 text 前，finalize 不兜底。"""
         chunks = [
             {"choices": [{"delta": {"reasoning_content": "先想想"}, "finish_reason": None}]},
             {"choices": [{"delta": {"content": "答案"}, "finish_reason": None}]},
@@ -794,15 +798,18 @@ class TestStreamReasoningFallback(unittest.TestCase):
         ]
         ad = pt.OpenAIToAnthropicStreamAdapter({}, "m")
         events = collect(ad, chunks)
-        self.assertEqual(types_of(events), [
-            "message_start", "ping",
-            "content_block_start", "content_block_delta", "content_block_stop",
-            "message_delta", "message_stop",
-        ])
-        # 只有一个 text block，内容是正式回答，不含前缀/思考
-        self.assertEqual(sum(1 for e in events if e["type"] == "content_block_start"), 1)
-        delta_ev = events[3]
-        self.assertEqual(delta_ev["delta"]["text"], "答案")
+        starts = [e for e in events if e["type"] == "content_block_start"]
+        # thinking block 在 text 前（index 0 / 1）
+        self.assertEqual([s["content_block"]["type"] for s in starts], ["thinking", "text"])
+        self.assertEqual([s["index"] for s in starts], [0, 1])
+        thinking = "".join(e["delta"]["thinking"] for e in events
+                           if e["type"] == "content_block_delta"
+                           and e["delta"]["type"] == "thinking_delta")
+        self.assertEqual(thinking, "先想想")
+        text = "".join(e["delta"]["text"] for e in events
+                       if e["type"] == "content_block_delta"
+                       and e["delta"]["type"] == "text_delta")
+        self.assertEqual(text, "答案")
 
     def test_reasoning_empty_no_fallback_block(self):
         """无 reasoning_content 分片时，finalize 不产出多余块（保持老行为）。"""
@@ -815,6 +822,82 @@ class TestStreamReasoningFallback(unittest.TestCase):
             "message_start", "ping",
             "message_delta", "message_stop",
         ])
+
+
+class TestChatReasoningMirror(unittest.TestCase):
+    """①b-chat 镜像：chat→anthropic 的 reasoning_content → thinking block（kimi 真实样本驱动）。
+
+    边界：content 非空 → reasoning_content 变 thinking block（置前）+ content 是 text block；
+    content 空 → 走既有兜底，reasoning_content 填成 text。两条路径互斥不双写。
+    """
+
+    def test_chat_reasoning_mirror_nonstream_from_kimi_sample(self):
+        """非流式：kimi 真实样本 → thinking block 在 text 前（th_chars 0→>0）。"""
+        resp = _load_json_sample("kimi_chat_reasoning_high_nonstream.json")
+        out = pt.openai_to_anthropic_response(resp, {"request_model": "kimi-k3"})
+        self.assertEqual(out["content"][0]["type"], "thinking")
+        expected = resp["choices"][0]["message"]["reasoning_content"]
+        self.assertEqual(out["content"][0]["thinking"], expected)
+        self.assertGreater(len(out["content"][0]["thinking"]), 0)
+        self.assertNotIn("signature", out["content"][0])   # signature 无来源
+        self.assertEqual(out["content"][1]["type"], "text")
+        self.assertEqual(out["content"][1]["text"],
+                         resp["choices"][0]["message"]["content"])
+
+    def test_chat_reasoning_mirror_stream_from_kimi_sample(self):
+        """流式：kimi 真实 SSE（delta.reasoning_content 增量）→ thinking block 在 text 前。"""
+        chunks = _load_chat_sse_chunks("kimi_chat_reasoning_high.sse")
+        ad = pt.OpenAIToAnthropicStreamAdapter({}, "kimi-k3")
+        evs = collect(ad, chunks)
+        starts = [e for e in evs if e["type"] == "content_block_start"]
+        # thinking block 开在 index 0，text 在 index 1
+        self.assertEqual([s["content_block"]["type"] for s in starts], ["thinking", "text"])
+        self.assertEqual([s["index"] for s in starts], [0, 1])
+        self.assertNotIn("signature", starts[0]["content_block"])
+        # thinking_delta 拼接 == 样本全部 reasoning_content 增量
+        thinking = "".join(e["delta"]["thinking"] for e in evs
+                           if e["type"] == "content_block_delta"
+                           and e["delta"]["type"] == "thinking_delta")
+        expected_reasoning = "".join(
+            (c["choices"][0].get("delta") or {}).get("reasoning_content", "")
+            for c in chunks if c.get("choices"))
+        self.assertEqual(thinking, expected_reasoning)
+        self.assertGreater(len(thinking), 0)
+        # text_delta 拼接 == 样本全部 content 增量
+        text = "".join(e["delta"]["text"] for e in evs
+                       if e["type"] == "content_block_delta"
+                       and e["delta"]["type"] == "text_delta")
+        expected_text = "".join(
+            (c["choices"][0].get("delta") or {}).get("content", "")
+            for c in chunks if c.get("choices"))
+        self.assertEqual(text, expected_text)
+        # start/stop 配对（thinking + text 各一对）
+        self.assertEqual(len([e for e in evs if e["type"] == "content_block_stop"]), 2)
+
+    def test_chat_reasoning_mirror_empty_content_uses_fallback(self):
+        """边界：content 空时仍走兜底（reasoning 填 text），不产 thinking block。"""
+        chunks = [
+            {"choices": [{"delta": {"reasoning_content": "思"}, "finish_reason": None}]},
+            {"choices": [{"delta": {"reasoning_content": "考中"}, "finish_reason": None}]},
+            {"choices": [{"delta": {}, "finish_reason": "length"}]},
+        ]
+        ad = pt.OpenAIToAnthropicStreamAdapter({}, "m")
+        evs = collect(ad, chunks)
+        starts = [e for e in evs if e["type"] == "content_block_start"]
+        self.assertEqual([s["content_block"]["type"] for s in starts], ["text"])  # 无 thinking
+        deltas = [e for e in evs if e["type"] == "content_block_delta"]
+        self.assertEqual(deltas[0]["delta"]["type"], "text_delta")
+        self.assertTrue(deltas[0]["delta"]["text"].startswith(pt._REASONING_FALLBACK_PREFIX))
+        self.assertIn("思考中", deltas[0]["delta"]["text"])
+
+    def test_chat_reasoning_mirror_nonstream_empty_content_uses_fallback(self):
+        """边界（非流式）：content 空时仍走兜底（reasoning 填 text），不产 thinking block。"""
+        resp = {"choices": [{"message": {"content": "", "reasoning_content": "思考"},
+                             "finish_reason": "stop"}]}
+        out = pt.openai_to_anthropic_response(resp, {})
+        self.assertEqual(len(out["content"]), 1)
+        self.assertEqual(out["content"][0]["type"], "text")
+        self.assertTrue(out["content"][0]["text"].startswith(pt._REASONING_FALLBACK_PREFIX))
 
 # ############################################################################
 # §2 反向 Responses → Anthropic
@@ -1507,6 +1590,21 @@ def _load_json_sample(name):
     path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "samples", name)
     with open(path, encoding="utf-8") as f:
         return json.load(f)
+
+
+def _load_chat_sse_chunks(name):
+    """读取 tests/samples/ 下的 openai chat SSE 样本，解析为 chunk dict 序列（跳过 [DONE]）。"""
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "samples", name)
+    chunks = []
+    with open(path, encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if line.startswith("data: "):
+                payload = line[len("data: "):]
+                if payload == "[DONE]":
+                    continue
+                chunks.append(json.loads(payload))
+    return chunks
 
 
 class TestARRequest(unittest.TestCase):
