@@ -9,7 +9,7 @@ tags: [architect, model_proxy, cli, status, help]
 
 > [理想] 路径：不计改动成本，评估信息展示的结构化、合理性、一致性、可用性，给目标形态。
 > 评估基准：master 工作区运行态，2026-08-07 实测（代理在跑 18889；config = **25 supplies / 4 routes / 2 strategies**，cc/codex 全 route_pool 写法；`config/session_overrides.json` 不存在，override=0）。本次实测无 e2e 并发测试干扰，是三篇同题文档中最干净的基线。
-> 前作关系：与同目录 [[2026-08-07-cli-status-help-evaluation]]、[[2026-08-07-cli-status-help-display-eval]] 同题。本文独立重核，结论与两者高度收敛（P1 pool 写路径落差、P3 sidecar count bug、列宽/长行、展示双实现等判断一致），并新增：nation1∩nation2 共享 3339 行、orphan supply 不可见、停机时 status 无降级、`supply add` 多参静默忽略等点。**三篇并存属重复，建议用户择一置 confirmed、其余置 superseded——本文不擅自改动前作。**
+> 去重记录：本题为重复派单产出的三份同题评估，结论高度收敛。2026-08-08 经主会话比对，本文为超集（独有 S5 共享 3339、S6 orphan supply、S9 链长、S10 停机降级、H7 静默忽略及完整目标输出样例），保留为 canonical；另两份（cli-status-help-evaluation、cli-status-help-display-eval）已删除。
 
 ## 1. 现状核实
 
@@ -265,8 +265,6 @@ stats 用法示例:（保留现有 :51-60 全部示例）
 
 ## 关联
 
-- [[2026-08-07-cli-status-help-evaluation]]（同题前作一，结论收敛）
-- [[2026-08-07-cli-status-help-display-eval]]（同题前作二，结论收敛；三篇建议择一 canonical）
 - [[2026-07-28-session-route-dispatch-design]]（route_pool / 一致性哈希 / 跨 route 兜底机制）
 - [[2026-08-06-session-overrides-single-storage]]（sidecar 单一存储，sidecar_overrides_count 来源）
 - [[2026-08-07-nation-route-supply-expansion]]（nation1/nation2 拆分与不重叠分配设计意图）
