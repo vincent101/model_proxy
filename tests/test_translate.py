@@ -1489,6 +1489,26 @@ def _run_ar_stream(adapter, events):
     return out
 
 
+def _load_sse_sample_events(name):
+    """读取 tests/samples/ 下的 SSE 样本，解析为 (event_type, data) 序列。"""
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "samples", name)
+    events = []
+    with open(path, encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if line.startswith("data: "):
+                payload = json.loads(line[len("data: "):])
+                events.append((payload.get("type"), payload))
+    return events
+
+
+def _load_json_sample(name):
+    """读取 tests/samples/ 下的 JSON 样本。"""
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "samples", name)
+    with open(path, encoding="utf-8") as f:
+        return json.load(f)
+
+
 class TestARRequest(unittest.TestCase):
     """§3.1 请求转换 anthropic_to_responses_request。"""
 
@@ -1653,9 +1673,32 @@ class TestARResponse(unittest.TestCase):
         self.assertEqual([b["type"] for b in ar["content"]], ["text", "tool_use"])
         self.assertEqual(ar["stop_reason"], "tool_use")
 
-    def test_ar_reasoning_item_dropped(self):
+    def test_ar_reasoning_item_backfilled_as_thinking(self):
+        """①b：非流式 reasoning item 不再丢弃，回传为 thinking block（glm content 通道）。"""
         resp = {"output": [
-            {"type": "reasoning", "summary": "x"},
+            {"type": "reasoning", "summary": [],
+             "content": [{"type": "reasoning_text", "text": "思考"}]},
+            {"type": "message", "content": [{"type": "output_text", "text": "ok"}]}]}
+        ar = pt.responses_to_anthropic_response(resp)
+        self.assertEqual(ar["content"], [
+            {"type": "thinking", "thinking": "思考"},
+            {"type": "text", "text": "ok"}])
+        # signature 无来源，不产出（已知限制）
+        self.assertNotIn("signature", ar["content"][0])
+
+    def test_ar_reasoning_summary_channel_multi_part(self):
+        """①b：openai 官方 summary 通道，多 part 用 \\n\\n 连接。"""
+        resp = {"output": [
+            {"type": "reasoning", "summary": [
+                {"type": "summary_text", "text": "s1"},
+                {"type": "summary_text", "text": "s2"}]}]}
+        ar = pt.responses_to_anthropic_response(resp)
+        self.assertEqual(ar["content"], [{"type": "thinking", "thinking": "s1\n\ns2"}])
+
+    def test_ar_reasoning_empty_produces_no_block(self):
+        """①b：reasoning item 无文本内容（空 content 空 summary）时不产空 thinking block。"""
+        resp = {"output": [
+            {"type": "reasoning", "summary": []},
             {"type": "message", "content": [{"type": "output_text", "text": "ok"}]}]}
         ar = pt.responses_to_anthropic_response(resp)
         self.assertEqual(ar["content"], [{"type": "text", "text": "ok"}])
@@ -1690,6 +1733,18 @@ class TestARResponse(unittest.TestCase):
     def test_ar_empty_output_end_turn(self):
         ar = pt.responses_to_anthropic_response({"output": []})
         self.assertEqual(ar["content"], [])
+        self.assertEqual(ar["stop_reason"], "end_turn")
+
+    def test_ar_reasoning_nonstream_from_glm_sample(self):
+        """①b 非流式回传：glm 真实样本 → thinking block 且文本完整（th_chars 0→>0）。"""
+        resp = _load_json_sample("glm52_openai_resp_reasoning_high_nonstream.json")
+        ar = pt.responses_to_anthropic_response(resp, {"request_model": "glm-5.2"})
+        self.assertEqual(ar["content"][0]["type"], "thinking")
+        expected = resp["output"][0]["content"][0]["text"]
+        self.assertEqual(ar["content"][0]["thinking"], expected)
+        self.assertGreater(len(ar["content"][0]["thinking"]), 0)
+        self.assertNotIn("signature", ar["content"][0])
+        self.assertEqual(ar["content"][1]["type"], "text")
         self.assertEqual(ar["stop_reason"], "end_turn")
 
 
@@ -1865,6 +1920,71 @@ class TestARStream(unittest.TestCase):
         self.assertEqual(types[-1], "message_stop")
         # 开着的 text block 被 finalize 收掉
         self.assertIn("content_block_stop", types)
+
+    def test_ar_reasoning_stream_from_glm_sample(self):
+        """①b 流式回传：glm 真实 SSE 样本（reasoning_text.delta 通道）→ thinking block。"""
+        sample = _load_sse_sample_events("glm52_openai_resp_reasoning_max.sse")
+        adapter = pt.ResponsesToAnthropicStreamAdapter({}, "glm-5.2")
+        evs = _run_ar_stream(adapter, sample)
+        starts = [e for e in evs if e["type"] == "content_block_start"]
+        # thinking block 开在 index 0（text 之前，对齐 anthropic 原生约定）
+        self.assertEqual([s["content_block"]["type"] for s in starts], ["thinking", "text"])
+        self.assertEqual([s["index"] for s in starts], [0, 1])
+        # thinking_delta 拼接 == 样本 reasoning 全文（以 response.completed 为权威）
+        thinking = "".join(e["delta"]["thinking"] for e in evs
+                           if e["type"] == "content_block_delta"
+                           and e["delta"]["type"] == "thinking_delta")
+        completed = [d for et, d in sample if et == "response.completed"][0]
+        expected = completed["response"]["output"][0]["content"][0]["text"]
+        self.assertEqual(thinking, expected)
+        self.assertGreater(len(thinking), 0)
+        # start/stop 配对（thinking + text 各一对）
+        self.assertEqual(len([e for e in evs if e["type"] == "content_block_stop"]), 2)
+        # usage：reasoning_tokens=513 经 usage_tuple 透出
+        self.assertEqual(adapter.usage_tuple(), (38, 625, 513))
+
+    def test_ar_reasoning_summary_stream_openai_channel(self):
+        """①b 流式回传：openai 官方 reasoning_summary_text.delta 通道 → thinking block。"""
+        adapter = pt.ResponsesToAnthropicStreamAdapter({}, "m")
+        evs = _run_ar_stream(adapter, [
+            ("response.created", {"response": {"id": "r"}}),
+            ("response.output_item.added", {"item": {"type": "reasoning", "summary": []}}),
+            ("response.reasoning_summary_text.delta", {"delta": "思"}),
+            ("response.reasoning_summary_text.delta", {"delta": "考"}),
+            ("response.reasoning_summary_text.done", {"text": "思考"}),
+            ("response.output_item.done", {"item": {"type": "reasoning"}}),
+            ("response.output_item.added", {"item": {"type": "message", "content": []}}),
+            ("response.output_text.delta", {"delta": "答"}),
+            ("response.completed", {"response": {"usage": {"input_tokens": 1, "output_tokens": 2}}}),
+        ])
+        starts = [e for e in evs if e["type"] == "content_block_start"]
+        self.assertEqual([s["content_block"]["type"] for s in starts], ["thinking", "text"])
+        self.assertEqual([s["index"] for s in starts], [0, 1])
+        thinking = "".join(e["delta"]["thinking"] for e in evs
+                           if e["type"] == "content_block_delta"
+                           and e["delta"]["type"] == "thinking_delta")
+        self.assertEqual(thinking, "思考")
+        # thinking stop 先于 text start
+        types = [e["type"] for e in evs]
+        self.assertLess(types.index("content_block_stop"),
+                        len(types) - 1 - types[::-1].index("content_block_start"))
+
+    def test_ar_reasoning_delta_without_item_added_defensive(self):
+        """①b 防御：上游跳过 output_item.added 直接发 reasoning delta，自动开 thinking block。"""
+        adapter = pt.ResponsesToAnthropicStreamAdapter({}, "m")
+        evs = _run_ar_stream(adapter, [
+            ("response.created", {"response": {"id": "r"}}),
+            ("response.reasoning_text.delta", {"delta": "想", "obfuscation": "obf_x"}),
+            ("response.completed", {"response": {"usage": {"input_tokens": 1, "output_tokens": 1}}}),
+        ])
+        starts = [e for e in evs if e["type"] == "content_block_start"]
+        self.assertEqual(starts[0]["content_block"]["type"], "thinking")
+        thinking = "".join(e["delta"]["thinking"] for e in evs
+                           if e["type"] == "content_block_delta"
+                           and e["delta"]["type"] == "thinking_delta")
+        self.assertEqual(thinking, "想")
+        # completed 时开着的 thinking block 被收掉
+        self.assertIn("content_block_stop", [e["type"] for e in evs])
 
 
 if __name__ == "__main__":

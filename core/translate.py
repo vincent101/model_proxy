@@ -1832,7 +1832,7 @@ class ResponsesToAnthropicStreamAdapter:
         self.sent_message_start = False
         self.block_open = False
         self.cur_index = -1
-        self.cur_type = None                          # "text" | "tool_use"
+        self.cur_type = None                          # "text" | "tool_use" | "thinking"
         self.final_stop_reason = None
         self.input_tokens = 0
         self.output_tokens = 0
@@ -1895,6 +1895,24 @@ class ResponsesToAnthropicStreamAdapter:
         }
 
     @staticmethod
+    def _content_block_start_thinking(index: int) -> dict:
+        # ①b：reasoning→thinking 回传。signature 无来源（正向丢 signature_delta），
+        # 不产出 signature 字段——已知限制。
+        return {
+            "type": "content_block_start",
+            "index": index,
+            "content_block": {"type": "thinking", "thinking": ""},
+        }
+
+    @staticmethod
+    def _content_block_delta_thinking(index: int, thinking: str) -> dict:
+        return {
+            "type": "content_block_delta",
+            "index": index,
+            "delta": {"type": "thinking_delta", "thinking": thinking},
+        }
+
+    @staticmethod
     def _content_block_stop(index: int) -> dict:
         return {"type": "content_block_stop", "index": index}
 
@@ -1951,6 +1969,36 @@ class ResponsesToAnthropicStreamAdapter:
                 original = self.tool_name_mapping.get(item.get("name", ""), item.get("name", ""))
                 tool_id = item.get("call_id") or gen_toolu_id()
                 events.append(self._content_block_start_tool(self.cur_index, tool_id, original))
+            elif it == "reasoning":
+                # ①b：开 thinking block（reasoning item 在 output 中位于 message 之前，
+                # 对齐 anthropic 原生"thinking 在前"约定）
+                if self.block_open:
+                    events.append(self._content_block_stop(self.cur_index))
+                self.cur_index += 1
+                self.cur_type = "thinking"
+                self.block_open = True
+                events.append(self._content_block_start_thinking(self.cur_index))
+
+        elif event_type in ("response.reasoning_text.delta",           # glm 通道（实测词表）
+                            "response.reasoning_summary_text.delta"):  # openai 官方通道
+            self._ensure_message_start(events)
+            if self.cur_type != "thinking" or not self.block_open:
+                if self.block_open:
+                    events.append(self._content_block_stop(self.cur_index))
+                self.cur_index += 1
+                self.cur_type = "thinking"
+                self.block_open = True
+                events.append(self._content_block_start_thinking(self.cur_index))
+            txt = data.get("delta", "")
+            if txt:
+                # obfuscation 字段（glm 特有混淆标记）忽略，不写入 thinking block
+                events.append(self._content_block_delta_thinking(self.cur_index, txt))
+
+        elif event_type in ("response.reasoning_text.done",
+                            "response.reasoning_summary_text.done"):
+            if self.cur_type == "thinking" and self.block_open:
+                events.append(self._content_block_stop(self.cur_index))
+                self.block_open = False
 
         elif event_type == "response.output_text.delta":
             self._ensure_message_start(events)
