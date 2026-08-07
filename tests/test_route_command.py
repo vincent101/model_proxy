@@ -146,6 +146,26 @@ class TestSidecarBasics(unittest.TestCase):
             sc.maybe_reload()
             self.assertEqual(sc.get_overrides_for("cc"), {"sess-x": "nation"})
 
+    def test_sidecar_file_deleted_clears_memory(self):
+        """sidecar 文件被删除后，内存数据必须清空（视为 {}）。
+        回归 bug：_maybe_reload_locked 在 FileNotFoundError 时直接 return，
+        导致已删除的 sidecar 数据残留在内存里（曾导致 status 误报 +6）。
+        """
+        with tempfile.TemporaryDirectory() as d:
+            path = Path(d) / "session_overrides.json"
+            sc = SessionOverridesSidecar(path)
+            # 用 apply_command 种一条记录（同时创建文件）
+            sc.apply_command("cc", "sess-1", "set", target_route_id="nation")
+            self.assertEqual(sc.get_overrides_for("cc"), {"sess-1": "nation"})
+            self.assertTrue(path.exists())
+
+            # 删 sidecar 文件
+            path.unlink()
+            # 调对外入口 maybe_reload（不是 _maybe_reload_locked）
+            sc.maybe_reload()
+            # 内存数据必须清空
+            self.assertEqual(sc.get_overrides_for("cc"), {})
+
 
 # ---------------------------------------------------------------------------
 # 回归：apply_command 不得在外部改动 sidecar mtime 后死锁（bug 报告见

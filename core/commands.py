@@ -229,6 +229,11 @@ class SessionOverridesSidecar:
         try:
             mtime = self._path.stat().st_mtime
         except FileNotFoundError:
+            # 文件被删除：视为空（与 __init__/_reload_locked 的文件缺失语义一致），
+            # 必须清空内存，否则已删除的 sidecar 数据会残留在内存里（曾导致 status 误报 +6）
+            if self._data or self._mtime:
+                self._data = {}
+                self._mtime = 0.0
             return
         if mtime <= self._mtime:
             return
