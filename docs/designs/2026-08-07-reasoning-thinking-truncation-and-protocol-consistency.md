@@ -58,17 +58,29 @@ model_eval 评估体系（`tools/model_eval/`）经 model_proxy（`tools/model_p
 
 经实测复算（非脑推），这是**两个独立的 defect 叠加**，都在 model_proxy 转换层，与"上游不回传"无关：
 
-**Defect A：effort=max 在 responses 域被静默降级为 "medium"（实锤）**
+**Defect A：effort=max 在 chat/responses 域被静默降级为 "medium"（实锤，根因已修正）**
 
-链路：入站 anthropic `output_config.effort=max` → `AnthropicReasoningCodec.decode` → level=MAX；`remap` 用 source 默认 5 档（`_DEFAULT_ENUM=(OFF,LOW,MEDIUM,HIGH,XHIGH)`，capability.py:25-31，**不含 MAX**）与 target glm effort_enum=[high,max] 做相对映射，正确落到 target MAX（level=6）。问题出在 `ResponsesReasoningCodec.syntax_adapt`：
+链路：入站 anthropic `output_config.effort=max` → `AnthropicReasoningCodec.decode` → level=MAX；`remap`（source `tiers_source_capability=[low,medium,high,xhigh,max]` 与 target glm `effort_enum=[high,max]`）正确落到 target MAX（level=6）。问题出在 `ResponsesReasoningCodec.syntax_adapt` 的最后一公里：
 
-- `_canonical_to_openai_effort_name(MAX)` = `_CANONICAL_TO_CHAT_NAME.get(MAX, "medium")`（codecs.py:185-190）。
-- `_CANONICAL_TO_CHAT_NAME` 由 `_CHAT_NAME_TO_CANONICAL={none,low,medium,high,xhigh}` 反转而来（codecs.py:175-182），**词表里没有 max**。
-- 于是 MAX 查表落空，兜底返回 `"medium"`。
+- `_canonical_to_openai_effort_name(MAX)` = `_CANONICAL_TO_CHAT_NAME.get(MAX, "medium")`（codecs.py:185-190）
+- `_CANONICAL_TO_CHAT_NAME` 由 `_CHAT_NAME_TO_CANONICAL={none,low,medium,high,xhigh}` 反转（codecs.py:175-182），**写死、不含 max**（反映 openai 原生 chat/responses 协议规范）
+- MAX 查表落空，兜底返回 `"medium"`
 
-实测复算（同进程调 remap + codec）确认：`responses wire sent upstream: {'reasoning': {'effort': 'medium'}}`，而对照 anthropic 协议版发出 `{'thinking': {'type':'adaptive'}, 'output_config': {'effort': 'max'}}`。**这就是报告里"responses 版模型自述中等水平、anthropic 版自述最高级"的直接代码根因**——effort 在 wire 序列化阶段被降级，根本没把 max 发给上游。
+实测复算确认：`responses wire: {'reasoning':{'effort':'medium'}}`，对照 anthropic 协议版 `{'output_config':{'effort':'max'}}`。
 
-根因层次：这不是 remap 的错（remap 正确输出了 target MAX），而是 **chat/responses 域的词表窄于 canonical 全序，且 MAX→openai 档名的兜底策略是"悄悄medium"而非"报错或映射到该域最高可用档 xhigh"**。注释（codecs.py:185-189）自称"该域本就不该被配置出 MAX"，但配置层（supply `reasoning_capability.effort_enum=["high","max"]`）与词表层（chat/responses 域无 max）之间**没有一个一致性校验去真正阻止这个"不该"**，于是配置里写了 max、词表里没有，兜底悄然降级。
+**根因修正（经实测+全档推演，推翻原"兜底策略选错/应钳 xhigh"的判断）**：
+
+- **写死字典 `_CHAT_NAME_TO_CANONICAL` 这一层本身就不该存在**。它反映 openai 原生 chat/responses 协议规范（无 max），但 aigc.sankuai.com 的 chat/responses 端点是网关给各家模型（glm/kimi/ds）用的，支持的档位由模型 supply 决定，不是 openai 原生规范。
+- **supply 的 `effort_enum`（如 `[high,max]`）就是上游真实支持的 wire 档名字符串**——这是权威来源。代理该信配置发档名，不该用一张写死的、比 supply 配置窄的字典二次过滤。
+- 实测证据（直接 curl 上游网关，绕开 model_proxy）：
+  - responses 端点（glm-52-sankuai-openai-3339）：`reasoning.effort=max` → HTTP 200 + 模型自述"最高档" + rt=578 ✓
+  - chat 端点（kimi-k3-sankuai-openai-3339）：`reasoning_effort=max` → HTTP 200 + 模型自述"max(最高档)" + reasoning_content 756字符 ✓
+  - 两个网关端点都真实接受 max，写死字典挡了一个真实存在的档。
+- 对比 anthropic 域字典 `_ANTHROPIC_NAME_TO_CANONICAL`（codecs.py:74-81）**含 max**——所以 anthropic 协议 target 正常发 max，chat/responses target 被降 medium。**两个域字典覆盖范围不同是直接原因**。
+
+**结论**：Defect A 不是"兜底值选错"（原方案"钳到 xhigh"是治标），是**写死字典这一层不该存在**——supply 配置才是上游真实能力的权威，encode 该信 supply 直接发档名。
+
+**附带发现（decode 对称 bug）**：decode（入站）也查同一写死字典。responses/chat SDK 发 `effort=max` → `Chat/ResponsesReasoningCodec.decode` 查 `_CHAT_NAME_TO_CANONICAL` 不认 max → present=False → max 意图被丢（推演组合 C/D 的 max，见验证）。anthropic SDK（adaptive/enabled）decode 用 `_ANTHROPIC_NAME_TO_CANONICAL`（含 max）+ budget 锚点（含 max），不受影响。**source 侧也被同一写死字典挡了 max，与 target 侧同源**。
 
 **Defect B：responses→anthropic 方向根本没实现 reasoning→thinking 的回传（实锤）**
 
