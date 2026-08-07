@@ -12,7 +12,7 @@ tools/model_proxy/core/commands.py — 内建 in-band 指令层
     1. 指令匹配规则（§1.4/§2.2）：与 tests/test_command_match_rules.py 同一份实现
        （该测试文件 import 本模块，不再自持第二份逻辑）。
     2. sidecar 存储（§4.5/§5.4）：session_overrides.json 的加载、mtime 热重载、
-       与主 config 合并（sidecar 优先）、写入、7 天清理、last_seen 内存记账。
+       写入、7 天清理、last_seen 内存记账。sidecar 是唯一来源。
     3. 命令层骨架（§7.3）：命令名 → handler 注册表，目前只注册 `$route` 一个命令。
 """
 
@@ -169,8 +169,8 @@ def normalize_override_entry(entry) -> "str | None":
     """把一条 override 条目（旧式纯字符串 或 新式 {route_id,last_seen,created}）
     规范化为 route_id 字符串。无法识别返回 None。
 
-    兼容性要求（§5.4 正确性耦合点）：现网 5 条是旧式纯字符串 value；sidecar
-    写入的是新式 dict。读取侧必须同时支持两种形态。
+    兼容性要求（§5.4 正确性耦合点）：人工手改 sidecar 时可能写成纯字符串；
+    apply_command 写入的是新式 dict。读取侧必须同时支持两种形态。
     """
     if isinstance(entry, str):
         return entry or None
@@ -186,8 +186,7 @@ class SessionOverridesSidecar:
     - 文件缺失视为 `{}`（首次运行的正常状态，不报错）。
     - 文件非法 JSON：保留上一次成功加载的内存值 + warning，不中断请求。
     - 结构：{"<client_token>": {"<session_id>": {"route_id","last_seen","created"}}}。
-      按 client_token 分组是为了能与主 config 内每条 strategy 各自的
-      dispatch.session_overrides 对应合并（§4.5 合并语义）。
+      按 client_token 分组，与每条 strategy 各自对应。
     - last_seen 内存记账（§5.4 代价一节）：命中 override 的普通请求只更新
       `self._mem_last_seen`（不写盘）；只有 `$route` 写操作（`apply_command`）
       才会把内存中已记录的时间戳刷入对应 sidecar 条目，随后一次性原子写盘。
@@ -254,7 +253,7 @@ class SessionOverridesSidecar:
 
     def get_overrides_for(self, client_token: str) -> dict[str, str]:
         """返回该 client_token 下 sidecar 的 {session_id: route_id} 映射
-        （已规范化为纯字符串，供与主 config 合并、sidecar 优先覆盖）。
+        （已规范化为纯字符串，供 extract_route_candidates 读取）。
         """
         with self._lock:
             token_map = self._data.get(client_token) or {}
@@ -402,43 +401,6 @@ class CommandResult:
         self.wrote = wrote
 
 
-def effective_overrides(strategy: dict, sidecar: SessionOverridesSidecar) -> dict[str, str]:
-    """合并主 config 内该 strategy 的 session_overrides（基线）与 sidecar（优先）。
-    同 key 冲突时 sidecar 覆盖（§4.5 合并语义）。
-
-    server.py 侧在把 strategy 传给 `extract_route_candidates` 前，用本函数算出的
-    结果构造一份 strategy 的浅拷贝（只替换 dispatch.session_overrides），确保普通
-    请求命中 override 时能读到 sidecar 里刚写入的最新值，同时不污染 ConfigStore
-    内部对象（不 deepcopy 整个 strategy，只浅拷贝顶层两层，见 §4.2）。
-    """
-    client_token = strategy.get("client_token", "")
-    dispatch = strategy.get("dispatch") or {}
-    base = dispatch.get("session_overrides") or {}
-    merged: dict[str, str] = {}
-    for sid, entry in base.items():
-        rid = normalize_override_entry(entry)
-        if rid:
-            merged[sid] = rid
-    merged.update(sidecar.get_overrides_for(client_token))  # sidecar 优先
-    return merged
-
-
-def build_merged_strategy(strategy: dict, sidecar: SessionOverridesSidecar) -> dict:
-    """构造一份仅用于本次调用的 strategy 视图：dispatch.session_overrides 替换为
-    `effective_overrides` 的合并结果，其余字段原样引用。
-
-    只浅拷贝 strategy 与 dispatch 两层（不 deepcopy 整个 strategy），返回的新 dict
-    与 ConfigStore 内部对象无任何共享的可变引用会被写入——调用方后续也不得对
-    返回值做任何就地修改（§4.2 别名污染要求：写路径必须 deepcopy 后改，这里的
-    "浅拷贝" 只用于读路径的一次性合并视图，从不写回）。
-    """
-    merged = dict(strategy)
-    dispatch = dict(strategy.get("dispatch") or {})
-    dispatch["session_overrides"] = effective_overrides(strategy, sidecar)
-    merged["dispatch"] = dispatch
-    return merged
-
-
 def _short_session(session_key: str) -> str:
     return session_key[:8] if session_key else ""
 
@@ -510,17 +472,14 @@ def _handle_query(ctx: CommandContext) -> CommandResult:
     routes_map = ctx.routes_map
 
     sidecar_map = ctx.sidecar.get_overrides_for(client_token)
-    base_dispatch = strategy.get("dispatch") or {}
-    base_overrides = base_dispatch.get("session_overrides") or {}
-    # 去重后计数：同一 session_id 若同时存在于主 config 与 sidecar（被 $route
-    # 覆盖过的旧手工条目），只算一条，避免虚高（reviewer 指出的疑点，已确认为真）。
-    total_overrides = len(set(base_overrides.keys()) | set(sidecar_map.keys()))
+    # sidecar 是唯一来源，总条数即 sidecar 条数。
+    total_overrides = len(sidecar_map)
     available = ", ".join(sorted(routes_map.keys())) or "(无可用 route)"
 
     if not strategy.get("route_pool"):
         # 与写路径（handle_route_command 里对 route_id/无 route_pool 的防御）对称：
         # extract_route_candidates 对旧式单值 route_id strategy 完全不读取
-        # session_overrides，此时即便 effective_overrides 命中该 session_id，也
+        # session_overrides，此时即便 sidecar 命中该 session_id，也
         # 不代表实际生效——不能展示一个看似生效实则不生效的 route（假成功回执）。
         fixed_route = strategy.get("route_id")
         lines = [
@@ -529,15 +488,13 @@ def _handle_query(ctx: CommandContext) -> CommandResult:
             f"实际路由固定为 \"{fixed_route}\"（来自 strategy.route_id）。",
             f"可用 route id: {available}",
             f"该 strategy override 总条数: {total_overrides}"
-            f"（主 config {len(base_overrides)} / sidecar {len(sidecar_map)}，"
-            f"以上条目对当前 strategy 均不生效）",
+            f"（sidecar {len(sidecar_map)}，以上条目对当前 strategy 均不生效）",
         ]
         return CommandResult("\n".join(lines), wrote=False)
 
-    merged = effective_overrides(strategy, ctx.sidecar)
-    override_rid = merged.get(session_key)
+    override_rid = sidecar_map.get(session_key)
     if override_rid and override_rid in routes_map:
-        source = "sidecar（本次会话最近一次 $route 指令）" if session_key in sidecar_map else "主 config 手工 override"
+        source = "sidecar（本次会话最近一次 $route 指令）"
         current_route = override_rid
     else:
         # 未命中 override：自动哈希分配。具体候选顺序由 server.py 调用
@@ -555,8 +512,7 @@ def _handle_query(ctx: CommandContext) -> CommandResult:
         route_line,
         f"可用 route id: {available}",
         f"该 strategy override 总条数: {total_overrides}"
-        f"（主 config {len(base_overrides)} / sidecar {len(sidecar_map)}，"
-        f"同一 session 同时存在两处时已去重只计一条）",
+        f"（sidecar {len(sidecar_map)}）",
     ]
     return CommandResult("\n".join(lines), wrote=False)
 

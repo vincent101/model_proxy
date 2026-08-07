@@ -34,7 +34,6 @@ from .commands import (
     COMMAND_HANDLERS,
     CommandContext,
     SessionOverridesSidecar,
-    build_merged_strategy,
     extract_last_user_message_content,
     parse_route_command,
 )
@@ -1023,22 +1022,24 @@ class ModelProxyHandler(BaseHTTPRequestHandler):
                                               routes_map, sidecar, request_model, body_json)
                 return
 
-        # 命中 override 的普通请求：合并 sidecar（优先）与主 config 基线后再选 route，
+        # 命中 override 的普通请求：读 sidecar 后构造浅拷贝视图再选 route，
         # 确保 $route 写入 sidecar 的最新值立刻对后续请求生效（不等 ConfigStore 重载）。
-        # build_merged_strategy 只浅拷贝 strategy 与 dispatch 两层，不 deepcopy、不改
-        # ConfigStore 内部对象引用（§4.2 别名污染要求），merged_strategy 只是这次调用
-        # 的局部变量。
+        # 浅拷贝 strategy 与 dispatch 两层，不 deepcopy、不改 ConfigStore 内部对象引用
+        # （§4.2 别名污染要求），view 只是这次调用的局部变量。
         if strategy is not None:
-            merged_strategy = build_merged_strategy(strategy, sidecar)
-            merged_overrides = merged_strategy["dispatch"]["session_overrides"]
+            overrides = sidecar.get_overrides_for(strategy.get("client_token", ""))
+            view = dict(strategy)
+            view_dispatch = dict(strategy.get("dispatch") or {})
+            view_dispatch["session_overrides"] = overrides
+            view["dispatch"] = view_dispatch
         else:
-            merged_overrides = {}
-            merged_strategy = strategy
+            overrides = {}
+            view = strategy
 
-        route_candidates = extract_route_candidates(merged_strategy, session_key, routes_map)
+        route_candidates = extract_route_candidates(view, session_key, routes_map)
         if (strategy is not None and session_key
-                and merged_overrides.get(session_key) in routes_map
-                and route_candidates and route_candidates[0].get("id") == merged_overrides.get(session_key)):
+                and overrides.get(session_key) in routes_map
+                and route_candidates and route_candidates[0].get("id") == overrides.get(session_key)):
             # 命中 override：只更新内存 last_seen，不写盘（热路径无 IO，见 §5.4 / V13）。
             sidecar.touch(strategy.get("client_token", ""), session_key)
 
@@ -1489,8 +1490,12 @@ class ModelProxyHandler(BaseHTTPRequestHandler):
 
         # 查询命令需要"若无 override 会落到哪个候选 route"，复用既有一致性哈希算法，
         # 不在 commands.py 里重复实现（避免与 server.py 侧算法出现第二份漂移）。
-        merged_strategy = build_merged_strategy(strategy, sidecar)
-        resolved_candidates = extract_route_candidates(merged_strategy, session_key, routes_map)
+        overrides = sidecar.get_overrides_for(strategy.get("client_token", ""))
+        view = dict(strategy)
+        view_dispatch = dict(strategy.get("dispatch") or {})
+        view_dispatch["session_overrides"] = overrides
+        view["dispatch"] = view_dispatch
+        resolved_candidates = extract_route_candidates(view, session_key, routes_map)
         resolved_route_id = resolved_candidates[0].get("id") if resolved_candidates else None
 
         ctx = CommandContext(
@@ -1511,8 +1516,12 @@ class ModelProxyHandler(BaseHTTPRequestHandler):
         if result.wrote and cmd_arg not in (None, "reset"):
             self._acc["route"] = cmd_arg
         elif result.wrote and cmd_arg == "reset":
-            post_reset_strategy = build_merged_strategy(strategy, sidecar)
-            post_candidates = extract_route_candidates(post_reset_strategy, session_key, routes_map)
+            post_overrides = sidecar.get_overrides_for(strategy.get("client_token", ""))
+            post_view = dict(strategy)
+            post_view_dispatch = dict(strategy.get("dispatch") or {})
+            post_view_dispatch["session_overrides"] = post_overrides
+            post_view["dispatch"] = post_view_dispatch
+            post_candidates = extract_route_candidates(post_view, session_key, routes_map)
             self._acc["route"] = post_candidates[0].get("id") if post_candidates else ""
         else:
             self._acc["route"] = resolved_route_id or ""

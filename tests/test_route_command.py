@@ -4,7 +4,7 @@
 - V5  写路径无别名污染（deepcopy 生效，ConfigStore._config 不被就地改动）
 - V9  fail-open 反例集（已在 test_command_match_rules.py 覆盖匹配规则本身，这里
       补覆盖端到端场景：非命令消息一律照常转发，不进入命令层）
-- V10 旧式纯字符串 override 不被清理逻辑误删（现网 5 条兼容性回归，最严重回归）
+- V10 旧式纯字符串 override 不被清理逻辑误删（人工手改 sidecar 纯字符串不被清理）
 - V11 清理判据正确（6 天/8 天边界、当前 session 永不清理）
 - V12 清理与变更同一次原子写（一次 $route 只产生一次 os.replace）
 - V13 last_seen 不写热路径（命中 override 的普通请求只改内存，不触发写盘 IO）
@@ -30,8 +30,6 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from core.commands import (  # noqa: E402
     CommandContext,
     SessionOverridesSidecar,
-    build_merged_strategy,
-    effective_overrides,
     extract_last_user_message_content,
     handle_route_command,
     normalize_override_entry,
@@ -303,7 +301,6 @@ class TestNoAliasPollution(unittest.TestCase):
                 "strategies": [{
                     "client_token": "cc",
                     "route_pool": [{"route_id": "claude", "weight": 1}],
-                    "dispatch": {"session_overrides": {"sess-a": "nation"}},
                 }],
             }
             cfg_path.write_text(json.dumps(cfg), encoding="utf-8")
@@ -316,10 +313,14 @@ class TestNoAliasPollution(unittest.TestCase):
             strategy = cs.get_strategies()[0]
             routes_map = cs.get_routes_map()
 
-            # 模拟 server.py 的读路径：合并 sidecar + 主 config（不得改动 strategy 本身）
-            merged = build_merged_strategy(strategy, sidecar)
-            self.assertIsNot(merged, strategy)
-            self.assertIsNot(merged.get("dispatch"), strategy.get("dispatch"))
+            # 模拟 server.py 的读路径：读 sidecar 构造浅拷贝视图（不得改动 strategy 本身）
+            overrides = sidecar.get_overrides_for(strategy.get("client_token", ""))
+            view = dict(strategy)
+            view_dispatch = dict(strategy.get("dispatch") or {})
+            view_dispatch["session_overrides"] = overrides
+            view["dispatch"] = view_dispatch
+            self.assertIsNot(view, strategy)
+            self.assertIsNot(view.get("dispatch"), strategy.get("dispatch"))
 
             # 模拟写路径：$route 切换
             ctx = CommandContext(
@@ -377,7 +378,7 @@ class TestFailOpenEndToEnd(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------
-# 命令层骨架：切换/查询/reset 的基本行为 + 合法性校验 + effective_overrides 合并优先级
+# 命令层骨架：切换/查询/reset 的基本行为 + 合法性校验 + sidecar 读取
 # ---------------------------------------------------------------------------
 
 class TestRouteCommandHandler(unittest.TestCase):
