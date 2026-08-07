@@ -631,6 +631,22 @@ class TestAnthropicCodecDecode(unittest.TestCase):
         intent = self.codec.decode({"thinking": {"type": "adaptive"}})
         self.assertEqual(intent.level, CE.MEDIUM)
 
+    def test_adaptive_unrecognized_effort_not_silent_medium(self):
+        # 非空但未识别的档名 → warning + present=False（不静默降级 MEDIUM，原字段透传与否
+        # 由 remap 决定）。
+        intent = self.codec.decode({"thinking": {"type": "adaptive"},
+                                    "output_config": {"effort": "bogus"}})
+        self.assertFalse(intent.present)
+        self.assertIsNone(intent.level)
+
+    def test_adaptive_none_off_decode_to_off(self):
+        # 行为变化（有意）：effort="none"/"off" 经全表识别为 OFF，不再是旧行为的静默 MEDIUM。
+        for name in ("none", "off"):
+            intent = self.codec.decode({"thinking": {"type": "adaptive"},
+                                        "output_config": {"effort": name}})
+            self.assertTrue(intent.present)
+            self.assertEqual(intent.level, CE.OFF)
+
     def test_bare_output_config_not_present(self):
         intent = self.codec.decode({"output_config": {"effort": "high"}})
         self.assertFalse(intent.present)
@@ -680,7 +696,7 @@ class TestAnthropicCodecSyntaxAdapt(unittest.TestCase):
         self.assertEqual(out["output_config"], {"effort": "high"})
 
     def test_adaptive_variant_max_level_no_special_branch(self):
-        # MAX 走跟其余档位完全一样的查表路径（_CANONICAL_TO_ANTHROPIC_NAME 本身含 max）。
+        # MAX 走跟其余档位完全一样的直出路径（level.name.lower()，codec 零词表）。
         abstract = AbstractReasoning(kind=AbstractKind.THINKING, level=CE.MAX, source_budget=None)
         out = self.codec.syntax_adapt(abstract, ANTHROPIC_ADAPTIVE)
         self.assertEqual(out["output_config"], {"effort": "max"})
@@ -776,11 +792,12 @@ class TestChatCodec(unittest.TestCase):
         abstract = AbstractReasoning(kind=AbstractKind.DISABLED, level=None, source_budget=None)
         self.assertEqual(self.codec.syntax_adapt(abstract, CHAT_EFFORT), {"reasoning_effort": "none"})
 
-    def test_syntax_adapt_max_no_special_branch_falls_back_default(self):
-        # 该协议域本不该配出 MAX（配置层责任），若真出现，走通用查表兜底（非专门 if MAX 判断）。
+    def test_syntax_adapt_max_passthrough(self):
+        # codec 零词表后：MAX 与其余档走同一条 level.name.lower() 直出路径，
+        # supply 声明了 max 就发 max，不再被写死字典静默降为 medium。
         abstract = AbstractReasoning(kind=AbstractKind.THINKING, level=CE.MAX, source_budget=None)
         out = self.codec.syntax_adapt(abstract, CHAT_EFFORT)
-        self.assertEqual(out, {"reasoning_effort": "medium"})  # 通用兜底值，非针对 MAX 的判断结果
+        self.assertEqual(out, {"reasoning_effort": "max"})
 
     def test_syntax_adapt_regular_levels(self):
         for level, name in [(CE.LOW, "low"), (CE.MEDIUM, "medium"),
@@ -816,7 +833,7 @@ class TestResponsesCodec(unittest.TestCase):
     def test_syntax_adapt_max_no_special_branch(self):
         abstract = AbstractReasoning(kind=AbstractKind.THINKING, level=CE.MAX, source_budget=None)
         out = self.codec.syntax_adapt(abstract, RESP_EFFORT)
-        self.assertEqual(out, {"reasoning": {"effort": "medium"}})
+        self.assertEqual(out, {"reasoning": {"effort": "max"}})
 
     def test_syntax_adapt_absent_returns_empty(self):
         abstract = AbstractReasoning(kind=AbstractKind.ABSENT, level=None, source_budget=None)
@@ -1035,9 +1052,9 @@ class TestMaxNoSpecialBranch(unittest.TestCase):
         self._assert_no_max_if_branch("capability.py")
 
     def test_max_walks_same_lookup_path_as_other_levels_in_anthropic_adaptive(self):
-        """构造性验证：MAX 作为普通序列项查表，跟 LOW/MEDIUM/HIGH 走同一条代码路径
+        """构造性验证：MAX 作为普通序列项直出，跟 LOW/MEDIUM/HIGH 走同一条代码路径
         （AnthropicReasoningCodec.syntax_adapt 的 ANTHROPIC_ADAPTIVE 分支，统一走
-        _CANONICAL_TO_ANTHROPIC_NAME 查表，没有独立的 if level==MAX 分支）。"""
+        level.name.lower()，没有独立的 if level==MAX 分支）。"""
         codec = AnthropicReasoningCodec()
         for level, name in [(CE.LOW, "low"), (CE.MEDIUM, "medium"), (CE.HIGH, "high"),
                              (CE.XHIGH, "xhigh"), (CE.MAX, "max")]:

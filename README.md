@@ -140,8 +140,9 @@ session override 的唯一来源是独立 sidecar 文件 `config/session_overrid
 
 > 注意：Anthropic 协议上游用 `thinking.type=disabled` 表达"关闭思考"，不使用 `off`/`none`
 > 档位；因此 anthropic supply 的 `effort_enum` 通常不含 `off`（关闭走 disabled 指令，不占一档）。
-> Chat/Responses 协议域用 `reasoning_effort=none` / `reasoning.effort=none` 表达关闭，其
-> `effort_enum` 词表本身不含 `max`/`minimal`。
+> Chat/Responses 协议域用 `reasoning_effort=none` / `reasoning.effort=none` 表达关闭（"none"
+> 是该域关闭词的协议事实）。档名词表的唯一权威在 `ladder._NAME_TO_CANONICAL`，codec 层零词表：
+> supply `effort_enum` 声明的档名即 wire 档名，代理照配置直发，不做写死字典二次过滤。
 
 #### protocol 推断规则
 
@@ -661,7 +662,10 @@ source 侧（strategy 下 `tiers_source_capability` 的每个 tier entry）共�
 **档名词表**（`effort_enum`/`off_alias` 里的字符串，协议无关规范名，大小写不敏感）：
 `off`（等价 `none`）/ `minimal` / `low` / `medium` / `high` / `xhigh` / `max`。未识别的档名
 被忽略（容错，不报错）。`off` 与 `max` 都是强度全序的正式成员，无任何协议层专属特殊分支，走
-跟 `low`/`medium`/`high` 完全一样的相对映射路径。
+跟 `low`/`medium`/`high` 完全一样的相对映射路径。词表唯一权威在
+`core/reasoning/ladder.py::_NAME_TO_CANONICAL`，codec 层零词表：encode 直接把 canonical
+枚举名小写作为 wire 档名发出（`effort_enum` 声明什么就发什么），decode 用同一全表识别入站
+档名（含 `max`/`minimal`），映射约束统一收在 remap。
 
 budget 分档断点（Anthropic `thinking.budget_tokens` 语义）是全局固定常量，与上游厂商无关，
 不支持 per-supply 自定义。
@@ -774,6 +778,10 @@ token 里选定）过滤候选 client_token；无匹配协议的 token 时提示
   响应/事件，不会让客户端挂死。
 - 只在 Claude Code 会话启动时（SessionStart hook）拉起一次，会话运行期间进程崩溃不会自动
   重启/自愈，需手动 `on`。
+- responses→anthropic 方向的 reasoning 回传：当前上游 reasoning 内容块不回传给 anthropic
+  客户端（th_chars 恒 0，补齐回传属后续批工作）；且即便补齐，产出的 thinking block 也不会有
+  `signature` 字段（正向转换不保留 signature_delta，反向无来源）——对只读评估无影响，对会把
+  thinking 回传上游的多轮客户端（Claude Code）是已知限制。
 - 未接入自动化测试覆盖真实上游网络调用（转换器单测均为脱网络单测，转发编排本身未做端到端自动化
   测试，依赖手动 curl 验证）。
 - effort 探测（`supply test`）解析结果不保证准确，仅供人工审阅参考。

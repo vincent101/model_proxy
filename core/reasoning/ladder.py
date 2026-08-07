@@ -2,8 +2,9 @@
 
 零依赖模块：不 import 本包内其他模块，也不 import server/translate。
 
-CanonicalEffort 是内部统一的强度全序（跨协议），各协议档名字符串在 codecs.py 里
-双向映射到这个全序上。budget_to_canonical / canonical_to_budget 是 Anthropic
+CanonicalEffort 是内部统一的强度全序（跨协议），各协议档名字符串 ↔ canonical 的映射
+唯一权威在本模块的 _NAME_TO_CANONICAL（codec 层零词表，见 codecs.py 模块头注释）。
+budget_to_canonical / canonical_to_budget 是 Anthropic
 enabled 语法（budget_tokens 整数）与 canonical 之间的唯一换算锚点——budget 语义是
 Anthropic 侧固定的，与 per-supply 配置无关，故上收为全局常量（不再是 per-supply
 可配置的 budget_breakpoints，参见架构决策 #1）。
@@ -74,7 +75,8 @@ _CANONICAL_TO_BUDGET = {
 }
 
 # 配置文件 / 通用协议字符串 → canonical 的规范名称表（协议无关，供 capability.from_config
-# 解析 effort_enum/off_alias 字符串用）。"off"/"none" 两种拼法都接受
+# 解析 effort_enum/off_alias 字符串、以及 codecs 各协议 decode 识别入站档名用——codec 层
+# 零词表，本表是全局唯一权威）。"off"/"none" 两种拼法都接受
 # （旧 schema 用 "none" 表达最低/关闭档，这里两者等价）。
 _NAME_TO_CANONICAL = {
     "off": CanonicalEffort.OFF,
