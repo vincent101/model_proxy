@@ -267,3 +267,38 @@ for e in CanonicalEffort:
 ### 结论
 
 **体系化方向确认，方案可执行，但需按上述硬伤 1/2/3 把 ① 推到终态后再实施**：三域零写死字典（codec 零词表）、词表不变量单测固化、①b 事件词表先实测。做到这三点，本方案从"修对了地方"升级为"同类问题在架构上不可能复发"；不做，则 anthropic 域与 decode 侧仍各埋着一颗与 Defect A 同种的雷。
+
+---
+
+## 第二轮复核（architect-max 独立新实例，[理想] 路径，2026-08-07）
+
+复核范围：逐条核对第一轮 5 条硬伤的修订落实；整体一致性；二轮修订是否引入新问题；实施可行性终审。复核中实证了：live config（glm-52-sankuai-openai-3339 `effort_enum=[high,max]`、kimi-k3-sankuai-openai-3339 `[low,high,max]`，openai 域已配 max，①a 落地后 encode 立即正确、无需改配置）、translate.py 正向镜像蓝本（1300-1310 thinking_delta→reasoning_summary_text.delta、1311 signature_delta 跳过）、反向缺口（1752 `pass`、1906-1926 无 reasoning 分支）、server.py 各引用行号（809-856 debug 旁路、1238 兜底 4096、1290-1298 语法重试）、既有单测全文。
+
+### 5 条硬伤逐条核对结论
+
+1. **硬伤 1（anthropic 强制化 + decode absent/unrecognized 区分）：已解决**。①a 段落（"anthropic 统一（终态，非可选）"）三项全部落实：encode 改 `level.name.lower()`、decode 区分 absent（维持 MEDIUM）/unrecognized（warning + 进观测）、四表整体删除 + DISABLED `"none"` 保留并声明理由。残留两个实施级待定项（见新增问题 4），不影响本条关闭。
+2. **硬伤 2（词表不变量单测）：已解决**。①c 单测不变量 `name_to_canonical(e.name.lower()) == e`（OFF 双拼断言）与 ladder.py:79-88 实际键集核对无误，7 个枚举成员 `name.lower()` 全部命中 `_NAME_TO_CANONICAL`。
+3. **硬伤 3（①b 事件词表实测前置 + signature 已知限制）：已解决**。前置实测要求与 signature 无来源声明均已写入 ①b；正向蓝本行号经核实属实。
+4. **硬伤 4（②a/④b 职责边界显式化）：已解决**。④b 段落已点明"预防地板 vs 反应阶梯、时序串联不重叠、补偿控制定位、触发频率进 ⑤ 作标定失准信号"，与 ⑤a 三事件字段（budget_raised/budget_truncated/budget_retried）呼应自洽。
+5. **硬伤 5（stale 引用订正）：已解决**。⑤b 与风险节已无 "overflow" 残留，全文 grep 确认。
+
+### 整体一致性
+
+①a 终态"codec 零词表"与 DISABLED `"none"` 硬编码保留、与 ①c 单测不变量互相自洽；②a/④b 边界与 ③ 表、⑤ 监控呼应；⑤b "wire 档名恒等于配置档名"经 remap 全路径核实成立（THINKING 的 level 恒 ∈ tgt_cap.enum）。无方向级矛盾。
+
+### 新增问题（均为实施级遗漏/表述错误，非方向级）
+
+1. **【必须在实施清单点名】①a/①b 会反转 3 处既有单测断言，文档未点名**，而验证方式节自己要求"回归：跑通既有 tests/ 全部脱网络单测"——implementer 跑回归必撞红：
+   - `tests/test_reasoning.py:768-772` `test_syntax_adapt_max_no_special_branch_falls_back_default`：断言 chat MAX→`"medium"`，①a 后应为 `"max"`；测试名中 `falls_back_default` 语义失效，需改名。
+   - `tests/test_reasoning.py:805-808` `test_syntax_adapt_max_no_special_branch`（responses）：断言 MAX→`{"effort":"medium"}`，①a 后应为 `"max"`。
+   - `tests/test_translate.py:1657-1662` `test_ar_reasoning_item_dropped`：断言非流式 reasoning item 被丢弃，①b 后应产出 thinking block，断言需反转。
+2. **README/注释同步缺口**：README line 143-144"Chat/Responses 协议域……其 effort_enum 词表本身不含 max/minimal"与 ①a 论据（网关真实接受 max、词表以 supply 配置为权威）及 live config 现实均矛盾，落地后必须改；README §8 已知限制需新增 ①b signature 无来源条目；codecs.py 模块头注释与域字典注释（line 72-73、172-174）随四表删除需重写。方案未列此同步任务，建议在 ⑥ 或验证方式补一条"文档/注释同步清单"。
+3. **表述错误（订正级 typo）**：风险节"符合 codes/capability 的决策2约束"——`codes` 应为 `codecs`。
+4. **①a decode 两个实施语义未定死**：
+   - anthropic decode unrecognized 的返回值未写死（"warning + 不静默 MEDIUM"之后返回什么）。建议明确为 `present=False`（原字段透传，与 chat/responses decode 的 unrecognized 行为对齐；上游 400 由既有 interpret_rejection 自适应兜底），而非 `level=None,present=True`（走 STRIP 会静默清掉客户端字段）。
+   - 四表删除后 anthropic decode 必然改查全表 `_NAME_TO_CANONICAL`，则 `output_config.effort="none"/"off"` 从现状"未识别→MEDIUM"变为"识别为 OFF → remap OFF 吸收态 → DISABLED/STRIP"。语义更正确，但属行为变化，文档应点一句。
+5. **小模糊**：④b"封顶 supply 配置上限"在 ③ 的 `output_budget` schema 中无对应字段（只有 default/by_effort/min_for_thinking），需定死封顶读哪个键（建议新增 `max` 键或约定取 by_effort 最大值）。①b 的 SSE 抓取操作建议补一句（直 curl 网关 responses 端点 `stream:true` 存原始 SSE，Defect A 实测已证明直 curl 可行；抓到的真实事件流可存成 `tests/samples/` 样本文件做脱网络回归，复用既有样本机制）。
+
+### 终审结论
+
+方向级无硬伤，第一轮 5 条硬伤全部妥善解决，方案整体自洽、前提经实证成立。但新增问题 1（3 处既有单测断言反转）是回归阶段必然爆红的实质遗漏，新增问题 2/4 属落地正确性所需。**判定：需再修订（小订正级，非方向修订）**——把上述 5 点并入文档（验证方式节加"既有单测改动清单"、①a decode 段落定死 unrecognized 返回值与 none/off 行为变化、方案设计补"README/注释同步"条目、③ schema 补封顶键约定、①b 补抓取方法一句话）后，即可交 implementer 落地。
