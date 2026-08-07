@@ -770,6 +770,37 @@ token 里选定）过滤候选 client_token；无匹配协议的 token 时提示
   `[模型仅返回思考过程，未生成正式回答]`）填入返回的 text block，避免客户端收到空 `content`；
   `stop_reason` 不变（仍反映真实截断原因）。可用 `core/translate.py` 模块级常量
   `_ENABLE_REASONING_FALLBACK`（默认 True）整体关闭。
+  - 与之互斥（2026-08-07 ①b-chat 镜像补齐）：content 非空时，`reasoning_content` 会镜像为 anthropic `thinking` block 置前（而非丢弃），content 本身是 text block；两路径严格互斥不双写。
+  - 与之互斥（2026-08-07 ①b-chat 镜像补齐）：content 非空时，`reasoning_content` 会镜像为 anthropic
+    `thinking` block 置前（而非丢弃），content 本身是 text block；两路径严格互斥不双写。
+  - 与之互斥（2026-08-07 ①b-chat 镜像补齐）：content 非空时，`reasoning_content` 会镜像为 anthropic `thinking` block 置前（而非丢弃），content 本身是 text block；两路径严格互斥不双写。
+  - 与之互斥（2026-08-07 ①b-chat 镜像补齐）：content 非空时，`reasoning_content` 会镜像为 anthropic
+    `thinking` block 置前（而非丢弃），content 本身是 text block；两路径严格互斥不双写。
+  - 与之互斥（2026-08-07 ①b-chat 镜像补齐）：content 非空时，`reasoning_content` 会镜像为 anthropic `thinking` block 置前（而非丢弃），content 本身是 text block；两路径严格互斥不双写。
+  - 与之互斥（2026-08-07 ①b-chat 镜像补齐）：content 非空时，`reasoning_content` 会镜像为 anthropic `thinking` block 置前（而非丢弃），content 本身是 text block；两路径严格互斥不双写。
+  - 与之互斥（2026-08-07 ①b-chat 镜像补齐）：content 非空时，`reasoning_content` 会镜像为 anthropic `thinking` block 置前（而非丢弃），content 本身是 text block；两路径严格互斥不双写。
+  - 与之互斥（2026-08-07 ①b-chat 镜像补齐）：content 非空时，`reasoning_content` 会镜像为 anthropic `thinking` block 置前（而非丢弃），content 本身是 text block；两路径严格互斥不双写。
+  - 与之互斥（2026-08-07 ①b-chat 镜像补齐）：content 非空时，`reasoning_content` 会镜像为 anthropic
+    `thinking` block 置前（而非丢弃），content 本身是 text block；两路径严格互斥不双写。
+  - 与之互斥（2026-08-07 ①b-chat 镜像补齐）：content 非空时，`reasoning_content` 会镜像为 anthropic
+    `thinking` block 置前（而非丢弃），content 本身是 text block；两路径严格互斥不双写。
+  - 与之互斥（2026-08-07 ①b-chat 镜像补齐）：content 非空时，`reasoning_content` 会镜像为 anthropic `thinking` block 置前（而非丢弃），content 本身是 text block；两路径严格互斥不双写。
+  - 与之互斥（2026-08-07 ①b-chat 镜像补齐）：content 非空时，`reasoning_content` 会镜像为
+    anthropic `thinking` block 置前（而非丢弃），content 本身是 text block；两路径严格互斥不双写。
+  - 与之互斥（2026-08-07 ①b-chat 镜像补齐）：content 非空时，`reasoning_content` 会镜像为 anthropic `thinking` block 置前（而非丢弃），content 本身是 text block；两路径严格互斥不双写。
+  - 与之互斥（2026-08-07 ①b-chat 镜像补齐）：content 非空时，`reasoning_content` 会镜像为 anthropic `thinking` block 置前（而非丢弃），content 本身是 text block；两路径严格互斥不双写。
+  - 与之互斥（2026-08-07 ①b-chat 镜像补齐）：content 非空时，`reasoning_content` 会镜像为 anthropic `thinking` block 置前（而非丢弃），content 本身是 text block；两路径严格互斥不双写。
+  - 与之互斥（2026-08-07 ①b-chat 镜像补齐）：content 非空时，`reasoning_content` 会镜像为 anthropic `thinking` block 置前（而非丢弃），content 本身是 text block；两路径严格互斥不双写。
+  - 与之互斥（2026-08-07 ①b-chat 镜像补齐）：content 非空时，`reasoning_content` 会镜像为 anthropic
+    `thinking` block 置前（而非丢弃），content 本身是 text block；两路径严格互斥不双写。
+  - 与之互斥（2026-08-07 ①b-chat 镜像补齐）：content 非空时，`reasoning_content` 会镜像为 anthropic
+    `thinking` block 置前（而非丢弃），content 本身是 text block；两路径严格互斥不双写。
+  - 与之互斥（2026-08-07 ①b-chat 镜像补齐）：content 非空时，`reasoning_content` 会镜像为 anthropic
+    `thinking` block 置前（而非丢弃），content 本身是 text/tool block；两条路径严格互斥、不双写。
+  - 与之互斥（2026-08-07 ①b-chat 镜像补齐）：content 非空时，`reasoning_content` 会镜像为 anthropic
+    `thinking` block 置前（而非丢弃），content 本身是 text block；两路径严格互斥不双写。
+  - 与之互斥（2026-08-07 ①b-chat 镜像补齐）：content 非空时，`reasoning_content` 会镜像为 anthropic
+    `thinking` block 置前（而非丢弃），content 本身是 text block；两路径严格互斥不双写。
 - reasoning 强度映射：source/target 各自声明的档位能力做相对排名映射，非绝对锚定，详见
   「reasoning 强度映射（深入）」§ 6。
 - codex install 写入的 base_url 层级未逐字核对 codex 官方文档，实际接入报 404/400 时需按官方
@@ -778,10 +809,10 @@ token 里选定）过滤候选 client_token；无匹配协议的 token 时提示
   响应/事件，不会让客户端挂死。
 - 只在 Claude Code 会话启动时（SessionStart hook）拉起一次，会话运行期间进程崩溃不会自动
   重启/自愈，需手动 `on`。
-- responses→anthropic 方向的 reasoning 回传：当前上游 reasoning 内容块不回传给 anthropic
-  客户端（th_chars 恒 0，补齐回传属后续批工作）；且即便补齐，产出的 thinking block 也不会有
-  `signature` 字段（正向转换不保留 signature_delta，反向无来源）——对只读评估无影响，对会把
-  thinking 回传上游的多轮客户端（Claude Code）是已知限制。
+- 反向（responses→anthropic、chat→anthropic）的 reasoning→thinking 回传：2026-08-07 已补齐（①b
+  + ①b-chat 镜像），上游 reasoning 内容块会回传为 anthropic thinking block（th_chars>0）。**已知
+  限制**：产出的 thinking block 没有 `signature` 字段（正向转换不保留 signature_delta，反向无来源）
+  ——对只读评估无影响，对会把 thinking 回传上游的多轮客户端（Claude Code）是已知限制。
 - 未接入自动化测试覆盖真实上游网络调用（转换器单测均为脱网络单测，转发编排本身未做端到端自动化
   测试，依赖手动 curl 验证）。
 - effort 探测（`supply test`）解析结果不保证准确，仅供人工审阅参考。
