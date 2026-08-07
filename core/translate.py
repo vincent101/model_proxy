@@ -520,9 +520,16 @@ def openai_to_anthropic_response(resp: dict, ctx: dict = None) -> dict:
             "input": parsed,
         })
 
+    # ①b-chat 镜像：reasoning_content → thinking block（置前，对齐 anthropic 原生
+    # "thinking 在前"约定）。仅在已有正文/工具块（content 非空场景）时镜像；
+    # content 空场景由下方兜底把 reasoning_content 填成 text——两条路径互斥不双写。
+    # signature 无来源（与 ①b 一致），不产出 signature 字段。
+    reasoning = message.get("reasoning_content")
+    if isinstance(reasoning, str) and reasoning.strip() and content_blocks:
+        content_blocks.insert(0, {"type": "thinking", "thinking": reasoning})
+
     # 空回答兜底：content 与 tool_calls 都为空，但 reasoning_content 非空
     if _ENABLE_REASONING_FALLBACK and not content_blocks:
-        reasoning = message.get("reasoning_content")
         if isinstance(reasoning, str) and reasoning.strip():
             content_blocks.append({
                 "type": "text",
@@ -602,6 +609,7 @@ class OpenAIToAnthropicStreamAdapter:
         self._finalized = False
         self.reasoning_buf = ""              # 累积 delta.reasoning_content
         self.produced_content_block = False  # 是否产出过 text/tool block（不含 reasoning 累积）
+        self.thinking_emitted = False        # ①b-chat：reasoning_buf 是否已镜像为 thinking block
         self.reasoning_tokens = 0
 
     # ---- 事件构造 helper（§3.2） ----
