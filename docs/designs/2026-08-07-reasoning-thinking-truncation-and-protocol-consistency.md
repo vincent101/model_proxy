@@ -3,6 +3,7 @@ type: design-decision
 status: draft
 target: "[[tools/model_proxy]]"
 tags: [architect, model_proxy, reasoning, max_tokens, truncation, protocol-consistency, effort-mapping]
+updated: 2026-08-07（基于实测+全档推演，修正 Defect A 根因与方案方向：原"钳到 xhigh"→"去掉写死字典、信 supply 配置"；新增 decode 对称修复）
 ---
 
 # reasoning 模型经 model_proxy 的 thinking 截断与协议不一致：根因与理想治理方案
@@ -106,10 +107,21 @@ model_eval 评估体系（`tools/model_eval/`）经 model_proxy（`tools/model_p
 
 ### ① 协议转换层（translate.py / reasoning/codecs.py / reasoning/ladder.py）
 
-**1a. 修复 Defect A——canonical→chat/responses 档名映射不得静默降级。**
-- 新增"档名映射溢出"的显式处理策略，替代当前 `.get(level, "medium")` 的静默兜底。三选一并可配置，默认推荐"向上钳到该域最高可用思考档"：MAX→`"xhigh"`（而非 medium）。理由：客户端表达了"要最强思考"，降级到 medium 是反向违背意图，向上钳到域内最高（xhigh）最贴近原意图；XML/配置错误应暴露而非吞噬。
-- 在 `codecs.py` 给 `_canonical_to_openai_effort_name` 增加 overflow 分支：命中不了时按 `_CANONICAL_TO_CHAT_NAME` 已注册键里 ≤ level 的最高者取值；level 高于所有键则取最高键（xhigh）。同时在该处记 `logger.warning`（"effort X 超出 responses 域词表，已钳到 xhigh"），让降级可见。
-- **配套**：`registry.py` 增一个"supply capability 与协议域词表一致性"启动期校验——若 supply 是 responses/chat 协议但其 `effort_enum` 含 `max`/`minimal`（域外档名），启动/重载时 warning 提示该档在 wire 层会被钳位，从配置源头杜绝"配置写了 max 但域里不存在"的隐性漂移。
+**1a. 修复 Defect A——encode+decode 双侧去掉写死字典，信 supply 配置（根因修正后的方向）。**
+
+encode（出站，target 侧）：
+- `_canonical_to_openai_effort_name`（codecs.py:185-190）改为 `return abstract.level.name.lower()`（MAX→"max"，HIGH→"high"），不再查 `_CANONICAL_TO_CHAT_NAME` 写死字典。
+- **安全性**：remap 已把 level 收窄到 target supply 的 `effort_enum` 内（supply 没配的档不会出现在 level），所以 `level.name.lower()` 一定是 supply 声明支持的 wire 档名字符串。supply 配 max 就发 max，配置是权威。
+- 上游不认该档（400）= supply 配置与上游实际不符（配置错误），该修配置，不是代理偷偷降级。代理职责是"忠实地把配置的档位发给上游"。
+- 实测验证：responses/chat 端点发 max 都 200（见 Defect A 实测），supply 配 max 是对的、网关接受，写死字典是多余且有害的一层。
+
+decode（入站，source 侧，对称修复）：
+- `ChatReasoningCodec.decode` / `ResponsesReasoningCodec.decode`（codecs.py:204/234 附近）把查 `_CHAT_NAME_TO_CANONICAL`（不含 max）改为查全表 `_NAME_TO_CANONICAL`（ladder.py:79-88，含 off/none/minimal/low/medium/high/xhigh/max）。
+- **现状 bug**：responses/chat SDK 发 `effort=max` → decode 查窄字典不认 → present=False → max 意图被丢（推演组合 C/D 的 max，见验证）。
+- **为什么用全表而非 source capability**：decode 职责是"识别客户端档名字符串→canonical"，这是固定映射（档名=canonical 枚举小写），协议无关；source capability（`tiers_source_capability`）约束（SDK 能发哪些档）在 remap 阶段 clamp，不在 decode。decode 用全表识别所有合法档名，remap 信 source/target capability 映射——职责分离。
+
+anthropic 统一（一致性，可选）：
+- anthropic encode/decode 本就含 max、无 bug（`_ANTHROPIC_NAME_TO_CANONICAL` 含全档）。但为未来加新档不再改字典，可统一 encode 用 `level.name.lower()`、decode 用全表 `_NAME_TO_CANONICAL`。不改也无 bug，改了更一致。
 
 **1b. 修复 Defect B——补齐 responses→anthropic 的 reasoning→thinking 回传，实现双向对称。**
 - `ResponsesToAnthropicStreamAdapter.feed` 增加 reasoning item 分支：`response.output_item.added` 遇 `item.type=="reasoning"` 开一个 anthropic `thinking` block；`response.reasoning_summary_text.delta` → `thinking_delta`；对应 `.done` → `content_block_stop`。产出与 anthropic 原生 thinking 块同构，使 anthropic 客户端经 responses 上游也能看到 thinking。
@@ -172,18 +184,27 @@ model_eval 评估体系（`tools/model_eval/`）经 model_proxy（`tools/model_p
   - ④b 自动放大重试会让"原本一次失败的请求"变成"放大后多花 token 的重试"，对有成本敏感的上游要可关；且重试放大可能加剧延迟（ds-flash Q5 已 499s）。
 - **不影响既有正确性**：所有修复都应是"增量补齐"（补回传、补 overflow 钳位、补预算治理），不改变 remap 主算法的相对映射语义（①a 只动 overflow 兜底，不动 remap 本体；MAX 在主路径仍走查表，无特殊分支，符合 codes/capability 的决策2约束）。
 - **需用户确认**：
-  1. ①a 的 overflow 默认策略取"向上钳到域内最高档 xhigh"是否认可（另一选项是"配置错误即 400 拒绝"，更严格但会让当前 glm responses 接入直接不可用）。
-  2. ②a 允许 proxy 主动放大 max_tokens 是否可接受（涉及"代理改动客户端显式参数"的边界）；若不接受，退化为只告警不放大。
-  3. 是否接受新增 per-supply `output_budget` 配置字段（config schema 扩展）。
+  1. ①a 方向已从原"钳到 xhigh"修正为"去掉写死字典、信 supply 配置直接发档名"（依据：实测 responses/chat 网关都接受 max，supply 配置是上游真实能力权威）。是否认可？上游不认该档则 400 暴露配置错误，代理不偷偷降级。
+  2. decode 改用全表 `_NAME_TO_CANONICAL`（含 max）替代窄字典——是否认可？（source capability 约束仍在 remap。）
+  3. ②a 允许 proxy 主动放大 max_tokens 是否可接受；若不接受，退化为只告警不放大。
+  4. 是否接受新增 per-supply `output_budget` 配置字段。
 - **与 2026-07-24 reasoning 统计移除决策的边界**：⑤a 不重启 reasoning token 记账，只新增截断/放大/重试的事件标记与可选 stop_reason，与"不再单独统计 reasoning token"的原决策不冲突。
 
 ## 验证方式
 
-- **Defect A 修复验证**：构造 anthropic 请求 `output_config.effort=max` → responses 上游，断言发出的 wire 为 `reasoning.effort=="xhigh"`（而非 medium）；单测覆盖 MAX/MINIMAL 溢出、域内正常档。对照：修复前实测为 `'medium'`。
+- **Defect A 修复验证（encode）**：构造 anthropic 请求 `output_config.effort=max` → responses/chat 上游，断言发出的 wire 为 `reasoning.effort=="max"`（修复前为 `'medium'`）。单测覆盖全档 low/medium/high/xhigh/max，断言均发 `level.name.lower()`。
+- **Defect A 修复验证（decode）**：构造 responses/chat 入站请求 `reasoning.effort=max`，断言 decode 产出 `RawIntent(level=MAX, present=True)`（修复前 `present=False`）；anthropic 入站 decode 不回归。
+- **Defect A 实测证据（网关真实接受 max，绕开 model_proxy 直 curl 上游）**：
+  - responses 端点（glm-52-sankuai-openai-3339）：`reasoning.effort=max` → HTTP 200 + 模型自述"最高档" + reasoning_tokens=578
+  - chat 端点（kimi-k3-sankuai-openai-3339）：`reasoning_effort=max` → HTTP 200 + 模型自述"max(最高档)" + reasoning_content 756 字符
+  - 证明 supply 配 max 正确、网关接受，写死字典是多余且有害的一层。
+- **全档推演验证（6+3 组合 × low/medium/high/max）**：source=`[low,medium,high,xhigh,max]`，覆盖 sdk=anthropic(adaptive/enabled budget)/responses × target=anthropic(`[high,max]` 与 `[low,high,max]`)/responses(`[high,max]`)。脚本 `/tmp/trace_combos.py`（含 ds-flash target=`[low,high,max]` 组合 G/H/I）。关键断言：
+  - 修复前：target=responses/chat 且 remap=MAX（high/xhigh/max）时 encode 发 medium（bug）；修复后发 max。
+  - 修复前：responses/chat sdk 发 max 时 decode present=0（bug）；修复后 present=1。
+  - low/medium 全协议无 bug（remap→HIGH，字典有 high）；anthropic target 全档无 bug（字典含 max）。
+  - ds-flash（anthropic target `[low,high,max]`）：encode 本就正常，low→low 不升档（对比 glm-openai `[high,max]` 的 low→high 升档），证明 target cap 档位越多 remap 越保真。
 - **Defect B 修复验证**：非流式 + 流式各构造含 reasoning item 的 responses 响应/事件流，断言 anthropic 侧产出 `thinking` block 且文本完整；回归 glm-52-sankuai-openai-3339 跑 Q10，th_chars 应从 0 变为 >0。
-- **预算治理验证**：
-  - 用 max_tokens=16000 对 ds-flash@max 发 Q6，验证 ②a 自动放大 + ④b 重试后正常 end_turn（不再 stop=max_tokens 且 text 缺失），ACCESS 出现 `budget_raised/budget_retried`。
-  - 用 responses→anthropic 且客户端不传 max_tokens，验证不再默认 4096，而按 supply output_budget 取值。
+- **预算治理验证**：用 max_tokens=16000 对 ds-flash@max 发 Q6，验证 ②a 自动放大 + ④b 重试后正常 end_turn；用 responses→anthropic 且客户端不传 max_tokens，验证不再默认 4096。
 - **一致性验证**：对 glm-5.2 同一 canonical effort，分别走 anthropic / responses 入口发探针，断言两侧 th_chars 均 >0 且模型自述档位一致。
 - **回归**：跑通 model_proxy 既有 tests/ 全部脱网络单测；确认 remap 主算法单测不受影响（①a 不改 remap）。
 
