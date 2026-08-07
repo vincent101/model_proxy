@@ -16,6 +16,15 @@ decode() 只产出 RawIntent（协议无关，未经跨模型换算），不再�
 对应的 wire 结构模板，不需要重复判断 level 本身、也不需要 cap 参数（remap 阶段已把
 level 收窄到该 target 能力范围内的合法值）。
 
+词表约定（codec 层零词表）：档名字符串 ↔ canonical 的映射唯一权威在 ladder 的
+_NAME_TO_CANONICAL（name_to_canonical()），本模块不持有任何协议域词表字典。
+encode 直接把 canonical 枚举名小写作为 wire 档名（level.name.lower()）——remap 阶段已把
+level 收窄到 target supply 的 effort_enum 内，故 supply 声明的档名即 wire 档名；上游不认
+该档（400）是配置错误，由既有 400 自适应机制暴露，代理不做静默降级。decode 用全表识别
+所有合法档名（含 max/minimal/off/none），source/target capability 约束统一收在 remap，
+职责分离。唯一保留的协议域常量是 openai 域（chat/responses）的关闭词 "none"（DISABLED
+分支）：这是协议事实（openai 域用 effort="none" 表达关闭），不是配置事实。
+
 OFF/MAX 统一约束（决策2，全代码库范围）：
 - OFF 唯一允许的两处判断：capability.remap() 里的 OFF 吸收态 clause + capability.
   abstract_encode() 里 level==OFF -> DISABLED 的判断。本模块不再出现任何
@@ -25,9 +34,18 @@ OFF/MAX 统一约束（决策2，全代码库范围）：
 """
 
 from abc import ABC, abstractmethod
+import logging
 
 from .capability import AbstractKind, AbstractReasoning
-from .ladder import CanonicalEffort, RawIntent, budget_to_canonical, canonical_to_budget
+from .ladder import (
+    CanonicalEffort,
+    RawIntent,
+    budget_to_canonical,
+    canonical_to_budget,
+    name_to_canonical,
+)
+
+log = logging.getLogger(__name__)
 
 # 语法变体标识
 CHAT_EFFORT = "chat_effort"
@@ -69,19 +87,6 @@ class ReasoningCodec(ABC):
 # Anthropic：thinking.type=enabled(+budget_tokens) / adaptive(+output_config.effort) / disabled
 # ============================================================================
 
-# Anthropic 协议域内的档名字符串集合（有 max，没有 none/off——"不思考"是 thinking.type=disabled，
-# 不是 effort=none）。
-_ANTHROPIC_NAME_TO_CANONICAL = {
-    "minimal": CanonicalEffort.MINIMAL,
-    "low": CanonicalEffort.LOW,
-    "medium": CanonicalEffort.MEDIUM,
-    "high": CanonicalEffort.HIGH,
-    "xhigh": CanonicalEffort.XHIGH,
-    "max": CanonicalEffort.MAX,
-}
-_CANONICAL_TO_ANTHROPIC_NAME = {v: k for k, v in _ANTHROPIC_NAME_TO_CANONICAL.items()}
-
-
 class AnthropicReasoningCodec(ReasoningCodec):
     """thinking.type ∈ {enabled, adaptive, disabled} 双变体编解码器。"""
 
@@ -114,11 +119,19 @@ class AnthropicReasoningCodec(ReasoningCodec):
             return RawIntent(level=level, source_budget=budget, present=True)
 
         if ttype == "adaptive":
-            level = _ANTHROPIC_NAME_TO_CANONICAL.get(effort_str)
-            if level is None:
-                # 未指定/不是 Anthropic 域内识别的标准词 → 沿用现状默认兜底：medium
+            if effort_str is None:
+                # absent：effort 缺失 → 维持现状默认兜底 medium
                 # （现状 bare adaptive 无 effort 时的既有行为，钳位/映射由 remap() 统一处理）
-                level = CanonicalEffort.MEDIUM
+                return RawIntent(level=CanonicalEffort.MEDIUM, source_budget=None, present=True)
+            level = name_to_canonical(effort_str)
+            if level is None:
+                # unrecognized：非空但未识别的档名 → 不静默降级 MEDIUM，诚实标注"无法识别"，
+                # 原字段是否透传/清理由 remap 决定（与 chat/responses decode 未识别行为对齐）。
+                log.warning("anthropic adaptive decode: unrecognized effort %r, treated as not-present",
+                            effort_str)
+                return RawIntent(level=None, source_budget=None, present=False)
+            # 行为变化点明：effort="none"/"off" 经全表识别为 OFF（走 remap 的 OFF 吸收态），
+            # 不再是旧行为的"未识别 → 静默 MEDIUM"，与 openai 域"none=关闭"语义对齐。
             return RawIntent(level=level, source_budget=None, present=True)
 
         # thinking 缺失/其他值 → 不产出（含裸 output_config.effort 场景，保持现状"不生效"语义）
@@ -139,8 +152,9 @@ class AnthropicReasoningCodec(ReasoningCodec):
             # 且清除游离的 output_config.effort（现状 haiku 报错防护逻辑保留）。
             return {"thinking": {"type": "enabled", "budget_tokens": budget}, "output_config": None}
 
-        # ANTHROPIC_ADAPTIVE：查表取协议域档名字符串，MAX 走正常查表，无特殊分支。
-        name = _CANONICAL_TO_ANTHROPIC_NAME.get(abstract.level, "medium")
+        # ANTHROPIC_ADAPTIVE：canonical 枚举名小写即 wire 档名（remap 已把 level 收窄到
+        # target supply 的 effort_enum 内），MAX 走同一路径，无特殊分支。
+        name = abstract.level.name.lower()
         return {"thinking": {"type": "adaptive"}, "output_config": {"effort": name}}
 
     def interpret_rejection(self, error_body: bytes, used_variant: str) -> "str | None":
@@ -169,25 +183,12 @@ class AnthropicReasoningCodec(ReasoningCodec):
 # Chat（OpenAI chat/completions）：reasoning_effort 字段，单变体
 # ============================================================================
 
-# Chat/Responses 协议域内的档名字符串集合（有 none，没有 max/minimal——该域词表本身比
-# canonical 全序窄，属协议 wire 层限制，应体现为该域 ModelReasoningCapability 的
-# effort_enum 配置不含 max/minimal，而不是在转换函数里写 if 分支降级）。
-_CHAT_NAME_TO_CANONICAL = {
-    "none": CanonicalEffort.OFF,
-    "low": CanonicalEffort.LOW,
-    "medium": CanonicalEffort.MEDIUM,
-    "high": CanonicalEffort.HIGH,
-    "xhigh": CanonicalEffort.XHIGH,
-}
-_CANONICAL_TO_CHAT_NAME = {v: k for k, v in _CHAT_NAME_TO_CANONICAL.items()}
-
-
 def _canonical_to_openai_effort_name(level: CanonicalEffort) -> str:
-    """canonical → Chat/Responses 域内档名字符串，纯查表 + 默认兜底，无 MAX/MINIMAL 专门
-    if 分支（决策2：MAX 完全统一，走查表路径；该域本就不该被配置出 MAX，配置层责任见
-    方案文档 §3.1，这里只做兜底防御，不做针对 MAX 的判断）。
+    """canonical → Chat/Responses 域 wire 档名字符串：枚举名小写直出，无查表、无兜底、
+    无 MAX/MINIMAL 专门 if 分支（决策2）。安全性：remap 已把 level 收窄到 target supply 的
+    effort_enum 内，supply 声明的档名即 wire 档名；上游不认（400）是配置错误，不静默降级。
     """
-    return _CANONICAL_TO_CHAT_NAME.get(level, "medium")
+    return level.name.lower()
 
 
 class ChatReasoningCodec(ReasoningCodec):
@@ -201,7 +202,8 @@ class ChatReasoningCodec(ReasoningCodec):
         effort_str = body.get("reasoning_effort")
         if effort_str is None:
             return RawIntent(level=None, source_budget=None, present=False)
-        level = _CHAT_NAME_TO_CANONICAL.get(effort_str)
+        # 全表识别（含 max/minimal/off/none），capability 约束收在 remap，不在 decode。
+        level = name_to_canonical(effort_str)
         if level is None:
             return RawIntent(level=None, source_budget=None, present=False)
         return RawIntent(level=level, source_budget=None, present=True)
@@ -212,6 +214,7 @@ class ChatReasoningCodec(ReasoningCodec):
         if abstract.kind == AbstractKind.STRIP:
             return {"reasoning_effort": None}
         if abstract.kind == AbstractKind.DISABLED:
+            # "none" 是 openai 域关闭词的协议事实（不是配置），是本模块唯一保留的域常量。
             return {"reasoning_effort": "none"}
         return {"reasoning_effort": _canonical_to_openai_effort_name(abstract.level)}
 
@@ -232,7 +235,8 @@ class ResponsesReasoningCodec(ReasoningCodec):
         effort_str = r.get("effort") if isinstance(r, dict) else None
         if effort_str is None:
             return RawIntent(level=None, source_budget=None, present=False)
-        level = _CHAT_NAME_TO_CANONICAL.get(effort_str)
+        # 全表识别（含 max/minimal/off/none），capability 约束收在 remap，不在 decode。
+        level = name_to_canonical(effort_str)
         if level is None:
             return RawIntent(level=None, source_budget=None, present=False)
         return RawIntent(level=level, source_budget=None, present=True)
@@ -243,5 +247,6 @@ class ResponsesReasoningCodec(ReasoningCodec):
         if abstract.kind == AbstractKind.STRIP:
             return {"reasoning": None}
         if abstract.kind == AbstractKind.DISABLED:
+            # "none" 是 openai 域关闭词的协议事实（不是配置），是本模块唯一保留的域常量。
             return {"reasoning": {"effort": "none"}}
         return {"reasoning": {"effort": _canonical_to_openai_effort_name(abstract.level)}}

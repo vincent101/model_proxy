@@ -116,6 +116,17 @@ class TestLadder(unittest.TestCase):
         self.assertIsNone(name_to_canonical(None))
         self.assertIsNone(name_to_canonical(123))
 
+    def test_name_to_canonical_enum_name_invariant(self):
+        """词表不变量（codec 零词表后的全局唯一映射约定）：canonical 枚举名小写 ==
+        wire 档名字符串，name_to_canonical 对其自映射。未来新增枚举值时本测试强制
+        同步词表，杜绝"新增档名 → 某处漏加 → 静默降级"的复发路径。"""
+        for e in CE:
+            self.assertEqual(name_to_canonical(e.name.lower()), e,
+                             f"{e.name} 未自映射，词表与枚举失同步")
+        # OFF 双拼：off 与 none 都映射 OFF
+        self.assertEqual(name_to_canonical("off"), CE.OFF)
+        self.assertEqual(name_to_canonical("none"), CE.OFF)
+
 
 # ============================================================================
 # capability：ModelReasoningCapability.from_config（含 off_alias 单调性守卫）
