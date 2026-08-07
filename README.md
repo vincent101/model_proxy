@@ -771,36 +771,6 @@ token 里选定）过滤候选 client_token；无匹配协议的 token 时提示
   `stop_reason` 不变（仍反映真实截断原因）。可用 `core/translate.py` 模块级常量
   `_ENABLE_REASONING_FALLBACK`（默认 True）整体关闭。
   - 与之互斥（2026-08-07 ①b-chat 镜像补齐）：content 非空时，`reasoning_content` 会镜像为 anthropic `thinking` block 置前（而非丢弃），content 本身是 text block；两路径严格互斥不双写。
-  - 与之互斥（2026-08-07 ①b-chat 镜像补齐）：content 非空时，`reasoning_content` 会镜像为 anthropic
-    `thinking` block 置前（而非丢弃），content 本身是 text block；两路径严格互斥不双写。
-  - 与之互斥（2026-08-07 ①b-chat 镜像补齐）：content 非空时，`reasoning_content` 会镜像为 anthropic `thinking` block 置前（而非丢弃），content 本身是 text block；两路径严格互斥不双写。
-  - 与之互斥（2026-08-07 ①b-chat 镜像补齐）：content 非空时，`reasoning_content` 会镜像为 anthropic
-    `thinking` block 置前（而非丢弃），content 本身是 text block；两路径严格互斥不双写。
-  - 与之互斥（2026-08-07 ①b-chat 镜像补齐）：content 非空时，`reasoning_content` 会镜像为 anthropic `thinking` block 置前（而非丢弃），content 本身是 text block；两路径严格互斥不双写。
-  - 与之互斥（2026-08-07 ①b-chat 镜像补齐）：content 非空时，`reasoning_content` 会镜像为 anthropic `thinking` block 置前（而非丢弃），content 本身是 text block；两路径严格互斥不双写。
-  - 与之互斥（2026-08-07 ①b-chat 镜像补齐）：content 非空时，`reasoning_content` 会镜像为 anthropic `thinking` block 置前（而非丢弃），content 本身是 text block；两路径严格互斥不双写。
-  - 与之互斥（2026-08-07 ①b-chat 镜像补齐）：content 非空时，`reasoning_content` 会镜像为 anthropic `thinking` block 置前（而非丢弃），content 本身是 text block；两路径严格互斥不双写。
-  - 与之互斥（2026-08-07 ①b-chat 镜像补齐）：content 非空时，`reasoning_content` 会镜像为 anthropic
-    `thinking` block 置前（而非丢弃），content 本身是 text block；两路径严格互斥不双写。
-  - 与之互斥（2026-08-07 ①b-chat 镜像补齐）：content 非空时，`reasoning_content` 会镜像为 anthropic
-    `thinking` block 置前（而非丢弃），content 本身是 text block；两路径严格互斥不双写。
-  - 与之互斥（2026-08-07 ①b-chat 镜像补齐）：content 非空时，`reasoning_content` 会镜像为 anthropic `thinking` block 置前（而非丢弃），content 本身是 text block；两路径严格互斥不双写。
-  - 与之互斥（2026-08-07 ①b-chat 镜像补齐）：content 非空时，`reasoning_content` 会镜像为
-    anthropic `thinking` block 置前（而非丢弃），content 本身是 text block；两路径严格互斥不双写。
-  - 与之互斥（2026-08-07 ①b-chat 镜像补齐）：content 非空时，`reasoning_content` 会镜像为 anthropic `thinking` block 置前（而非丢弃），content 本身是 text block；两路径严格互斥不双写。
-  - 与之互斥（2026-08-07 ①b-chat 镜像补齐）：content 非空时，`reasoning_content` 会镜像为 anthropic `thinking` block 置前（而非丢弃），content 本身是 text block；两路径严格互斥不双写。
-  - 与之互斥（2026-08-07 ①b-chat 镜像补齐）：content 非空时，`reasoning_content` 会镜像为 anthropic `thinking` block 置前（而非丢弃），content 本身是 text block；两路径严格互斥不双写。
-  - 与之互斥（2026-08-07 ①b-chat 镜像补齐）：content 非空时，`reasoning_content` 会镜像为 anthropic `thinking` block 置前（而非丢弃），content 本身是 text block；两路径严格互斥不双写。
-  - 与之互斥（2026-08-07 ①b-chat 镜像补齐）：content 非空时，`reasoning_content` 会镜像为 anthropic
-    `thinking` block 置前（而非丢弃），content 本身是 text block；两路径严格互斥不双写。
-  - 与之互斥（2026-08-07 ①b-chat 镜像补齐）：content 非空时，`reasoning_content` 会镜像为 anthropic
-    `thinking` block 置前（而非丢弃），content 本身是 text block；两路径严格互斥不双写。
-  - 与之互斥（2026-08-07 ①b-chat 镜像补齐）：content 非空时，`reasoning_content` 会镜像为 anthropic
-    `thinking` block 置前（而非丢弃），content 本身是 text/tool block；两条路径严格互斥、不双写。
-  - 与之互斥（2026-08-07 ①b-chat 镜像补齐）：content 非空时，`reasoning_content` 会镜像为 anthropic
-    `thinking` block 置前（而非丢弃），content 本身是 text block；两路径严格互斥不双写。
-  - 与之互斥（2026-08-07 ①b-chat 镜像补齐）：content 非空时，`reasoning_content` 会镜像为 anthropic
-    `thinking` block 置前（而非丢弃），content 本身是 text block；两路径严格互斥不双写。
 - reasoning 强度映射：source/target 各自声明的档位能力做相对排名映射，非绝对锚定，详见
   「reasoning 强度映射（深入）」§ 6。
 - codex install 写入的 base_url 层级未逐字核对 codex 官方文档，实际接入报 404/400 时需按官方
