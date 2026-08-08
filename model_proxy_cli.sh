@@ -27,21 +27,20 @@ print_help() {
 查询观察:
   status                            显示运行态总览
   logs [N] [field=val]              显示最近 N 条日志（默认 30 条 ACCESS）。
-                                    支持按字段过滤（OPT-11）：
+                                    支持按字段过滤：
                                       logs                最近 30 条 ACCESS
                                       logs 50             最近 50 条 ACCESS
                                       logs req=abc12345   按 req_id 过滤所有日志行
                                       logs level=ERROR    按级别过滤（ERROR/WARNING/INFO）
                                       logs event=cooldown  按事件关键词过滤
                                       logs req=abc 50     过滤 + 条数
-  stats [时间]                      读独立账本（不受日志截断影响），按 supply/route/strategy
-                                    三维度各投影一段。用法示例：
+  stats [时间]                      统计 supply/route/strategy 用量（独立账本，不受日志截断影响）
+                                    支持按时间过滤：
                                       stats                          全历史 total
                                       stats today                    今天（UTC+8）
                                       stats month                    本月（UTC+8）
                                       stats 2026-07-23                指定某天
                                       stats 2026-07                   指定某月
-                                    max_ms 在 period 行（账本口径）
 
 配置管理:
   supply                            打印 supply list 后进入交互菜单，可选操作：
