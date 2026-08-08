@@ -4,8 +4,8 @@
 由 model_proxy_cli.sh 的 cmd_status 调用，也可被 _config_ops.py import。
 
 两个 CLI 入口：
-    python3 _format_ops.py status-format           # stdin 读 server JSON，打印五段
-    python3 _format_ops.py status-offline <config>  # 直读 config + sidecar，打印静态三段
+    python3 _format_ops.py status-format <config> <totals>   # stdin 读 server JSON
+    python3 _format_ops.py status-offline <config> <totals>  # 直读 config + sidecar
 
 格式化函数返回 list[str]（不直接 print），可被 unittest 覆盖。
 
@@ -18,6 +18,7 @@ import json
 import os
 import sys
 import unicodedata
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -26,6 +27,13 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from core.commands import SessionOverridesSidecar
 
 TIER_NAMES = ("opus", "sonnet", "haiku")
+
+# P0 degraded 阈值（用户拍板：fail%>30% 且样本≥5）
+DEGRADED_MIN_REQUESTS = 5
+DEGRADED_FAIL_PCT = 30.0
+
+# CST 时区（与 server _cst_now 一致，账本 today 桶按 CST 取）
+_CST = timezone(timedelta(hours=8))
 
 
 # ---------------------------------------------------------------------------
@@ -108,38 +116,130 @@ def normalize_supply(d: dict) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# P0 数据函数（全部 stdlib，零 server 改动）
+# ---------------------------------------------------------------------------
+
+def _parse_combo_key(key: str) -> dict:
+    """拆 combo 键 `supply=X|route=Y|strategy=Z` 成 dict。
+
+    与 cmd_stats 的 parse_combo_key（model_proxy_cli.sh:483-488）同逻辑；
+    heredoc 内嵌 python 无法 import，此为有注释互指的小重复。
+    """
+    dims = {}
+    for part in key.split("|"):
+        k, v = part.split("=", 1)
+        dims[k] = v
+    return dims
+
+
+def load_supply_health(totals_path: str) -> dict[str, dict]:
+    """读账本 CST today 桶，combos 按 supply 聚合 {requests, ok, fail}。
+
+    文件缺失/JSON 损坏 → 返回 {}（降级不报错）。
+    """
+    try:
+        with open(totals_path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        return {}
+
+    today_str = datetime.now(_CST).strftime("%Y-%m-%d")
+    day = data.get("days", {}).get(today_str, {})
+    combos = day.get("combos", {})
+
+    health: dict[str, dict] = {}
+    for key, v in combos.items():
+        dims = _parse_combo_key(key)
+        sid = dims.get("supply", "?")
+        agg = health.setdefault(sid, {"requests": 0, "ok": 0, "fail": 0})
+        agg["requests"] += v.get("requests", 0)
+        agg["ok"] += v.get("ok", 0)
+        agg["fail"] += v.get("fail", 0)
+    return health
+
+
+def compute_config_anomalies(cfg: dict) -> dict:
+    """遍历 config 收集 orphan / missing_tiers / dangling_refs。
+
+    - orphan: 在 supplies 里但未被任何 route tier 引用的 supply id
+    - missing_tiers: route 的 opus/haiku 档为空（提示级，eval- 路由不硬编码豁免）
+    - dangling_refs: route tier 引用了但不在 supplies 中的 id
+    """
+    supply_ids = {s.get("id", "") for s in cfg.get("supplies", [])}
+
+    referenced: set[str] = set()
+    missing_tiers: list[str] = []
+    for r in cfg.get("routes", []):
+        rid = r.get("id", "?")
+        tiers = r.get("tiers", {})
+        for tn in TIER_NAMES:
+            ids = tiers.get(tn, [])
+            for sid in ids:
+                referenced.add(sid)
+        # 缺档检测：opus/haiku 为空
+        empty_tiers = [tn for tn in TIER_NAMES if not tiers.get(tn, [])]
+        if empty_tiers:
+            missing_tiers.append(f"{rid} 缺 {'/'.join(empty_tiers)}")
+
+    orphan_supplies = sorted(supply_ids - referenced)
+    dangling_refs = sorted(referenced - supply_ids)
+
+    return {
+        "orphan_supplies": orphan_supplies,
+        "missing_tiers": missing_tiers,
+        "dangling_refs": dangling_refs,
+    }
+
+
+def find_damaged_routes(cfg: dict, bad_supplies: set[str], cooldown: dict) -> list[str]:
+    """tier 内含 degraded∪cooling supply 的 route，输出描述行。
+
+    bad_supplies: degraded supply id 集合（不含 (none)）
+    cooldown: server JSON cooldown dict {supply_id: 剩余秒}
+    """
+    bad_set = bad_supplies | set(cooldown.keys())
+    if not bad_set:
+        return []
+
+    results = []
+    for r in cfg.get("routes", []):
+        rid = r.get("id", "?")
+        tiers = r.get("tiers", {})
+        hits: list[str] = []
+        for tn in TIER_NAMES:
+            ids = tiers.get(tn, [])
+            bad_in_tier = [sid for sid in ids if sid in bad_set]
+            if bad_in_tier:
+                # 区分 degraded / cooling
+                parts = []
+                for sid in bad_in_tier:
+                    if sid in cooldown:
+                        parts.append(f"{sid} cooling({int(cooldown[sid])}s)")
+                    elif sid in bad_supplies:
+                        parts.append(f"{sid} degraded")
+                    else:
+                        parts.append(f"{sid} abnormal")
+                hits.append(f"{tn} 档 {', '.join(parts)}")
+        if hits:
+            results.append(f"  {rid}   {'; '.join(hits)}")
+    return results
+
+
+# ---------------------------------------------------------------------------
 # 格式化函数（返回 list[str]，不直接 print）
 # ---------------------------------------------------------------------------
 
 def format_supplies(supplies: list[dict], *, preset: str) -> list[str]:
     """动态列宽格式化 supplies。
 
-    preset="STATUS": (id, protocol, model, key)，裸值无标签（仅 key 带 key= 前缀）。
-        实测最坏 71 列 <=80。
     preset="MENU": (id, protocol, model, key, rcap, cooldown)，保留带标签样式。
         菜单是交互宽屏场景，不受 80 列约束。
+
+    STATUS preset 已下线（P0），明细全归菜单。
     """
     rows = [normalize_supply(s) for s in supplies]
     if not rows:
         return ["  (无)"]
-
-    if preset == "STATUS":
-        cols = ["id", "protocol", "model", "key_masked"]
-        labels = ["", "", "", "key="]
-        # 动态列宽：每列取最大展示宽度（含 label 前缀）
-        col_widths = []
-        for i, col in enumerate(cols):
-            mw = max(display_width(labels[i] + r[col]) for r in rows)
-            col_widths.append(mw)
-        lines = []
-        for r in rows:
-            parts = []
-            for i, col in enumerate(cols):
-                val = labels[i] + r[col]
-                parts.append(_pad(val, col_widths[i]))
-            line = "  " + "  ".join(parts).rstrip()
-            lines.append(line)
-        return lines
 
     if preset == "MENU":
         lines = []
@@ -221,10 +321,10 @@ def format_strategies(strategies: list[dict], *, style: str,
                       override_counts: dict[str, int] | None = None) -> list[str]:
     """格式化 strategies。
 
-    style="status": 每个 strategy 两行——route 归属 + 覆盖/note 行。
-        覆盖行无条件打印（S3）：0 时 (无)，>0 时含来源标注。
-        override_counts: {client_token: count}，从 sidecar 或 server JSON 取。
     style="menu": 保持现有单行 {tok} -> {rid} ({note})，不传 override_counts。
+        override_counts 参数保留以兼容调用方签名，menu 分支不使用。
+
+    style="status" 已下线（P0），明细全归菜单。
     """
     if not strategies:
         return ["  (无)"]
@@ -238,25 +338,6 @@ def format_strategies(strategies: list[dict], *, style: str,
             lines.append(f"  {_pad(tok, 16)} -> {_pad(rid, 12)} ({note})")
         return lines
 
-    if style == "status":
-        lines = []
-        for st in strategies:
-            tok = st.get("client_token", "?")
-            rid = strategy_route_desc(st)
-            note = st.get("note", "") or ""
-            count = 0
-            if override_counts:
-                count = override_counts.get(tok, 0) or 0
-            # S3: 覆盖行无条件打印（S4: 拼接在 route_id/pool 分支之外）
-            if count > 0:
-                cov = (f"覆盖: {count}个session"
-                       f"（来源: sidecar，由会话内 $route 指令产生）")
-            else:
-                cov = "覆盖: (无)"
-            lines.append(f"  {_pad(tok, 16)} -> {rid}")
-            lines.append(f"      {cov}   note: {note}")
-        return lines
-
     raise ValueError(f"unknown style: {style}")
 
 
@@ -264,74 +345,201 @@ def format_strategies(strategies: list[dict], *, style: str,
 # CLI 入口
 # ---------------------------------------------------------------------------
 
-def _format_status_from_json(data: dict) -> list[str]:
-    """从 server status JSON 格式化五段输出。"""
+def _compute_degraded(health: dict[str, dict]) -> list[dict]:
+    """从 load_supply_health 结果算 degraded supply 列表（按 fail% 降序）。
+
+    阈值：fail%>DEGRADED_FAIL_PCT 且 requests>=DEGRADED_MIN_REQUESTS，排除 (none)。
+    返回 [{"id":..., "requests":..., "fail":..., "fail_pct":...}, ...]
+    """
+    degraded = []
+    for sid, v in health.items():
+        if sid == "(none)":
+            continue
+        r = v.get("requests", 0)
+        f = v.get("fail", 0)
+        if r < DEGRADED_MIN_REQUESTS:
+            continue
+        pct = 100.0 * f / r if r > 0 else 0.0
+        if pct > DEGRADED_FAIL_PCT:
+            degraded.append({"id": sid, "requests": r, "fail": f, "fail_pct": pct})
+    degraded.sort(key=lambda x: -x["fail_pct"])
+    return degraded
+
+
+def _format_config_notices(anomalies: dict) -> list[str]:
+    """格式化 config notices 段（orphan / 缺档 / dangling）。"""
     lines = []
-    lines.append("supplies:")
-    lines.extend(format_supplies(data.get("supplies", []), preset="STATUS"))
+    orphan = anomalies.get("orphan_supplies", [])
+    missing = anomalies.get("missing_tiers", [])
+    dangling = anomalies.get("dangling_refs", [])
+    if orphan:
+        lines.append(f"  orphan supplies: {', '.join(orphan)}")
+    if missing:
+        lines.append(f"  缺档: {'; '.join(missing)}（若属预期请忽略）")
+    if dangling:
+        lines.append(f"  dangling refs: {', '.join(dangling)}（route tier 引用了不存在的 supply）")
+    return lines
 
-    lines.append("routes (家族模板):")
-    lines.extend(format_routes(data.get("routes", [])))
 
-    lines.append("strategies (token 绑定):")
-    # server JSON 里 strategies 已含 sidecar_overrides_count
-    override_counts = {}
-    for st in data.get("strategies", []):
-        tok = st.get("client_token", "")
-        count = st.get("sidecar_overrides_count", 0) or 0
-        override_counts[tok] = count
-    lines.extend(format_strategies(data.get("strategies", []),
-                                  style="status", override_counts=override_counts))
+def _format_status_from_json(data: dict, config_path: str, totals_path: str) -> list[str]:
+    """从 server status JSON + config + 账本 格式化 status 输出。
 
+    布局：health 行 → 异常清单（degraded/unmatched/cooldown/damaged/config notices）
+    → config 计数行。全 0 时 health 行即"系统健康"，异常段不打印。
+    """
     cooldown = data.get("cooldown", {})
-    if cooldown:
-        lines.append("cooldown (剩余秒):")
-        for sid, remain in cooldown.items():
-            lines.append(f"  {_pad(sid, 20)} {remain}s")
+    n_supplies = len(data.get("supplies", []))
+    n_routes = len(data.get("routes", []))
+    n_strategies = len(data.get("strategies", []))
+    default_cd = data.get("default_cooldown_seconds", "?")
+
+    # overrides 求和
+    overrides_count = sum(
+        st.get("sidecar_overrides_count", 0) or 0
+        for st in data.get("strategies", [])
+    )
+
+    # config anomalies
+    with open(config_path, "r", encoding="utf-8") as f:
+        cfg = json.load(f)
+    anomalies = compute_config_anomalies(cfg)
+    n_orphan = len(anomalies.get("orphan_supplies", []))
+
+    # supply health
+    health = load_supply_health(totals_path)
+    degraded = _compute_degraded(health)
+    n_degraded = len(degraded)
+
+    # (none) unmatched
+    none_health = health.get("(none)")
+    none_fail = none_health.get("fail", 0) if none_health else 0
+
+    n_cooldown = len(cooldown)
+
+    lines = []
+
+    # health 行
+    parts = [f"cooldown {n_cooldown}/{n_supplies}"]
+    if n_degraded > 0:
+        parts.append(f"degraded {n_degraded}")
     else:
-        lines.append("cooldown: (无)")
-    lines.append(f"default_cooldown_seconds: {data.get('default_cooldown_seconds', '?')}")
+        parts.append("degraded 0")
+    parts.append(f"overrides {overrides_count}")
+    if n_orphan > 0:
+        parts.append(f"orphan {n_orphan}")
+    lines.append("health: " + " · ".join(parts))
+
+    # 异常清单（只列问题）
+    has_issues = False
+
+    if degraded:
+        has_issues = True
+        lines.append("")
+        lines.append(f"degraded supplies (today fail%>{DEGRADED_FAIL_PCT:.0f}%, n>={DEGRADED_MIN_REQUESTS}):")
+        for d in degraded:
+            lines.append(f"  {_pad(d['id'], 24)} fail {d['fail_pct']:.1f}% ({d['fail']}/{d['requests']})")
+
+    if none_fail > 0:
+        has_issues = True
+        none_req = none_health.get("requests", 0)
+        lines.append("")
+        lines.append(f"unmatched: {none_req} req 今日全失败（supply=(none)，未匹配 strategy/route，多为 401）")
+
+    if cooldown:
+        has_issues = True
+        lines.append("")
+        lines.append("cooldown (剩余秒):")
+        for sid, remain in sorted(cooldown.items()):
+            lines.append(f"  {_pad(sid, 24)} {int(remain)}s")
+
+    # damaged routes
+    degraded_ids = {d["id"] for d in degraded}
+    damaged = find_damaged_routes(cfg, degraded_ids, cooldown)
+    if damaged:
+        has_issues = True
+        lines.append("")
+        lines.append("damaged routes:")
+        lines.extend(damaged)
+
+    # config notices
+    notice_lines = _format_config_notices(anomalies)
+    if notice_lines:
+        has_issues = True
+        lines.append("")
+        lines.append("config notices:")
+        lines.extend(notice_lines)
+
+    # config 计数行
+    lines.append("")
+    cd_display = f"{default_cd}s" if default_cd != "?" else "?"
+    lines.append(f"config: {n_supplies} supplies / {n_routes} routes / {n_strategies} strategies · default_cooldown={cd_display}")
+    lines.append("       （明细: supply / route / strategy 菜单 list；今日明细: stats today supply）")
 
     return lines
 
 
-def _format_status_offline(config_path: str) -> list[str]:
-    """直读 config + sidecar 格式化静态三段（S10: 代理未运行时的降级展示）。"""
+def _format_status_offline(config_path: str, totals_path: str) -> list[str]:
+    """代理未运行时的降级展示。
+
+    cooldown/degraded 显 (代理未运行) 且不读账本（避免历史值误导为当前态）；
+    overrides/orphan/config 计数静态照常；退出码 1 由 cmd_status 保持。
+    """
     with open(config_path, "r", encoding="utf-8") as f:
         cfg = json.load(f)
 
-    lines = []
-    lines.append("supplies:")
-    lines.extend(format_supplies(cfg.get("supplies", []), preset="STATUS"))
+    n_supplies = len(cfg.get("supplies", []))
+    n_routes = len(cfg.get("routes", []))
+    n_strategies = len(cfg.get("strategies", []))
+    default_cd = cfg.get("default_cooldown_seconds", "?")
 
-    lines.append("routes (家族模板):")
-    lines.extend(format_routes(cfg.get("routes", [])))
-
-    lines.append("strategies (token 绑定):")
-    # 经 SessionOverridesSidecar 取覆盖数（复用类的文件缺失/损坏语义）
+    # overrides: sidecar 静态可读
     sidecar_path = Path(config_path).parent / "session_overrides.json"
     sidecar = SessionOverridesSidecar(sidecar_path)
-    override_counts = {}
-    for st in cfg.get("strategies", []):
-        tok = st.get("client_token", "")
-        override_counts[tok] = sidecar.count_overrides_for(tok)
-    lines.extend(format_strategies(cfg.get("strategies", []),
-                                  style="status", override_counts=override_counts))
+    overrides_count = sum(
+        sidecar.count_overrides_for(st.get("client_token", ""))
+        for st in cfg.get("strategies", [])
+    )
 
-    lines.append("cooldown: (代理未运行)")
-    lines.append(f"default_cooldown_seconds: {cfg.get('default_cooldown_seconds', '?')}")
+    # config anomalies
+    anomalies = compute_config_anomalies(cfg)
+    n_orphan = len(anomalies.get("orphan_supplies", []))
+
+    lines = []
+    parts = ["cooldown (代理未运行)", "degraded (代理未运行)"]
+    parts.append(f"overrides {overrides_count}")
+    if n_orphan > 0:
+        parts.append(f"orphan {n_orphan}")
+    lines.append("health: " + " · ".join(parts))
+
+    # config notices（静态可算，照常展示）
+    notice_lines = _format_config_notices(anomalies)
+    if notice_lines:
+        lines.append("")
+        lines.append("config notices:")
+        lines.extend(notice_lines)
+
+    # config 计数行
+    lines.append("")
+    cd_display = f"{default_cd}s" if default_cd != "?" else "?"
+    lines.append(f"config: {n_supplies} supplies / {n_routes} routes / {n_strategies} strategies · default_cooldown={cd_display}")
+    lines.append("       （明细: supply / route / strategy 菜单 list）")
 
     return lines
 
 
 def main() -> None:
     if len(sys.argv) < 2:
-        sys.stderr.write("用法: _format_ops.py <status-format|status-offline> [config_file]\n")
+        sys.stderr.write("用法: _format_ops.py <status-format|status-offline> <config_file> <totals_file>\n")
         sys.exit(1)
 
     subcmd = sys.argv[1]
 
     if subcmd == "status-format":
+        if len(sys.argv) < 4:
+            sys.stderr.write("status-format 需要 config_file 和 totals_file 参数\n")
+            sys.exit(1)
+        config_path = sys.argv[2]
+        totals_path = sys.argv[3]
         # stdin 读 server JSON，保留容错语义
         raw = sys.stdin.read()
         try:
@@ -343,19 +551,20 @@ def main() -> None:
         if isinstance(data, dict) and "error" in data:
             print(f"Error: {data['error']}")
             sys.exit(0)
-        for line in _format_status_from_json(data):
+        for line in _format_status_from_json(data, config_path, totals_path):
             print(line)
         sys.exit(0)
 
     if subcmd == "status-offline":
-        if len(sys.argv) < 3:
-            sys.stderr.write("status-offline 需要 config_file 参数\n")
+        if len(sys.argv) < 4:
+            sys.stderr.write("status-offline 需要 config_file 和 totals_file 参数\n")
             sys.exit(1)
         config_path = sys.argv[2]
+        totals_path = sys.argv[3]
         if not os.path.isfile(config_path):
             sys.stderr.write(f"Error: config not found: {config_path}\n")
             sys.exit(1)
-        for line in _format_status_offline(config_path):
+        for line in _format_status_offline(config_path, totals_path):
             print(line)
         sys.exit(0)
 

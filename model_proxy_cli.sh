@@ -19,7 +19,7 @@ print_help() {
   cat <<'EOF'
 用法: model_proxy_cli.sh <子命令> [参数]
 
-status                            显示运行状态 + supplies/routes/strategies/cooldown 概览；代理未运行时仍展示 config 静态段
+status                            显示运行态总览（health 计数 + 异常清单 + config 计数）；代理未运行时降级展示静态 config 信息
 reload                            触发配置热重载（无条件清空所有 cooldown）
 
 supply                            打印 supply list 后进入交互菜单，可选操作：
@@ -71,7 +71,7 @@ stats [时间] [维度/过滤...]        读独立账本（不受日志截断影
   $route                      查询当前 session 的生效 route 与 override
   $route <route_id>           把当前 session 固定到指定 route（写 config/session_overrides.json）
   $route reset                清除当前 session 的 override
-  ※ status strategies 段的 "N个session覆盖" 计数即来自 $route 写入的 sidecar
+  ※ status health 行的 overrides 计数即来自 $route 写入的 sidecar
 
 --help / -h                       显示此帮助
 
@@ -130,12 +130,40 @@ cmd_status() {
     return 1
   fi
 
-  if lsof -i :"$MODEL_PROXY_PORT" -sTCP:LISTEN -t &>/dev/null; then
-    echo "model_proxy: running on port $MODEL_PROXY_PORT"
-  else
+  local pid
+  pid=$(lsof -i :"$MODEL_PROXY_PORT" -sTCP:LISTEN -t 2>/dev/null)
+  if [[ -z "$pid" ]]; then
     echo "model_proxy: NOT running on port $MODEL_PROXY_PORT（以下展示 config 静态信息）"
-    python3 "$SCRIPT_DIR/_format_ops.py" status-offline "$CONFIG_FILE"
+    python3 "$SCRIPT_DIR/_format_ops.py" status-offline "$CONFIG_FILE" "$TOTALS_FILE"
     return 1
+  fi
+
+  # 进程态信息（ps 失败则省略，不报错）
+  local etime="" started="" config_mtime=""
+  local ps_etime ps_lstart
+  ps_etime=$(ps -o etime= -p "$pid" 2>/dev/null | xargs)
+  ps_lstart=$(ps -o lstart= -p "$pid" 2>/dev/null)
+  if [[ -n "$ps_etime" ]]; then
+    etime="  up $ps_etime"
+  fi
+  if [[ -n "$ps_lstart" ]]; then
+    # lstart 格式如 "Sat Aug  8 19:53:05 2026"，取月日时间部分
+    local md hm
+    md=$(echo "$ps_lstart" | awk '{print $2, $3}')
+    hm=$(echo "$ps_lstart" | awk '{print $4}' | cut -c1-5)
+    started="  (started $md $hm"
+  fi
+  config_mtime=$(stat -f "%Sm" -t "%m-%d %H:%M" "$CONFIG_FILE" 2>/dev/null)
+  local mtime_part=""
+  if [[ -n "$config_mtime" ]]; then
+    mtime_part=", config mtime $config_mtime"
+  fi
+
+  # 首行（bash 侧打印，信息全在 bash 侧）
+  if [[ -n "$started" ]]; then
+    echo "model_proxy: running on port $MODEL_PROXY_PORT  pid $pid$etime$started$mtime_part)"
+  else
+    echo "model_proxy: running on port $MODEL_PROXY_PORT  pid $pid$etime$mtime_part"
   fi
 
   local out
@@ -144,7 +172,7 @@ cmd_status() {
     echo "Error: model_proxy not responding"
     return 1
   fi
-  echo "$out" | python3 "$SCRIPT_DIR/_format_ops.py" status-format
+  echo "$out" | python3 "$SCRIPT_DIR/_format_ops.py" status-format "$CONFIG_FILE" "$TOTALS_FILE"
 }
 
 # ---- reload ----
