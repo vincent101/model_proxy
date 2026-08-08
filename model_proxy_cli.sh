@@ -57,7 +57,7 @@ print_help() {
                                     [q]uit 退出
   strategy                          打印 strategy list 后进入交互菜单，可选操作：
                                     [a]dd  交互式新增 strategy 绑定 route_id/note/source
-                                    [e]dit 交互式编辑 strategy 的 route_id/note/source 能力
+                                    [e]dit 交互式编辑 strategy 的 route_id/note/source
                                     [d]el  删除 strategy
                                     [q]uit 退出
   switch <client_token> <route_id>  改 strategy.route_id 后 reload

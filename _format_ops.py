@@ -631,7 +631,6 @@ def _format_status_from_json(data: dict, config_path: str, totals_path: str,
     # config 计数行
     lines.append("")
     lines.append(f"config: {n_supplies} supplies / {n_routes} routes / {n_strategies} strategies")
-    lines.append("       （明细: supply / route / strategy 菜单 list；今日明细: stats today supply）")
 
     return lines
 
