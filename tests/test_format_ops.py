@@ -20,7 +20,6 @@ from _format_ops import (
     DEGRADED_MIN_REQUESTS,
     _format_status_from_json,
     _format_status_offline,
-    compute_config_anomalies,
     display_width,
     find_damaged_routes,
     format_routes,
@@ -98,57 +97,6 @@ class TestLoadSupplyHealth(unittest.TestCase):
 # ---------------------------------------------------------------------------
 # compute_config_anomalies
 # ---------------------------------------------------------------------------
-
-class TestComputeConfigAnomalies(unittest.TestCase):
-
-    def test_orphan_supplies(self):
-        """在 supplies 但未被任何 route 引用的 supply → orphan。"""
-        cfg = {
-            "supplies": [
-                {"id": "s1"}, {"id": "s2"}, {"id": "unused-sid"},
-            ],
-            "routes": [
-                {"id": "r1", "tiers": {"opus": ["s1"], "sonnet": ["s2"], "haiku": []}},
-            ],
-        }
-        anomalies = compute_config_anomalies(cfg)
-        self.assertEqual(anomalies["orphan_supplies"], ["unused-sid"])
-
-    def test_missing_tiers(self):
-        """route 的空档 → missing_tiers。"""
-        cfg = {
-            "supplies": [{"id": "s1"}],
-            "routes": [
-                {"id": "eval-x", "tiers": {"opus": [], "sonnet": ["s1"], "haiku": []}},
-            ],
-        }
-        anomalies = compute_config_anomalies(cfg)
-        self.assertIn("eval-x 缺 opus/haiku", anomalies["missing_tiers"])
-
-    def test_dangling_refs(self):
-        """route tier 引用了不存在的 supply → dangling_refs。"""
-        cfg = {
-            "supplies": [{"id": "s1"}],
-            "routes": [
-                {"id": "r1", "tiers": {"opus": ["s1", "ghost"], "sonnet": [], "haiku": []}},
-            ],
-        }
-        anomalies = compute_config_anomalies(cfg)
-        self.assertEqual(anomalies["dangling_refs"], ["ghost"])
-
-    def test_no_anomalies(self):
-        """正常配置 → 全空。"""
-        cfg = {
-            "supplies": [{"id": "s1"}, {"id": "s2"}, {"id": "s3"}],
-            "routes": [
-                {"id": "r1", "tiers": {"opus": ["s1"], "sonnet": ["s2"], "haiku": ["s3"]}},
-            ],
-        }
-        anomalies = compute_config_anomalies(cfg)
-        self.assertEqual(anomalies["orphan_supplies"], [])
-        self.assertEqual(anomalies["missing_tiers"], [])
-        self.assertEqual(anomalies["dangling_refs"], [])
-
 
 # ---------------------------------------------------------------------------
 # find_damaged_routes

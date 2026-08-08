@@ -622,8 +622,8 @@ model_proxy_cli.sh logs req=<id>                     # 按 req_id 过滤（串�
 model_proxy_cli.sh logs level=ERROR                  # 按级别过滤（ERROR/WARNING/INFO/DEBUG）
 model_proxy_cli.sh logs event=cooldown               # 按事件关键词过滤（如 config.reload / admin.reload / sidecar.write）
 model_proxy_cli.sh logs req=<id> N                   # 过滤 + 限制条数
-model_proxy_cli.sh stats [时间] [维度/过滤...]        # 读独立累计账本，按 supply/route/strategy 任意
-                                                      # 维度组合切片，支持 today/month/YYYY-MM-DD/YYYY-MM/全历史
+model_proxy_cli.sh stats [时间]                       # 读独立累计账本，按 supply/route/strategy 三维度
+                                                      # 各投影一段，支持 today/month/YYYY-MM-DD/YYYY-MM/全历史
 model_proxy_cli.sh --help / -h                       # 显示帮助
 ```
 
@@ -655,9 +655,9 @@ model_proxy_cli.sh --help / -h                       # 显示帮助
   不再发第二次探测请求；否则打印归因并跳过（`add` 时会二次确认是否仍要保存该 supply）。
 - `stats` 读独立账本文件 `.claude_model_proxy_totals.json`（schema v3，按天分桶、supply×route×strategy
   组合键累加），与 ACCESS 日志完全独立、不受进程启动时 `_trim_log` 截断影响，长期累计不丢。
-  支持按 `supply`/`route`/`strategy` 任意维度组合切片（投影和/或过滤），按天/月/全历史查询
-  （`stats` / `stats today` / `stats month` / `stats 2026-07-23` / `stats 2026-07` /
-  `stats today supply` / `stats today route=claude supply` 等）。`max_ms` 从账本取（OPT-10 起入账本），
+  对 supply/route/strategy 三维度各投影一段，按天/月/全历史查询
+  （`stats` / `stats today` / `stats month` / `stats 2026-07-23` / `stats 2026-07`）。
+  `max_ms` 从账本取（OPT-10 起入账本），
   与 `avg_ms` 同口径，不再依赖日志窗口；`attempt_fail` 为 attempt 级失败计数（仅盖 failover 中间失败，
   budget 重试不记账），supply 真实失败率可观测。
 

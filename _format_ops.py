@@ -158,51 +158,6 @@ def load_supply_health(totals_path: str) -> dict[str, dict]:
     return health
 
 
-def compute_config_anomalies(cfg: dict) -> dict:
-    """遍历 config 收集 orphan / missing_tiers / dangling_refs。
-
-    - orphan: 在 supplies 里但未被任何 route tier 引用的 supply id
-    - missing_tiers: route 的 opus/sonnet/haiku 任一档为空（提示级，eval- 路由不硬编码豁免）
-    - dangling_refs: route tier 引用了但不在 supplies 中的 id；strategy 引用了但不在 routes 中的 route_id
-    """
-    supply_ids = {s.get("id", "") for s in cfg.get("supplies", [])}
-    route_ids = {r.get("id", "") for r in cfg.get("routes", [])}
-
-    referenced: set[str] = set()
-    missing_tiers: list[str] = []
-    for r in cfg.get("routes", []):
-        rid = r.get("id", "?")
-        tiers = r.get("tiers", {})
-        for tn in TIER_NAMES:
-            ids = tiers.get(tn, [])
-            for sid in ids:
-                referenced.add(sid)
-        # 缺档检测：opus/sonnet/haiku 任一档为空
-        empty_tiers = [tn for tn in TIER_NAMES if not tiers.get(tn, [])]
-        if empty_tiers:
-            missing_tiers.append(f"{rid} 缺 {'/'.join(empty_tiers)}")
-
-    orphan_supplies = sorted(supply_ids - referenced)
-    dangling_refs = sorted(referenced - supply_ids)
-
-    # strategy → route 引用检查：route_id 或 route_pool 里的 route_id 不在 routes 中
-    for st in cfg.get("strategies", []):
-        tok = st.get("client_token", "?")
-        if st.get("route_id") and st["route_id"] not in route_ids:
-            dangling_refs.append(f"{st['route_id']} (strategy={tok})")
-        for item in st.get("route_pool") or []:
-            if isinstance(item, dict):
-                rid = item.get("route_id", "")
-                if rid and rid not in route_ids:
-                    dangling_refs.append(f"{rid} (strategy={tok} route_pool)")
-
-    return {
-        "orphan_supplies": orphan_supplies,
-        "missing_tiers": missing_tiers,
-        "dangling_refs": dangling_refs,
-    }
-
-
 def find_damaged_routes(cfg: dict, bad_supplies: set[str], cooldown: dict) -> list[str]:
     """tier 内含 degraded∪cooling supply 的 route，输出描述行。
 
@@ -378,21 +333,6 @@ def _compute_degraded(health: dict[str, dict]) -> list[dict]:
     return degraded
 
 
-def _format_config_notices(anomalies: dict) -> list[str]:
-    """格式化 config notices 段（orphan / 缺档 / dangling）。"""
-    lines = []
-    orphan = anomalies.get("orphan_supplies", [])
-    missing = anomalies.get("missing_tiers", [])
-    dangling = anomalies.get("dangling_refs", [])
-    if orphan:
-        lines.append(f"  orphan supplies: {', '.join(orphan)}")
-    if missing:
-        lines.append(f"  缺档: {'; '.join(missing)}（若属预期请忽略）")
-    if dangling:
-        lines.append(f"  dangling refs: {', '.join(dangling)}（route tier 引用了不存在的 supply）")
-    return lines
-
-
 def _format_status_from_json(data: dict, config_path: str, totals_path: str) -> list[str]:
     """从 server status JSON + config + 账本 格式化 status 输出。
 
@@ -411,11 +351,9 @@ def _format_status_from_json(data: dict, config_path: str, totals_path: str) -> 
         for st in data.get("strategies", [])
     )
 
-    # config anomalies
+    # config 读取（find_damaged_routes 需要）
     with open(config_path, "r", encoding="utf-8") as f:
         cfg = json.load(f)
-    anomalies = compute_config_anomalies(cfg)
-    n_orphan = len(anomalies.get("orphan_supplies", []))
 
     # supply health
     health = load_supply_health(totals_path)
@@ -494,10 +432,6 @@ def _format_status_offline(config_path: str, totals_path: str) -> list[str]:
         sidecar.count_overrides_for(st.get("client_token", ""))
         for st in cfg.get("strategies", [])
     )
-
-    # config anomalies
-    anomalies = compute_config_anomalies(cfg)
-    n_orphan = len(anomalies.get("orphan_supplies", []))
 
     lines = []
     parts = ["cooldown (代理未运行)", "degraded (代理未运行)"]

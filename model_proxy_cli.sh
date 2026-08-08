@@ -56,16 +56,13 @@ logs [N] [field=val]              显示最近 N 条日志（默认 30 条 ACCES
                                       logs level=ERROR    按级别过滤（ERROR/WARNING/INFO）
                                       logs event=cooldown  按事件关键词过滤
                                       logs req=abc 50     过滤 + 条数
-stats [时间] [维度/过滤...]        读独立账本（不受日志截断影响），按 supply/route/strategy
-                                    任意维度组合切片。用法示例：
-                                      stats                          全历史 total，三维度各投影一段
+stats [时间]                      读独立账本（不受日志截断影响），按 supply/route/strategy
+                                    三维度各投影一段。用法示例：
+                                      stats                          全历史 total
                                       stats today                    今天（UTC+8）
                                       stats month                    本月（UTC+8）
                                       stats 2026-07-23                指定某天
                                       stats 2026-07                   指定某月
-                                      stats today supply              按 supply 投影
-                                      stats today supply=<id>         过滤单个 supply
-                                      stats today route=claude supply 过滤 route 后按 supply 投影
                                     max_ms 在 period 行（账本口径，OPT-10 起从账本取）
 会话内指令（非 CLI 子命令，在对话里直接发送）:
   $route                      查询当前 session 的生效 route 与 override
@@ -530,9 +527,8 @@ def main():
     with open(totals_file, "r", encoding="utf-8") as f:
         data = json.load(f)
 
-    # 第 1 个非时间参数如果匹配时间选择器格式则消费为时间选择器，其余全部是维度/过滤参数。
+    # 参数解析：只接受时间选择器（today/month/total/YYYY-MM-DD/YYYY-MM），其余参数报错。
     time_sel = None
-    dim_args = args
     if args:
         first = args[0]
         is_time_like = (
@@ -542,24 +538,11 @@ def main():
         )
         if is_time_like:
             time_sel = first
-            dim_args = args[1:]
+        else:
+            print(f"Error: 无法识别的参数: {first!r}（应为 today/month/total/YYYY-MM-DD/YYYY-MM）", file=sys.stderr)
+            sys.exit(1)
 
     bucket, label = select_bucket(data, time_sel)
-
-    filters = {}
-    proj = None
-    for tok in dim_args:
-        if "=" in tok:
-            field, val = tok.split("=", 1)
-            if field not in DIMS:
-                print(f"Error: 未知过滤字段: {field!r}（应为 supply/route/strategy）", file=sys.stderr)
-                sys.exit(1)
-            filters[field] = val
-        elif tok in DIMS:
-            proj = tok
-        else:
-            print(f"Error: 无法识别的参数: {tok!r}", file=sys.stderr)
-            sys.exit(1)
 
     combos = bucket.get("combos", {})
 
@@ -567,43 +550,26 @@ def main():
         groups = {}
         for key, v in combos.items():
             dims = parse_combo_key(key)
-            if any(dims.get(f) != val for f, val in filters.items()):
-                continue
             gkey = dims.get(proj_dim) if proj_dim else "(all)"
             g = groups.setdefault(gkey, zero_group())
             for f in VAL_FIELDS:
                 g[f] += v.get(f, 0)
         return groups
 
-    # period 总计行：无过滤用桶顶层（含 avg_ms/max_ms）；有过滤则由过滤后的组合求和（无 sum_ms/avg_ms/max_ms）。
-    if filters:
-        all_groups = aggregate(None)
-        filtered_total = all_groups.get("(all)", zero_group())
-        period_requests = filtered_total["requests"]
-        period_ok = filtered_total["ok"]
-        period_fail = filtered_total["fail"]
-        avg_ms_str = "n/a（有过滤条件，账本不存组合键粒度 sum_ms）"
-        max_ms_str = "n/a（有过滤条件）"
-        usage_in, usage_out = (
-            filtered_total["usage_in"], filtered_total["usage_out"])
-    else:
-        period_requests = bucket.get("requests", 0)
-        period_ok = bucket.get("ok", 0)
-        period_fail = bucket.get("fail", 0)
-        sum_ms = bucket.get("sum_ms", 0)
-        avg_ms_str = f"{sum_ms / period_requests:.1f}" if period_requests else "0"
-        max_ms_str = str(bucket.get("max_ms", 0))
-        all_groups = aggregate(None)
-        filtered_total = all_groups.get("(all)", zero_group())
-        usage_in, usage_out = (
-            filtered_total["usage_in"], filtered_total["usage_out"])
+    period_requests = bucket.get("requests", 0)
+    period_ok = bucket.get("ok", 0)
+    period_fail = bucket.get("fail", 0)
+    sum_ms = bucket.get("sum_ms", 0)
+    avg_ms_str = f"{sum_ms / period_requests:.1f}" if period_requests else "0"
+    max_ms_str = str(bucket.get("max_ms", 0))
+    all_groups = aggregate(None)
+    filtered_total = all_groups.get("(all)", zero_group())
+    usage_in, usage_out = (
+        filtered_total["usage_in"], filtered_total["usage_out"])
 
     print(f"period: {label}   requests={period_requests}  ok={period_ok}  fail={period_fail}  "
           f"avg_ms={avg_ms_str}  max_ms={max_ms_str}  "
           f"usage_in={fmt_k(usage_in)} usage_out={fmt_k(usage_out)}")
-    if filters:
-        filt_desc = " ".join(f"{k}={v}" for k, v in filters.items())
-        print(f"filters: {filt_desc}")
 
     def print_groups(proj_dim):
         groups = aggregate(proj_dim)
@@ -614,14 +580,10 @@ def main():
             print(f"  {gkey:32} requests={g['requests']:<6} ok={g['ok']:<6} fail={g['fail']:<4} "
                   f"in={fmt_k(g['usage_in'])} out={fmt_k(g['usage_out'])}")
 
-    if proj:
-        print(f"by {proj}:")
-        print_groups(proj)
-    else:
-        # 都省略：默认对三个维度各做一次投影，各列一段
-        for d in DIMS:
-            print(f"by {d}:")
-            print_groups(d)
+    # 对 supply/route/strategy 三个维度各做一次投影，各列一段
+    for d in DIMS:
+        print(f"by {d}:")
+        print_groups(d)
 
 
 main()
