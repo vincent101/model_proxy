@@ -23,6 +23,13 @@ import urllib.request
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from core.reasoning.registry import resolve_protocol
+from _format_ops import (
+    mask_appkey as _mask_appkey,
+    strategy_route_desc as _strategy_route_desc,
+    format_supplies as _format_supplies,
+    format_routes as _format_routes,
+    format_strategies as _format_strategies,
+)
 
 PROBE_VALUE = "__probe_invalid__"
 VALID_PROTOCOLS = ("anthropic", "chat", "responses")
@@ -535,21 +542,13 @@ def connectivity_test_then_probe(supply: dict) -> "tuple[str, str, dict | None]"
 # supply
 # ---------------------------------------------------------------------------
 
-def _mask_appkey(appkey: str) -> str:
-    return f"...{appkey[-4:]}" if appkey else "(空)"
+# _mask_appkey 已迁入 _format_ops.py（通过头部 import 别名引入，调用方不变）
 
 
 def supply_list(path: str) -> None:
     cfg = load_config(path)
-    for s in cfg.get("supplies", []):
-        sid = s.get("id", "?")
-        proto = s.get("protocol", "?")
-        model = s.get("target_model", "?")
-        tail4 = _mask_appkey(s.get("appkey", ""))
-        rcap = "Y" if s.get("reasoning_capability") else "-"
-        cd = f"{s['cooldown_seconds']}s" if "cooldown_seconds" in s else "(默认)"
-        print(f"  {sid:24} protocol={proto:10} model={model:26} appkey={tail4:8}"
-              f"  reasoning_capability={rcap}  cooldown={cd}")
+    for line in _format_supplies(cfg.get("supplies", []), preset="MENU"):
+        print(line)
     done(False)
 
 
@@ -737,14 +736,8 @@ def supply_del(path: str, sid: str) -> None:
 
 def route_list(path: str) -> None:
     cfg = load_config(path)
-    for r in cfg.get("routes", []):
-        rid = r.get("id", "?")
-        tiers = r.get("tiers", {})
-        opus = ",".join(tiers.get("opus", []))
-        sonnet = ",".join(tiers.get("sonnet", []))
-        haiku = ",".join(tiers.get("haiku", []))
-        failover = r.get("failover", "?")
-        print(f"  {rid:12} opus=[{opus}] sonnet=[{sonnet}] haiku=[{haiku}] failover={failover}")
+    for line in _format_routes(cfg.get("routes", [])):
+        print(line)
     done(False)
 
 
@@ -858,30 +851,14 @@ def route_del(path: str, rid: str) -> None:
 # strategy
 # ---------------------------------------------------------------------------
 
-def _strategy_route_desc(st: dict) -> str:
-    """打印用的 route 归属描述：兼容旧单值 route_id 与新 route_pool 写法（见
-    docs/designs/2026-07-28-session-route-dispatch-design.md §4/§5）。
-    """
-    route_pool = st.get("route_pool")
-    if route_pool:
-        parts = []
-        for item in route_pool:
-            if not isinstance(item, dict):
-                continue
-            rid = item.get("route_id", "?")
-            weight = item.get("weight", 1)
-            parts.append(f"{rid}:{weight}")
-        return "pool[" + ",".join(parts) + "]"
-    return st.get("route_id", "?")
+# _strategy_route_desc 已迁入 _format_ops.py（通过头部 import 别名引入，
+# 调用方 strategy_edit/switch 不变）
 
 
 def strategy_list(path: str) -> None:
     cfg = load_config(path)
-    for st in cfg.get("strategies", []):
-        tok = st.get("client_token", "?")
-        rid = _strategy_route_desc(st)
-        note = st.get("note", "") or ""
-        print(f"  {tok:16} -> {rid:12} ({note})")
+    for line in _format_strategies(cfg.get("strategies", []), style="menu"):
+        print(line)
     done(False)
 
 

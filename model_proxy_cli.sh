@@ -118,15 +118,16 @@ run_config_ops() {
 
 # ---- status ----
 cmd_status() {
-  if lsof -i :"$MODEL_PROXY_PORT" -sTCP:LISTEN -t &>/dev/null; then
-    echo "model_proxy: running on port $MODEL_PROXY_PORT"
-  else
-    echo "model_proxy: NOT running on port $MODEL_PROXY_PORT"
+  if [[ ! -f "$CONFIG_FILE" ]]; then
+    echo "Error: config not found: $CONFIG_FILE"
     return 1
   fi
 
-  if [[ ! -f "$CONFIG_FILE" ]]; then
-    echo "Error: config not found: $CONFIG_FILE"
+  if lsof -i :"$MODEL_PROXY_PORT" -sTCP:LISTEN -t &>/dev/null; then
+    echo "model_proxy: running on port $MODEL_PROXY_PORT"
+  else
+    echo "model_proxy: NOT running on port $MODEL_PROXY_PORT（以下展示 config 静态信息）"
+    python3 "$SCRIPT_DIR/_format_ops.py" status-offline "$CONFIG_FILE"
     return 1
   fi
 
@@ -136,59 +137,7 @@ cmd_status() {
     echo "Error: model_proxy not responding"
     return 1
   fi
-  echo "$out" | python3 -c "
-import json, sys
-try:
-    data = json.load(sys.stdin)
-except Exception:
-    print(sys.stdin.read())
-    sys.exit(0)
-if 'error' in data:
-    print(f\"Error: {data['error']}\")
-    sys.exit(0)
-print('supplies:')
-for s in data.get('supplies', []):
-    sid = s.get('id', '?')
-    proto = s.get('protocol', '?')
-    tail4 = s.get('appkey_tail4', '????')
-    model = s.get('target_model', '?')
-    print(f'  {sid:20} protocol={proto:10} model={model:20} appkey=...{tail4}')
-print('routes (家族模板):')
-for r in data.get('routes', []):
-    rid = r.get('id', '?')
-    tiers = r.get('tiers', {})
-    opus = ','.join(tiers.get('opus', []))
-    sonnet = ','.join(tiers.get('sonnet', []))
-    haiku = ','.join(tiers.get('haiku', []))
-    failover = r.get('failover', '?')
-    print(f'  {rid:12} opus=[{opus}] sonnet=[{sonnet}] haiku=[{haiku}] failover={failover}')
-print('strategies (token 绑定):')
-for st in data.get('strategies', []):
-    tok = st.get('client_token', '?')
-    route_id = st.get('route_id')
-    route_pool = st.get('route_pool')
-    if route_id:
-        rid_desc = route_id
-    elif route_pool:
-        pool_desc = ','.join(
-            f\"{p.get('route_id', '?')}:{p.get('weight', 1)}\" for p in route_pool
-        )
-        sidecar_count = st.get('sidecar_overrides_count', 0) or 0
-        rid_desc = f'pool[{pool_desc}]'
-        if sidecar_count:
-            rid_desc += f' +{sidecar_count}个session覆盖'
-    else:
-        rid_desc = '?'
-    print(f'  {tok:16} -> {rid_desc:12}')
-cooldown = data.get('cooldown', {})
-if cooldown:
-    print('cooldown (剩余秒):')
-    for sid, remain in cooldown.items():
-        print(f'  {sid:20} {remain}s')
-else:
-    print('cooldown: (无)')
-print(f\"default_cooldown_seconds: {data.get('default_cooldown_seconds', '?')}\")
-"
+  echo "$out" | python3 "$SCRIPT_DIR/_format_ops.py" status-format
 }
 
 # ---- reload ----
