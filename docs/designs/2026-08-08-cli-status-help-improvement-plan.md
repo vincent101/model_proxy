@@ -1,8 +1,15 @@
 ---
 type: design-decision
-status: pending
+status: confirmed
 target: "[[tools/model_proxy]]"
-tags: [architect, model_proxy, cli, status, help]
+tags:
+  - architect
+  - model_proxy
+  - cli
+  - status
+  - help
+modified: 2026-08-08 14:21:36
+created: 2026-08-08 13:53:34
 ---
 
 # CLI status / --help 改进实施方案（务实路径 · 第一+第二梯队）
@@ -127,9 +134,9 @@ status/--help 存在硬伤（help 文案与现实矛盾、S4 单值分支漏报�
 - `_mask_appkey`/`_strategy_route_desc` 迁出，原地改 `from _format_ops import ...`（`_strategy_route_desc` 调用方 `:958,985,1019` 不动）。
 - 增删改逻辑、`_DISPATCH`（`:1037-1052`）、写盘路径一律不动。
 
-### 3.5 已知偏差记录（config 数据，按拍板维持现状）
+### 3.5 config 数据现状（2026-08-08 实测已干净）
 
-- 6372 三条 supply 的 id 尾号（6372）≠ appkey 尾4（3672）；nation1∩nation2 共享 3339 整行 3 个 supply。展示层设计已容忍：orphan supply 正常平铺不报错，id 与 key 尾4 并置展示恰好让该笔误保持可见（S13 的独立校验价值保留）。
+- 评估阶段担心的两个 config 数据问题均已不存在：当前 supply id 尾号 = appkey 尾4（`3672`，非 `6372`）；nation1=`[3339,8101,9907]`、nation2=`[2330,4200,3672]` 不重叠、不共享 3339。展示层设计仍保留对 orphan supply 平铺、id/key 尾4 并置展示的容忍度（未来若再出现偏差可见可校验）。
 
 ## 4. 风险与权衡
 
