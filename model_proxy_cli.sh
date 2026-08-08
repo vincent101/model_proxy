@@ -48,7 +48,7 @@ print_help() {
                                     [a]dd  交互式新增 supply
                                     [e]dit 交互式编辑 supply
                                     [d]el  删除 supply
-                                    [t]est 连通性测试；若连通，接着做 effort 探测并可确认写入 reasoning_capability
+                                    [t]est 连通性测试 & effort 探测和登记
                                     [q]uit 退出
   route                             打印 route list 后进入交互菜单，可选操作：
                                     [a]dd  交互式新增 route 家族模板
