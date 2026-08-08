@@ -437,8 +437,6 @@ def _format_status_from_json(data: dict, config_path: str, totals_path: str) -> 
     else:
         parts.append("degraded 0")
     parts.append(f"overrides {overrides_count}")
-    if n_orphan > 0:
-        parts.append(f"orphan {n_orphan}")
     lines.append("health: " + " · ".join(parts))
 
     # 异常清单（只列问题）
@@ -467,17 +465,9 @@ def _format_status_from_json(data: dict, config_path: str, totals_path: str) -> 
         lines.append("damaged routes:")
         lines.extend(damaged)
 
-    # config notices
-    notice_lines = _format_config_notices(anomalies)
-    if notice_lines:
-        lines.append("")
-        lines.append("config notices:")
-        lines.extend(notice_lines)
-
     # config 计数行
     lines.append("")
-    cd_display = f"{default_cd}s" if default_cd != "?" else "?"
-    lines.append(f"config: {n_supplies} supplies / {n_routes} routes / {n_strategies} strategies · default_cooldown={cd_display}")
+    lines.append(f"config: {n_supplies} supplies / {n_routes} routes / {n_strategies} strategies")
     lines.append("       （明细: supply / route / strategy 菜单 list；今日明细: stats today supply）")
 
     return lines
@@ -512,21 +502,11 @@ def _format_status_offline(config_path: str, totals_path: str) -> list[str]:
     lines = []
     parts = ["cooldown (代理未运行)", "degraded (代理未运行)"]
     parts.append(f"overrides {overrides_count}")
-    if n_orphan > 0:
-        parts.append(f"orphan {n_orphan}")
     lines.append("health: " + " · ".join(parts))
-
-    # config notices（静态可算，照常展示）
-    notice_lines = _format_config_notices(anomalies)
-    if notice_lines:
-        lines.append("")
-        lines.append("config notices:")
-        lines.extend(notice_lines)
 
     # config 计数行
     lines.append("")
-    cd_display = f"{default_cd}s" if default_cd != "?" else "?"
-    lines.append(f"config: {n_supplies} supplies / {n_routes} routes / {n_strategies} strategies · default_cooldown={cd_display}")
+    lines.append(f"config: {n_supplies} supplies / {n_routes} routes / {n_strategies} strategies")
     lines.append("       （明细: supply / route / strategy 菜单 list）")
 
     return lines

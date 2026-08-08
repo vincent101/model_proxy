@@ -317,6 +317,10 @@ _CONTROL_PATH_PREFIX = "/model_proxy"
 # 顶层默认冷却时长（秒）
 _DEFAULT_COOLDOWN_SECONDS = 300
 
+# 上游请求超时（秒），缺省 30min，对齐 API_TIMEOUT_MS；config 顶层
+# upstream_timeout_seconds 可覆盖
+_UPSTREAM_TIMEOUT_DEFAULT = 1800
+
 
 # ---------------------------------------------------------------------------
 # reasoning 语法偏好存储（取代旧 _THINKING_FMT_CACHE / _get/_set_thinking_fmt）。
@@ -411,16 +415,20 @@ class ConfigStore:
         with self._lock:
             return int(self._config.get("default_cooldown_seconds", _DEFAULT_COOLDOWN_SECONDS))
 
+    def get_upstream_timeout(self) -> int:
+        with self._lock:
+            return int(self._config.get("upstream_timeout_seconds", _UPSTREAM_TIMEOUT_DEFAULT))
+
     def get_budget_retry(self) -> dict:
         """可选顶层块 budget_retry（④b 反应式预算重试）。缺省全开：
-        {"enabled": True, "max_retries": _BUDGET_RETRY_MAX, "ceiling": _BUDGET_CEILING}。
+        {"enabled": True, "max_retries": _BUDGET_RETRY_MAX}。
+        封顶 ceiling 硬编码为 _BUDGET_CEILING，不暴露到 config。
         无 per-supply 维度（③ output_budget 已撤销，见设计记录 §③/§④）。"""
         with self._lock:
             cfg = self._config.get("budget_retry") or {}
         return {
             "enabled": bool(cfg.get("enabled", True)),
             "max_retries": int(cfg.get("max_retries", _BUDGET_RETRY_MAX)),
-            "ceiling": int(cfg.get("ceiling", _BUDGET_CEILING)),
         }
 
     # ------------------------------------------------------------------
@@ -590,7 +598,7 @@ _TRANSLATOR_TABLE = {
 # ④b 预算治理：反应式 ×2 阶梯重试（③ 撤销后的唯一预算机制，见
 # docs/designs/2026-08-07-reasoning-thinking-truncation-and-protocol-consistency.md §④）
 # ---------------------------------------------------------------------------
-_BUDGET_CEILING = 131072       # 放大封顶（config 顶层 budget_retry.ceiling 可覆盖）
+_BUDGET_CEILING = 131072       # 放大封顶（硬编码，不暴露到 config）
 _BUDGET_RETRY_MAX = 5          # 放大重试次数上限（config budget_retry.max_retries 可覆盖）
 
 # ② 反向缺省预算（responses→anthropic 客户端不传 max_tokens 时）：按 remap 结果分档——
@@ -1300,7 +1308,7 @@ class ModelProxyHandler(BaseHTTPRequestHandler):
                 return False
             nxt = 0
             if _budget_current > 0 and _budget_retries < budget_cfg["max_retries"]:
-                nxt = min(_budget_current * 2, budget_cfg["ceiling"])
+                nxt = min(_budget_current * 2, _BUDGET_CEILING)
                 if nxt <= _budget_current:
                     nxt = 0   # 已达封顶（next==current），停止
             if not nxt:
@@ -1531,7 +1539,7 @@ class ModelProxyHandler(BaseHTTPRequestHandler):
                 cd_seconds = int(supply.get("cooldown_seconds", default_cd))
 
                 try:
-                    resp = urllib.request.urlopen(req, timeout=1800)  # 30min,对齐 API_TIMEOUT_MS
+                    resp = urllib.request.urlopen(req, timeout=cs.get_upstream_timeout())  # 缺省30min,对齐 API_TIMEOUT_MS
                     resp_status = resp.status
                 except urllib.error.HTTPError as e:
                     resp_status = e.code

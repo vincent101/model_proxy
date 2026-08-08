@@ -883,7 +883,8 @@ token 里选定）过滤候选 client_token；无匹配协议的 token 时提示
 |---|---|---|---|
 | `admin_token` | string | 必填 | 控制 API 鉴权，供 `X-Proxy-Admin-Token` 请求头校验 |
 | `default_cooldown_seconds` | number | 必填 | supply 未单独配置 `cooldown_seconds` 时的默认冷却时长 |
-| `budget_retry` | object | 可选 | ④b 输出预算自动放大重试：`{"enabled": true, "max_retries": 5, "ceiling": 131072}`，缺省全开；无 per-supply 维度 |
+| `upstream_timeout_seconds` | number | 可选 | 上游请求超时（秒），缺省 1800（30min，对齐 API_TIMEOUT_MS） |
+| `budget_retry` | object | 可选 | ④b 输出预算自动放大重试：`{"enabled": true, "max_retries": 5}`，缺省全开；封顶 131072 硬编码不暴露；无 per-supply 维度 |
 
 完整样例见 `config/model_proxy_config.example.json`。
 

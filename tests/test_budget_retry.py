@@ -88,8 +88,11 @@ class _FakeConfig:
     def get_default_cooldown(self):
         return 300
 
+    def get_upstream_timeout(self):
+        return 1800
+
     def get_budget_retry(self):
-        return self._budget_retry or {"enabled": True, "max_retries": 5, "ceiling": 131072}
+        return self._budget_retry or {"enabled": True, "max_retries": 5}
 
 
 class _FakeCooldown:
@@ -308,7 +311,7 @@ class TestBudgetRetryPassthrough(unittest.TestCase):
     def test_disabled_config_falls_back_to_passthrough(self):
         ns, _, _ = _make_server([_supply("s1", "anthropic")], ["s1"],
                                 budget_retry={"enabled": False,
-                                              "max_retries": 5, "ceiling": 131072})
+                                              "max_retries": 5})
         h = _make_handler(ns, _anth_client_body())
         m = _run(h, [_FakeResp(_anth_truncated()), _FakeResp(_anth_good())])
         self.assertEqual(m.call_count, 1)   # 不重试
