@@ -603,8 +603,11 @@ bucket 补 `max_ms=0`（断档但保真，不虚高），既有值保留，记 `
 用 `tools/model_proxy/model_proxy_cli.sh`：
 
 ```bash
-model_proxy_cli.sh status                            # 运行状态 + supplies/routes/strategies/cooldown 概览；
-                                                      # 代理未运行时仍展示 config 静态段
+model_proxy_cli.sh status                            # 运行态健康总览：health 计数（cooldown/degraded/overrides）
+                                                      # + degraded supplies（账本 today 桶失败率>30% 且 n≥5）
+                                                      # + active sessions（30min 内有请求的 session 链路健康，
+                                                      #   解析 ACCESS 日志）+ cooldown 明细 + config 计数；
+                                                      # 离线统一展示（仅 cooldown 显"未知"）
 model_proxy_cli.sh reload                            # 触发配置热重载（无条件清空所有 cooldown）
 
 model_proxy_cli.sh supply                            # 打印 list 后进入交互菜单 [a]dd/[e]dit/[d]el/[t]est/[q]uit
