@@ -55,6 +55,63 @@ import time
 logger = logging.getLogger(__name__)                       # 正向侧日志
 logger_reverse = logging.getLogger("model_proxy.translate_reverse")  # 反向侧日志
 
+
+# ---------------------------------------------------------------------------
+# OPT-07：translate 降级/缺 usage 限流 helper
+# key=事件 kind，60s 窗口，首条全量 + 窗口末 suppressed=N 汇总一条。
+# 进程退出丢 suppressed 计数（可接受，方案已认可）。
+# budget_retry warn 不挂此限流器（保持 WARNING + 完整阶梯轨迹）。
+# ---------------------------------------------------------------------------
+
+class _RateLimitedLogger:
+    """按 key 限流的日志辅助器。
+
+    每个 key 独立 60s 窗口：
+    - 窗口首条：全量输出（原 msg）
+    - 窗口内后续：计数吞掉，不输出
+    - 窗口过期后首次调用：先输出旧窗口 suppressed=N 汇总条，再输出新窗口首条全量
+
+    线程安全：translate 调用均在请求线程内（ThreadingHTTPServer），各 key 的
+    dict 操作用 dict.setdefault + 赋值，Python GIL 下原子性足够（最坏丢一条计数，
+    不影响正确性）。
+    """
+
+    _WINDOW = 60.0  # 秒
+
+    def __init__(self):
+        self._state: dict[str, tuple[float, int]] = {}  # key -> (window_start, suppressed)
+
+    def warning(self, key: str, log_obj, msg: str, *args) -> None:
+        """限流 WARNING 调用。
+
+        Args:
+            key: 事件 kind（用于去重，同 key 在窗口内只出首条）
+            log_obj: logger 或 logger_reverse
+            msg: 原始日志消息（含 %s 占位符）
+            *args: msg 的格式化参数
+        """
+        now = time.time()
+        entry = self._state.get(key)
+        if entry is None:
+            # 首次：全量输出，开窗口
+            log_obj.warning(msg, *args)
+            self._state[key] = (now, 0)
+            return
+        window_start, suppressed = entry
+        if now - window_start >= self._WINDOW:
+            # 窗口过期：先出旧窗口汇总，再开新窗口
+            if suppressed > 0:
+                log_obj.warning("%s suppressed=%d (window=%.0fs)",
+                                key, suppressed, self._WINDOW)
+            log_obj.warning(msg, *args)
+            self._state[key] = (now, 0)
+        else:
+            # 窗口内：计数吞掉
+            self._state[key] = (window_start, suppressed + 1)
+
+
+_rl = _RateLimitedLogger()
+
 # OpenAI 工具名上限（正向规格 §1.5.1）
 OPENAI_MAX_TOOL_NAME_LENGTH = 64
 
@@ -342,7 +399,8 @@ def _tool_result_to_openai(block: dict) -> dict:
         elif len(inner) == 1 and image_blocks:
             # 保守策略（§1.3.3 边界）：role:tool 图片支持未实测，降级为占位文本
             content = "[image omitted]"
-            logger.warning("tool_result image content downgraded to placeholder")
+            _rl.warning("tool_result_image_downgrade", logger,
+                        "tool_result image content downgraded to placeholder")
         else:
             # 多块：文本原样、图片降级为占位文本，序列化为字符串数组
             parts = []
@@ -354,7 +412,8 @@ def _tool_result_to_openai(block: dict) -> dict:
                 elif b.get("type") == "image":
                     parts.append({"type": "text", "text": "[image omitted]"})
             content = json.dumps(parts, ensure_ascii=False)
-            logger.warning("tool_result multi-block content serialized to string")
+            _rl.warning("tool_result_multiblock_serialize", logger,
+                        "tool_result multi-block content serialized to string")
     else:
         content = ""
     return {"role": "tool", "tool_call_id": tool_call_id, "content": content}
@@ -398,7 +457,8 @@ def _translate_messages(messages):
             if isinstance(content, str):
                 out.append({"role": role, "content": content})
             else:
-                logger.warning("unknown message role dropped: %r", role)
+                _rl.warning("unknown_role_dropped", logger,
+                            "unknown message role dropped: %r", role)
     return out
 
 
@@ -422,11 +482,13 @@ def _translate_user_message(content):
             if url is not None:
                 normal_parts.append({"type": "image_url", "image_url": {"url": url}})
             else:
-                logger.warning("unsupported image source dropped")
+                _rl.warning("unsupported_image_source", logger,
+                            "unsupported image source dropped")
         elif btype == "tool_result":
             tool_result_msgs.append(_tool_result_to_openai(block))
         else:
-            logger.warning("unsupported user content block dropped: %r", btype)
+            _rl.warning("unsupported_user_block", logger,
+                        "unsupported user content block dropped: %r", btype)
 
     result = list(tool_result_msgs)  # 先 tool_result，再 normal（§1.3.1）
     if normal_parts:
@@ -464,7 +526,8 @@ def _translate_assistant_message(content):
                 # native 端点不吃 thinking block，丢弃（§1.3.2）
                 logger.debug("thinking block dropped in assistant message")
             else:
-                logger.warning("unsupported assistant content block dropped: %r", btype)
+                _rl.warning("unsupported_assistant_block", logger,
+                            "unsupported assistant content block dropped: %r", btype)
     msg = {"role": "assistant"}
     msg["content"] = "\n".join(text_parts) if text_parts else None
     if tool_calls:
@@ -589,7 +652,8 @@ def openai_to_anthropic_response(resp: dict, ctx: dict = None) -> dict:
             parsed = json.loads(raw_args)
         except (ValueError, TypeError):
             parsed = {}  # 参数非法 JSON 降级为空对象
-            logger.warning("tool_call arguments not valid JSON, downgraded to {}")
+            _rl.warning("tool_call_bad_json", logger,
+                        "tool_call arguments not valid JSON, downgraded to {}")
         name = tool_name_mapping.get(fn.get("name", ""), fn.get("name", ""))  # 还原原名
         content_blocks.append({
             "type": "tool_use",
@@ -613,17 +677,17 @@ def openai_to_anthropic_response(resp: dict, ctx: dict = None) -> dict:
                 "type": "text",
                 "text": _REASONING_FALLBACK_PREFIX + reasoning,
             })
-            logger.warning("empty content fallback: filled reasoning_content into text block")
+            _rl.warning("empty_content_fallback", logger,
+                        "empty content fallback: filled reasoning_content into text block")
 
     # stop_reason 映射
     stop_reason = map_finish_reason(choice.get("finish_reason"))
 
     # usage 映射
     if not resp.get("usage"):
-        logger.warning(
-            "upstream chat completion response missing usage field, "
-            "anthropic usage will be all-zero"
-        )
+        _rl.warning("missing_usage_chat", logger,
+                    "upstream chat completion response missing usage field, "
+                    "anthropic usage will be all-zero")
     u = resp.get("usage") or {}
     anthropic_usage = {
         "input_tokens": u.get("prompt_tokens", 0),
@@ -635,7 +699,8 @@ def openai_to_anthropic_response(resp: dict, ctx: dict = None) -> dict:
 
     # content_filter_results：丢弃 + 记 log（§2.4）
     if resp.get("content_filter_results") or (choice.get("finish_reason") == "content_filter"):
-        logger.warning("content_filter triggered (dropped from anthropic response)")
+        _rl.warning("content_filter", logger,
+                    "content_filter triggered (dropped from anthropic response)")
 
     return {
         "id": resp.get("id") or gen_msg_id(),
@@ -1194,9 +1259,8 @@ def _extract_reasoning_tokens(usage: dict) -> int:
 def _anthropic_usage_to_responses(usage: dict) -> dict:
     """Anthropic usage -> Responses usage（反向规格 §2.3）。"""
     if not usage:
-        logger_reverse.warning(
-            "anthropic response missing usage field, responses usage will be all-zero"
-        )
+        _rl.warning("missing_usage_responses", logger_reverse,
+                    "anthropic response missing usage field, responses usage will be all-zero")
     u = usage or {}
     in_tok = u.get("input_tokens", 0) or 0
     out_tok = u.get("output_tokens", 0) or 0
@@ -1692,7 +1756,8 @@ def _messages_to_input(messages, tool_name_mapping: dict) -> list:
                     if url is not None:
                         normal_parts.append({"type": "input_image", "image_url": url})
                     else:
-                        logger.warning("unsupported image source dropped (a2r)")
+                        _rl.warning("unsupported_image_source_a2r", logger,
+                                    "unsupported image source dropped (a2r)")
                 elif bt == "tool_result":
                     inner = block.get("content")
                     if isinstance(inner, str):
@@ -1709,7 +1774,8 @@ def _messages_to_input(messages, tool_name_mapping: dict) -> list:
                         "output": out,
                     })
                 else:
-                    logger.warning("unsupported user content block dropped (a2r): %r", bt)
+                    _rl.warning("unsupported_user_block_a2r", logger,
+                                "unsupported user content block dropped (a2r): %r", bt)
             if normal_parts:
                 items.append({"type": "message", "role": "user", "content": normal_parts})
 
@@ -1742,11 +1808,13 @@ def _messages_to_input(messages, tool_name_mapping: dict) -> list:
                 elif bt in ("thinking", "redacted_thinking"):
                     logger.debug("thinking block dropped in assistant message (a2r)")
                 else:
-                    logger.warning("unsupported assistant content block dropped (a2r): %r", bt)
+                    _rl.warning("unsupported_assistant_block_a2r", logger,
+                                "unsupported assistant content block dropped (a2r): %r", bt)
             if text_parts:
                 items.append({"type": "message", "role": "assistant", "content": text_parts})
         else:
-            logger.warning("unknown message role dropped (a2r): %r", role)
+            _rl.warning("unknown_role_dropped_a2r", logger,
+                        "unknown message role dropped (a2r): %r", role)
     return items
 
 
@@ -1896,7 +1964,8 @@ def responses_to_anthropic_response(resp: dict, ctx: dict = None) -> dict:
                 parsed = json.loads(raw_args)
             except (ValueError, TypeError):
                 parsed = {}
-                logger.warning("function_call arguments not valid JSON, downgraded to {} (r2a)")
+                _rl.warning("function_call_bad_json_r2a", logger,
+                            "function_call arguments not valid JSON, downgraded to {} (r2a)")
             name = tool_name_mapping.get(item.get("name", ""), item.get("name", ""))  # 还原
             content_blocks.append({
                 "type": "tool_use",

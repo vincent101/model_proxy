@@ -217,6 +217,8 @@ class TestExtractRouteCandidatesMutuallyExclusiveField(unittest.TestCase):
         self.assertEqual([r["id"] for r in candidates], ["deepseek"])
 
     def test_both_fields_present_logs_warning(self):
+        """OPT-06：校验挪到 reload 时统一跑，热路径降 DEBUG 保底。
+        热路径不再产生 WARNING（降 DEBUG），只验证行为正确性。"""
         rm = _routes_map()
         strategy = {
             "client_token": "illegal-test",
@@ -224,12 +226,9 @@ class TestExtractRouteCandidatesMutuallyExclusiveField(unittest.TestCase):
             "route_pool": [{"route_id": "nation", "weight": 1}],
             "dispatch": {},
         }
-        with self.assertLogs("core.server", level="WARNING") as cm:
-            extract_route_candidates(strategy, None, rm)
-        joined = "\n".join(cm.output)
-        self.assertIn("illegal-test", joined)
-        self.assertIn("route_id", joined)
-        self.assertIn("route_pool", joined)
+        # 热路径降为 DEBUG，不再 WARNING；验证行为正确即可
+        candidates = extract_route_candidates(strategy, None, rm)
+        self.assertEqual([r["id"] for r in candidates], ["nation"])
 
 
 if __name__ == "__main__":

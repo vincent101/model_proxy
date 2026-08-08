@@ -69,10 +69,10 @@ class TestUsageTotalsStoreRecord(unittest.TestCase):
     def test_cold_start_creates_expected_structure(self):
         store = UsageTotalsStore(self.path)
         data = store._data
-        self.assertEqual(data["version"], 2)
+        self.assertEqual(data["version"], 3)
         self.assertIn("since", data)
         self.assertEqual(data["keep_days"], 400)
-        self.assertEqual(data["total"], {"requests": 0, "ok": 0, "fail": 0, "sum_ms": 0, "combos": {}})
+        self.assertEqual(data["total"], {"requests": 0, "ok": 0, "fail": 0, "sum_ms": 0, "max_ms": 0, "combos": {}})
         self.assertEqual(data["months_archive"], {})
         self.assertEqual(data["days"], {})
         # record 前文件不落盘（只在 record 时才写）
@@ -512,6 +512,182 @@ class TestGetMonthBucketSplitArchive(unittest.TestCase):
         self.assertEqual(by_supply["s1"], 2)
         self.assertEqual(by_supply["s2"], 1)
         self.assertEqual(sum(by_supply.values()), bucket["requests"])
+
+
+# ---------------------------------------------------------------------------
+# OPT-10: 账本 schema v3 测试（max_ms + attempts/attempt_fail + v2→v3 迁移）
+# ---------------------------------------------------------------------------
+
+class TestSchemaV3(unittest.TestCase):
+    """OPT-10：v3 schema 新字段 + 迁移正确性。"""
+
+    def setUp(self):
+        self._tmpdir = tempfile.TemporaryDirectory()
+        self.path = Path(self._tmpdir.name) / "totals.json"
+
+    def tearDown(self):
+        self._tmpdir.cleanup()
+
+    def test_new_combo_has_attempt_fields(self):
+        """新 record 的 combo 应含 attempts/attempt_fail 字段，初始为 0。"""
+        store = UsageTotalsStore(self.path)
+        store.record(_acc(), 100)
+        day_key = _cst_now().strftime("%Y-%m-%d")
+        combo = store._data["days"][day_key]["combos"][
+            "supply=s1|route=r1|strategy=cc"]
+        self.assertIn("attempts", combo)
+        self.assertIn("attempt_fail", combo)
+
+    def test_bucket_has_max_ms(self):
+        """新 record 的天桶应含 max_ms 字段。"""
+        store = UsageTotalsStore(self.path)
+        store.record(_acc(), 100)
+        day_key = _cst_now().strftime("%Y-%m-%d")
+        self.assertIn("max_ms", store._data["days"][day_key])
+        self.assertEqual(store._data["days"][day_key]["max_ms"], 100)
+
+    def test_max_ms_tracks_maximum(self):
+        """多次 record 后 max_ms 应为最大值，非累加。"""
+        store = UsageTotalsStore(self.path)
+        store.record(_acc(), 100)
+        store.record(_acc(), 300)
+        store.record(_acc(), 200)
+        day_key = _cst_now().strftime("%Y-%m-%d")
+        self.assertEqual(store._data["days"][day_key]["max_ms"], 300)
+        self.assertEqual(store._data["total"]["max_ms"], 300)
+
+    def test_attempts_accumulate_in_combo(self):
+        """combo 的 attempts 应累加每次请求的 attempts 值。"""
+        store = UsageTotalsStore(self.path)
+        acc1 = _acc()
+        acc1["attempts"] = 3
+        store.record(acc1, 100)
+        acc2 = _acc()
+        acc2["attempts"] = 2
+        store.record(acc2, 50)
+        day_key = _cst_now().strftime("%Y-%m-%d")
+        combo = store._data["days"][day_key]["combos"][
+            "supply=s1|route=r1|strategy=cc"]
+        self.assertEqual(combo["attempts"], 5)
+
+    def test_attempt_fail_from_errors_list(self):
+        """combo 的 attempt_fail 应等于 attempt_errors 列表长度。"""
+        store = UsageTotalsStore(self.path)
+        acc1 = _acc()
+        acc1["attempts"] = 2
+        acc1["attempt_errors"] = [("s1", "http_500"), ("s1", "http_503")]
+        store.record(acc1, 100)
+        day_key = _cst_now().strftime("%Y-%m-%d")
+        combo = store._data["days"][day_key]["combos"][
+            "supply=s1|route=r1|strategy=cc"]
+        self.assertEqual(combo["attempt_fail"], 2)
+
+    def test_attempt_fail_zero_when_no_errors(self):
+        """无 attempt_errors 时 attempt_fail=0。"""
+        store = UsageTotalsStore(self.path)
+        acc1 = _acc()
+        acc1["attempts"] = 1
+        acc1["attempt_errors"] = []
+        store.record(acc1, 100)
+        day_key = _cst_now().strftime("%Y-%m-%d")
+        combo = store._data["days"][day_key]["combos"][
+            "supply=s1|route=r1|strategy=cc"]
+        self.assertEqual(combo["attempt_fail"], 0)
+
+
+class TestV2ToV3Migration(unittest.TestCase):
+    """OPT-10：v2→v3 迁移（旧桶补 0）。"""
+
+    def setUp(self):
+        self._tmpdir = tempfile.TemporaryDirectory()
+        self.path = Path(self._tmpdir.name) / "totals.json"
+
+    def tearDown(self):
+        self._tmpdir.cleanup()
+
+    def test_migrate_v2_adds_max_ms_to_buckets(self):
+        """v2 旧桶（无 max_ms）迁移后应补 max_ms=0。"""
+        old_data = {
+            "version": 2,
+            "since": "2026-07-01",
+            "keep_days": 400,
+            "total": {"requests": 5, "ok": 4, "fail": 1, "sum_ms": 500, "combos": {}},
+            "months_archive": {
+                "2026-07": {"requests": 2, "ok": 2, "fail": 0, "sum_ms": 200, "combos": {}}
+            },
+            "days": {
+                "2026-08-08": {"requests": 3, "ok": 2, "fail": 1, "sum_ms": 300, "combos": {}}
+            },
+        }
+        self.path.write_text(json.dumps(old_data), encoding="utf-8")
+        store = UsageTotalsStore(self.path)
+        self.assertEqual(store._data["version"], 3)
+        self.assertEqual(store._data["total"]["max_ms"], 0)
+        self.assertEqual(store._data["months_archive"]["2026-07"]["max_ms"], 0)
+        self.assertEqual(store._data["days"]["2026-08-08"]["max_ms"], 0)
+
+    def test_migrate_v2_adds_attempt_fields_to_combos(self):
+        """v2 旧 combo（无 attempts/attempt_fail）迁移后应补 0。"""
+        old_combo = {"requests": 5, "ok": 4, "fail": 1, "usage_in": 50, "usage_out": 100}
+        old_data = {
+            "version": 2,
+            "since": "2026-07-01",
+            "keep_days": 400,
+            "total": {"requests": 5, "ok": 4, "fail": 1, "sum_ms": 500,
+                      "combos": {"supply=s1|route=r1|strategy=cc": dict(old_combo)}},
+            "months_archive": {},
+            "days": {},
+        }
+        self.path.write_text(json.dumps(old_data), encoding="utf-8")
+        store = UsageTotalsStore(self.path)
+        combo = store._data["total"]["combos"]["supply=s1|route=r1|strategy=cc"]
+        self.assertEqual(combo["attempts"], 0)
+        self.assertEqual(combo["attempt_fail"], 0)
+
+    def test_migrate_v2_preserves_existing_values(self):
+        """迁移不破坏既有字段值。"""
+        old_combo = {"requests": 5, "ok": 4, "fail": 1, "usage_in": 50, "usage_out": 100}
+        old_data = {
+            "version": 2,
+            "since": "2026-07-01",
+            "keep_days": 400,
+            "total": {"requests": 5, "ok": 4, "fail": 1, "sum_ms": 500,
+                      "combos": {"supply=s1|route=r1|strategy=cc": dict(old_combo)}},
+            "months_archive": {},
+            "days": {},
+        }
+        self.path.write_text(json.dumps(old_data), encoding="utf-8")
+        store = UsageTotalsStore(self.path)
+        combo = store._data["total"]["combos"]["supply=s1|route=r1|strategy=cc"]
+        self.assertEqual(combo["requests"], 5)
+        self.assertEqual(combo["ok"], 4)
+        self.assertEqual(combo["fail"], 1)
+        self.assertEqual(combo["usage_in"], 50)
+        self.assertEqual(combo["usage_out"], 100)
+
+    def test_migrated_ledger_can_continue_recording(self):
+        """迁移后的账本可以正常继续 record（新字段已存在，不报 KeyError）。"""
+        old_data = {
+            "version": 2,
+            "since": "2026-07-01",
+            "keep_days": 400,
+            "total": {"requests": 1, "ok": 1, "fail": 0, "sum_ms": 100,
+                      "combos": {"supply=s1|route=r1|strategy=cc":
+                                 {"requests": 1, "ok": 1, "fail": 0,
+                                  "usage_in": 10, "usage_out": 20}}},
+            "months_archive": {},
+            "days": {},
+        }
+        self.path.write_text(json.dumps(old_data), encoding="utf-8")
+        store = UsageTotalsStore(self.path)
+        # 迁移后再 record，不应崩溃
+        acc = _acc()
+        acc["attempts"] = 1
+        acc["attempt_errors"] = []
+        store.record(acc, 150)
+        combo = store._data["total"]["combos"]["supply=s1|route=r1|strategy=cc"]
+        self.assertEqual(combo["requests"], 2)
+        self.assertEqual(combo["attempts"], 1)
 
 
 if __name__ == "__main__":

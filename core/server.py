@@ -86,12 +86,15 @@ _root_handler = logging.FileHandler(LOG_FILE)
 _root_handler.setFormatter(logging.Formatter(
     "%(asctime)s %(levelname)s req_id=%(req_id)s %(message)s"))
 _root_handler.addFilter(_req_filter)
-logging.basicConfig(level=logging.WARNING, handlers=[_root_handler])
+logging.basicConfig(level=logging.INFO, handlers=[_root_handler])
 log = logging.getLogger(__name__)
 
-# access logger：单独 INFO 级别，复用同一日志文件、不向 root 传播（root 仍 WARNING，
-# 避免误收其他 INFO 噪声）。固定前缀 ACCESS，key=value 单行文本，与现有 WARNING 行
-# 风格一致，grep/awk 友好（见 docs/designs/2026-07-22-access-log-and-latency.md）。
+# access logger：单独 INFO 级别，复用同一日志文件、不向 root 传播（root 已开 INFO，
+# 但 access 独立 logger 避免相互 propagate 干扰）。固定前缀 ACCESS，key=value 单行文本，
+# 与现有 WARNING 行风格一致，grep/awk 友好（见 docs/designs/2026-07-22-access-log-and-latency.md）。
+# root 开 INFO 安全前提（已核实）：BaseHTTPRequestHandler.log_message 已屏蔽
+# （pass），stdlib 默认请求日志不会刷屏；进程内 INFO 级调用方只有本模块运维事件 +
+# translate.py 两条降级日志（OPT-03 已提 WARNING）。
 _access_handler = logging.FileHandler(LOG_FILE)
 _access_handler.setFormatter(logging.Formatter(
     "%(asctime)s req_id=%(req_id)s %(message)s"))
@@ -138,13 +141,16 @@ def _atomic_write_json(path: Path, obj: dict) -> None:
 
 
 def _zero_bucket() -> dict:
-    """天桶/月归档/total 顶层的零值结构。"""
-    return {"requests": 0, "ok": 0, "fail": 0, "sum_ms": 0, "combos": {}}
+    """天桶/月归档/total 顶层的零值结构。OPT-10: 新增 max_ms。"""
+    return {"requests": 0, "ok": 0, "fail": 0, "sum_ms": 0, "max_ms": 0, "combos": {}}
 
 
 def _zero_combo() -> dict:
-    """combos 单条目的零值结构（不存 sum_ms，见方案 §1）。"""
-    return {"requests": 0, "ok": 0, "fail": 0, "usage_in": 0, "usage_out": 0}
+    """combos 单条目的零值结构（不存 sum_ms，见方案 §1）。
+    OPT-10: 新增 attempts/attempt_fail（failover 口径，不含 budget 重试）。"""
+    return {"requests": 0, "ok": 0, "fail": 0,
+            "usage_in": 0, "usage_out": 0,
+            "attempts": 0, "attempt_fail": 0}
 
 
 class UsageTotalsStore:
@@ -161,7 +167,7 @@ class UsageTotalsStore:
     def _load(self) -> dict:
         if not self._path.exists():
             return {
-                "version": 2,
+                "version": 3,
                 "since": _cst_now().strftime("%Y-%m-%d"),
                 "keep_days": KEEP_DAYS,
                 "total": _zero_bucket(),
@@ -170,7 +176,7 @@ class UsageTotalsStore:
             }
         try:
             with open(self._path, "r", encoding="utf-8") as f:
-                return json.load(f)
+                data = json.load(f)
         except (json.JSONDecodeError, OSError) as e:
             log.warning("usage totals ledger corrupt, resetting: %s", e)
             try:
@@ -180,13 +186,27 @@ class UsageTotalsStore:
             except OSError:
                 pass
             return {
-                "version": 2,
+                "version": 3,
                 "since": _cst_now().strftime("%Y-%m-%d"),
                 "keep_days": KEEP_DAYS,
                 "total": _zero_bucket(),
                 "months_archive": {},
                 "days": {},
             }
+        # OPT-10: v2→v3 迁移（补 0，断档但保真）
+        if data.get("version", 2) < 3:
+            data["version"] = 3
+            for bucket in [data.get("total"), *(data.get("months_archive") or {}).values(),
+                           *(data.get("days") or {}).values()]:
+                if not isinstance(bucket, dict):
+                    continue
+                bucket.setdefault("max_ms", 0)
+                for combo in (bucket.get("combos") or {}).values():
+                    if isinstance(combo, dict):
+                        combo.setdefault("attempts", 0)
+                        combo.setdefault("attempt_fail", 0)
+            log.info("usage_totals.migrated v2→v3 (旧桶补 0: max_ms/attempts/attempt_fail)")
+        return data
 
     @staticmethod
     def _combo_key(acc: dict) -> str:
@@ -197,7 +217,8 @@ class UsageTotalsStore:
         )
 
     def record(self, acc: dict, ms: int) -> None:
-        """核心记账方法：锁内累加内存 dict + 归档检查 + 原子落盘。"""
+        """核心记账方法：锁内累加内存 dict + 归档检查 + 原子落盘。
+        OPT-10: 新增 max_ms（bucket 级）和 attempts/attempt_fail（combo 级）。"""
         with self._lock:
             day_key = _cst_now().strftime("%Y-%m-%d")
             days = self._data.setdefault("days", {})
@@ -209,18 +230,28 @@ class UsageTotalsStore:
             fail = 0 if ok else 1
             usage_in = acc.get("usage_in", 0) or 0
             usage_out = acc.get("usage_out", 0) or 0
+            # OPT-10: attempts = ACCESS 的 attempts 字段（含 failover + budget 重试），
+            # attempt_fail = attempt_errors 长度（仅 failover 口径，不含 budget 重试）
+            attempts = acc.get("attempts", 0) or 0
+            attempt_fail = len(acc.get("attempt_errors") or [])
 
             for bucket in (day_bucket, total_bucket):
                 bucket["requests"] += 1
                 bucket["ok"] += ok
                 bucket["fail"] += fail
                 bucket["sum_ms"] += ms
+                # OPT-10: max_ms（bucket 级，跨 combo）
+                if ms > bucket.get("max_ms", 0):
+                    bucket["max_ms"] = ms
                 combo = bucket.setdefault("combos", {}).setdefault(combo_key, _zero_combo())
                 combo["requests"] += 1
                 combo["ok"] += ok
                 combo["fail"] += fail
                 combo["usage_in"] += usage_in
                 combo["usage_out"] += usage_out
+                # OPT-10: attempts/attempt_fail（combo 级）
+                combo["attempts"] = combo.get("attempts", 0) + attempts
+                combo["attempt_fail"] = combo.get("attempt_fail", 0) + attempt_fail
 
             self._archive_if_needed()
             _atomic_write_json(self._path, self._data)
@@ -228,6 +259,7 @@ class UsageTotalsStore:
     def _archive_if_needed(self) -> None:
         """days 超过 KEEP_DAYS 时，把最旧的天桶按组合键汇总进 months_archive 后删除。
         必须持锁调用（由 record 内已持锁的调用点触发）。
+        OPT-10: 归档时传递 max_ms（取 max）和 attempts/attempt_fail（累加）。
         """
         days = self._data.setdefault("days", {})
         while len(days) > KEEP_DAYS:
@@ -240,6 +272,10 @@ class UsageTotalsStore:
             month_bucket["ok"] += oldest_bucket.get("ok", 0)
             month_bucket["fail"] += oldest_bucket.get("fail", 0)
             month_bucket["sum_ms"] += oldest_bucket.get("sum_ms", 0)
+            # OPT-10: max_ms 归档取 max
+            old_max = oldest_bucket.get("max_ms", 0)
+            if old_max > month_bucket.get("max_ms", 0):
+                month_bucket["max_ms"] = old_max
             month_combos = month_bucket.setdefault("combos", {})
             for combo_key, combo_val in oldest_bucket.get("combos", {}).items():
                 dest = month_combos.setdefault(combo_key, _zero_combo())
@@ -248,6 +284,9 @@ class UsageTotalsStore:
                 dest["fail"] += combo_val.get("fail", 0)
                 dest["usage_in"] += combo_val.get("usage_in", 0)
                 dest["usage_out"] += combo_val.get("usage_out", 0)
+                # OPT-10: attempts/attempt_fail 归档累加
+                dest["attempts"] = dest.get("attempts", 0) + combo_val.get("attempts", 0)
+                dest["attempt_fail"] = dest.get("attempt_fail", 0) + combo_val.get("attempt_fail", 0)
 
 
 usage_totals = UsageTotalsStore(TOTALS_FILE)
@@ -306,7 +345,7 @@ class SyntaxPreferenceStore:
     def learn(self, model: str, variant: str) -> None:
         with self._lock:
             self._cache[model] = {"variant": variant, "at": time.time()}
-        log.warning("reasoning_pref: model=%r → variant=%r (cached 48h)", model, variant)
+        log.info("reasoning_pref.learn: model=%r → variant=%r (cached 48h)", model, variant)
 
 
 # ---------------------------------------------------------------------------
@@ -428,6 +467,7 @@ class ConfigStore:
                 new_config: dict[str, Any] = json.load(f)
             self._mtime = self._path.stat().st_mtime
             self._config = new_config
+            self._validate_config()
 
     def _reload_locked(self) -> bool:
         """持锁加载文件，替换 config 引用。解析失败时保留旧配置，返回 False。"""
@@ -436,10 +476,45 @@ class ConfigStore:
                 new_config: dict[str, Any] = json.load(f)
             self._mtime = self._path.stat().st_mtime
             self._config = new_config
+            log.info("config.reload.ok mtime=%s supplies=%d routes=%d strategies=%d",
+                     self._mtime,
+                     len(new_config.get("supplies", [])),
+                     len(new_config.get("routes", [])),
+                     len(new_config.get("strategies", [])))
+            try:
+                self._validate_config()
+            except Exception as e:
+                log.warning("config.validate raised (ignored, load still ok): %s", e)
             return True
         except (json.JSONDecodeError, OSError) as e:
             log.warning("config reload failed, keeping old config: %s", e)
             return False
+
+    def _validate_config(self) -> None:
+        """OPT-06：配置校验（告警 ≠ 拒绝加载）。
+
+        在 _reload / _reload_locked 成功后各跑一次，替代热路径 extract_route_candidates
+        内的每请求重复告警。校验项：
+        - route_id 与 route_pool 互斥：每个 strategy 最多告警一次
+        - route_pool 非法项：每个 strategy 最多告警一次（聚合非法 route_id 列表）
+        容错语义：校验只告警，不影响加载成功（_reload_locked 仍返回 True）。
+        """
+        routes_map = {r["id"]: r for r in self._config.get("routes", [])
+                      if isinstance(r, dict) and "id" in r}
+        for st in self._config.get("strategies", []):
+            if not isinstance(st, dict):
+                continue
+            ct = st.get("client_token", "")
+            if st.get("route_id") and st.get("route_pool"):
+                log.warning("config.validate: strategy=%s has both route_id and route_pool, "
+                            "route_id will be ignored", ct)
+            pool = st.get("route_pool") or []
+            invalid = [item.get("route_id") for item in pool
+                       if isinstance(item, dict)
+                       and (not item.get("route_id") or item.get("route_id") not in routes_map)]
+            if invalid:
+                log.warning("config.validate: strategy=%s route_pool has invalid route_ids=%s",
+                            ct, invalid)
 
 
 # ---------------------------------------------------------------------------
@@ -693,20 +768,18 @@ def extract_route_candidates(strategy: "dict | None", session_key: "str | None",
         return [route] if route else []
 
     if strategy.get("route_id"):
-        # 非法态：route_id 与 route_pool 互斥（见设计文档 §4 校验规则），
-        # _config_ops.py 写入侧已用 _validate_strategy_route_fields 拒绝该态，
-        # 但配置文件可能被手工/外部改动绕过写入侧校验，运行时兜底：不中断
-        # 请求，按 route_pool 处理并忽略 route_id，但要留日志可见性。
-        log.warning("strategy=%s 同时配置了 route_id 和 route_pool，已忽略 "
-                    "route_id，按 route_pool 处理", strategy.get("client_token", ""))
+        # OPT-06：校验已挪到 reload 时统一跑（ConfigStore._validate_config），热路径降 DEBUG 保底。
+        log.debug("strategy=%s has both route_id and route_pool, ignoring route_id",
+                  strategy.get("client_token", ""))
 
     # 新写法：先校验 route_pool 每项引用合法性，跳过非法项。
     valid_pool: list[dict] = []
     for item in route_pool:
         rid = item.get("route_id") if isinstance(item, dict) else None
         if not rid or rid not in routes_map:
-            log.warning("route_pool entry invalid, skip: strategy=%s route_id=%r",
-                        strategy.get("client_token", ""), rid)
+            # OPT-06：校验已挪到 reload 时统一跑，热路径降 DEBUG 保底。
+            log.debug("route_pool entry invalid, skip: strategy=%s route_id=%r",
+                      strategy.get("client_token", ""), rid)
             continue
         weight = item.get("weight", 1)
         if not isinstance(weight, int) or weight <= 0:
@@ -1031,6 +1104,9 @@ class ModelProxyHandler(BaseHTTPRequestHandler):
             # OPT-04: final_error 记错误出口的短 reason（截断 80 字符、空格转下划线）。
             # budget 截断终态（status=200 + budget_truncated=1）不写 final_error，两者正交。
             "final_error": "",
+            # OPT-10: attempt_errors 记 failover 失败明细（supply_id, reason），
+            # 仅 3 处 failover continue 前 append（不含 budget 重试的 4 处 continue）。
+            "attempt_errors": [],
         }
         t0 = time.monotonic()
         try:
@@ -1254,13 +1330,15 @@ class ModelProxyHandler(BaseHTTPRequestHandler):
 
             supplies_list = select_supply_list(route, tier)
             if not supplies_list:
-                log.warning("route missing tier config: route=%s tier=%s", route.get("id"), tier)
                 if not is_last_candidate:
+                    # OPT-05 双发合并：非末候选只打动作行（消息内含原因），吞并条件行
                     log.warning(
                         "route_failover: route=%s missing tier=%s config, trying next candidate route",
                         route.get("id"), tier)
                     self._acc["route_failover"] = 1
                     continue
+                # 末候选只打条件行
+                log.warning("route missing tier config: route=%s tier=%s", route.get("id"), tier)
                 self._write_buffered_response(
                     503, [], error_body_for_source(
                         source, 503, f"route {route.get('id')} missing tier {tier}"))
@@ -1295,6 +1373,8 @@ class ModelProxyHandler(BaseHTTPRequestHandler):
                 mode = pick_translator(source, target)
 
                 if mode == UNSUPPORTED:
+                    log.warning("request.reject source=%s target=%s mode=UNSUPPORTED",
+                                source, target)
                     self._write_buffered_response(
                         501, [], error_body_for_source(
                             source, 501,
@@ -1479,6 +1559,8 @@ class ModelProxyHandler(BaseHTTPRequestHandler):
                         log.warning("cooldown+failover: supply=%s status=%s key_tail4=%s",
                                     supply_id, resp_status, appkey[-4:] if appkey else "")
                         self._acc["failover"] = 1
+                        self._acc["attempt_errors"].append(
+                            (supply_id, f"http_{resp_status}"))
                         cd.cooldown(supply_id, cd_seconds)
                         tried_set.add(supply_id)
                         continue
@@ -1496,6 +1578,8 @@ class ModelProxyHandler(BaseHTTPRequestHandler):
                         log.warning("cooldown+failover(net): supply=%s err=%s key_tail4=%s",
                                     supply_id, e, appkey[-4:] if appkey else "")
                         self._acc["failover"] = 1
+                        self._acc["attempt_errors"].append(
+                            (supply_id, f"net_error:{e}"))
                         cd.cooldown(supply_id, cd_seconds)
                         tried_set.add(supply_id)
                         continue
@@ -1510,6 +1594,8 @@ class ModelProxyHandler(BaseHTTPRequestHandler):
                     log.warning("cooldown+failover: supply=%s status=%s key_tail4=%s",
                                 supply_id, resp_status, appkey[-4:] if appkey else "")
                     self._acc["failover"] = 1
+                    self._acc["attempt_errors"].append(
+                        (supply_id, f"cooldown_signal_{resp_status}"))
                     cd.cooldown(supply_id, cd_seconds)
                     tried_set.add(supply_id)
                     continue
@@ -1689,11 +1775,15 @@ class ModelProxyHandler(BaseHTTPRequestHandler):
             # 一个候选（含单候选、即旧单值 route_id 配置的现状行为）才最终 503。
             if route_exhausted:
                 if not is_last_candidate:
+                    # OPT-05 双发合并：非末候选只打动作行（消息内含 exhausted 原因），吞并条件行
                     log.warning(
                         "route_failover: route=%s tier=%s all supplies failed or cooling, "
                         "trying next candidate route", route.get("id"), tier)
                     self._acc["route_failover"] = 1
                     continue
+                # 末候选只打条件行
+                log.warning("all supplies failed or cooling: route=%s tier=%s",
+                            route.get("id"), tier)
                 self._write_buffered_response(
                     503, [], error_body_for_source(
                         source, 503, "all upstream supplies failed or cooling"))
@@ -1837,6 +1927,7 @@ class ModelProxyHandler(BaseHTTPRequestHandler):
 
         # GET /model_proxy/status
         if method == "GET" and path == "/model_proxy/status":
+            log.info("admin.status")
             self._handle_status(cs, cd)
             return
 
@@ -1845,6 +1936,7 @@ class ModelProxyHandler(BaseHTTPRequestHandler):
             self._handle_reload(cs, cd)
             return
 
+        log.info("admin.404 path=%s method=%s", path, method)
         self._send_json(404, {"error": "not found"})
 
     # ------------------------------------------------------------------
@@ -1891,7 +1983,9 @@ class ModelProxyHandler(BaseHTTPRequestHandler):
         自动 reload 只是发现文件变了顺手换配置，不应该悄悄影响运行中的冷却状态。
         """
         cs.reload()
+        cleared = len(cd.snapshot())
         cd.clear_all()
+        log.info("admin.reload cleared_cooldowns=%d", cleared)
         self._send_json(200, {"ok": True})
 
     # ------------------------------------------------------------------
@@ -2264,7 +2358,7 @@ def main():
         fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
     except OSError:
         existing_pid = _LOCK_FILE.read_text().strip() if _LOCK_FILE.exists() else "unknown"
-        print(f"ERROR: another model_proxy.py is already running (pid {existing_pid}). Exiting.", flush=True)
+        log.warning("startup.lock_conflict existing_pid=%s", existing_pid)
         lock_fd.close()
         raise SystemExit(1)
     lock_fd.write(str(os.getpid()))
@@ -2290,14 +2384,16 @@ def main():
     server.pref_store = pref_store        # type: ignore[attr-defined]
     server.sidecar_store = sidecar_store  # type: ignore[attr-defined]
 
-    print(f"model_proxy listening on 127.0.0.1:{port}", flush=True)
+    log.info("startup.listening port=%d pid=%d config_path=%s",
+             port, os.getpid(), str(config_path))
     try:
         server.serve_forever()
     except KeyboardInterrupt:
-        pass
+        log.info("shutdown.signal KeyboardInterrupt")
     finally:
         server.shutdown()
         server.server_close()
+        log.info("shutdown.complete")
 
 
 if __name__ == "__main__":

@@ -520,19 +520,43 @@ v1 代理（18888）已于 2026-07-24 下线归档，不再涉及并行关系。
 
 ### 5.2 日志与观测
 
-日志除 WARNING 级别（异常/降级路径，如 no route、cooldown+failover、stream interrupted 等）外，
-还有一条 INFO 级别的 `ACCESS` 访问日志：每个转发请求（不含 `/model_proxy/*` 控制端点）结束时
-记一条，覆盖整个请求生命周期，字段为
-`ms status source route tier supply failover attempts usage_in usage_out token session route_failover builtin budget_retried budget_truncated stop_reason`
-（`ms` 为端到端耗时毫秒，`token` 为客户端 token 尾4位，`session` 为该请求解析出的 session_id
-取不到为空串，`route_failover` 为 0/1 标记本次请求是否发生了「pin route 全挂后跨 route 兜底」，
-区别于同 route 内换 supply 的 `failover`；`builtin` 为空表示普通转发请求，非空（当前只有
-`route`）表示该请求被内建命令层拦截、未打上游，此时 `supply=(builtin)`、`route=` 记录命令
-操作/查询后的生效 route，见「内建命令层」一节；`budget_retried` 为 ④b 预算放大轨迹
-（形如 `16000→32000`，多次逗号相接，空串=未发生），`budget_truncated=1` 为放大到上限仍截断
-或流式收口检测到截断（如实返回了截断响应），`stop_reason` 为响应停止原因（能拿到才记）。
-`budget_retried` 高频出现是「调用侧预算普遍偏小/该模型 thinking 量大」的运营信号，提示调高
-调用侧起步 max_tokens 以减少重试浪费）。两者共用同一文件，用固定前缀 `ACCESS` 区分。
+日志分四个级别（ERROR/WARNING/INFO/DEBUG），统一写本目录 `.claude_model_proxy.log`
+（启动时 `_trim_log` 截断保留末 5000 行）。所有日志行带 `req_id=` 关联键——同一请求的
+ACCESS 行与各 WARNING/ERROR/INFO 事件行同 req_id，`grep req_id=xxx` 可严格还原一次请求的
+完整链路（含 failover/cooldown/转换降级等过程，不再靠时间戳猜）。req_id 由 `logging.Filter`
+从 `threading.local` 注入，不改任何 `log.*` 调用点签名；非请求线程（启动/控制面）默认 `-`。
+
+级别规范：
+- **ERROR** = 客户端拿到失败响应或流被截断（请求/响应转换失败、流式中断、502、detect_target 500）
+- **WARNING** = 可恢复降级、数据有损但流程继续（cooldown+failover、route_failover、内容降级丢弃、上游缺 usage、reload 失败、sidecar/账本 corrupt、budget_retry 截断、401/501 拒绝）
+- **INFO** = 生命周期与运维事件（startup.listening / config.reload.ok / admin.reload / admin.status / admin.auth_fail / sidecar.write / usage_totals.migrated / reasoning_pref.learn 等）
+- **DEBUG** = 排障细节（reasoning 映射细节，`MODEL_PROXY_REASONING_DEBUG=1` 门控；配置校验告警挪到 reload 后也降 DEBUG）
+
+INFO 级运维事件（OPT-08）：`config.reload.ok`（mtime + supplies/routes/strategies 计数）、
+`admin.reload`（cleared_cooldowns=N）、`admin.status`/`admin.404`、`admin.auth_fail`（401 未授权
+访问尝试，不记 token 值）、`request.reject`（501 UNSUPPORTED）、`sidecar.write`（$route 写
+sidecar 成功）、`startup.listening`/`shutdown.*`、`usage_totals.migrated`（账本 schema 迁移）。
+root 开 INFO 安全前提：`BaseHTTPRequestHandler.log_message` 已屏蔽（pass），stdlib 无 INFO 噪声。
+
+ACCESS 访问日志：每个转发请求（不含 `/model_proxy/*` 控制端点）结束时记一条 INFO 级 `ACCESS`
+行，覆盖整个请求生命周期，字段为
+`req_id ms status source route tier supply failover attempts usage_in usage_out token session route_failover builtin budget_retried budget_truncated stop_reason final_error`
+（`req_id` 为请求关联键；`ms` 为端到端耗时毫秒；`token` 为客户端 token 尾4位；`session` 为该
+请求解析出的 session_id 取不到为空串；`route_failover` 为 0/1 标记本次请求是否发生了「pin
+route 全挂后跨 route 兜底」，区别于同 route 内换 supply 的 `failover`；`builtin` 为空表示普通
+转发请求，非空（当前只有 `route`）表示该请求被内建命令层拦截、未打上游，此时 `supply=(builtin)`、
+`route=` 记录命令操作/查询后的生效 route，见「内建命令层」一节；`budget_retried` 为 ④b 预算放大
+轨迹（形如 `16000→32000`，多次逗号相接，空串=未发生），`budget_truncated=1` 为放大到上限仍截断
+或流式收口检测到截断（如实返回了截断响应），`stop_reason` 为响应停止原因（能拿到才记）；
+`final_error` 为终态错误摘要（仅真失败出口写，截断 80 字符、空白转下划线保 k=v 可解析，budget
+截断终态 status=200 不写 final_error，两者正交）。`budget_retried` 高频出现是「调用侧预算普遍
+偏小/该模型 thinking 量大」的运营信号，提示调高调用侧起步 max_tokens 以减少重试浪费。
+
+translate 降级限流（OPT-07）：`core/translate.py` 的 14 处内容降级 WARNING（unsupported block
+dropped / role dropped / image downgraded / tool_call arguments 非法 JSON / 上游缺 usage 等）
+经 `_RateLimitedLogger` 按 event key 60s 窗口限流——窗口内首条全量、后续同 key 计数 suppressed，
+窗口过期后下次触发出 `suppressed=N` 汇总 + 新首条（lazy，进程退出前若该 key 不再触发则计数丢失）。
+budget_retry warn 不挂限流器（保留阶梯 progression 运营信号）。
 
 token 用量统计：转换模式（Anthropic↔Chat/Responses，流式+非流式）、PASSTHROUGH 非流式、
 以及 PASSTHROUGH 流式（anthropic→anthropic、responses→responses 的流式请求）均会提取
@@ -545,16 +569,22 @@ token 用量统计：转换模式（Anthropic↔Chat/Responses，流式+非流�
 事件里覆盖式提取 usage），不改变、不阻塞原有转发时序，异常整体隔离不影响透传正确性。
 不做 token 成本折算，只统计数量。
 
-累计用量账本：ACCESS 日志会在进程启动时被 `_trim_log` 截断到最后 5000 行，早期行永久丢失，无法
-回答「本月/某天累计用了多少 token」这类长期问题。为此另建一个独立账本文件
+累计用量账本（schema v3）：ACCESS 日志会在进程启动时被 `_trim_log` 截断到最后 5000 行，早期行
+永久丢失，无法回答「本月/某天累计用了多少 token」这类长期问题。为此另建一个独立账本文件
 `.claude_model_proxy_totals.json`（与日志文件同目录），每请求在 `_forward_logged` 收口处同步累加、
 原子写盘：按天分桶，桶内以 `supply×route×strategy` 组合键（形如
 `supply=<s>|route=<r>|strategy=<t>`，strategy 段是 client_token 明文如 `cc`/`codex`）累加
-`requests`/`ok`/`fail`/`usage_in`/`usage_out`，另存 `total` 全历史汇总。账本
-**只增不截**，不受进程重启与日志截断影响。天分桶只保留最近 `KEEP_DAYS=400` 天，超窗旧天桶汇总进
-`months_archive` 月归档节点（永久保留）。天/月边界固定按 UTC+8 划分（`timezone(timedelta(hours=8))`，
-不依赖系统时区）。账本供 `stats` 命令查询（见「CLI 命令参考」），与 ACCESS 日志完全独立。账本结构
-细节见设计记录 `docs/designs/2026-07-23-usage-totals-ledger.md`。
+`requests`/`ok`/`fail`/`usage_in`/`usage_out`/`max_ms`/`attempts`/`attempt_fail`，另存 `total`
+全历史汇总。`max_ms`（OPT-10）入账本，CLI stats 的 max_ms 从账本取，不再依赖日志窗口；
+`attempts`/`attempt_fail`（OPT-10）为 attempt 级计数——failover 中间失败计入对应 supply（仅盖
+3 处 failover continue，budget 重试按 §5a 决策不记账），supply 真实失败率可观测。账本 **只增不截**，
+不受进程重启与日志截断影响。天分桶只保留最近 `KEEP_DAYS=400` 天，超窗旧天桶汇总进 `months_archive`
+月归档节点（永久保留）。天/月边界固定按 UTC+8 划分（`timezone(timedelta(hours=8))`，不依赖系统时区）。
+schema 升级（v2→v3）在 `_load` 启动时自动迁移：旧桶 combo 补 `attempts=0`/`attempt_fail=0`、
+bucket 补 `max_ms=0`（断档但保真，不虚高），既有值保留，记 `usage_totals.migrated` INFO 日志。
+**迁移与重启顺序**：先停旧进程→起新进程（启动时迁移），避免旧进程写旧 schema 覆盖新进程已迁移的文件。
+账本供 `stats` 命令查询（见「CLI 命令参考」），与 ACCESS 日志完全独立。账本结构细节见设计记录
+`docs/designs/2026-07-23-usage-totals-ledger.md` + `docs/designs/2026-08-08-log-optimization-plan.md`。
 
 ### 5.3 配置热重载
 
@@ -573,19 +603,25 @@ token 用量统计：转换模式（Anthropic↔Chat/Responses，流式+非流�
 用 `tools/model_proxy/model_proxy_cli.sh`：
 
 ```bash
-model_proxy_cli.sh status                            # 运行状态 + supplies/routes/strategies/cooldown 概览
+model_proxy_cli.sh status                            # 运行状态 + supplies/routes/strategies/cooldown 概览；
+                                                      # 代理未运行时仍展示 config 静态段
 model_proxy_cli.sh reload                            # 触发配置热重载（无条件清空所有 cooldown）
 
 model_proxy_cli.sh supply                            # 打印 list 后进入交互菜单 [a]dd/[e]dit/[d]el/[t]est/[q]uit
 model_proxy_cli.sh route                             # 打印 list 后进入交互菜单 [a]dd/[e]dit/[d]el/[q]uit
 model_proxy_cli.sh strategy                          # 打印 list 后进入交互菜单 [a]dd/[e]dit/[d]el/[q]uit
 
-model_proxy_cli.sh switch <client_token> <route_id>  # 切换某 token 绑定的 route 家族（改 route_id 后 reload）
+model_proxy_cli.sh switch <client_token> <route_id>  # 改 strategy.route_id 后 reload。仅支持单值写法；
+                                                      # route_pool 写法会被拒绝，请直接编辑 config
 model_proxy_cli.sh install                           # 交互式列出四个 SDK + 本机检测状态，选择安装
 model_proxy_cli.sh on                                # 启动 model_proxy.py（已在监听则跳过）
 model_proxy_cli.sh off                               # 停止 model_proxy.py（严格按脚本绝对路径匹配进程）
 
 model_proxy_cli.sh logs [N]                          # 显示最近 N 条 ACCESS 访问日志（默认 30 条）
+model_proxy_cli.sh logs req=<id>                     # 按 req_id 过滤（串起一个请求的全部日志行）
+model_proxy_cli.sh logs level=ERROR                  # 按级别过滤（ERROR/WARNING/INFO/DEBUG）
+model_proxy_cli.sh logs event=cooldown               # 按事件关键词过滤（如 config.reload / admin.reload / sidecar.write）
+model_proxy_cli.sh logs req=<id> N                   # 过滤 + 限制条数
 model_proxy_cli.sh stats [时间] [维度/过滤...]        # 读独立累计账本，按 supply/route/strategy 任意
                                                       # 维度组合切片，支持 today/month/YYYY-MM-DD/YYYY-MM/全历史
 model_proxy_cli.sh --help / -h                       # 显示帮助
@@ -617,12 +653,13 @@ model_proxy_cli.sh --help / -h                       # 显示帮助
   查阅目标模型官方文档确认支持的分档，再进入人工输入环节手动填。`supply add`/`edit`（重新探测
   环节）内部同样先跑这次连通性测试：若判定 REACHABLE，直接复用该次响应做 effort 档位解析，
   不再发第二次探测请求；否则打印归因并跳过（`add` 时会二次确认是否仍要保存该 supply）。
-- `stats` 读独立账本文件 `.claude_model_proxy_totals.json`（按天分桶、supply×route×strategy
+- `stats` 读独立账本文件 `.claude_model_proxy_totals.json`（schema v3，按天分桶、supply×route×strategy
   组合键累加），与 ACCESS 日志完全独立、不受进程启动时 `_trim_log` 截断影响，长期累计不丢。
   支持按 `supply`/`route`/`strategy` 任意维度组合切片（投影和/或过滤），按天/月/全历史查询
   （`stats` / `stats today` / `stats month` / `stats 2026-07-23` / `stats 2026-07` /
-  `stats today supply` / `stats today route=claude supply` 等）。`max ms` 仍来自 ACCESS 日志
-  现场聚合（受日志窗口限制，输出中标注「近日志窗口内，非账本口径」）。
+  `stats today supply` / `stats today route=claude supply` 等）。`max_ms` 从账本取（OPT-10 起入账本），
+  与 `avg_ms` 同口径，不再依赖日志窗口；`attempt_fail` 为 attempt 级失败计数（仅盖 failover 中间失败，
+  budget 重试不记账），supply 真实失败率可观测。
 
 ## 6. reasoning 强度映射（深入）
 

@@ -14,9 +14,12 @@ test_model_proxy_translate_reverse.py（反向，24 个函数 / 120 条断言）
 """
 
 import json
+import logging
 import os
 import sys
+import time
 import unittest
+from unittest.mock import patch
 
 # tests/ 与 core/ 同级，sys.path 指向 tools/model_proxy/ 以便 from core import translate
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -2204,6 +2207,102 @@ class TestIsBudgetTruncated(unittest.TestCase):
         self.assertFalse(pt.is_budget_truncated("chat", None))
         self.assertFalse(pt.is_budget_truncated("responses", [1, 2]))
         self.assertFalse(pt.is_budget_truncated("unknown-proto", {"stop_reason": "max_tokens"}))
+
+
+# ---------------------------------------------------------------------------
+# OPT-07：translate 限流 helper 单测
+# ---------------------------------------------------------------------------
+
+class TestRateLimitedLogger(unittest.TestCase):
+    """OPT-07 限流 helper：连续触发同类 WARNING 20 次，日志行数 ≤ 2（首条 + 汇总）。"""
+
+    def setUp(self):
+        # 每个测试重置限流器状态，避免跨测试污染
+        pt._rl._state.clear()
+
+    def tearDown(self):
+        pt._rl._state.clear()
+
+    def test_first_call_logs_full(self):
+        """窗口首条全量输出。"""
+        records = []
+        logger = logging.getLogger("test_rl_first")
+        logger.setLevel(logging.WARNING)
+        handler = logging.Handler()
+        handler.emit = lambda r: records.append(r)
+        old_handlers = logger.handlers[:]
+        logger.handlers = [handler]
+        try:
+            pt._rl.warning("test_key", logger, "test message: %s", "arg")
+        finally:
+            logger.handlers = old_handlers
+        self.assertEqual(len(records), 1)
+        self.assertIn("test message: arg", records[0].getMessage())
+
+    def test_20_calls_within_window_produces_at_most_2_lines(self):
+        """连续 20 次同类 WARNING（窗口内），日志行数 ≤ 2（首条 + 窗口末汇总）。
+        注：窗口内只出首条（1 条）；窗口末汇总需窗口过期后才在下一次调用时出。
+        故 20 次全在窗口内时只出 1 条（首条），suppressed=19 不立即出。"""
+        records = []
+        logger = logging.getLogger("test_rl_20")
+        logger.setLevel(logging.WARNING)
+        handler = logging.Handler()
+        handler.emit = lambda r: records.append(r)
+        old_handlers = logger.handlers[:]
+        logger.handlers = [handler]
+        try:
+            for i in range(20):
+                pt._rl.warning("test_key_20", logger, "downgraded %d", i)
+        finally:
+            logger.handlers = old_handlers
+        # 窗口内：只出首条，后续 19 条被 suppressed
+        self.assertEqual(len(records), 1)
+
+    def test_window_expiry_produces_summary_then_new_first(self):
+        """窗口过期后首次调用：先出旧窗口 suppressed=N 汇总条，再出新窗口首条。"""
+        records = []
+        logger = logging.getLogger("test_rl_expiry")
+        logger.setLevel(logging.WARNING)
+        handler = logging.Handler()
+        handler.emit = lambda r: records.append(r)
+        old_handlers = logger.handlers[:]
+        logger.handlers = [handler]
+        try:
+            # 先在窗口内触发 5 次（出 1 条，suppressed=4）
+            for i in range(5):
+                pt._rl.warning("test_key_expiry", logger, "downgraded %d", i)
+            # 模拟窗口过期：手动把 window_start 往前移 61 秒
+            ws, sup = pt._rl._state["test_key_expiry"]
+            pt._rl._state["test_key_expiry"] = (ws - 61.0, sup)
+            # 第 6 次调用：窗口已过期，应出汇总条 + 新首条
+            pt._rl.warning("test_key_expiry", logger, "downgraded after expiry")
+        finally:
+            logger.handlers = old_handlers
+        # 1（首条）+ 1（汇总）+ 1（新窗口首条）= 3
+        self.assertEqual(len(records), 3)
+        # 第二条是汇总
+        self.assertIn("suppressed=4", records[1].getMessage())
+        # 第三条是新窗口首条
+        self.assertIn("downgraded after expiry", records[2].getMessage())
+
+    def test_different_keys_independent(self):
+        """不同 key 独立限流，互不影响。"""
+        records = []
+        logger = logging.getLogger("test_rl_multi")
+        logger.setLevel(logging.WARNING)
+        handler = logging.Handler()
+        handler.emit = lambda r: records.append(r)
+        old_handlers = logger.handlers[:]
+        logger.handlers = [handler]
+        try:
+            pt._rl.warning("key_a", logger, "message a")
+            pt._rl.warning("key_b", logger, "message b")
+            pt._rl.warning("key_a", logger, "message a again")
+            pt._rl.warning("key_b", logger, "message b again")
+        finally:
+            logger.handlers = old_handlers
+        # 每个 key 首条各出 1 条，后续被 suppressed
+        self.assertEqual(len(records), 2)
 
 
 if __name__ == "__main__":

@@ -48,7 +48,14 @@ install                           交互式列出四个 SDK + 本机检测状态
 on                                启动 model_proxy.py（已在监听则跳过）
 off                               停止 model_proxy.py（严格按脚本绝对路径匹配，绝不影响 v1 的 proxy.py）
 
-logs [N]                          显示最近 N 条 ACCESS 访问日志（默认 30 条）
+logs [N] [field=val]              显示最近 N 条日志（默认 30 条 ACCESS）。
+                                    支持按字段过滤（OPT-11）：
+                                      logs                最近 30 条 ACCESS
+                                      logs 50             最近 50 条 ACCESS
+                                      logs req=abc12345   按 req_id 过滤所有日志行
+                                      logs level=ERROR    按级别过滤（ERROR/WARNING/INFO）
+                                      logs event=cooldown  按事件关键词过滤
+                                      logs req=abc 50     过滤 + 条数
 stats [时间] [维度/过滤...]        读独立账本（不受日志截断影响），按 supply/route/strategy
                                     任意维度组合切片。用法示例：
                                       stats                          全历史 total，三维度各投影一段
@@ -59,7 +66,7 @@ stats [时间] [维度/过滤...]        读独立账本（不受日志截断影
                                       stats today supply              按 supply 投影
                                       stats today supply=<id>         过滤单个 supply
                                       stats today route=claude supply 过滤 route 后按 supply 投影
-                                    末尾附一行 max_ms（来自日志，受日志窗口限制，非账本口径）
+                                    max_ms 在 period 行（账本口径，OPT-10 起从账本取）
 会话内指令（非 CLI 子命令，在对话里直接发送）:
   $route                      查询当前 session 的生效 route 与 override
   $route <route_id>           把当前 session 固定到指定 route（写 config/session_overrides.json）
@@ -346,10 +353,52 @@ cmd_off() {
   done
 }
 
-# ---- logs：最近 N 条 ACCESS 记录（默认 30） ----
+# ---- logs：最近 N 条日志（OPT-11：支持按字段过滤） ----
+# 用法：
+#   logs              最近 30 条 ACCESS 记录（默认行为，向后兼容）
+#   logs N            最近 N 条 ACCESS 记录
+#   logs req=xxx      按 req_id 过滤（显示所有匹配的日志行，含 WARNING/ERROR/INFO/ACCESS）
+#   logs level=ERROR  按日志级别过滤（ERROR/WARNING/INFO/DEBUG）
+#   logs event=xxx    按事件关键词过滤（如 cooldown.set / config.reload.ok / admin.reload）
+#   logs req=xxx N    过滤 + 限制条数（过滤在前，数量在后）
 cmd_logs() {
-  local n="${1:-30}"
-  grep ' ACCESS ' "$LOG_FILE" | tail -n "$n"
+  local n=30
+  local filter_field="" filter_val=""
+
+  # 解析参数：field=value 形式为过滤，纯数字为条数
+  for arg in "$@"; do
+    if [[ "$arg" =~ ^([a-z]+)=(.+)$ ]]; then
+      filter_field="${BASH_REMATCH[1]}"
+      filter_val="${BASH_REMATCH[2]}"
+    elif [[ "$arg" =~ ^[0-9]+$ ]]; then
+      n="$arg"
+    fi
+  done
+
+  if [[ -z "$filter_field" ]]; then
+    # 无过滤：默认行为（ACCESS 行）
+    grep ' ACCESS ' "$LOG_FILE" | tail -n "$n"
+    return
+  fi
+
+  # 有过滤：在全量日志里按字段 grep
+  local pattern=""
+  case "$filter_field" in
+    req)
+      pattern="req_id=${filter_val}"
+      ;;
+    level)
+      pattern=" ${filter_val} "
+      ;;
+    event)
+      pattern="${filter_val}"
+      ;;
+    *)
+      echo "Unknown filter field: $filter_field (supported: req/level/event)"
+      return 1
+      ;;
+  esac
+  grep "$pattern" "$LOG_FILE" 2>/dev/null | tail -n "$n"
 }
 
 # ---- stats：读独立账本（$TOTALS_FILE），组合键投影+过滤聚合；末尾补日志窗口内 max ms ----
@@ -371,7 +420,7 @@ VAL_FIELDS = ("requests", "ok", "fail", "usage_in", "usage_out")
 
 
 def zero_bucket():
-    return {"requests": 0, "ok": 0, "fail": 0, "sum_ms": 0, "combos": {}}
+    return {"requests": 0, "ok": 0, "fail": 0, "sum_ms": 0, "max_ms": 0, "combos": {}}
 
 
 def zero_group():
@@ -387,6 +436,10 @@ def merge_bucket_into(dst, src):
     dst["ok"] += src.get("ok", 0)
     dst["fail"] += src.get("fail", 0)
     dst["sum_ms"] += src.get("sum_ms", 0)
+    # OPT-10: max_ms 取 max（跨天桶合并）
+    src_max = src.get("max_ms", 0)
+    if src_max > dst.get("max_ms", 0):
+        dst["max_ms"] = src_max
     for key, v in src.get("combos", {}).items():
         combo = dst["combos"].setdefault(key, zero_group())
         for f in VAL_FIELDS:
@@ -494,7 +547,7 @@ def main():
                 g[f] += v.get(f, 0)
         return groups
 
-    # period 总计行：无过滤用桶顶层（含 avg_ms）；有过滤则由过滤后的组合求和（无 sum_ms/avg_ms）。
+    # period 总计行：无过滤用桶顶层（含 avg_ms/max_ms）；有过滤则由过滤后的组合求和（无 sum_ms/avg_ms/max_ms）。
     if filters:
         all_groups = aggregate(None)
         filtered_total = all_groups.get("(all)", zero_group())
@@ -502,6 +555,7 @@ def main():
         period_ok = filtered_total["ok"]
         period_fail = filtered_total["fail"]
         avg_ms_str = "n/a（有过滤条件，账本不存组合键粒度 sum_ms）"
+        max_ms_str = "n/a（有过滤条件）"
         usage_in, usage_out = (
             filtered_total["usage_in"], filtered_total["usage_out"])
     else:
@@ -510,13 +564,15 @@ def main():
         period_fail = bucket.get("fail", 0)
         sum_ms = bucket.get("sum_ms", 0)
         avg_ms_str = f"{sum_ms / period_requests:.1f}" if period_requests else "0"
+        max_ms_str = str(bucket.get("max_ms", 0))
         all_groups = aggregate(None)
         filtered_total = all_groups.get("(all)", zero_group())
         usage_in, usage_out = (
             filtered_total["usage_in"], filtered_total["usage_out"])
 
     print(f"period: {label}   requests={period_requests}  ok={period_ok}  fail={period_fail}  "
-          f"avg_ms={avg_ms_str}  usage_in={fmt_k(usage_in)} usage_out={fmt_k(usage_out)}")
+          f"avg_ms={avg_ms_str}  max_ms={max_ms_str}  "
+          f"usage_in={fmt_k(usage_in)} usage_out={fmt_k(usage_out)}")
     if filters:
         filt_desc = " ".join(f"{k}={v}" for k, v in filters.items())
         print(f"filters: {filt_desc}")
@@ -542,17 +598,6 @@ def main():
 
 main()
 PYEOF
-
-  echo "$(grep ' ACCESS ' "$LOG_FILE" 2>/dev/null | awk '
-  {
-    ms = 0
-    for (i = 1; i <= NF; i++) {
-      if ($i ~ /^ms=/) { split($i, a, "="); ms = a[2] }
-    }
-    if (ms > max_ms) max_ms = ms
-  }
-  END { printf "max_ms=%d", max_ms + 0 }
-  ')  (近日志窗口内，非账本口径)"
 }
 
 # ---- 主逻辑 ----
@@ -588,7 +633,7 @@ case "${1:-}" in
     cmd_off
     ;;
   logs)
-    cmd_logs "${2:-30}"
+    cmd_logs "${@:2}"
     ;;
   stats)
     cmd_stats "${@:2}"

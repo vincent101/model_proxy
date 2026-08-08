@@ -226,7 +226,7 @@ def _make_handler(server_ns, body: dict, path="/v1/messages"):
         "usage_in": 0, "usage_out": 0,
         "strategy": "", "session": "", "route_failover": 0,
         "builtin": "", "budget_retried": "", "budget_truncated": 0, "stop_reason": "",
-        "final_error": "",
+        "final_error": "", "attempt_errors": [],
     }
     h._responses = []
 
