@@ -3,7 +3,7 @@ type: design-decision
 status: draft
 target: "[[tools/model_proxy]]"
 tags: [architect, model_proxy, reasoning, max_tokens, truncation, protocol-consistency, effort-mapping]
-updated: 2026-08-07（三轮修订：并入第二轮复核 5 条实施级问题——验证方式加"既有单测改动清单"、①a decode 返回值定死+none/off 行为变化点明、新增 1d 文档同步条目、③ 补 ceiling 封顶键、①b 补 SSE 抓取方法、typo 订正）
+updated: 2026-08-08（第四轮修订：按用户决策重构预算治理——③ output_budget 整条撤销、②a 预防性放大撤销、④b 强化为唯一预算机制（×2 阶梯反应式重试，可落地细化）、② 反向兜底与 ⑤ 监控同步调整；① 与两轮复核章节保持原样。此前：2026-08-07 三轮修订）
 ---
 
 # reasoning 模型经 model_proxy 的 thinking 截断与协议不一致：根因与理想治理方案
@@ -146,43 +146,60 @@ for e in CanonicalEffort:
 - README §8 已知限制加"反向（responses→anthropic）thinking block 无 signature 字段"条目。
 - codecs.py 模块头注释与域字典注释随四表删除重写。
 
-### ② 入站参数处理（server.py 对 max_tokens 的解析与钳位、effort 映射）
+### ② 入站参数处理（server.py 对 max_tokens 的解析、effort 映射）
 
-**2a. max_tokens 不再无条件透传，引入"理解 thinking 的出站预算治理"。**
-- server.py 在出站前对 max_tokens 做一次**显式解析与条件性放大**：当判定本次请求将产生 thinking（target_cap 有真实思考档且 remap 结果为 THINKING，非 DISABLED/STRIP）时，若客户端 max_tokens 低于该 supply 的"thinking 安全下限"（见 ③），自动放大到 `max(客户端值, supply 该 effort 档的建议下限)`，并在 ACCESS 日志记 `budget_raised=<old>→<new>`。客户端显式给的更大值优先（不向下钳）。
-- 反向（responses→anthropic）的 `max_tokens_default=4096` 兜底：对 max/high 档 reasoning 上游，4096 是陷阱默认值。改为按 supply 能力读"该 effort 档默认预算"（见 ③），无配置时才退回一个保守全局值，并对 reasoning 请求与非 reasoning 请求用不同默认。
+> 2026-08-08 调整：原 ②a（出站前按 ③ 表预防性放大）随 ③ 一并**撤销**。proxy 不再主动改客户端已给的 max_tokens——客户端预算是权威；代理只在两处介入：客户端**缺省时给合理默认**（本条）、**截断后反应式重试**（④b）。
 
-**2b. effort 映射现状已带来的另一个隐患**：source 默认 5 档（`_DEFAULT_ENUM`）不含 MAX/MINIMAL，导致 target 声明 [high,max] 时，source 侧"max 意图"需先 clamp 到 XHIGH 再 remap（Q3 中 i=3=clamp 后的 XHIGH rank）。本例结果巧合正确（仍映射到 target MAX），但语义脆弱。**理想做法**：source 能力（`tiers_source_capability`）应能声明完整 7 档含 MAX，临时 eval strategy 也应显式配置，避免依赖 clamp 的偶然对齐。这属于配置规范而非代码改动，但要在 README/SOP 写清"eval strategy 的 source capability 必须覆盖到被测 effort 档"。
+**2a（撤销）**：出站前预防性放大删除，不存在 `budget_raised` 行为。
 
-### ③ 运维默认值（不同模型/effort 档的 max_tokens 合理默认）
+**2b. 反向 4096 兜底改造（不依赖 ③，保留并修正）**：responses→anthropic 方向客户端不传 max_tokens 时的 `max_tokens_default=4096`（server.py:1238）对 reasoning 上游是陷阱默认值（glm-5.2 首轮 4096 截断的直接来源）。改为按 remap 结果区分默认：
+- remap 结果为 THINKING（本请求将产生 thinking）→ 用全局 `_THINKING_MAX_TOKENS_DEFAULT`（建议 16384，全局 config 可覆盖）；
+- 非 thinking 请求 → 维持 4096 不变。
+- 即便 16384 仍不够，④b 反应式爬升兜底——默认值只决定"从哪开始爬"，不追求一次给准。
 
-**3a. 在 supply 配置引入结构化预算档**：每条 reasoning supply 增加可选字段，按 effort 档声明建议的最小/默认 max_tokens：
-```jsonc
-"output_budget": {
-  "default": 16000,          // 该 supply 非 thinking 或低档的默认
-  "by_effort": { "high": 32000, "max": 48000 },  // 按档覆盖
-  "min_for_thinking": 32000, // 凡产生 thinking 时的安全下限
-  "ceiling": 131072          // ④b 阶梯放大封顶值（复核新增，否则"封顶 supply 配置上限"无对应键）
-}
-```
-- 来源：用真实 thinking 量分布标定。ds-flash@max thinking 峰值约 79k 字符（~20k+ tokens）+ 正文，建议 max 档 min_for_thinking ≥ 48000（留正文余量）；glm-5.2@max thinking 峰值 14k 字符（~4k tokens），min_for_thinking ≥ 12000。**按 supply 单独标定，不搞全局一刀切**。
-- server.py ②a 的放大逻辑、反向兜底的 ②a 默认值，都读这张表。
+**2c（原 2b，保留不动）. source capability 配置规范**：source 能力（`tiers_source_capability`）应能声明完整 7 档含 MAX，eval strategy 应显式配置，避免依赖 clamp 的偶然对齐。属配置规范而非代码改动，README/SOP 写清"eval strategy 的 source capability 必须覆盖到被测 effort 档"。
 
-**3b. 评估侧默认值同步**：model_eval 的 SOP（README §SOP）应改为"按 supply output_budget 取该 effort 档预算"，替代当前手工试 16000→32000 的试错。
+### ③ 运维默认值（per-supply output_budget）——已撤销（2026-08-08 用户决策）
 
-### ④ 重试/兜底策略（检测到 stop=max_tokens 且正文缺失时自动重试）
+整条撤销，不引入 `output_budget` 配置字段。原因（用户决策依据）：手动维护"每模型 × 每 effort 档"预算表成本高，且标定永远滞后于上游模型行为变化；反应式 ④b 用有界重试替代了先验标定，运维零表格。原 3b（model_eval SOP 按表取预算）同步失效，eval SOP 改为"给一个合理起步 max_tokens，截断由代理自动放大重试；关注 budget_retried 日志"。本节编号保留以示追溯。
 
-**4a. 响应侧截断检测**：非流式 anthropic 响应转换/透传收口处，检测 `stop_reason=="max_tokens"` 且 content 中无 text block（只有 thinking 或全空）→ 判定"预算被 thinking 耗尽、正文缺失"。流式在 message_delta 的 stop_reason=max_tokens 且全程未产出 text block 时同理。
+### ④ 重试/兜底策略（检测到 stop=max_tokens 且正文缺失时自动放大重试）——唯一预算机制（2026-08-08 强化）
 
-**4b. 自动放大重试（有限次、不rotate supply、不计 failover）**：命中 4a 且 thinking 仍在持续产出（说明正文本可有、只是预算不够）时，自动把 max_tokens 按阶梯放大（如 ×2，封顶 supply 配置上限）重发一次。语义对齐现有 reasoning 语法自适应重试（server.py:1290-1298，单次、不 cooldown、不进 tried_set），新增一条独立的 `_budget_retried` 位，与语法重试互不干扰。重试仍失败才返回截断响应（如实 stop_reason=max_tokens），并在 ACCESS 记 `budget_truncated=1`。
-- **与 ②a 的职责边界（审核硬伤 4，显式化）**：两者都改 max_tokens，但时序先后串联不重叠——②a 是发送前预防性地板（读 ③ 表 `min_for_thinking`/`by_effort`），④b 是截断后反应式阶梯（从 ②a 放大后的有效值起算、封顶 supply 上限）。④b 是**补偿控制而非根因治理**：③标定准确时 ④b 应近似零触发，其触发频率本身进 ⑤ 作为"③ 标定失准"信号。
-- 与现有 chat `_ENABLE_REASONING_FALLBACK` 的关系：④处理的是"请求侧预算不足"（根因），fallback 处理的是"已有 reasoning 但无 text"（症状）。两者正交，保留 fallback 作为 chat 协议的最后兜底，但有了 ③④后 chat 场景的 4096 级截断应先被预算放大防住。
+③ 撤销后，④ 成为 model_proxy 唯一的预算治理机制：**不做先验标定，只在截断真实发生后反应式放大重试**。
+
+**4a. 响应侧截断检测——在原始上游响应上判定（关键，不能被转换层兜底掩盖）**。非流式各分支在 `resp.read()` 之后、响应转换/写回之前检测：
+
+| mode | 判定对象（原始响应 JSON） | 截断且正文缺失的条件 |
+|---|---|---|
+| PASSTHROUGH（anth→anth） | 透传 body | `stop_reason=="max_tokens"` 且 content 无 text/tool_use block（只有 thinking 或全空） |
+| ANTHROPIC_TO_CHAT | chat 原始响应 | `choices[0].finish_reason=="length"` 且 `message.content` 为空且无 `tool_calls` |
+| ANTHROPIC_TO_RESPONSES | responses 原始响应 | `status=="incomplete"` 且 `incomplete_details.reason=="max_output_tokens"` 且 output 无 message 项（或 output_text 全空） |
+| RESPONSES_TO_ANTHROPIC | anthropic 原始响应 | `stop_reason=="max_tokens"` 且 content 无 text/tool_use block |
+| PASSTHROUGH（responses→responses） | 透传 body | 同 ANTHROPIC_TO_RESPONSES 的 responses 判定 |
+
+**必须在原始响应上判，不能在转换后的 anthropic 响应上判**——`_ENABLE_REASONING_FALLBACK`（translate.py:532-538）会把 reasoning_content 填成 text block，转换后再判"无 text"永远为假，检测被兜底掩盖。"正文缺失"定义：无 text 且无 tool_use（只有 thinking 或全空）。
+
+**4b. ×2 阶梯自动放大重试（反应式，唯一预算机制）**。命中 4a 即触发：
+
+- **起点**：客户端有效 max_tokens（客户端给了就用客户端值；反向缺省用 ②b 新默认）。proxy 不改动客户端给定值的首次发送。
+- **阶梯**：每次重试 ×2，即 `next = min(current × 2, CEILING)`；`next == current`（已达封顶）则停止。
+- **次数上限**：`_BUDGET_RETRY_MAX = 5` 次（有限次，防无限重试）。
+- **封顶**：`_BUDGET_CEILING = 131072`（全局上限，不依赖任何 per-supply 配置）。
+- **示例**：4096→8192→16384→32768→65536→131072（5 次）；16000→32000→64000→128000→131072（4 次，末次钳到封顶）。
+- **配置**：全局 config 增加可选顶层块 `budget_retry: {"enabled": true, "max_retries": 5, "ceiling": 131072}`，ConfigStore 照 `get_default_cooldown` 模式加 `get_budget_retry()`；缺省全开。无 per-supply 维度。
+- **机制（对齐现有 reasoning 语法自适应重试，server.py:1290-1298）**：`resp.close()` 后 `continue` 重进 while 循环——同一 supply 重发（不进 tried_set、不 cooldown、不计 failover、不 rotate）。独立计数 `_budget_retries`（请求周期作用域，与 `_reasoning_retried` 并列声明于 1066 附近），两类重试互不干扰、可先后发生（先 400 语法重试、后 200 截断预算重试）。remap 缓存（`_reasoning_cache_supply_id`）照常复用，重试只改预算不改档。
+- **出站覆写点**：四个转发分支构建完 outgoing body 后统一 stamp 当前预算值——PASSTHROUGH 写 `body_json["max_tokens"]`；ANTHROPIC_TO_CHAT 写 `openai_body["max_completion_tokens"]`；ANTHROPIC_TO_RESPONSES 写 `responses_body["max_output_tokens"]`；RESPONSES_TO_ANTHROPIC 写 `anthropic_body["max_tokens"]`。首轮 stamp 原值（无行为变化），重试轮 stamp 放大值。
+- **流式边界（显式）**：流式响应字节即时下发客户端，发出后无法回追重试——**④b 仅非流式生效**；流式仅在收口处（adapter finalize，`produced_content_block` 状态允许处）检测记 `budget_truncated` 日志，不重试、不改流式行为。
+- **终态**：爬升途中 end_turn → 正常写回（ACCESS 记 `budget_retried=<old>→<new>` 轨迹）；到上限仍截断 → 如实写回截断响应（stop=max_tokens、thinking 原样保留、chat 场景 fallback 照常兜底），ACCESS 记 `budget_truncated=1`。
+
+**与现有 chat `_ENABLE_REASONING_FALLBACK` 的关系（正交，保留）**：④b 处理请求侧预算不足（根因）——预算够了正文自然出来；fallback 处理"已有 reasoning 但无 text"（症状）——chat 协议的最后兜底。④b 检测在原始响应上，不被 fallback 掩盖；④b 最终放弃时 fallback 照常生效，两者不冲突不重复。
 
 ### ⑤ 监控告警（thinking/output 占比、effort 生效性）
 
-**5a. thinking/output 占比指标**：ACCESS 日志与 totals 账本目前只记 `usage_in`/`usage_out`（server.py:1348-1354，reasoning token 已被 2026-07-24 有意移除，见其设计记录）。理想方案不违背该"不单独统计 reasoning"决策，但**新增两个派生观测维度**（不记账、只进 ACCESS 瞬时值）：
-  - `budget_raised`（②a 触发时）、`budget_truncated`（④b 失败时）、`budget_retried`（④b 重试时）三个事件字段，能让"thinking 占满"从"事后看原始回答才发现"变成"日志可直接 grep"。
-  - 可选：`stop_reason` 字段（end_turn/max_tokens/...）进 ACCESS，占比统计 max_tokens 出现频率作为"预算是否普遍偏小"的信号。
+**5a. 预算治理事件指标**：ACCESS 日志与 totals 账本目前只记 `usage_in`/`usage_out`（server.py:1348-1354，reasoning token 已被 2026-07-24 有意移除，见其设计记录）。本方案不违背该"不单独统计 reasoning"决策，**新增两个派生观测维度**（不记账、只进 ACCESS 瞬时值）：
+  - `budget_retried=<old>→<new>`（④b 每次放大重试时记，轨迹可 grep）、`budget_truncated=1`（④b 爬升到上限仍截断、或流式收口检测到截断时记）。`budget_raised` 随 ②a 撤销**不再存在**。
+  - 可选：`stop_reason` 字段（end_turn/max_tokens/...）进 ACCESS，占比统计 max_tokens 出现频率。
+  - **④b 触发频率的信号语义（2026-08-08 调整）**：③ 撤销后不再是"标定失准"信号，而是**"调用侧预算普遍偏小 / 该模型 thinking 量大"的运营信号**——某 supply 的 budget_retried 高频出现时，提示调高调用侧（eval SOP/客户端）的起步 max_tokens，减少重试浪费。
 
 **5b. effort 生效性指标**：Defect A 这类"wire 层降级"要有可见性。①a 终态后 wire 档名恒等于配置档名（不再有降级兜底），观测点是"intent → wire 档名"保真度：在 reasoning debug 旁路日志（server.py:809-856）的 wire dump 里**固定记录最终发给上游的档名字符串**，并使 `MODEL_PROXY_REASONING_DEBUG=1` 时能一眼看到"intent=max → wire effort 实际值"。更进一步：smoke test / 评估 SOP 增加一条"读模型自述档位 ≠ 请求档位则告警"的校验（本轮正是靠模型自述"中等"发现的）。
 
@@ -198,14 +215,15 @@ for e in CanonicalEffort:
 
 - **迁移/落地代价提示（[理想] 路径不计成本，仅供知情）**：
   - ①b（responses→anthropic 补 reasoning 回传）是真实功能开发，要在流式状态机里正确管理 thinking block 的开/合/index 时序，需补脱网络单测覆盖 reasoning item 的开合、thinking_delta 增量、与 text/tool_use 交错；评估面改动中等。
-  - ②/③（出站预算治理 + per-supply 预算档）改动 server.py 出站热路径与 config schema，引入"代理主动改客户端 max_tokens"这一此前没有的行为，需谨慎设计为**只向上放大、绝不向下钳、且可整体关闭**，避免误伤客户端刻意给的小预算（如省成本场景）。建议配 `output_budget.enforce: on/off` 开关，默认对"会产生 thinking 且预算低于安全下限"才介入。
-  - ④b 自动放大重试会让"原本一次失败的请求"变成"放大后多花 token 的重试"，对有成本敏感的上游要可关；且重试放大可能加剧延迟（ds-flash Q5 已 499s）。
-- **不影响既有正确性**：所有修复都应是"增量补齐"（补回传、去写死字典、补预算治理），不改变 remap 主算法的相对映射语义（①a 只动档名映射函数/字典引用，不动 remap 本体；MAX 在主路径仍走正常映射路径，无特殊分支，符合 codecs/capability 的决策2约束）。
+  - ②b/④b（反向默认值区分 + 截断反应式重试）改动 server.py 出站热路径与响应收口，但**不引入"代理主动改客户端已给 max_tokens"的行为**——客户端给定值首轮原样发出，代理只在客户端缺省时给默认、在截断真实发生后放大重试。原 ②a/③ 的"误伤客户端刻意小预算"风险随撤销消失。
+  - ④b 自动放大重试会让"原本一次失败的请求"变成"最多 5 次放大重试"：成本上 input+thinking 每轮重付（最坏 4096 起步爬 5 轮），延迟上叠加（ds-flash Q5 单轮已 499s）。`budget_retry.enabled=false` 可全局关闭。**流式请求不受益**（字节已下发无法回追），流式场景仍靠调用侧给足预算。
+- **不影响既有正确性**：所有修复都应是"增量补齐"（补回传、去写死字典、补反应式重试），不改变 remap 主算法的相对映射语义（①a 只动档名映射函数/字典引用，不动 remap 本体；MAX 在主路径仍走正常映射路径，无特殊分支，符合 codecs/capability 的决策2约束）。④b 不动 remap、不动 supply 选择，只在响应收口处判定后重进循环。
 - **需用户确认**：
   1. ①a 方向已从原"钳到 xhigh"修正为"去掉写死字典、信 supply 配置直接发档名"（依据：实测 responses/chat 网关都接受 max，supply 配置是上游真实能力权威）。是否认可？上游不认该档则 400 暴露配置错误，代理不偷偷降级。
   2. decode 改用全表 `_NAME_TO_CANONICAL`（含 max）替代窄字典——是否认可？（source capability 约束仍在 remap。）
-  3. ②a 允许 proxy 主动放大 max_tokens 是否可接受；若不接受，退化为只告警不放大。
-  4. 是否接受新增 per-supply `output_budget` 配置字段。
+  3. ~~②a 允许 proxy 主动放大 max_tokens~~ → **2026-08-08 用户决策：不允许，②a 撤销**。
+  4. ~~新增 per-supply `output_budget` 配置字段~~ → **2026-08-08 用户决策：不要，③ 整条撤销**。
+  5. ④b 三个数值待确认：封顶 131072、重试上限 5 次、反向 thinking 默认 16384（均为全局常量/config 可覆盖，非 per-supply）。
 - **与 2026-07-24 reasoning 统计移除决策的边界**：⑤a 不重启 reasoning token 记账，只新增截断/放大/重试的事件标记与可选 stop_reason，与"不再单独统计 reasoning token"的原决策不冲突。
 
 ## 验证方式
@@ -222,7 +240,8 @@ for e in CanonicalEffort:
   - low/medium 全协议无 bug（remap→HIGH，字典有 high）；anthropic target 全档无 bug（字典含 max）。
   - ds-flash（anthropic target `[low,high,max]`）：encode 本就正常，low→low 不升档（对比 glm-openai `[high,max]` 的 low→high 升档），证明 target cap 档位越多 remap 越保真。
 - **Defect B 修复验证**：非流式 + 流式各构造含 reasoning item 的 responses 响应/事件流，断言 anthropic 侧产出 `thinking` block 且文本完整；回归 glm-52-sankuai-openai-3339 跑 Q10，th_chars 应从 0 变为 >0。
-- **预算治理验证**：用 max_tokens=16000 对 ds-flash@max 发 Q6，验证 ②a 自动放大 + ④b 重试后正常 end_turn；用 responses→anthropic 且客户端不传 max_tokens，验证不再默认 4096。
+- **预算治理验证（2026-08-08 调整）**：用 max_tokens=16000 对 ds-flash@max 发 Q6，验证 ④b 自动 ×2 爬升（16000→32000）后正常 end_turn、ACCESS 可见 `budget_retried` 轨迹；构造"恒截断"stub 上游验证爬升到封顶后如实返回 stop=max_tokens 且记 `budget_truncated=1`；responses→anthropic 且客户端不传 max_tokens 时，thinking 请求默认 16384（非 4096）、非 thinking 请求仍 4096；流式请求验证不重试、仅收口记日志；`budget_retry.enabled=false` 时全链路退回原透传行为。
+- **④b 新增单测**：三协议原始响应的截断判定（含"fallback 填 reasoning 成 text 后检测仍触发"的 chat 用例）；阶梯计算（×2、封顶钳位、次数上限、next==current 停止）；与语法重试共存（同请求先 400 语法重试后 200 预算重试，互不消耗对方次数）；重试不 cooldown/不进 tried_set。
 - **一致性验证**：对 glm-5.2 同一 canonical effort，分别走 anthropic / responses 入口发探针，断言两侧 th_chars 均 >0 且模型自述档位一致。
 - **既有单测改动清单（复核新增，回归必撞红）**：①a/①b 落地后以下断言反转，必须同步修改，否则回归爆红：
   - `tests/test_reasoning.py:768-772` chat MAX 断言 `"medium"` → 改 `"max"`（测试名 `falls_back_default` 语义失效，改名）
@@ -339,3 +358,20 @@ for e in CanonicalEffort:
 **新增单测**：`TestChatReasoningMirror` 4 个——非流式 kimi 样本（thinking 在 text 前、无 signature）、流式 kimi SSE 样本（thinking/text index 0/1、thinking_delta 拼接==样本 reasoning_content 全文、text_delta 拼接==样本 content 全文、start/stop 配对）、两条 content 空走兜底边界。
 
 **验证结果**：`python3 -m unittest discover -s tests -q` 482 全绿（478+新增4）；样本验证 th_chars 非流式 0→96、流式 0→92。
+
+---
+
+## 预算治理重构（第四轮调整记录，2026-08-08，[理想] 路径）
+
+**用户决策**：
+1. 要 ④b 自动放大重试（反应式，×2 阶梯）——遇 stop=max_tokens 且正文缺失，自动放大 max_tokens（每次 ×2）重试，直到 end_turn 或到上限。
+2. 不要 ③ per-supply output_budget（预防式）——手动维护每模型每档预算表成本太高，放弃。
+3. 倾向 ×2 阶梯（保守，多次重试），而非直接跳大值。
+
+**落地结论**：
+- ③ 整条撤销（无 output_budget 配置字段）；②a 预防性放大同步撤销（proxy 不再主动改客户端已给的 max_tokens）。
+- ④b 强化为**唯一预算机制**：反应式 ×2 阶梯（起点=客户端有效值，封顶全局 131072，上限 5 次），机制对齐现有 reasoning 语法自适应重试（continue 重进循环、同 supply、不 cooldown、不计 failover）；检测在原始上游响应上判定（防 chat fallback 掩盖）；仅非流式生效（流式字节已下发无法回追，仅收口记日志）。
+- ②b 反向 4096 兜底改为按 remap 结果区分（THINKING→16384 / 非 thinking→4096，全局常量可覆盖），不依赖 ③ 表。
+- ⑤ 去掉 budget_raised，保留 budget_retried/budget_truncated + 可选 stop_reason；④b 触发频率语义从"③ 标定失准"改为"调用侧预算偏小/模型 thinking 量大"的运营信号。
+- ⑥ 不动。
+- 正文 ②-⑥、风险与权衡、验证方式已按本轮决策就地重写；两轮复核章节（针对 ① 及原 ②-⑥）保留原样作历史记录，其中涉 ②a/③/④b 边界的论断以本轮重写为准。
