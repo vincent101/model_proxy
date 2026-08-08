@@ -581,6 +581,7 @@ def _send(h, text, session_id, stream=False):
         "status": 0, "source": "", "route": "", "tier": "", "supply": "",
         "failover": 0, "attempts": 0, "token": "", "usage_in": 0, "usage_out": 0,
         "strategy": "", "session": "", "route_failover": 0, "builtin": "",
+        "final_error": "",
     }
     h._forward("POST")
     return h._acc, h.wfile.getvalue()

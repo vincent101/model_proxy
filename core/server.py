@@ -1298,6 +1298,7 @@ class ModelProxyHandler(BaseHTTPRequestHandler):
                         501, [], error_body_for_source(
                             source, 501,
                             f"unsupported combination source={source} target={target}"))
+                    self._acc["final_error"] = f"unsupported source={source} target={target}"
                     return
 
                 target_model = supply.get("target_model")
@@ -1487,6 +1488,7 @@ class ModelProxyHandler(BaseHTTPRequestHandler):
                         error_body_for_source(
                             source, resp_status,
                             f"upstream error {resp_status}: {upstream_msg}"))
+                    self._acc["final_error"] = f"upstream_error {resp_status} {upstream_msg}"
                     return
                 except (urllib.error.URLError, OSError) as e:
                     if failover == "on":
@@ -1498,6 +1500,7 @@ class ModelProxyHandler(BaseHTTPRequestHandler):
                         continue
                     self._write_buffered_response(
                         502, [], error_body_for_source(source, 502, f"upstream error: {e}"))
+                    self._acc["final_error"] = f"upstream net error: {e}"
                     return
 
                 # 成功拿到响应：若为冷却信号码且允许 failover，则冷却后继续
@@ -1693,6 +1696,7 @@ class ModelProxyHandler(BaseHTTPRequestHandler):
                 self._write_buffered_response(
                     503, [], error_body_for_source(
                         source, 503, "all upstream supplies failed or cooling"))
+                self._acc["final_error"] = "all supplies failed or cooling"
                 return
 
     # ------------------------------------------------------------------
