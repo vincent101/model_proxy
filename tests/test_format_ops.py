@@ -121,7 +121,7 @@ class TestSupplyRefs(unittest.TestCase):
             ],
         }
         refs = _supply_refs(cfg)
-        self.assertEqual(sorted(refs["s1"]), ["r1.opus(cc)", "r2.opus(cc,codex)"])
+        self.assertEqual(sorted(refs["s1"]), ["r1(cc) opus", "r2(cc,codex) opus"])
 
     def test_unreferenced_supply(self):
         """未被引用的 supply 不在 refs 里（展示侧回退"未被引用"）。"""
@@ -131,7 +131,7 @@ class TestSupplyRefs(unittest.TestCase):
         }
         refs = _supply_refs(cfg)
         self.assertNotIn("s-orphan", refs)
-        self.assertEqual(refs["s1"], ["r1.opus(cc)"])
+        self.assertEqual(refs["s1"], ["r1(cc) opus"])
 
 
 # ---------------------------------------------------------------------------
@@ -381,7 +381,7 @@ class TestStatusFormatFromJson(unittest.TestCase):
             lines = _format_status_from_json(data, cfg_path, totals_path)
             joined = "\n".join(lines)
             self.assertIn("s1", joined)
-            self.assertIn("fail 80.0% (8/10)  ← r1.opus(cc)", joined)
+            self.assertIn("fail 80.0% (8/10)  ← r1(cc) opus", joined)
 
 
 # ---------------------------------------------------------------------------
@@ -845,15 +845,20 @@ class TestFormatActiveSessions(unittest.TestCase):
                   last_ts=None, last_route="nation1", last_tier="opus",
                   last_supply="kimi-k3-sankuai-3339",
                   last_error="", last_req_id="abc12345",
-                  builtin_only=False):
+                  builtin_only=False, chains=None, routes=None):
         if last_ts is None:
             last_ts = datetime.now() - timedelta(minutes=5)
+        if chains is None:
+            chains = {(last_tier, last_supply): n} if n else {}
+        if routes is None:
+            routes = {last_route: n} if n else {}
         return {
             "n": n, "fail": fail, "fo": fo,
             "last_ts": last_ts, "last_status": last_status,
             "last_route": last_route, "last_tier": last_tier,
             "last_supply": last_supply, "last_error": last_error,
             "last_req_id": last_req_id, "builtin_only": builtin_only,
+            "chains": chains, "routes": routes,
         }
 
     def test_fail_state_when_last_non_200(self):
@@ -955,6 +960,24 @@ class TestFormatActiveSessions(unittest.TestCase):
         joined = "\n".join(lines)
         self.assertIn("err:", joined)
         self.assertIn("req=deadbeef", joined)
+
+    def test_chain_distribution_with_route_tokens(self):
+        """行尾展示 route(tokens) + 窗口内 tier/supply 分布占比。"""
+        sessions = {"abc12345-xxxx": self._make_agg(
+            n=10,
+            chains={("sonnet", "glm-52-sankuai-3339"): 6,
+                    ("opus", "kimi-k3-sankuai-3339"): 4},
+            routes={"nation1": 10})}
+        cfg = {"routes": [{"id": "nation1", "tiers": {}}],
+               "strategies": [{"client_token": "cc",
+                               "route_pool": [{"route_id": "nation1", "weight": 1}]}]}
+        lines = _format_active_sessions(self._make_result(sessions), cfg)
+        joined = "\n".join(lines)
+        self.assertIn("nation1(cc)", joined)
+        self.assertIn("sonnet/glm-52-3339(60%)", joined)
+        self.assertIn("opus/kimi-k3-3339(40%)", joined)
+        # 分布降序：sonnet(60%) 在 opus(40%) 前
+        self.assertLess(joined.index("sonnet/"), joined.index("opus/kimi"))
 
     def test_none_bucket_shown_as_none(self):
         """(none) 桶显示为 (none)。"""

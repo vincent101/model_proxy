@@ -158,12 +158,8 @@ def load_supply_health(totals_path: str) -> dict[str, dict]:
     return health
 
 
-def _supply_refs(cfg: dict) -> dict[str, list[str]]:
-    """supply_id → 引用它的 `route.tier(token,...)` 列表。
-
-    用于在 degraded/cooldown 行尾标注该 supply 被哪个 route 的哪档、哪个 strategy 引用。
-    """
-    # route → 引用它的 strategy tokens（route_id 单值 + route_pool 两种写法）
+def _route_tokens(cfg: dict) -> dict[str, list[str]]:
+    """route_id → 引用它的 strategy token 列表（route_id 单值 + route_pool 两种写法）。"""
     route_tokens: dict[str, list[str]] = {}
     for st in cfg.get("strategies", []):
         tok = st.get("client_token", "?")
@@ -172,6 +168,15 @@ def _supply_refs(cfg: dict) -> dict[str, list[str]]:
         for item in st.get("route_pool") or []:
             if isinstance(item, dict) and item.get("route_id"):
                 route_tokens.setdefault(item["route_id"], []).append(tok)
+    return route_tokens
+
+
+def _supply_refs(cfg: dict) -> dict[str, list[str]]:
+    """supply_id → 引用它的 `route(token,...) tier` 列表。
+
+    用于在 degraded/cooldown 行尾标注该 supply 被哪个 route 的哪档、哪个 strategy 引用。
+    """
+    route_tokens = _route_tokens(cfg)
     refs: dict[str, list[str]] = {}
     for r in cfg.get("routes", []):
         rid = r.get("id", "?")
@@ -179,7 +184,7 @@ def _supply_refs(cfg: dict) -> dict[str, list[str]]:
         toks_str = f"({','.join(toks)})" if toks else ""
         for tn in TIER_NAMES:
             for sid in r.get("tiers", {}).get(tn, []):
-                refs.setdefault(sid, []).append(f"{rid}.{tn}{toks_str}")
+                refs.setdefault(sid, []).append(f"{rid}{toks_str} {tn}")
     return refs
 
 
@@ -234,6 +239,14 @@ def parse_access_line(line: str) -> dict | None:
     }
 
 
+def _short_supply(sid: str) -> str:
+    """supply id 缩写：去掉 vendor 段（-sankuai / -openai）。
+
+    kimi-k3-sankuai-3339 → kimi-k3-3339；glm-52-sankuai-openai-3339 → glm-52-3339。
+    """
+    return sid.replace("-sankuai", "").replace("-openai", "")
+
+
 def load_active_sessions(log_path: str, *, now: datetime | None = None,
                          window_minutes: int = 30,
                          tail_bytes: int = 2 * 1024 * 1024) -> dict:
@@ -282,6 +295,7 @@ def load_active_sessions(log_path: str, *, now: datetime | None = None,
             "last_ts": None, "last_status": "", "last_route": "",
             "last_tier": "", "last_supply": "", "last_error": "",
             "last_req_id": "", "builtin_only": True,
+            "chains": {}, "routes": {},
         })
         is_builtin = parsed["builtin"] == "route"
         if is_builtin:
@@ -309,6 +323,9 @@ def load_active_sessions(log_path: str, *, now: datetime | None = None,
                 pass
             agg["fo"] += fo
             agg["builtin_only"] = False
+            chain = (parsed["tier"], parsed["supply"])
+            agg["chains"][chain] = agg["chains"].get(chain, 0) + 1
+            agg["routes"][parsed["route"]] = agg["routes"].get(parsed["route"], 0) + 1
             if agg["last_ts"] is None or parsed["ts"] > agg["last_ts"]:
                 agg["last_ts"] = parsed["ts"]
                 agg["last_status"] = parsed["status"]
@@ -327,11 +344,14 @@ def load_active_sessions(log_path: str, *, now: datetime | None = None,
     return {"sessions": sessions, "truncated": truncated, "log_missing": False}
 
 
-def _format_active_sessions(result: dict) -> list[str]:
+def _format_active_sessions(result: dict, cfg: dict | None = None) -> list[str]:
     """渲染活跃 session 段（header + 每 session 一行 + FAIL err 续行）。
 
-    排序：FAIL → warn → ok，同档按最近请求时间倒序。行 ≤80 列。
+    行格式：`sid8  state n=N fail=F [fo=K]  HH:MM status  route(tokens) tier/supply(pct%) ...`
+    链路为窗口内 (tier, supply) 分布按次数降序；route 取窗口内主 route，括注引用它的 strategy。
+    排序：FAIL → warn → ok，同档按最近请求时间倒序。
     """
+    route_tokens = _route_tokens(cfg) if cfg else {}
     sessions = result["sessions"]
     truncated = result["truncated"]
     log_missing = result["log_missing"]
@@ -392,17 +412,31 @@ def _format_active_sessions(result: dict) -> list[str]:
         fo_part = f" fo={agg['fo']}" if agg["fo"] > 0 else ""
         ts_str = agg["last_ts"].strftime("%H:%M") if agg["last_ts"] else "--:--"
 
+        # 主 route + strategy 括注
+        main_route = ""
+        if agg["routes"]:
+            main_route = max(agg["routes"].items(), key=lambda kv: kv[1])[0]
+        elif agg["last_route"]:
+            main_route = agg["last_route"]
+        toks = route_tokens.get(main_route, [])
+        route_part = f"{main_route}({','.join(toks)})" if toks else main_route
+
         if agg["builtin_only"]:
             line = (f"  {_pad(id_str, 8)}  {_pad(state, 4)} n=0 fail=0"
                     f"  {ts_str} 200"
-                    f"  {agg['last_route']}/{agg['last_tier']}/{agg['last_supply']}"
-                    f"  （仅 $route)")
+                    f"  {route_part}（仅 $route)")
         else:
+            # 窗口内链路分布：tier/supply(pct%)，按次数降序
+            chains = sorted(agg["chains"].items(), key=lambda kv: -kv[1])
+            chain_parts = []
+            for (tier, supply), cnt in chains:
+                pct = round(cnt / agg["n"] * 100) if agg["n"] else 0
+                chain_parts.append(f"{tier}/{_short_supply(supply)}({pct}%)")
             line = (f"  {_pad(id_str, 8)}  {_pad(state, 4)}"
                     f" n={agg['n']} fail={agg['fail']}{fo_part}"
                     f"  {ts_str} {agg['last_status']}"
-                    f"  {agg['last_route']}/{agg['last_tier']}/{agg['last_supply']}")
-        lines.append(line)
+                    f"  {route_part} {' '.join(chain_parts)}")
+        lines.append(line.rstrip())
 
         # FAIL err 续行
         if state == "FAIL" and agg["last_error"]:
@@ -619,7 +653,7 @@ def _format_status_from_json(data: dict, config_path: str, totals_path: str,
     # active sessions 段（在线时恒展示）
     if log_path:
         lines.append("")
-        lines.extend(_format_active_sessions(load_active_sessions(log_path)))
+        lines.extend(_format_active_sessions(load_active_sessions(log_path), cfg))
 
     if cooldown and not cooldown_unknown:
         lines.append("")
