@@ -1,6 +1,7 @@
 {
   "admin_token": "<ADMIN_TOKEN_PLACEHOLDER>",
   "default_cooldown_seconds": 300,
+  "budget_retry": {"enabled": true, "max_retries": 5, "ceiling": 131072},
   "supplies": [
     {
       "id": "claude-opus-k0",

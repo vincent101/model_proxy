@@ -185,6 +185,84 @@ def map_finish_reason(finish) -> str:
 
 
 # ============================================================
+# 辅助：预算截断判定（④b 反应式预算重试的检测谓词，架构审查 R1）
+# ============================================================
+
+def is_budget_truncated(target_protocol: str, raw_resp) -> bool:
+    """在**原始上游响应**上判定「达到输出预算上限且正文缺失」（④b 重试触发条件）。
+
+    target_protocol：响应所在协议（anthropic / chat / responses，即上游 supply 侧协议）。
+    raw_resp：原始响应体（bytes/str/dict 均可）；无法解析一律返回 False（判不出就不重试，
+    由调用方按正常路径处理/报错）。
+
+    判定条件（三协议本质相同：思考与正文共享同一输出预算，预算耗尽即硬截断；
+    「正文缺失」= 无 text 且无 tool_use/function_call，只有 thinking 或全空）：
+      - anthropic：stop_reason=="max_tokens" 且 content 无 text/tool_use block；
+      - chat：choices[0].finish_reason=="length"（与本模块 _FINISH_REASON_MAP 的
+        "length"→"max_tokens" 映射同源）且 message.content 为空且无 tool_calls；
+      - responses：status=="incomplete" 且 incomplete_details.reason==
+        "max_output_tokens" 且 output 无文本项且无 function_call。
+
+    必须在原始响应上判、不能在转换后的 anthropic 响应上判：chat 的空回答兜底
+    （_ENABLE_REASONING_FALLBACK）会把 reasoning_content 填成 text block，转换后再判
+    「无 text」恒为假，检测会被兜底掩盖。纯函数，无副作用；重试编排留在 server.py。
+    """
+    if isinstance(raw_resp, (bytes, bytearray, str)):
+        try:
+            raw_resp = json.loads(raw_resp)
+        except (ValueError, TypeError):
+            return False
+    if not isinstance(raw_resp, dict):
+        return False
+
+    if target_protocol == "anthropic":
+        if raw_resp.get("stop_reason") != "max_tokens":
+            return False
+        for block in raw_resp.get("content") or []:
+            if not isinstance(block, dict):
+                continue
+            bt = block.get("type")
+            if bt == "tool_use":
+                return False
+            if bt == "text" and (block.get("text") or "").strip():
+                return False
+        return True
+
+    if target_protocol == "chat":
+        choices = raw_resp.get("choices") or []
+        choice = choices[0] if choices and isinstance(choices[0], dict) else {}
+        if choice.get("finish_reason") != "length":
+            return False
+        message = choice.get("message") or {}
+        if (message.get("content") or "").strip():
+            return False
+        if message.get("tool_calls"):
+            return False
+        return True
+
+    if target_protocol == "responses":
+        if raw_resp.get("status") != "incomplete":
+            return False
+        if (raw_resp.get("incomplete_details") or {}).get("reason") != "max_output_tokens":
+            return False
+        for item in raw_resp.get("output") or []:
+            if not isinstance(item, dict):
+                continue
+            it = item.get("type")
+            if it == "function_call":
+                return False
+            if it == "message":
+                for part in item.get("content") or []:
+                    if (isinstance(part, dict)
+                            and part.get("type") in ("output_text", "text")
+                            and (part.get("text") or "").strip()):
+                        return False
+        return True
+
+    return False
+
+
+# ============================================================
 # 辅助：图片转 data url（正向规格 §1.3.1）
 # ============================================================
 

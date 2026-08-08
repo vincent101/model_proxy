@@ -523,12 +523,16 @@ v1 代理（18888）已于 2026-07-24 下线归档，不再涉及并行关系。
 日志除 WARNING 级别（异常/降级路径，如 no route、cooldown+failover、stream interrupted 等）外，
 还有一条 INFO 级别的 `ACCESS` 访问日志：每个转发请求（不含 `/model_proxy/*` 控制端点）结束时
 记一条，覆盖整个请求生命周期，字段为
-`ms status source route tier supply failover attempts usage_in usage_out token session route_failover builtin`
+`ms status source route tier supply failover attempts usage_in usage_out token session route_failover builtin budget_retried budget_truncated stop_reason`
 （`ms` 为端到端耗时毫秒，`token` 为客户端 token 尾4位，`session` 为该请求解析出的 session_id
 取不到为空串，`route_failover` 为 0/1 标记本次请求是否发生了「pin route 全挂后跨 route 兜底」，
 区别于同 route 内换 supply 的 `failover`；`builtin` 为空表示普通转发请求，非空（当前只有
 `route`）表示该请求被内建命令层拦截、未打上游，此时 `supply=(builtin)`、`route=` 记录命令
-操作/查询后的生效 route，见「内建命令层」一节）。两者共用同一文件，用固定前缀 `ACCESS` 区分。
+操作/查询后的生效 route，见「内建命令层」一节；`budget_retried` 为 ④b 预算放大轨迹
+（形如 `16000→32000`，多次逗号相接，空串=未发生），`budget_truncated=1` 为放大到上限仍截断
+或流式收口检测到截断（如实返回了截断响应），`stop_reason` 为响应停止原因（能拿到才记）。
+`budget_retried` 高频出现是「调用侧预算普遍偏小/该模型 thinking 量大」的运营信号，提示调高
+调用侧起步 max_tokens 以减少重试浪费）。两者共用同一文件，用固定前缀 `ACCESS` 区分。
 
 token 用量统计：转换模式（Anthropic↔Chat/Responses，流式+非流式）、PASSTHROUGH 非流式、
 以及 PASSTHROUGH 流式（anthropic→anthropic、responses→responses 的流式请求）均会提取
@@ -773,6 +777,18 @@ token 里选定）过滤候选 client_token；无匹配协议的 token 时提示
   - 与之互斥（2026-08-07 ①b-chat 镜像补齐）：content 非空时，`reasoning_content` 会镜像为 anthropic `thinking` block 置前（而非丢弃），content 本身是 text block；两路径严格互斥不双写。
 - reasoning 强度映射：source/target 各自声明的档位能力做相对排名映射，非绝对锚定，详见
   「reasoning 强度映射（深入）」§ 6。
+- 输出预算自动放大重试（④b，2026-08-08 起）：非流式响应若「达到输出预算上限且正文缺失」
+  （anthropic `stop_reason=max_tokens` / chat `finish_reason=length` / responses
+  `status=incomplete`+`reason=max_output_tokens`，且只有 thinking 无 text/tool），代理在
+  **原始上游响应**上判定后自动把预算 ×2 重发（封顶 131072、最多 5 次，同 supply 重选、
+  不冷却、不计 failover；爬升途中 failover 换 supply 时放大值被继承）。首轮永远按客户端
+  给定值原样发出（代理不主动改客户端预算），只在截断真实发生后反应式放大；字段名分协议
+  （`max_tokens`/`max_completion_tokens`/`max_output_tokens`）。可由顶层 `budget_retry`
+  块配置或整体关闭。反向（responses→anthropic）客户端不传 max_tokens 时缺省按请求是否
+  产生 thinking 分档：16384 / 4096。
+  - **已知限制：仅非流式生效**。流式响应字节即时下发客户端、发出后无法回追，流式只在收口
+    处检测记 `budget_truncated` 日志不重试——流式场景仍需调用侧给足起步预算（流式检测覆盖
+    anthropic 透传与 chat 方向；responses 协议流式 adapter 未持有 incomplete 状态，不检测）。
 - codex install 写入的 base_url 层级未逐字核对 codex 官方文档，实际接入报 404/400 时需按官方
   文档调整（详见「接入各 SDK（install）」）。
 - 错误路径加固：不支持的协议组合、上游 4xx/5xx、流式中途中断均按客户端协议包裹成合法的 error
@@ -830,6 +846,7 @@ token 里选定）过滤候选 client_token；无匹配协议的 token 时提示
 |---|---|---|---|
 | `admin_token` | string | 必填 | 控制 API 鉴权，供 `X-Proxy-Admin-Token` 请求头校验 |
 | `default_cooldown_seconds` | number | 必填 | supply 未单独配置 `cooldown_seconds` 时的默认冷却时长 |
+| `budget_retry` | object | 可选 | ④b 输出预算自动放大重试：`{"enabled": true, "max_retries": 5, "ceiling": 131072}`，缺省全开；无 per-supply 维度 |
 
 完整样例见 `config/model_proxy_config.example.json`。
 

@@ -2085,5 +2085,126 @@ class TestARStream(unittest.TestCase):
         self.assertIn("content_block_stop", [e["type"] for e in evs])
 
 
+# ############################################################################
+# ④b 预算截断判定 is_budget_truncated（架构审查 R1 纯函数）
+# ############################################################################
+
+class TestIsBudgetTruncated(unittest.TestCase):
+    """三协议「达到输出预算上限且正文缺失」判定。
+
+    关键约束：判定在**原始上游响应**上进行（转换前），chat 的 reasoning fallback
+    会把 reasoning_content 填成 text block——转换后再判恒为假，本类用例固定
+    「原始响应上判仍 True」这一不被兜底掩盖的性质。
+    """
+
+    # ---- anthropic ----
+
+    def test_anthropic_max_tokens_only_thinking(self):
+        resp = {"stop_reason": "max_tokens",
+                "content": [{"type": "thinking", "thinking": "长考…"}]}
+        self.assertTrue(pt.is_budget_truncated("anthropic", resp))
+
+    def test_anthropic_max_tokens_empty_content(self):
+        self.assertTrue(pt.is_budget_truncated(
+            "anthropic", {"stop_reason": "max_tokens", "content": []}))
+
+    def test_anthropic_max_tokens_empty_text_block_counts_as_missing(self):
+        # 空白 text block 视为正文缺失
+        resp = {"stop_reason": "max_tokens",
+                "content": [{"type": "text", "text": "  "}]}
+        self.assertTrue(pt.is_budget_truncated("anthropic", resp))
+
+    def test_anthropic_max_tokens_with_text_not_truncated(self):
+        resp = {"stop_reason": "max_tokens",
+                "content": [{"type": "thinking", "thinking": "t"},
+                            {"type": "text", "text": "正文"}]}
+        self.assertFalse(pt.is_budget_truncated("anthropic", resp))
+
+    def test_anthropic_max_tokens_with_tool_use_not_truncated(self):
+        resp = {"stop_reason": "max_tokens",
+                "content": [{"type": "tool_use", "id": "x", "name": "f", "input": {}}]}
+        self.assertFalse(pt.is_budget_truncated("anthropic", resp))
+
+    def test_anthropic_end_turn_no_content_not_truncated(self):
+        # 非 max_tokens 停止，即便无正文也不是预算截断
+        self.assertFalse(pt.is_budget_truncated(
+            "anthropic", {"stop_reason": "end_turn", "content": []}))
+
+    # ---- chat ----
+
+    def test_chat_length_reasoning_only_is_truncated(self):
+        """fallback 不掩盖用例：原始响应只有 reasoning_content（转换后兜底会填成
+        text block），在原始响应上判仍识别为截断。"""
+        resp = {"choices": [{"finish_reason": "length",
+                             "message": {"content": "",
+                                         "reasoning_content": "思考占满预算"}}]}
+        self.assertTrue(pt.is_budget_truncated("chat", resp))
+        # 对照：转换后 fallback 填 text，若误判转换后结果就永远判不出（本测试只
+        # 固定"原始响应上判 == True"，转换行为本身由既有 fallback 单测覆盖）
+        converted = pt.openai_to_anthropic_response(resp, {})
+        self.assertEqual(converted["content"][0]["type"], "text")
+
+    def test_chat_length_null_content_is_truncated(self):
+        resp = {"choices": [{"finish_reason": "length", "message": {"content": None}}]}
+        self.assertTrue(pt.is_budget_truncated("chat", resp))
+
+    def test_chat_length_with_content_not_truncated(self):
+        resp = {"choices": [{"finish_reason": "length",
+                             "message": {"content": "半截正文"}}]}
+        self.assertFalse(pt.is_budget_truncated("chat", resp))
+
+    def test_chat_length_with_tool_calls_not_truncated(self):
+        resp = {"choices": [{"finish_reason": "length",
+                             "message": {"content": "",
+                                         "tool_calls": [{"id": "c", "function": {}}]}}]}
+        self.assertFalse(pt.is_budget_truncated("chat", resp))
+
+    def test_chat_finish_stop_empty_not_truncated(self):
+        resp = {"choices": [{"finish_reason": "stop", "message": {"content": ""}}]}
+        self.assertFalse(pt.is_budget_truncated("chat", resp))
+
+    # ---- responses ----
+
+    def test_responses_incomplete_reasoning_only_is_truncated(self):
+        resp = {"status": "incomplete",
+                "incomplete_details": {"reason": "max_output_tokens"},
+                "output": [{"type": "reasoning", "summary": []}]}
+        self.assertTrue(pt.is_budget_truncated("responses", resp))
+
+    def test_responses_incomplete_with_output_text_not_truncated(self):
+        resp = {"status": "incomplete",
+                "incomplete_details": {"reason": "max_output_tokens"},
+                "output": [{"type": "message",
+                            "content": [{"type": "output_text", "text": "半截"}]}]}
+        self.assertFalse(pt.is_budget_truncated("responses", resp))
+
+    def test_responses_incomplete_with_function_call_not_truncated(self):
+        resp = {"status": "incomplete",
+                "incomplete_details": {"reason": "max_output_tokens"},
+                "output": [{"type": "function_call", "name": "f", "arguments": "{}"}]}
+        self.assertFalse(pt.is_budget_truncated("responses", resp))
+
+    def test_responses_completed_not_truncated(self):
+        resp = {"status": "completed", "output": []}
+        self.assertFalse(pt.is_budget_truncated("responses", resp))
+
+    def test_responses_incomplete_other_reason_not_truncated(self):
+        resp = {"status": "incomplete",
+                "incomplete_details": {"reason": "content_filter"}, "output": []}
+        self.assertFalse(pt.is_budget_truncated("responses", resp))
+
+    # ---- 输入形态 ----
+
+    def test_bytes_input_accepted(self):
+        raw = json.dumps({"stop_reason": "max_tokens", "content": []}).encode()
+        self.assertTrue(pt.is_budget_truncated("anthropic", raw))
+
+    def test_garbage_returns_false(self):
+        self.assertFalse(pt.is_budget_truncated("anthropic", b"{not json"))
+        self.assertFalse(pt.is_budget_truncated("chat", None))
+        self.assertFalse(pt.is_budget_truncated("responses", [1, 2]))
+        self.assertFalse(pt.is_budget_truncated("unknown-proto", {"stop_reason": "max_tokens"}))
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

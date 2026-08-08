@@ -37,7 +37,7 @@ from .commands import (
     extract_last_user_message_content,
     parse_route_command,
 )
-from .reasoning.capability import ModelReasoningCapability, abstract_encode, remap
+from .reasoning.capability import AbstractKind, ModelReasoningCapability, abstract_encode, remap
 from .reasoning.ladder import CanonicalEffort
 from .reasoning.registry import apply_fields, get_codec, resolve_protocol
 
@@ -350,6 +350,18 @@ class ConfigStore:
         with self._lock:
             return int(self._config.get("default_cooldown_seconds", _DEFAULT_COOLDOWN_SECONDS))
 
+    def get_budget_retry(self) -> dict:
+        """可选顶层块 budget_retry（④b 反应式预算重试）。缺省全开：
+        {"enabled": True, "max_retries": _BUDGET_RETRY_MAX, "ceiling": _BUDGET_CEILING}。
+        无 per-supply 维度（③ output_budget 已撤销，见设计记录 §③/§④）。"""
+        with self._lock:
+            cfg = self._config.get("budget_retry") or {}
+        return {
+            "enabled": bool(cfg.get("enabled", True)),
+            "max_retries": int(cfg.get("max_retries", _BUDGET_RETRY_MAX)),
+            "ceiling": int(cfg.get("ceiling", _BUDGET_CEILING)),
+        }
+
     # ------------------------------------------------------------------
     # 热重载（拷贝 proxy.py 原样）
     # ------------------------------------------------------------------
@@ -475,6 +487,27 @@ _TRANSLATOR_TABLE = {
     ("anthropic", "chat"): ANTHROPIC_TO_CHAT,
     ("responses", "anthropic"): RESPONSES_TO_ANTHROPIC,
     ("anthropic", "responses"): ANTHROPIC_TO_RESPONSES,
+}
+
+# ---------------------------------------------------------------------------
+# ④b 预算治理：反应式 ×2 阶梯重试（③ 撤销后的唯一预算机制，见
+# docs/designs/2026-08-07-reasoning-thinking-truncation-and-protocol-consistency.md §④）
+# ---------------------------------------------------------------------------
+_BUDGET_CEILING = 131072       # 放大封顶（config 顶层 budget_retry.ceiling 可覆盖）
+_BUDGET_RETRY_MAX = 5          # 放大重试次数上限（config budget_retry.max_retries 可覆盖）
+
+# ② 反向缺省预算（responses→anthropic 客户端不传 max_tokens 时）：按 remap 结果分档——
+# 本请求将产生 thinking 用 16384（4096 对 reasoning 模型是陷阱默认值，思考会占满预算
+# 挤出正文）；非 thinking 维持 4096。
+_THINKING_MAX_TOKENS_DEFAULT = 16384
+_NON_THINKING_MAX_TOKENS_DEFAULT = 4096
+
+# ④b 出站预算字段名按协议分（架构审查 R2）：PASSTHROUGH responses→responses 是
+# max_output_tokens 不是 max_tokens。
+_BUDGET_FIELD_BY_PROTOCOL = {
+    "anthropic": "max_tokens",
+    "chat": "max_completion_tokens",
+    "responses": "max_output_tokens",
 }
 
 
@@ -944,6 +977,10 @@ class ModelProxyHandler(BaseHTTPRequestHandler):
             "usage_in": 0, "usage_out": 0,
             "strategy": "", "session": "", "route_failover": 0,
             "builtin": "",
+            # ④b/⑤ 预算治理观测：budget_retried 为放大轨迹（"16000→32000[,…]"），
+            # budget_truncated=1 为最终仍截断（含流式收口检测），stop_reason 为
+            # 响应停止原因（能拿到才记，拿不到留空）。
+            "budget_retried": "", "budget_truncated": 0, "stop_reason": "",
         }
         t0 = time.monotonic()
         try:
@@ -954,11 +991,13 @@ class ModelProxyHandler(BaseHTTPRequestHandler):
             access_log.info(
                 "ACCESS ms=%d status=%s source=%s route=%s tier=%s supply=%s "
                 "failover=%s attempts=%s usage_in=%s usage_out=%s token=%s session=%s "
-                "route_failover=%s builtin=%s",
+                "route_failover=%s builtin=%s budget_retried=%s budget_truncated=%s "
+                "stop_reason=%s",
                 ms, a["status"], a["source"],
                 a["route"], a["tier"], a["supply"], a["failover"], a["attempts"],
                 a["usage_in"], a["usage_out"], a["token"], a["session"],
-                a["route_failover"], a["builtin"])
+                a["route_failover"], a["builtin"], a["budget_retried"],
+                a["budget_truncated"], a["stop_reason"])
             try:
                 usage_totals.record(a, ms)
             except Exception:
@@ -1085,6 +1124,73 @@ class ModelProxyHandler(BaseHTTPRequestHandler):
         _cached_target_effort = None
         _cached_abstract = None
 
+        # ---- ④b 预算治理：反应式 ×2 阶梯重试（唯一预算机制，设计记录 §④）----
+        # _budget_retries 是计数器（int，≤max_retries；架构审查 R3：不是布尔位），与
+        # 语法重试 _reasoning_retried 状态独立、可同请求先后发生（先 400 语法重试、
+        # 后 200 截断预算重试），互不消耗对方次数。
+        # _budget_current 为当前生效预算，0=未定（首轮 stamp 时从出站 body 读回客户端
+        # 有效值；反向缺省场景由 ② 的 max_tokens_default 先行填入，读回的即是有效值）。
+        # R4 声明（有意行为）：两者都是请求周期作用域——爬升途中触发 failover 换 supply
+        # 时，放大后的预算被下一 supply 继承（预算不足是模型属性，同 tier 换 supply
+        # 不必从起点重爬）。
+        budget_cfg = cs.get_budget_retry()
+        _budget_retries = 0
+        _budget_current = 0
+
+        def _stamp_budget(outgoing: dict, target_protocol: str) -> None:
+            """④b 出站预算 stamp（构建完 outgoing body 后、json.dumps 前调用）：
+            首轮读回客户端有效预算作爬升起点（写回原值，无行为变化）；重试轮覆写为
+            放大值。字段名分协议（R2，_BUDGET_FIELD_BY_PROTOCOL）。"""
+            nonlocal _budget_current
+            field = _BUDGET_FIELD_BY_PROTOCOL.get(target_protocol)
+            if not field or not isinstance(outgoing, dict):
+                return
+            if _budget_current:
+                outgoing[field] = _budget_current
+            else:
+                try:
+                    _budget_current = int(outgoing.get(field) or 0)
+                except (TypeError, ValueError):
+                    _budget_current = 0
+
+        def _maybe_budget_retry(raw_resp_bytes: bytes, target_protocol: str, sid: str) -> bool:
+            """④b 截断检测 + 放大决策（仅非流式成功响应、resp.read() 之后/转换之前调用）。
+
+            在原始上游响应上判定（R1 纯函数 pt.is_budget_truncated；chat 方向必须在
+            转换前判，否则被 _ENABLE_REASONING_FALLBACK 填 text 掩盖）。命中且未达上限
+            → 预算 ×2（封顶 ceiling）、计数 +1、返回 True，调用方随后 resp.close() +
+            continue 重进 while：同 supply 重选（不 cooldown、不进 tried_set、不计
+            failover），remap 缓存经 _reasoning_cache_supply_id 复用，重试只改预算
+            不改档。命中但已到上限/次数耗尽/预算基线未知 → 记 budget_truncated=1、
+            返回 False，调用方如实写回截断响应。
+            """
+            nonlocal _budget_retries, _budget_current
+            if not budget_cfg["enabled"]:
+                return False
+            if not pt.is_budget_truncated(target_protocol, raw_resp_bytes):
+                return False
+            nxt = 0
+            if _budget_current > 0 and _budget_retries < budget_cfg["max_retries"]:
+                nxt = min(_budget_current * 2, budget_cfg["ceiling"])
+                if nxt <= _budget_current:
+                    nxt = 0   # 已达封顶（next==current），停止
+            if not nxt:
+                self._acc["budget_truncated"] = 1
+                log.warning(
+                    "budget_truncated: supply=%s budget=%s retries=%d "
+                    "（到上限/无预算基线，如实返回截断响应）",
+                    sid, _budget_current, _budget_retries)
+                return False
+            old = _budget_current
+            _budget_current = nxt
+            _budget_retries += 1
+            trail = self._acc.get("budget_retried") or ""
+            self._acc["budget_retried"] = (
+                f"{trail},{old}→{nxt}" if trail else f"{old}→{nxt}")
+            log.warning("budget_retry: supply=%s budget %s→%s (%d/%d)",
+                        sid, old, nxt, _budget_retries, budget_cfg["max_retries"])
+            return True
+
         # 6. route 候选外层循环（§3 选项B：pin route/其tier全挂时，按 session_hash
         #    排好的候选顺序换下一个候选 route 重试；单候选（旧单值 route_id 配置）时
         #    该外层循环退化为只跑一轮，行为与改动前完全一致，不产生 route_failover）。
@@ -1191,6 +1297,14 @@ class ModelProxyHandler(BaseHTTPRequestHandler):
                     if isinstance(body_json, dict) and reasoning_wire:
                         apply_fields(body_json, reasoning_wire)
                         send_body = json.dumps(body_json, ensure_ascii=False).encode("utf-8")
+                    # ④b 预算 stamp（R2：透传按 target 子协议分字段；首轮写回原值不 re-dump，
+                    # 重试轮覆写放大值后需重新序列化）
+                    if isinstance(body_json, dict):
+                        _bf = _BUDGET_FIELD_BY_PROTOCOL.get(target)
+                        _pre_budget = body_json.get(_bf) if _bf else None
+                        _stamp_budget(body_json, target)
+                        if _bf and body_json.get(_bf) != _pre_budget:
+                            send_body = json.dumps(body_json, ensure_ascii=False).encode("utf-8")
 
                 elif mode == ANTHROPIC_TO_CHAT:
                     # 组合3：anthropic 请求 → chat 上游。转成 OpenAI body，打 native chat 端点。
@@ -1207,6 +1321,7 @@ class ModelProxyHandler(BaseHTTPRequestHandler):
                     if target_model:
                         openai_body["model"] = target_model
                         fwd_ctx["request_model"] = target_model  # 响应 model 字段回填 target_model
+                    _stamp_budget(openai_body, target)   # ④b（chat 字段 max_completion_tokens）
                     send_body = json.dumps(openai_body, ensure_ascii=False).encode("utf-8")
                     # target_url 已在分支前统一算好（supply.url 现在已是完整 /chat/completions 端点）
 
@@ -1225,6 +1340,7 @@ class ModelProxyHandler(BaseHTTPRequestHandler):
                     if target_model:
                         responses_body["model"] = target_model
                         fwd_ctx["request_model"] = target_model  # 响应 model 字段回填 target_model
+                    _stamp_budget(responses_body, target)   # ④b（responses 字段 max_output_tokens）
                     send_body = json.dumps(responses_body, ensure_ascii=False).encode("utf-8")
                     # target_url 已在分支前统一算好（supply.url 已配到完整 /v1/responses 端点）
                     # Responses reasoning.effort 机制无 Anthropic thinking.type 400 拒绝问题
@@ -1234,8 +1350,14 @@ class ModelProxyHandler(BaseHTTPRequestHandler):
                     # 组合4：responses 请求 → anthropic 上游。转成 Anthropic body，打 /v1/messages。
                     # 请求转换失败（异常）→ 合法 Responses error，400（反向规格 §5.1）
                     try:
+                        # ② 反向缺省预算按 remap 结果分档：本请求将产生 thinking → 16384
+                        # （4096 对 reasoning 模型是陷阱默认值，思考会占满预算挤出正文），
+                        # 非 thinking 维持 4096。即便 16384 仍不够，④b 反应式爬升兜底。
+                        _mt_default = (_THINKING_MAX_TOKENS_DEFAULT
+                                       if abstract.kind == AbstractKind.THINKING
+                                       else _NON_THINKING_MAX_TOKENS_DEFAULT)
                         anthropic_body = pt.responses_to_anthropic_request(
-                            body_json or {}, max_tokens_default=4096,
+                            body_json or {}, max_tokens_default=_mt_default,
                             reasoning_fields=reasoning_wire)
                     except Exception as e:
                         log.warning("RESPONSES_TO_ANTHROPIC request translate failed: %s", e)
@@ -1245,6 +1367,7 @@ class ModelProxyHandler(BaseHTTPRequestHandler):
                         return
                     if target_model:
                         anthropic_body["model"] = target_model
+                    _stamp_budget(anthropic_body, target)   # ④b（anthropic 字段 max_tokens）
                     send_body = json.dumps(anthropic_body, ensure_ascii=False).encode("utf-8")
                     # target_url 已在分支前统一算好（supply.url 现在已是完整 /v1/messages 端点）
 
@@ -1342,16 +1465,37 @@ class ModelProxyHandler(BaseHTTPRequestHandler):
                     if is_stream:
                         self._write_streaming_response(
                             resp_status, list(resp.getheaders()), resp, source)
+                        # ④b 流式不重试（字节已下发客户端无法回追），仅收口检测记日志：
+                        # stop_reason 与 stream_content 由 _sniff_passthrough_usage 旁路填
+                        if (self._acc.get("stop_reason") in ("max_tokens", "incomplete:max_output_tokens")
+                                and not self._acc.get("stream_content")):
+                            self._acc["budget_truncated"] = 1
+                            log.warning(
+                                "budget_truncated(stream,不重试): supply=%s stop=%s",
+                                supply_id, self._acc.get("stop_reason"))
                     else:
                         resp_body = resp.read()
+                        # ④b 截断检测（原始透传 body 上判）；命中且可爬 → 放大预算重进循环
+                        if _maybe_budget_retry(resp_body, target, supply_id):
+                            resp.close()
+                            continue
                         try:
-                            _pu = (json.loads(resp_body) or {}).get("usage") or {}
+                            _pj = json.loads(resp_body) or {}
+                            _pu = _pj.get("usage") or {}
                             # anthropic 侧: input_tokens/output_tokens；
                             # chat/openai 侧: prompt_tokens/completion_tokens
                             self._acc["usage_in"] = _pu.get(
                                 "input_tokens", _pu.get("prompt_tokens", 0)) or 0
                             self._acc["usage_out"] = _pu.get(
                                 "output_tokens", _pu.get("completion_tokens", 0)) or 0
+                            # ⑤ 可选 stop_reason：anthropic 形态取 stop_reason，
+                            # responses 形态取 status（incomplete 时带 reason）
+                            _st = _pj.get("stop_reason") or ""
+                            if not _st and _pj.get("status"):
+                                _reason = (_pj.get("incomplete_details") or {}).get("reason")
+                                _st = (f"{_pj['status']}:{_reason}" if _reason
+                                       else str(_pj["status"]))
+                            self._acc["stop_reason"] = _st
                         except Exception:
                             pass   # 解析失败不影响透传主流程，usage 记 0
                         self._write_buffered_response(
@@ -1365,11 +1509,27 @@ class ModelProxyHandler(BaseHTTPRequestHandler):
                         adapter = pt.OpenAIToAnthropicStreamAdapter(fwd_ctx, target_model or "")
                         self._write_translated_stream(resp, adapter)
                         (self._acc["usage_in"], self._acc["usage_out"], _) = adapter.usage_tuple()
+                        # ⑤ 可选 stop_reason（final_stop_reason 已经 map_finish_reason
+                        # 映射，"length"→"max_tokens"）
+                        self._acc["stop_reason"] = adapter.final_stop_reason or ""
+                        # ④b 流式不重试（字节已下发），仅收口检测记日志：
+                        # produced_content_block 不计 reasoning 累积/兜底填充，语义即
+                        # 「真实正文是否产出」，与 is_budget_truncated 的「正文缺失」同义
+                        if (adapter.final_stop_reason == "max_tokens"
+                                and not adapter.produced_content_block):
+                            self._acc["budget_truncated"] = 1
+                            log.warning(
+                                "budget_truncated(stream,不重试): supply=%s", supply_id)
                     else:
                         try:
                             raw_resp_body = resp.read()
                         finally:
                             resp.close()
+                        # ④b 截断检测：必须在原始 chat 响应上判（转换前）——转换的
+                        # reasoning fallback 会把 reasoning_content 填成 text，转换后
+                        # 再判「无 text」恒为假，检测被兜底掩盖（④a/R1）
+                        if _maybe_budget_retry(raw_resp_body, target, supply_id):
+                            continue
                         # 响应转换失败（JSON 非法/转换器异常）→ 合法 Anthropic error，500（正向规格 §5.1）
                         try:
                             openai_resp = json.loads(raw_resp_body)
@@ -1383,6 +1543,7 @@ class ModelProxyHandler(BaseHTTPRequestHandler):
                         _u = anthropic_resp.get("usage") or {}
                         self._acc["usage_in"] = _u.get("input_tokens", 0)
                         self._acc["usage_out"] = _u.get("output_tokens", 0)
+                        self._acc["stop_reason"] = anthropic_resp.get("stop_reason") or ""
                         self._write_buffered_response(
                             200, [("Content-Type", "application/json")],
                             json.dumps(anthropic_resp, ensure_ascii=False).encode("utf-8"))
@@ -1394,11 +1555,16 @@ class ModelProxyHandler(BaseHTTPRequestHandler):
                         adapter = pt.ResponsesToAnthropicStreamAdapter(fwd_ctx, target_model or "")
                         self._write_translated_stream_from_responses(resp, adapter)
                         (self._acc["usage_in"], self._acc["usage_out"], _) = adapter.usage_tuple()
+                        # ④b 流式不重试；本 adapter 未捕获 response.incomplete 状态，
+                        # 流式截断检测此处不做（状态不允许，仅非流式生效）
                     else:
                         try:
                             raw_resp_body = resp.read()
                         finally:
                             resp.close()
+                        # ④b 截断检测（原始 responses 响应上判，转换前）
+                        if _maybe_budget_retry(raw_resp_body, target, supply_id):
+                            continue
                         # 响应转换失败（JSON 非法/转换器异常）→ 合法 Anthropic error，500
                         try:
                             responses_resp = json.loads(raw_resp_body)
@@ -1413,6 +1579,7 @@ class ModelProxyHandler(BaseHTTPRequestHandler):
                         _u = anthropic_resp.get("usage") or {}
                         self._acc["usage_in"] = _u.get("input_tokens", 0)
                         self._acc["usage_out"] = _u.get("output_tokens", 0)
+                        self._acc["stop_reason"] = anthropic_resp.get("stop_reason") or ""
                         self._write_buffered_response(
                             200, [("Content-Type", "application/json")],
                             json.dumps(anthropic_resp, ensure_ascii=False).encode("utf-8"))
@@ -1427,11 +1594,17 @@ class ModelProxyHandler(BaseHTTPRequestHandler):
                         ctx={"tools": _tools_echo, "reasoning_effort": _r_effort})
                     self._write_responses_stream(resp, adapter)
                     (self._acc["usage_in"], self._acc["usage_out"], _) = adapter.usage_tuple()
+                    # ⑤ 可选 stop_reason（anthropic 原生值）；adapter 无「正文是否产出」
+                    # 状态，流式截断检测此处不做（仅非流式生效）
+                    self._acc["stop_reason"] = adapter.final_stop_reason or ""
                 else:
                     try:
                         raw_resp_body = resp.read()
                     finally:
                         resp.close()
+                    # ④b 截断检测（原始 anthropic 响应上判，转换前）
+                    if _maybe_budget_retry(raw_resp_body, target, supply_id):
+                        continue
                     # 响应转换失败（JSON 非法/转换器异常）→ 合法 Responses error，500（反向规格 §5.1）
                     try:
                         anthropic_resp = json.loads(raw_resp_body)
@@ -1447,6 +1620,7 @@ class ModelProxyHandler(BaseHTTPRequestHandler):
                     _u = responses_resp.get("usage") or {}
                     self._acc["usage_in"] = _u.get("input_tokens", 0)
                     self._acc["usage_out"] = _u.get("output_tokens", 0)
+                    self._acc["stop_reason"] = anthropic_resp.get("stop_reason") or ""
                     self._write_buffered_response(
                         200, [("Content-Type", "application/json")],
                         json.dumps(responses_resp, ensure_ascii=False).encode("utf-8"))
@@ -1925,27 +2099,56 @@ class ModelProxyHandler(BaseHTTPRequestHandler):
     def _sniff_passthrough_usage(self, block: bytes, source: str) -> None:
         """PASSTHROUGH 流式旁路：从一个完整 SSE 块里嗅探 usage，覆盖式写入 self._acc。
         字节预筛跳过绝大多数无关块，只对目标块做 json 解析。异常由调用方 try 兜住。
+
+        ④b/⑤ 顺带嗅探（同为旁路，不影响转发字节）：
+        - anthropic：message_delta 的 delta.stop_reason → _acc["stop_reason"]；
+          content_block_start 的 text/tool_use 块 → _acc["stream_content"]=1（正文出现标记）。
+        - responses：response.completed/response.incomplete 的 status（incomplete 带
+          reason，形如 "incomplete:max_output_tokens"）→ _acc["stop_reason"]；
+          output_item.added 的 message/function_call 项 → _acc["stream_content"]=1。
+        供流式收口检测「budget 截断且正文缺失」记日志用（流式不重试）。
         """
         if source == "anthropic":
-            if b"message_delta" not in block:          # 字节预筛
-                return
-            ev_type, data = self._parse_anthropic_sse_block(block)
-            if ev_type != "message_delta" or not isinstance(data, dict):
-                return
-            u = data.get("usage") or {}
-            if u.get("output_tokens") is not None:
-                self._acc["usage_out"] = u.get("output_tokens") or 0
-            if u.get("input_tokens") is not None:
-                self._acc["usage_in"] = u.get("input_tokens") or 0
+            if b"message_delta" in block:               # 字节预筛
+                ev_type, data = self._parse_anthropic_sse_block(block)
+                if ev_type != "message_delta" or not isinstance(data, dict):
+                    return
+                u = data.get("usage") or {}
+                if u.get("output_tokens") is not None:
+                    self._acc["usage_out"] = u.get("output_tokens") or 0
+                if u.get("input_tokens") is not None:
+                    self._acc["usage_in"] = u.get("input_tokens") or 0
+                _sr = (data.get("delta") or {}).get("stop_reason")
+                if _sr:
+                    self._acc["stop_reason"] = _sr
+            elif b"content_block_start" in block:       # 字节预筛
+                ev_type, data = self._parse_anthropic_sse_block(block)
+                if ev_type != "content_block_start" or not isinstance(data, dict):
+                    return
+                if (data.get("content_block") or {}).get("type") in ("text", "tool_use"):
+                    self._acc["stream_content"] = 1
         elif source == "responses":
-            if b"response.completed" not in block:      # 字节预筛
-                return
-            ev_type, data = self._parse_anthropic_sse_block(block)
-            if ev_type != "response.completed" or not isinstance(data, dict):
-                return
-            u = (data.get("response") or {}).get("usage") or {}
-            self._acc["usage_in"] = u.get("input_tokens", 0) or 0
-            self._acc["usage_out"] = u.get("output_tokens", 0) or 0
+            if b"response.completed" in block or b"response.incomplete" in block:
+                ev_type, data = self._parse_anthropic_sse_block(block)
+                if ev_type not in ("response.completed", "response.incomplete") \
+                        or not isinstance(data, dict):
+                    return
+                _resp = data.get("response") or {}
+                u = _resp.get("usage") or {}
+                if u.get("input_tokens") is not None:
+                    self._acc["usage_in"] = u.get("input_tokens") or 0
+                if u.get("output_tokens") is not None:
+                    self._acc["usage_out"] = u.get("output_tokens") or 0
+                _st = _resp.get("status")
+                if _st:
+                    _reason = (_resp.get("incomplete_details") or {}).get("reason")
+                    self._acc["stop_reason"] = f"{_st}:{_reason}" if _reason else str(_st)
+            elif b"output_item.added" in block:         # 字节预筛
+                ev_type, data = self._parse_anthropic_sse_block(block)
+                if not isinstance(data, dict):
+                    return
+                if (data.get("item") or {}).get("type") in ("message", "function_call"):
+                    self._acc["stream_content"] = 1
 
     @staticmethod
     def _parse_anthropic_sse_block(block: bytes):
