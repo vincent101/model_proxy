@@ -412,8 +412,8 @@ class TestStatusOffline(unittest.TestCase):
             json.dump(data, f)
         return path
 
-    def test_offline_shows_not_running_for_cooldown_degraded(self):
-        """停机时 health 行显 (代理未运行)，不读账本。"""
+    def test_offline_unified_display(self):
+        """停机时与在线统一展示：cooldown 显 (未知)（内存态拿不到），degraded 读账本就绪。"""
         with tempfile.TemporaryDirectory() as td:
             cfg_path = self._make_config(td)
             totals_path = self._make_totals(td, {
@@ -422,11 +422,10 @@ class TestStatusOffline(unittest.TestCase):
             lines = _format_status_offline(cfg_path, totals_path)
             joined = "\n".join(lines)
             self.assertIn("health:", joined)
-            self.assertIn("cooldown (代理未运行)", joined)
-            self.assertIn("degraded (代理未运行)", joined)
-            # 不应列出 degraded supply 明细（不读账本）
-            self.assertNotIn("degraded supplies", joined)
-            self.assertNotIn("fail 80.0%", joined)
+            self.assertIn("cooldown (未知)/1", joined)
+            # 统一展示：degraded 段照常（读账本）
+            self.assertIn("degraded supplies", joined)
+            self.assertIn("fail 80.0%", joined)
 
     def test_offline_config_count_row(self):
         """停机时 config 计数行照常。"""

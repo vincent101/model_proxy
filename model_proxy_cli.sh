@@ -25,7 +25,7 @@ print_help() {
   reload                            触发配置热重载（无条件清空所有 cooldown）
 
 查询观察:
-  status                            显示运行态总览（health 计数 + 活跃 session 链路健康 + 异常清单 + config 计数）；代理未运行时降级展示静态 config 信息
+  status                            显示运行态总览
   logs [N] [field=val]              显示最近 N 条日志（默认 30 条 ACCESS）。
                                     支持按字段过滤（OPT-11）：
                                       logs                最近 30 条 ACCESS
@@ -56,20 +56,17 @@ print_help() {
                                     [d]el  删除 route
                                     [q]uit 退出
   strategy                          打印 strategy list 后进入交互菜单，可选操作：
-                                    [a]dd  交互式新增 strategy 绑定
-                                          （仅录单值 route_id；route_pool/dispatch 写法请直接编辑 config 后 reload）
+                                    [a]dd  交互式新增 strategy 绑定 route_id/note/source
                                     [e]dit 交互式编辑 strategy 的 route_id/note/source 能力
-                                          （route_pool 写法仅可编辑 note/source 能力，route 不可经菜单改）
                                     [d]el  删除 strategy
                                     [q]uit 退出
-  switch <client_token> <route_id>  改 strategy.route_id 后 reload。仅支持单值写法；route_pool 写法会被拒绝，请直接编辑 config
+  switch <client_token> <route_id>  改 strategy.route_id 后 reload
   install                           交互式列出四个 SDK + 本机检测状态，选择安装
 
 会话内指令（非 CLI 子命令，在对话里直接发送）:
   $route                      查询当前 session 的生效 route 与 override
   $route <route_id>           把当前 session 固定到指定 route（写 config/session_overrides.json）
   $route reset                清除当前 session 的 override
-  ※ status health 行的 overrides 计数即来自 $route 写入的 sidecar
 
 --help / -h                       显示此帮助
 
@@ -130,8 +127,8 @@ cmd_status() {
   local pid
   pid=$(lsof -i :"$MODEL_PROXY_PORT" -sTCP:LISTEN -t 2>/dev/null)
   if [[ -z "$pid" ]]; then
-    echo "service NOT running on port $MODEL_PROXY_PORT（以下展示 config 静态信息）"
-    python3 "$SCRIPT_DIR/_format_ops.py" status-offline "$CONFIG_FILE" "$TOTALS_FILE"
+    echo "service NOT running on port $MODEL_PROXY_PORT"
+    python3 "$SCRIPT_DIR/_format_ops.py" status-offline "$CONFIG_FILE" "$TOTALS_FILE" "$LOG_FILE"
     return 1
   fi
 

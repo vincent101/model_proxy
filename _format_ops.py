@@ -558,11 +558,16 @@ def _compute_degraded(health: dict[str, dict]) -> list[dict]:
 
 
 def _format_status_from_json(data: dict, config_path: str, totals_path: str,
-                             log_path: str | None = None) -> list[str]:
+                             log_path: str | None = None,
+                             cooldown_unknown: bool = False) -> list[str]:
     """从 server status JSON + config + 账本 格式化 status 输出。
 
     布局：health 行 → degraded supplies 段 → active sessions 段（在线时恒展示）
     → cooldown 段 → config 计数行。全 0 时 health 行即"系统健康"，异常段不打印。
+
+    cooldown_unknown=True（离线统一展示路径）：cooldown 是 server 内存态离线拿不到，
+    health 行显 "cooldown (未知)/N"，明细段跳过；degraded（账本）/active sessions（日志）
+    /overrides（sidecar）均不依赖代理进程，离线照常展示。
     """
     cooldown = data.get("cooldown", {})
     n_supplies = len(data.get("supplies", []))
@@ -589,7 +594,10 @@ def _format_status_from_json(data: dict, config_path: str, totals_path: str,
     lines = []
 
     # health 行
-    parts = [f"cooldown {n_cooldown}/{n_supplies}"]
+    if cooldown_unknown:
+        parts = [f"cooldown (未知)/{n_supplies}"]
+    else:
+        parts = [f"cooldown {n_cooldown}/{n_supplies}"]
     if n_degraded > 0:
         parts.append(f"degraded {n_degraded}")
     else:
@@ -613,7 +621,7 @@ def _format_status_from_json(data: dict, config_path: str, totals_path: str,
         lines.append("")
         lines.extend(_format_active_sessions(load_active_sessions(log_path)))
 
-    if cooldown:
+    if cooldown and not cooldown_unknown:
         lines.append("")
         lines.append("cooldown (剩余秒):")
         for sid, remain in sorted(cooldown.items()):
@@ -628,39 +636,33 @@ def _format_status_from_json(data: dict, config_path: str, totals_path: str,
     return lines
 
 
-def _format_status_offline(config_path: str, totals_path: str) -> list[str]:
-    """代理未运行时的降级展示。
+def _format_status_offline(config_path: str, totals_path: str,
+                           log_path: str | None = None) -> list[str]:
+    """代理未运行时的统一展示：与在线布局一致。
 
-    cooldown/degraded 显 (代理未运行) 且不读账本（避免历史值误导为当前态）；
-    overrides/orphan/config 计数静态照常；退出码 1 由 cmd_status 保持。
+    degraded（账本）/active sessions（日志）/overrides（sidecar）/config 计数均不依赖
+    代理进程，照常展示；仅 cooldown（server 内存态）显 (未知)。退出码 1 由 cmd_status 保持。
     """
     with open(config_path, "r", encoding="utf-8") as f:
         cfg = json.load(f)
 
-    n_supplies = len(cfg.get("supplies", []))
-    n_routes = len(cfg.get("routes", []))
-    n_strategies = len(cfg.get("strategies", []))
-    default_cd = cfg.get("default_cooldown_seconds", "?")
-
-    # overrides: sidecar 静态可读
+    # overrides: sidecar 静态可读，注入 strategies 供统一格式化求和
     sidecar_path = Path(config_path).parent / "session_overrides.json"
     sidecar = SessionOverridesSidecar(sidecar_path)
-    overrides_count = sum(
-        sidecar.count_overrides_for(st.get("client_token", ""))
-        for st in cfg.get("strategies", [])
-    )
+    strategies = []
+    for st in cfg.get("strategies", []):
+        st2 = dict(st)
+        st2["sidecar_overrides_count"] = sidecar.count_overrides_for(st.get("client_token", ""))
+        strategies.append(st2)
 
-    lines = []
-    parts = ["cooldown (代理未运行)", "degraded (代理未运行)"]
-    parts.append(f"overrides {overrides_count}")
-    lines.append("health: " + " · ".join(parts))
-
-    # config 计数行
-    lines.append("")
-    lines.append(f"config: {n_supplies} supplies / {n_routes} routes / {n_strategies} strategies")
-    lines.append("       （明细: supply / route / strategy 菜单 list）")
-
-    return lines
+    data = {
+        "supplies": cfg.get("supplies", []),
+        "routes": cfg.get("routes", []),
+        "strategies": strategies,
+        "cooldown": {},
+    }
+    return _format_status_from_json(data, config_path, totals_path, log_path,
+                                    cooldown_unknown=True)
 
 
 def main() -> None:
@@ -698,10 +700,11 @@ def main() -> None:
             sys.exit(1)
         config_path = sys.argv[2]
         totals_path = sys.argv[3]
+        log_path = sys.argv[4] if len(sys.argv) >= 5 else None
         if not os.path.isfile(config_path):
             sys.stderr.write(f"Error: config not found: {config_path}\n")
             sys.exit(1)
-        for line in _format_status_offline(config_path, totals_path):
+        for line in _format_status_offline(config_path, totals_path, log_path):
             print(line)
         sys.exit(0)
 
