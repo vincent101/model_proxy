@@ -1,9 +1,9 @@
 ---
 type: design-decision
-status: draft
+status: confirmed
 target: "[[tools/model_proxy]]"
 tags: [architect, model_proxy, reasoning, max_tokens, truncation, protocol-consistency, effort-mapping]
-updated: 2026-08-08（第四轮修订：按用户决策重构预算治理——③ output_budget 整条撤销、②a 预防性放大撤销、④b 强化为唯一预算机制（×2 阶梯反应式重试，可落地细化）、② 反向兜底与 ⑤ 监控同步调整；① 与两轮复核章节保持原样。此前：2026-08-07 三轮修订）
+updated: 2026-08-08 confirmed（全档 5×4×2=40 探针验证通过：wire 符合推演、两协议一致、th_chars>0；①+②/④b/⑤ 已落地过复核；③/⑥ 不做）。此前：第四轮修订（预算治理重构）、2026-08-07 三轮修订
 ---
 
 # reasoning 模型经 model_proxy 的 thinking 截断与协议不一致：根因与理想治理方案
