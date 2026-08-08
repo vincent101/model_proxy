@@ -162,10 +162,11 @@ def compute_config_anomalies(cfg: dict) -> dict:
     """遍历 config 收集 orphan / missing_tiers / dangling_refs。
 
     - orphan: 在 supplies 里但未被任何 route tier 引用的 supply id
-    - missing_tiers: route 的 opus/haiku 档为空（提示级，eval- 路由不硬编码豁免）
-    - dangling_refs: route tier 引用了但不在 supplies 中的 id
+    - missing_tiers: route 的 opus/sonnet/haiku 任一档为空（提示级，eval- 路由不硬编码豁免）
+    - dangling_refs: route tier 引用了但不在 supplies 中的 id；strategy 引用了但不在 routes 中的 route_id
     """
     supply_ids = {s.get("id", "") for s in cfg.get("supplies", [])}
+    route_ids = {r.get("id", "") for r in cfg.get("routes", [])}
 
     referenced: set[str] = set()
     missing_tiers: list[str] = []
@@ -176,13 +177,24 @@ def compute_config_anomalies(cfg: dict) -> dict:
             ids = tiers.get(tn, [])
             for sid in ids:
                 referenced.add(sid)
-        # 缺档检测：opus/haiku 为空
+        # 缺档检测：opus/sonnet/haiku 任一档为空
         empty_tiers = [tn for tn in TIER_NAMES if not tiers.get(tn, [])]
         if empty_tiers:
             missing_tiers.append(f"{rid} 缺 {'/'.join(empty_tiers)}")
 
     orphan_supplies = sorted(supply_ids - referenced)
     dangling_refs = sorted(referenced - supply_ids)
+
+    # strategy → route 引用检查：route_id 或 route_pool 里的 route_id 不在 routes 中
+    for st in cfg.get("strategies", []):
+        tok = st.get("client_token", "?")
+        if st.get("route_id") and st["route_id"] not in route_ids:
+            dangling_refs.append(f"{st['route_id']} (strategy={tok})")
+        for item in st.get("route_pool") or []:
+            if isinstance(item, dict):
+                rid = item.get("route_id", "")
+                if rid and rid not in route_ids:
+                    dangling_refs.append(f"{rid} (strategy={tok} route_pool)")
 
     return {
         "orphan_supplies": orphan_supplies,
@@ -430,23 +442,18 @@ def _format_status_from_json(data: dict, config_path: str, totals_path: str) -> 
     lines.append("health: " + " · ".join(parts))
 
     # 异常清单（只列问题）
-    has_issues = False
-
     if degraded:
-        has_issues = True
         lines.append("")
         lines.append(f"degraded supplies (today fail%>{DEGRADED_FAIL_PCT:.0f}%, n>={DEGRADED_MIN_REQUESTS}):")
         for d in degraded:
             lines.append(f"  {_pad(d['id'], 24)} fail {d['fail_pct']:.1f}% ({d['fail']}/{d['requests']})")
 
     if none_fail > 0:
-        has_issues = True
         none_req = none_health.get("requests", 0)
         lines.append("")
         lines.append(f"unmatched: {none_req} req 今日全失败（supply=(none)，未匹配 strategy/route，多为 401）")
 
     if cooldown:
-        has_issues = True
         lines.append("")
         lines.append("cooldown (剩余秒):")
         for sid, remain in sorted(cooldown.items()):
@@ -456,7 +463,6 @@ def _format_status_from_json(data: dict, config_path: str, totals_path: str) -> 
     degraded_ids = {d["id"] for d in degraded}
     damaged = find_damaged_routes(cfg, degraded_ids, cooldown)
     if damaged:
-        has_issues = True
         lines.append("")
         lines.append("damaged routes:")
         lines.extend(damaged)
@@ -464,7 +470,6 @@ def _format_status_from_json(data: dict, config_path: str, totals_path: str) -> 
     # config notices
     notice_lines = _format_config_notices(anomalies)
     if notice_lines:
-        has_issues = True
         lines.append("")
         lines.append("config notices:")
         lines.extend(notice_lines)
