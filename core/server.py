@@ -1531,7 +1531,7 @@ class ModelProxyHandler(BaseHTTPRequestHandler):
                 cd_seconds = int(supply.get("cooldown_seconds", default_cd))
 
                 try:
-                    resp = urllib.request.urlopen(req, timeout=600)
+                    resp = urllib.request.urlopen(req, timeout=1800)  # 30min,对齐 API_TIMEOUT_MS
                     resp_status = resp.status
                 except urllib.error.HTTPError as e:
                     resp_status = e.code
