@@ -15,6 +15,7 @@ import hmac
 import json
 import logging
 import os
+import re
 import sys
 import tempfile
 import threading
@@ -1047,7 +1048,7 @@ class ModelProxyHandler(BaseHTTPRequestHandler):
                 a["usage_in"], a["usage_out"], a["token"], a["session"],
                 a["route_failover"], a["builtin"], a["budget_retried"],
                 a["budget_truncated"], a["stop_reason"],
-                a["final_error"][:80].replace(" ", "_"))
+                re.sub(r"\s+", "_", a["final_error"][:80]))
             try:
                 usage_totals.record(a, ms)
             except Exception:
