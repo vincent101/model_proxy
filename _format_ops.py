@@ -184,6 +184,239 @@ def _supply_refs(cfg: dict) -> dict[str, list[str]]:
 
 
 # ---------------------------------------------------------------------------
+# 活跃 session 链路健康（CLI 端解析 ACCESS 日志，零 server 改动）
+# ---------------------------------------------------------------------------
+
+def parse_access_line(line: str) -> dict | None:
+    """解析单条 ACCESS 日志行，返回字段 dict 或 None（非 ACCESS / 坏行）。
+
+    日志格式：``YYYY-MM-DD HH:MM:SS,mmm req_id=<id> ACCESS ms= status= ...``
+
+    关键陷阱：``route_failover=`` 含子串 ``failover=``——必须空格分词后
+    精确匹配 key，不能子串匹配（否则 failover 计数虚增一倍）。
+    """
+    if len(line) < 24:
+        return None
+    try:
+        ts = datetime.strptime(line[:23], "%Y-%m-%d %H:%M:%S,%f")
+    except ValueError:
+        return None
+    rest = line[23:].lstrip()
+    idx = rest.find(" ACCESS ")
+    if idx < 0:
+        return None
+    prefix = rest[:idx]
+    kvs_str = rest[idx + 8:]
+    req_id = ""
+    for tok in prefix.split():
+        if tok.startswith("req_id="):
+            req_id = tok.split("=", 1)[1]
+            break
+    # 空格分词后精确 key 匹配（route_failover 不误命中 failover）
+    fields: dict[str, str] = {}
+    for tok in kvs_str.split():
+        if "=" in tok:
+            k, v = tok.split("=", 1)
+            fields[k] = v
+    return {
+        "ts": ts,
+        "req_id": req_id,
+        "status": fields.get("status", ""),
+        "source": fields.get("source", ""),
+        "route": fields.get("route", ""),
+        "tier": fields.get("tier", ""),
+        "supply": fields.get("supply", ""),
+        "failover": fields.get("failover", ""),
+        "session": fields.get("session", ""),
+        "route_failover": fields.get("route_failover", ""),
+        "builtin": fields.get("builtin", ""),
+        "final_error": fields.get("final_error", ""),
+    }
+
+
+def load_active_sessions(log_path: str, *, now: datetime | None = None,
+                         window_minutes: int = 30,
+                         tail_bytes: int = 2 * 1024 * 1024) -> dict:
+    """tail 读日志末 tail_bytes，过滤 30min 窗口内 ACCESS 行，按 session 分组聚合。
+
+    返回 ``{"sessions": {...}, "truncated": bool, "log_missing": bool}``。
+
+    - builtin=route 行计入活跃、不计入统计（n/fail/fo）
+    - 空串 session 聚成 ``(none)`` 桶
+    - 截断检测：文件 > tail_bytes 且 buffer 内首条可解析行 ts 已在窗口内
+    """
+    if not os.path.isfile(log_path):
+        return {"sessions": {}, "truncated": False, "log_missing": True}
+    if now is None:
+        now = datetime.now()
+    window_start = now - timedelta(minutes=window_minutes)
+
+    file_size = os.path.getsize(log_path)
+    seek_tail = file_size > tail_bytes
+    try:
+        with open(log_path, "rb") as f:
+            if seek_tail:
+                f.seek(-tail_bytes, 2)
+                f.readline()  # 丢弃首条残行
+            else:
+                f.seek(0)
+            raw = f.read()
+    except OSError:
+        return {"sessions": {}, "truncated": False, "log_missing": True}
+
+    lines_decode = raw.decode("utf-8", errors="replace").splitlines()
+    sessions: dict[str, dict] = {}
+    first_ts_in_buffer: datetime | None = None
+
+    for line in lines_decode:
+        parsed = parse_access_line(line)
+        if parsed is None:
+            continue
+        if first_ts_in_buffer is None:
+            first_ts_in_buffer = parsed["ts"]
+        if parsed["ts"] < window_start:
+            continue
+        sid = parsed["session"] or "(none)"
+        agg = sessions.setdefault(sid, {
+            "n": 0, "fail": 0, "fo": 0,
+            "last_ts": None, "last_status": "", "last_route": "",
+            "last_tier": "", "last_supply": "", "last_error": "",
+            "last_req_id": "", "builtin_only": True,
+        })
+        is_builtin = parsed["builtin"] == "route"
+        if is_builtin:
+            # builtin 行只在 builtin_only session 上更新 last_*（用于活跃判定）
+            if agg["builtin_only"]:
+                if agg["last_ts"] is None or parsed["ts"] > agg["last_ts"]:
+                    agg["last_ts"] = parsed["ts"]
+                    agg["last_status"] = parsed["status"]
+                    agg["last_route"] = parsed["route"]
+                    agg["last_tier"] = parsed["tier"]
+                    agg["last_supply"] = parsed["supply"]
+                    agg["last_req_id"] = parsed["req_id"]
+        else:
+            agg["n"] += 1
+            if parsed["status"] != "200":
+                agg["fail"] += 1
+            fo = 0
+            try:
+                fo += int(parsed["failover"] or 0)
+            except ValueError:
+                pass
+            try:
+                fo += int(parsed["route_failover"] or 0)
+            except ValueError:
+                pass
+            agg["fo"] += fo
+            agg["builtin_only"] = False
+            if agg["last_ts"] is None or parsed["ts"] > agg["last_ts"]:
+                agg["last_ts"] = parsed["ts"]
+                agg["last_status"] = parsed["status"]
+                agg["last_route"] = parsed["route"]
+                agg["last_tier"] = parsed["tier"]
+                agg["last_supply"] = parsed["supply"]
+                agg["last_error"] = parsed["final_error"]
+                agg["last_req_id"] = parsed["req_id"]
+
+    # 截断判定：buffer 首条可解析行已在窗口内 → 窗口起点可能在 buffer 外
+    truncated = bool(
+        seek_tail and first_ts_in_buffer
+        and first_ts_in_buffer >= window_start
+    )
+
+    return {"sessions": sessions, "truncated": truncated, "log_missing": False}
+
+
+def _format_active_sessions(result: dict) -> list[str]:
+    """渲染活跃 session 段（header + 每 session 一行 + FAIL err 续行）。
+
+    排序：FAIL → warn → ok，同档按最近请求时间倒序。行 ≤80 列。
+    """
+    sessions = result["sessions"]
+    truncated = result["truncated"]
+    log_missing = result["log_missing"]
+
+    if log_missing:
+        return ["active sessions (30min): 无数据（日志文件缺失）"]
+    if not sessions:
+        return ["active sessions (30min): 无活跃请求"]
+
+    # 判定状态
+    order = {"FAIL": 0, "warn": 1, "ok": 2}
+    entries: list[tuple[str, dict, str]] = []
+    for sid, agg in sessions.items():
+        if agg["builtin_only"]:
+            state = "ok"
+        elif agg["last_status"] != "200":
+            state = "FAIL"
+        elif agg["fail"] > 0 or agg["fo"] > 0:
+            state = "warn"
+        else:
+            state = "ok"
+        entries.append((sid, agg, state))
+
+    def _sort_key(e):
+        sid, agg, st = e
+        ts_val = agg["last_ts"].timestamp() if agg["last_ts"] else 0
+        return (order[st], -ts_val)
+
+    entries.sort(key=_sort_key)
+
+    # 计数
+    counts = {"ok": 0, "warn": 0, "FAIL": 0}
+    for _, _, st in entries:
+        counts[st] += 1
+
+    # header
+    header = f"active sessions (30min): {len(entries)}"
+    summary_parts = []
+    if counts["ok"]:
+        summary_parts.append(f"{counts['ok']} ok")
+    if counts["warn"]:
+        summary_parts.append(f"{counts['warn']} warn")
+    if counts["FAIL"]:
+        summary_parts.append(f"{counts['FAIL']} FAIL")
+    if summary_parts:
+        header += "  (" + " · ".join(summary_parts) + ")"
+    if truncated:
+        header += "  （窗口数据可能被截断）"
+
+    lines = [header]
+
+    # 上限 20 行
+    max_rows = 20
+    shown = entries[:max_rows]
+
+    for sid, agg, state in shown:
+        id_str = "(none)" if sid == "(none)" else sid[:8]
+        fo_part = f" fo={agg['fo']}" if agg["fo"] > 0 else ""
+        ts_str = agg["last_ts"].strftime("%H:%M") if agg["last_ts"] else "--:--"
+
+        if agg["builtin_only"]:
+            line = (f"  {_pad(id_str, 8)}  {_pad(state, 4)} n=0 fail=0"
+                    f"  {ts_str} 200"
+                    f"  {agg['last_route']}/{agg['last_tier']}/{agg['last_supply']}"
+                    f"  （仅 $route)")
+        else:
+            line = (f"  {_pad(id_str, 8)}  {_pad(state, 4)}"
+                    f" n={agg['n']} fail={agg['fail']}{fo_part}"
+                    f"  {ts_str} {agg['last_status']}"
+                    f"  {agg['last_route']}/{agg['last_tier']}/{agg['last_supply']}")
+        lines.append(line)
+
+        # FAIL err 续行
+        if state == "FAIL" and agg["last_error"]:
+            req_short = agg["last_req_id"][:8]
+            err_line = f"            err: {agg['last_error']}  req={req_short}"
+            lines.append(err_line)
+
+    if len(entries) > max_rows:
+        lines.append(f"  ... 另有 {len(entries) - max_rows} 个 session")
+
+    return lines
+
+
+# ---------------------------------------------------------------------------
 # 格式化函数（返回 list[str]，不直接 print）
 # ---------------------------------------------------------------------------
 
@@ -324,11 +557,13 @@ def _compute_degraded(health: dict[str, dict]) -> list[dict]:
     return degraded
 
 
-def _format_status_from_json(data: dict, config_path: str, totals_path: str) -> list[str]:
+def _format_status_from_json(data: dict, config_path: str, totals_path: str,
+                             log_path: str | None = None) -> list[str]:
     """从 server status JSON + config + 账本 格式化 status 输出。
 
-    布局：health 行 → 异常清单（degraded/unmatched/cooldown/damaged/config notices）
-    → config 计数行。全 0 时 health 行即"系统健康"，异常段不打印。
+    布局：health 行 → active sessions 段（在线时恒展示）→ 异常清单
+    （degraded/unmatched/cooldown/damaged/config notices）→ config 计数行。
+    全 0 时 health 行即"系统健康"，异常段不打印。
     """
     cooldown = data.get("cooldown", {})
     n_supplies = len(data.get("supplies", []))
@@ -367,6 +602,11 @@ def _format_status_from_json(data: dict, config_path: str, totals_path: str) -> 
         parts.append("degraded 0")
     parts.append(f"overrides {overrides_count}")
     lines.append("health: " + " · ".join(parts))
+
+    # active sessions 段（在线时恒展示）
+    if log_path:
+        lines.append("")
+        lines.extend(_format_active_sessions(load_active_sessions(log_path)))
 
     # supply 引用标注（degraded/cooldown 行尾标出被哪个 route.tier(strategy) 引用）
     refs = _supply_refs(cfg)
@@ -447,6 +687,7 @@ def main() -> None:
             sys.exit(1)
         config_path = sys.argv[2]
         totals_path = sys.argv[3]
+        log_path = sys.argv[4] if len(sys.argv) >= 5 else None
         # stdin 读 server JSON，保留容错语义
         raw = sys.stdin.read()
         try:
@@ -458,7 +699,7 @@ def main() -> None:
         if isinstance(data, dict) and "error" in data:
             print(f"Error: {data['error']}")
             sys.exit(0)
-        for line in _format_status_from_json(data, config_path, totals_path):
+        for line in _format_status_from_json(data, config_path, totals_path, log_path):
             print(line)
         sys.exit(0)
 
