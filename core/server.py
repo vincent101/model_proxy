@@ -3,11 +3,11 @@ tools/model_proxy/core/server.py — 本地多协议路由代理主体
 
 多协议 AI 模型代理主程序：HTTP server、路由决策、转发编排、协议转换、控制 API。
 入口为 tools/model_proxy/model_proxy.py（thin wrapper 调用本模块 main()）。
-与线上 proxy.py（18888）完全隔离并行：新端口 18889、新配置
-tools/model_proxy/config/model_proxy_config.json（可用 MODEL_PROXY_CONFIG 环境变量覆盖）、
-新进程锁 /tmp/claude_model_proxy.lock、新日志 tools/model_proxy/.claude_model_proxy.log。
+端口 18889、配置 tools/model_proxy/config/model_proxy_config.json（可用 MODEL_PROXY_CONFIG
+环境变量覆盖）、进程锁 /tmp/claude_model_proxy.lock、日志 tools/model_proxy/.claude_model_proxy.log。
+（v1 proxy.py 于 2026-07-24 下线删除，本模块为唯一代理实现。）
 
-仅使用 Python 标准库，不引入第三方依赖，也不 import proxy.py。
+仅使用 Python 标准库，不引入第三方依赖。
 """
 
 import hashlib
@@ -63,8 +63,6 @@ def _trim_log(path: Path, keep: int = 5000) -> None:
         pass
 
 
-_trim_log(LOG_FILE)
-
 # req_id 全链关联（OPT-01）：threading.local 存当前请求的 req_id，Filter 注入到每条
 # log record。适用前提（O-2 已核实）：所有 warn 与请求同线程（ThreadingHTTPServer、
 # 流式同步内联、无子线程派生）。若未来出现子线程写日志路径，Filter 取默认值 '-'，
@@ -82,27 +80,42 @@ class _ReqIdFilter(logging.Filter):
 
 _req_filter = _ReqIdFilter()
 
-_root_handler = logging.FileHandler(LOG_FILE)
-_root_handler.setFormatter(logging.Formatter(
-    "%(asctime)s %(levelname)s req_id=%(req_id)s %(message)s"))
-_root_handler.addFilter(_req_filter)
-logging.basicConfig(level=logging.INFO, handlers=[_root_handler])
+# 模块级只声明 logger，不装配 handler / 不调 basicConfig / 不截断日志。
+# handler 装配与 _trim_log 延迟到 init_logging()（main() 启动路径调用），
+# 避免测试 import core.server 时触碰生产日志文件（S1 修复）。
 log = logging.getLogger(__name__)
-
-# access logger：单独 INFO 级别，复用同一日志文件、不向 root 传播（root 已开 INFO，
-# 但 access 独立 logger 避免相互 propagate 干扰）。固定前缀 ACCESS，key=value 单行文本，
-# 与现有 WARNING 行风格一致，grep/awk 友好（见 docs/designs/2026-07-22-access-log-and-latency.md）。
-# root 开 INFO 安全前提（已核实）：BaseHTTPRequestHandler.log_message 已屏蔽
-# （pass），stdlib 默认请求日志不会刷屏；进程内 INFO 级调用方只有本模块运维事件 +
-# translate.py 两条降级日志（OPT-03 已提 WARNING）。
-_access_handler = logging.FileHandler(LOG_FILE)
-_access_handler.setFormatter(logging.Formatter(
-    "%(asctime)s req_id=%(req_id)s %(message)s"))
-_access_handler.addFilter(_req_filter)
 access_log = logging.getLogger("model_proxy.access")
 access_log.setLevel(logging.INFO)
-access_log.addHandler(_access_handler)
 access_log.propagate = False
+
+
+def init_logging() -> None:
+    """生产启动路径调用：截断日志 + 装配 root/access handler 到 LOG_FILE。
+
+    仅在 main() 里调用一次。测试 import 本模块时不执行，root logger 无 FileHandler，
+    测试产生的 log 行不会写入生产日志文件。
+    幂等：重复调用直接返回（否则 access handler 会重复追加导致双写）。
+    """
+    if access_log.handlers:
+        return
+    _trim_log(LOG_FILE)
+    root_handler = logging.FileHandler(LOG_FILE)
+    root_handler.setFormatter(logging.Formatter(
+        "%(asctime)s %(levelname)s req_id=%(req_id)s %(message)s"))
+    root_handler.addFilter(_req_filter)
+    logging.basicConfig(level=logging.INFO, handlers=[root_handler])
+
+    # access logger：单独 INFO 级别，复用同一日志文件、不向 root 传播（root 已开 INFO，
+    # 但 access 独立 logger 避免相互 propagate 干扰）。固定前缀 ACCESS，key=value 单行文本，
+    # 与现有 WARNING 行风格一致，grep/awk 友好（见 docs/designs/2026-07-22-access-log-and-latency.md）。
+    # root 开 INFO 安全前提（已核实）：BaseHTTPRequestHandler.log_message 已屏蔽
+    # （pass），stdlib 默认请求日志不会刷屏；进程内 INFO 级调用方只有本模块运维事件 +
+    # translate.py 两条降级日志（OPT-03 已提 WARNING）。
+    access_handler = logging.FileHandler(LOG_FILE)
+    access_handler.setFormatter(logging.Formatter(
+        "%(asctime)s req_id=%(req_id)s %(message)s"))
+    access_handler.addFilter(_req_filter)
+    access_log.addHandler(access_handler)
 
 # ---------------------------------------------------------------------------
 # 累计用量账本：独立于 access 日志文件，只增不截、不受 _trim_log 影响。
@@ -289,13 +302,15 @@ class UsageTotalsStore:
                 dest["attempt_fail"] = dest.get("attempt_fail", 0) + combo_val.get("attempt_fail", 0)
 
 
-usage_totals = UsageTotalsStore(TOTALS_FILE)
+# 模块级占位 None，main() 启动路径实例化（S1 修复：避免测试 import 时触碰账本文件）。
+# _forward_logged 用 `if usage_totals is not None` 守卫，测试直驱 _forward 不会记账本。
+usage_totals: "UsageTotalsStore | None" = None
 
 # ---------------------------------------------------------------------------
 # reasoning debug 开关：默认关闭，不污染生产日志（沿用 MODEL_PROXY_CONFIG/
 # MODEL_PROXY_PORT 的环境变量风格，进程启动时读取一次，不支持热切换）。
 # 开启后把本模块 logger 的 effective level 调到 DEBUG（只影响 `log` 这一个具名
-# logger，root 仍是 WARNING），调用点用 log.isEnabledFor(logging.DEBUG) 判断，
+# logger，root 已开 INFO），调用点用 log.isEnabledFor(logging.DEBUG) 判断，
 # 关闭时不做任何字符串拼接。
 # 手动开启：MODEL_PROXY_REASONING_DEBUG=1 再启动/重启进程（export 后运行
 # model_proxy_cli.sh on 也会被 nohup 子进程继承）。
@@ -1120,10 +1135,11 @@ class ModelProxyHandler(BaseHTTPRequestHandler):
                 a["route_failover"], a["builtin"], a["budget_retried"],
                 a["budget_truncated"], a["stop_reason"],
                 re.sub(r"\s+", "_", a["final_error"][:80]))
-            try:
-                usage_totals.record(a, ms)
-            except Exception:
-                log.warning("usage_totals.record failed", exc_info=True)
+            if usage_totals is not None:
+                try:
+                    usage_totals.record(a, ms)
+                except Exception:
+                    log.warning("usage_totals.record failed", exc_info=True)
 
     # ------------------------------------------------------------------
     # 转发编排（阶段1：纯透传路由 + cooldown + failover）
@@ -1232,7 +1248,7 @@ class ModelProxyHandler(BaseHTTPRequestHandler):
         # body_json 在循环体内会被原地改写（model 改写为 target_model、reasoning_wire
         # 通过 apply_fields 写回），若在循环内重新 decode，第二轮起会对"已被上一轮写入
         # 结果污染过"的 body_json 解码，导致客户端原始意图被错误钳位/升档（bug 修复记录，
-        # 见 docs/proxy_v2_buildplan.md 或 commit message）。remap() 仍需在循环内按每轮
+        # 见 docs/archive/model_proxy_buildplan.md 或 commit message）。remap() 仍需在循环内按每轮
         # supply 的 target capability 重新计算，因为不同 supply 的能力上限不同；
         # source capability 只依赖 strategy+tier（strategy 才代表客户端身份，
         # request_model 字面值会被多个 SDK 共享，见 resolve_source_capability 注释），
@@ -2333,6 +2349,12 @@ class ModelProxyHandler(BaseHTTPRequestHandler):
 def main():
     config_path = _DEFAULT_CONFIG_PATH
     port = int(os.environ.get("MODEL_PROXY_PORT", "18889"))
+
+    # 0. 装配日志 handler + 截断日志 + 实例化账本（S1：从模块级挪到启动路径，
+    # 避免测试 import 时触碰生产日志/账本文件）
+    init_logging()
+    global usage_totals
+    usage_totals = UsageTotalsStore(TOTALS_FILE)
 
     # 进程级互斥锁：同一时刻只允许一个 model_proxy.py 实例运行
     import fcntl

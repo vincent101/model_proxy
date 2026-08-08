@@ -1,7 +1,7 @@
 #!/bin/bash
 # model_proxy_cli.sh
 # 手动控制 model_proxy.py（http://127.0.0.1:18889/model_proxy/*）。
-# 与 tools/proxy_cli.sh（v1，18888）完全独立，不共用进程/端口/配置。
+# （v1 proxy.py/proxy_cli.sh 于 2026-07-24 下线删除，本脚本为唯一代理 CLI。）
 # 用法：model_proxy_cli.sh <子命令> [参数]
 
 MODEL_PROXY_PORT="${MODEL_PROXY_PORT:-18889}"
@@ -344,12 +344,12 @@ cmd_on() {
 
 # ---- off ----
 # 安全约束：只匹配本脚本同目录下 model_proxy.py 的绝对路径，绝不使用宽泛的
-# "model_proxy.py" 或 "proxy.py" 之类的模式，避免误杀 v1 的 tools/proxy.py（18888 生产进程）。
+# "model_proxy.py" 或 "proxy.py" 之类的模式，避免误杀无关进程。
 #
 # 兜底（P1-3）：若 model_proxy.py 是以相对路径启动的（不经本脚本的 on），命令行里不含
 # $SCRIPT_DIR 绝对路径，pgrep -f "$target" 匹配不到，会导致 off 误报"未运行"而
 # 实际进程仍占用 $MODEL_PROXY_PORT。这里额外反查监听该端口的 PID，但必须校验其命令行
-# 确实包含 "model_proxy.py"（文件名级校验，仍不会匹配 v1 的 proxy.py）才纳入 kill 范围。
+# 确实包含 "model_proxy.py"（文件名级校验）才纳入 kill 范围。
 cmd_off() {
   local target="$SCRIPT_DIR/model_proxy.py"
   local pids
@@ -379,7 +379,7 @@ cmd_off() {
 #   logs N            最近 N 条 ACCESS 记录
 #   logs req=xxx      按 req_id 过滤（显示所有匹配的日志行，含 WARNING/ERROR/INFO/ACCESS）
 #   logs level=ERROR  按日志级别过滤（ERROR/WARNING/INFO/DEBUG）
-#   logs event=xxx    按事件关键词过滤（如 cooldown.set / config.reload.ok / admin.reload）
+#   logs event=xxx    按事件关键词过滤（如 cooldown+failover / config.reload.ok / admin.reload）
 #   logs req=xxx N    过滤 + 限制条数（过滤在前，数量在后）
 cmd_logs() {
   local n=30

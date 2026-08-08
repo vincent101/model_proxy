@@ -528,14 +528,15 @@ ACCESS 行与各 WARNING/ERROR/INFO 事件行同 req_id，`grep req_id=xxx` 可�
 
 级别规范：
 - **ERROR** = 客户端拿到失败响应或流被截断（请求/响应转换失败、流式中断、502、detect_target 500）
-- **WARNING** = 可恢复降级、数据有损但流程继续（cooldown+failover、route_failover、内容降级丢弃、上游缺 usage、reload 失败、sidecar/账本 corrupt、budget_retry 截断、401/501 拒绝）
-- **INFO** = 生命周期与运维事件（startup.listening / config.reload.ok / admin.reload / admin.status / admin.auth_fail / sidecar.write / usage_totals.migrated / reasoning_pref.learn 等）
+- **WARNING** = 可恢复降级、数据有损但流程继续（cooldown+failover、route_failover、内容降级丢弃、上游缺 usage、reload 失败、sidecar/账本 corrupt、budget_retry 截断、admin.auth_fail / request.reject）
+- **INFO** = 生命周期与运维事件（startup.listening / config.reload.ok / admin.reload / admin.status / sidecar.write / usage_totals.migrated / reasoning_pref.learn 等）
 - **DEBUG** = 排障细节（reasoning 映射细节，`MODEL_PROXY_REASONING_DEBUG=1` 门控；配置校验告警挪到 reload 后也降 DEBUG）
 
 INFO 级运维事件（OPT-08）：`config.reload.ok`（mtime + supplies/routes/strategies 计数）、
-`admin.reload`（cleared_cooldowns=N）、`admin.status`/`admin.404`、`admin.auth_fail`（401 未授权
-访问尝试，不记 token 值）、`request.reject`（501 UNSUPPORTED）、`sidecar.write`（$route 写
+`admin.reload`（cleared_cooldowns=N）、`admin.status`/`admin.404`、`sidecar.write`（$route 写
 sidecar 成功）、`startup.listening`/`shutdown.*`、`usage_totals.migrated`（账本 schema 迁移）。
+`admin.auth_fail`（401 未授权访问，不记 token 值）与 `request.reject`（501 UNSUPPORTED）实为
+WARNING 级（见上方级别规范），已从 INFO 列表移出。
 root 开 INFO 安全前提：`BaseHTTPRequestHandler.log_message` 已屏蔽（pass），stdlib 无 INFO 噪声。
 
 ACCESS 访问日志：每个转发请求（不含 `/model_proxy/*` 控制端点）结束时记一条 INFO 级 `ACCESS`
@@ -577,7 +578,7 @@ token 用量统计：转换模式（Anthropic↔Chat/Responses，流式+非流�
 `requests`/`ok`/`fail`/`usage_in`/`usage_out`/`max_ms`/`attempts`/`attempt_fail`，另存 `total`
 全历史汇总。`max_ms`（OPT-10）入账本，CLI stats 的 max_ms 从账本取，不再依赖日志窗口；
 `attempts`/`attempt_fail`（OPT-10）为 attempt 级计数——failover 中间失败计入对应 supply（仅盖
-3 处 failover continue，budget 重试按 §5a 决策不记账），supply 真实失败率可观测。账本 **只增不截**，
+3 处 failover continue，budget 重试按 §5a 决策不记账）。该字段只落账本 JSON，CLI stats 暂不投影。账本 **只增不截**，
 不受进程重启与日志截断影响。天分桶只保留最近 `KEEP_DAYS=400` 天，超窗旧天桶汇总进 `months_archive`
 月归档节点（永久保留）。天/月边界固定按 UTC+8 划分（`timezone(timedelta(hours=8))`，不依赖系统时区）。
 schema 升级（v2→v3）在 `_load` 启动时自动迁移：旧桶 combo 补 `attempts=0`/`attempt_fail=0`、
@@ -661,8 +662,7 @@ model_proxy_cli.sh --help / -h                       # 显示帮助
   对 supply/route/strategy 三维度各投影一段，按天/月/全历史查询
   （`stats` / `stats today` / `stats month` / `stats 2026-07-23` / `stats 2026-07`）。
   `max_ms` 从账本取（OPT-10 起入账本），
-  与 `avg_ms` 同口径，不再依赖日志窗口；`attempt_fail` 为 attempt 级失败计数（仅盖 failover 中间失败，
-  budget 重试不记账），supply 真实失败率可观测。
+  与 `avg_ms` 同口径，不再依赖日志窗口；`attempt_fail` 落账本 JSON，CLI stats 暂不投影该字段。
 
 ## 6. reasoning 强度映射（深入）
 

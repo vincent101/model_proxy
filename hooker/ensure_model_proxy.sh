@@ -2,8 +2,8 @@
 # ensure_model_proxy.sh
 # 确保 model_proxy.py 在 18889 运行（SessionStart hook 调用，也可手动调）
 # 幂等：已运行则直接退出；未运行则启动并等待就绪
-# 注：本脚本与 tools/ensure_proxy.sh（v1 代理，18888端口）职责独立，
-# PID/锁/日志文件均使用独立命名，避免互相冲突。
+# 注：v1 ensure_proxy.sh 于 2026-07-24 随 proxy.py 下线删除，
+# 本脚本为唯一代理启动守卫，PID/锁/日志文件独立命名。
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PID_FILE="/tmp/claude_model_proxy.pid"

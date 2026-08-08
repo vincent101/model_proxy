@@ -52,8 +52,7 @@ import logging
 import secrets
 import time
 
-logger = logging.getLogger(__name__)                       # 正向侧日志
-logger_reverse = logging.getLogger("model_proxy.translate_reverse")  # 反向侧日志
+logger = logging.getLogger(__name__)                       # 正向/反向侧日志
 
 
 # ---------------------------------------------------------------------------
@@ -86,7 +85,7 @@ class _RateLimitedLogger:
 
         Args:
             key: 事件 kind（用于去重，同 key 在窗口内只出首条）
-            log_obj: logger 或 logger_reverse
+            log_obj: logger
             msg: 原始日志消息（含 %s 占位符）
             *args: msg 的格式化参数
         """
@@ -1255,7 +1254,7 @@ def _extract_reasoning_tokens(usage: dict) -> int:
 def _anthropic_usage_to_responses(usage: dict) -> dict:
     """Anthropic usage -> Responses usage（反向规格 §2.3）。"""
     if not usage:
-        _rl.warning("missing_usage_responses", logger_reverse,
+        _rl.warning("missing_usage_responses", logger,
                     "anthropic response missing usage field, responses usage will be all-zero")
     u = usage or {}
     in_tok = u.get("input_tokens", 0) or 0

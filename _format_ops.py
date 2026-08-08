@@ -122,7 +122,7 @@ def normalize_supply(d: dict) -> dict:
 def _parse_combo_key(key: str) -> dict:
     """拆 combo 键 `supply=X|route=Y|strategy=Z` 成 dict。
 
-    与 cmd_stats 的 parse_combo_key（model_proxy_cli.sh:483-488）同逻辑；
+    与 cmd_stats 的 parse_combo_key（model_proxy_cli.sh:503-508）同逻辑；
     heredoc 内嵌 python 无法 import，此为有注释互指的小重复。
     """
     dims = {}

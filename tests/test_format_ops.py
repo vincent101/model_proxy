@@ -84,7 +84,7 @@ class TestLoadSupplyHealth(unittest.TestCase):
         self.assertEqual(health, {})
 
     def test_none_supply_included_in_health(self):
-        """(none) supply 也在 health 里（供 unmatched 段用）。"""
+        """(none) supply 也在 health 里（无 supply 维度的请求归入 (none)）。"""
         from datetime import datetime, timezone, timedelta
         cst = timezone(timedelta(hours=8))
         today = datetime.now(cst).strftime("%Y-%m-%d")
@@ -97,10 +97,6 @@ class TestLoadSupplyHealth(unittest.TestCase):
         self.assertIn("(none)", health)
         self.assertEqual(health["(none)"]["fail"], 5)
 
-
-# ---------------------------------------------------------------------------
-# compute_config_anomalies
-# ---------------------------------------------------------------------------
 
 # ---------------------------------------------------------------------------
 # _supply_refs
@@ -209,7 +205,7 @@ class TestStatusFormatFromJson(unittest.TestCase):
         return path
 
     def test_health_row_counts(self):
-        """health 行含 cooldown/supplies/degraded/overrides/orphan 计数。"""
+        """health 行含 cooldown/supplies/degraded/overrides 计数。"""
         with tempfile.TemporaryDirectory() as td:
             cfg_path = self._make_config(td)
             totals_path = self._make_totals(td)
@@ -335,7 +331,7 @@ class TestStatusFormatFromJson(unittest.TestCase):
             self.assertNotIn("default_cooldown", joined)
 
     def test_all_zero_no_anomaly_sections(self):
-        """全 0（无 cooldown/degraded/overrides/orphan/缺档）时无异常段。"""
+        """全 0（无 cooldown/degraded/overrides/缺档）时无异常段。"""
         with tempfile.TemporaryDirectory() as td:
             cfg_path = self._make_config(td, {
                 "default_cooldown_seconds": 60,
