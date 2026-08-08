@@ -158,38 +158,29 @@ def load_supply_health(totals_path: str) -> dict[str, dict]:
     return health
 
 
-def find_damaged_routes(cfg: dict, bad_supplies: set[str], cooldown: dict) -> list[str]:
-    """tier 内含 degraded∪cooling supply 的 route，输出描述行。
+def _supply_refs(cfg: dict) -> dict[str, list[str]]:
+    """supply_id → 引用它的 `route.tier(token,...)` 列表。
 
-    bad_supplies: degraded supply id 集合（不含 (none)）
-    cooldown: server JSON cooldown dict {supply_id: 剩余秒}
+    用于在 degraded/cooldown 行尾标注该 supply 被哪个 route 的哪档、哪个 strategy 引用。
     """
-    bad_set = bad_supplies | set(cooldown.keys())
-    if not bad_set:
-        return []
-
-    results = []
+    # route → 引用它的 strategy tokens（route_id 单值 + route_pool 两种写法）
+    route_tokens: dict[str, list[str]] = {}
+    for st in cfg.get("strategies", []):
+        tok = st.get("client_token", "?")
+        if st.get("route_id"):
+            route_tokens.setdefault(st["route_id"], []).append(tok)
+        for item in st.get("route_pool") or []:
+            if isinstance(item, dict) and item.get("route_id"):
+                route_tokens.setdefault(item["route_id"], []).append(tok)
+    refs: dict[str, list[str]] = {}
     for r in cfg.get("routes", []):
         rid = r.get("id", "?")
-        tiers = r.get("tiers", {})
-        hits: list[str] = []
+        toks = route_tokens.get(rid, [])
+        toks_str = f"({','.join(toks)})" if toks else ""
         for tn in TIER_NAMES:
-            ids = tiers.get(tn, [])
-            bad_in_tier = [sid for sid in ids if sid in bad_set]
-            if bad_in_tier:
-                # 区分 degraded / cooling
-                parts = []
-                for sid in bad_in_tier:
-                    if sid in cooldown:
-                        parts.append(f"{sid} cooling({int(cooldown[sid])}s)")
-                    elif sid in bad_supplies:
-                        parts.append(f"{sid} degraded")
-                    else:
-                        parts.append(f"{sid} abnormal")
-                hits.append(f"{tn} 档 {', '.join(parts)}")
-        if hits:
-            results.append(f"  {rid}   {'; '.join(hits)}")
-    return results
+            for sid in r.get("tiers", {}).get(tn, []):
+                refs.setdefault(sid, []).append(f"{rid}.{tn}{toks_str}")
+    return refs
 
 
 # ---------------------------------------------------------------------------
@@ -377,12 +368,16 @@ def _format_status_from_json(data: dict, config_path: str, totals_path: str) -> 
     parts.append(f"overrides {overrides_count}")
     lines.append("health: " + " · ".join(parts))
 
+    # supply 引用标注（degraded/cooldown 行尾标出被哪个 route.tier(strategy) 引用）
+    refs = _supply_refs(cfg)
+
     # 异常清单（只列问题）
     if degraded:
         lines.append("")
         lines.append(f"degraded supplies (today fail%>{DEGRADED_FAIL_PCT:.0f}%, n>={DEGRADED_MIN_REQUESTS}):")
         for d in degraded:
-            lines.append(f"  {_pad(d['id'], 24)} fail {d['fail_pct']:.1f}% ({d['fail']}/{d['requests']})")
+            ref = ",".join(refs.get(d["id"], [])) or "未被引用"
+            lines.append(f"  {_pad(d['id'], 24)} fail {d['fail_pct']:.1f}% ({d['fail']}/{d['requests']})  ← {ref}")
 
     if none_fail > 0:
         none_req = none_health.get("requests", 0)
@@ -393,15 +388,8 @@ def _format_status_from_json(data: dict, config_path: str, totals_path: str) -> 
         lines.append("")
         lines.append("cooldown (剩余秒):")
         for sid, remain in sorted(cooldown.items()):
-            lines.append(f"  {_pad(sid, 24)} {int(remain)}s")
-
-    # damaged routes
-    degraded_ids = {d["id"] for d in degraded}
-    damaged = find_damaged_routes(cfg, degraded_ids, cooldown)
-    if damaged:
-        lines.append("")
-        lines.append("damaged routes:")
-        lines.extend(damaged)
+            ref = ",".join(refs.get(sid, [])) or "未被引用"
+            lines.append(f"  {_pad(sid, 24)} {int(remain)}s  ← {ref}")
 
     # config 计数行
     lines.append("")

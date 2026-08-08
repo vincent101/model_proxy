@@ -20,8 +20,8 @@ from _format_ops import (
     DEGRADED_MIN_REQUESTS,
     _format_status_from_json,
     _format_status_offline,
+    _supply_refs,
     display_width,
-    find_damaged_routes,
     format_routes,
     format_strategies,
     format_supplies,
@@ -99,28 +99,35 @@ class TestLoadSupplyHealth(unittest.TestCase):
 # ---------------------------------------------------------------------------
 
 # ---------------------------------------------------------------------------
-# find_damaged_routes
+# _supply_refs
 # ---------------------------------------------------------------------------
 
-class TestFindDamagedRoutes(unittest.TestCase):
+class TestSupplyRefs(unittest.TestCase):
 
-    def test_degraded_supply_in_route(self):
-        cfg = {"routes": [{"id": "r1", "tiers": {"opus": ["bad-sid"], "sonnet": [], "haiku": []}}]}
-        result = find_damaged_routes(cfg, {"bad-sid"}, {})
-        self.assertEqual(len(result), 1)
-        self.assertIn("r1", result[0])
-        self.assertIn("bad-sid degraded", result[0])
+    def test_route_id_and_pool(self):
+        """route_id 单值与 route_pool 两种写法的 strategy 引用都能标出。"""
+        cfg = {
+            "routes": [
+                {"id": "r1", "tiers": {"opus": ["s1"], "sonnet": [], "haiku": []}},
+                {"id": "r2", "tiers": {"opus": ["s1"], "sonnet": [], "haiku": []}},
+            ],
+            "strategies": [
+                {"client_token": "cc", "route_pool": [{"route_id": "r1", "weight": 1}, {"route_id": "r2", "weight": 1}]},
+                {"client_token": "codex", "route_id": "r2"},
+            ],
+        }
+        refs = _supply_refs(cfg)
+        self.assertEqual(sorted(refs["s1"]), ["r1.opus(cc)", "r2.opus(cc,codex)"])
 
-    def test_cooling_supply_in_route(self):
-        cfg = {"routes": [{"id": "r1", "tiers": {"opus": ["cool-sid"], "sonnet": [], "haiku": []}}]}
-        result = find_damaged_routes(cfg, set(), {"cool-sid": 30})
-        self.assertEqual(len(result), 1)
-        self.assertIn("cool-sid cooling(30s)", result[0])
-
-    def test_no_damage(self):
-        cfg = {"routes": [{"id": "r1", "tiers": {"opus": ["good-sid"], "sonnet": [], "haiku": []}}]}
-        result = find_damaged_routes(cfg, set(), {})
-        self.assertEqual(result, [])
+    def test_unreferenced_supply(self):
+        """未被引用的 supply 不在 refs 里（展示侧回退"未被引用"）。"""
+        cfg = {
+            "routes": [{"id": "r1", "tiers": {"opus": ["s1"], "sonnet": [], "haiku": []}}],
+            "strategies": [{"client_token": "cc", "route_id": "r1"}],
+        }
+        refs = _supply_refs(cfg)
+        self.assertNotIn("s-orphan", refs)
+        self.assertEqual(refs["s1"], ["r1.opus(cc)"])
 
 
 # ---------------------------------------------------------------------------
@@ -366,30 +373,28 @@ class TestStatusFormatFromJson(unittest.TestCase):
             # 无异常段标题
             self.assertNotIn("degraded supplies", joined)
             self.assertNotIn("unmatched:", joined)
-            self.assertNotIn("damaged routes:", joined)
 
-    def test_damaged_routes_shown(self):
-        """degraded supply 被某 route tier 引用时，damaged routes 段列出。"""
+    def test_degraded_rows_annotated_with_refs(self):
+        """degraded supply 行尾标出被哪个 route.tier(strategy) 引用。"""
         with tempfile.TemporaryDirectory() as td:
             cfg_path = self._make_config(td, {
                 "default_cooldown_seconds": 60,
                 "supplies": [{"id": "s1"}, {"id": "s2"}],
                 "routes": [{"id": "r1", "tiers": {"opus": ["s1", "s2"], "sonnet": [], "haiku": []}}],
-                "strategies": [],
+                "strategies": [{"client_token": "cc", "route_id": "r1"}],
             })
             combos = {"supply=s1|route=r1|strategy=cc": {"requests": 10, "ok": 2, "fail": 8}}
             totals_path = self._make_totals(td, combos)
             data = {
                 "supplies": [{"id": "s1"}, {"id": "s2"}],
                 "routes": [{"id": "r1"}],
-                "strategies": [],
+                "strategies": [{"client_token": "cc", "route_id": "r1"}],
                 "cooldown": {}, "default_cooldown_seconds": 60,
             }
             lines = _format_status_from_json(data, cfg_path, totals_path)
             joined = "\n".join(lines)
-            self.assertIn("damaged routes:", joined)
-            self.assertIn("r1", joined)
-            self.assertIn("s1 degraded", joined)
+            self.assertIn("s1", joined)
+            self.assertIn("fail 80.0% (8/10)  ← r1.opus(cc)", joined)
 
 
 # ---------------------------------------------------------------------------
