@@ -192,7 +192,7 @@ def format_routes(routes: list[dict]) -> list[str]:
                 label = f"{tn}:"
                 indent = "    "
                 prefix = f"{indent}{_pad(label, 9)} "
-                base_line = prefix + ids_str
+                base_line = (prefix + ids_str).rstrip()
                 if display_width(base_line) <= 80:
                     lines.append(base_line)
                 else:
