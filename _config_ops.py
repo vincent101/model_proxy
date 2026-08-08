@@ -573,12 +573,13 @@ def supply_add(path: str) -> None:
     smodel = input("目标模型 target_model: ").strip()
     scooldown = input("冷却时长 cooldown_seconds (回车用全局默认): ").strip()
 
-    entry: dict = {
-        "id": sid, "url": surl,
-        "appkey": sappkey, "target_model": smodel,
-    }
+    # 键序对齐紧凑正则 _SUPPLY_OBJECT（id/url/protocol/appkey/target_model/reasoning_capability），
+    # 使 CLI 新增的 supply 写盘后也能被压成单行，与既有单行风格一致（O8）。
+    entry: dict = {"id": sid, "url": surl}
     if sproto:
         entry["protocol"] = sproto
+    entry["appkey"] = sappkey
+    entry["target_model"] = smodel
     if scooldown:
         if not scooldown.isdigit() or int(scooldown) <= 0:
             err(f"cooldown_seconds 须为正整数: {scooldown!r}")

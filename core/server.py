@@ -1683,8 +1683,8 @@ class ModelProxyHandler(BaseHTTPRequestHandler):
                                     source, 500, f"proxy translate failed: {e}"))
                             return
                         _u = anthropic_resp.get("usage") or {}
-                        self._acc["usage_in"] = _u.get("input_tokens", 0)
-                        self._acc["usage_out"] = _u.get("output_tokens", 0)
+                        self._acc["usage_in"] = _u.get("input_tokens") or 0
+                        self._acc["usage_out"] = _u.get("output_tokens") or 0
                         self._acc["stop_reason"] = anthropic_resp.get("stop_reason") or ""
                         self._write_buffered_response(
                             200, [("Content-Type", "application/json")],
@@ -1719,8 +1719,8 @@ class ModelProxyHandler(BaseHTTPRequestHandler):
                                     source, 500, f"proxy translate failed: {e}"))
                             return
                         _u = anthropic_resp.get("usage") or {}
-                        self._acc["usage_in"] = _u.get("input_tokens", 0)
-                        self._acc["usage_out"] = _u.get("output_tokens", 0)
+                        self._acc["usage_in"] = _u.get("input_tokens") or 0
+                        self._acc["usage_out"] = _u.get("output_tokens") or 0
                         self._acc["stop_reason"] = anthropic_resp.get("stop_reason") or ""
                         self._write_buffered_response(
                             200, [("Content-Type", "application/json")],
@@ -1760,8 +1760,8 @@ class ModelProxyHandler(BaseHTTPRequestHandler):
                                 source, 500, f"proxy translate failed: {e}"))
                         return
                     _u = responses_resp.get("usage") or {}
-                    self._acc["usage_in"] = _u.get("input_tokens", 0)
-                    self._acc["usage_out"] = _u.get("output_tokens", 0)
+                    self._acc["usage_in"] = _u.get("input_tokens") or 0
+                    self._acc["usage_out"] = _u.get("output_tokens") or 0
                     self._acc["stop_reason"] = anthropic_resp.get("stop_reason") or ""
                     self._write_buffered_response(
                         200, [("Content-Type", "application/json")],

@@ -132,6 +132,18 @@ def _parse_combo_key(key: str) -> dict:
     return dims
 
 
+def _load_config_tolerant(config_path: str) -> tuple[dict, str | None]:
+    """容错读 config：JSON 损坏/读取失败返回 ({}, 错误描述)，不抛异常。
+
+    与 proxy 侧 `_reload_locked` 的容错口径一致（损坏不至于让 CLI status 崩溃）。
+    """
+    try:
+        with open(config_path, "r", encoding="utf-8") as f:
+            return json.load(f), None
+    except (json.JSONDecodeError, OSError) as e:
+        return {}, f"config 读取失败: {e}"
+
+
 def load_supply_health(totals_path: str) -> dict[str, dict]:
     """读账本 CST today 桶，combos 按 supply 聚合 {requests, ok, fail}。
 
@@ -612,9 +624,8 @@ def _format_status_from_json(data: dict, config_path: str, totals_path: str,
         for st in data.get("strategies", [])
     )
 
-    # config 读取（_supply_refs 需要）
-    with open(config_path, "r", encoding="utf-8") as f:
-        cfg = json.load(f)
+    # config 读取（_supply_refs 需要；损坏时容错为空，refs 显示"未被引用"）
+    cfg, cfg_err = _load_config_tolerant(config_path)
 
     # supply health
     health = load_supply_health(totals_path)
@@ -660,9 +671,12 @@ def _format_status_from_json(data: dict, config_path: str, totals_path: str,
             ref = ",".join(refs.get(sid, [])) or "未被引用"
             lines.append(f"  {_pad(sid, 24)} {int(remain)}s  ← {ref}")
 
-    # config 计数行
+    # config 计数行（config 损坏时显式提示而非崩溃）
     lines.append("")
-    lines.append(f"config: {n_supplies} supplies / {n_routes} routes / {n_strategies} strategies")
+    if cfg_err:
+        lines.append(f"config: （{cfg_err}，server 仍按最近一次成功加载的配置运行）")
+    else:
+        lines.append(f"config: {n_supplies} supplies / {n_routes} routes / {n_strategies} strategies")
 
     return lines
 
@@ -674,8 +688,10 @@ def _format_status_offline(config_path: str, totals_path: str,
     degraded（账本）/active sessions（日志）/overrides（sidecar）/config 计数均不依赖
     代理进程，照常展示；仅 cooldown（server 内存态）显 (未知)。退出码 1 由 cmd_status 保持。
     """
-    with open(config_path, "r", encoding="utf-8") as f:
-        cfg = json.load(f)
+    cfg, cfg_err = _load_config_tolerant(config_path)
+    if cfg_err:
+        # 离线路径 config 是唯一数据源，损坏时只给错误行（不崩溃）
+        return [f"config: （{cfg_err}）"]
 
     # overrides: sidecar 静态可读，注入 strategies 供统一格式化求和
     sidecar_path = Path(config_path).parent / "session_overrides.json"
