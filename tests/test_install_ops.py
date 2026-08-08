@@ -20,6 +20,127 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import _install_ops as iops
 
 
+class TestCandidateTokens(unittest.TestCase):
+    """candidate_tokens 协议过滤用例——覆盖 route_pool 与 route_id 两种写法。
+
+    B1 修复前的 bug：candidate_tokens 只认 route_id 单值写法，对 route_pool
+    写法直接跳过 → 生产 config 全用 route_pool 时返回空列表，install 命令不可用。
+    """
+
+    def _make_cfg(self, strategies, routes, supplies=None):
+        return {
+            "routes": routes,
+            "supplies": supplies or [],
+            "strategies": strategies,
+        }
+
+    def _make_anthropic_route(self, rid="r1"):
+        return {"id": rid, "tiers": {"t0": ["s1"]}}
+
+    def _make_anthropic_supply(self, sid="s1"):
+        return {"id": sid, "url": "https://api.anthropic.com/v1/messages",
+                "appkey": "sk-test"}
+
+    def test_route_pool_returns_candidates(self):
+        """route_pool 写法：strategy 含 route_pool（无 route_id）→ 应返回候选。"""
+        cfg = self._make_cfg(
+            strategies=[{
+                "client_token": "tok_a",
+                "route_pool": [{"route_id": "r1", "weight": 1}],
+                "note": "pool strategy",
+            }],
+            routes=[self._make_anthropic_route("r1")],
+            supplies=[self._make_anthropic_supply("s1")],
+        )
+        cands = iops.candidate_tokens(cfg, "anthropic")
+        self.assertEqual(len(cands), 1)
+        self.assertEqual(cands[0]["client_token"], "tok_a")
+        self.assertEqual(cands[0]["protocol"], "anthropic")
+        self.assertIn("r1", cands[0]["route_desc"])
+
+    def test_route_id_single_returns_candidates(self):
+        """route_id 单值写法：strategy 含 route_id（无 route_pool）→ 应返回候选。"""
+        cfg = self._make_cfg(
+            strategies=[{
+                "client_token": "tok_b",
+                "route_id": "r2",
+                "note": "single strategy",
+            }],
+            routes=[self._make_anthropic_route("r2")],
+            supplies=[self._make_anthropic_supply("s1")],
+        )
+        cands = iops.candidate_tokens(cfg, "anthropic")
+        self.assertEqual(len(cands), 1)
+        self.assertEqual(cands[0]["client_token"], "tok_b")
+        self.assertEqual(cands[0]["protocol"], "anthropic")
+        self.assertEqual(cands[0]["route_desc"], "r2")
+
+    def test_protocol_filter_excludes_non_matching(self):
+        """协议不匹配的 strategy 应被过滤掉。"""
+        openai_supply = {"id": "s2", "url": "https://api.openai.com/v1/chat/completions",
+                         "appkey": "sk-oai"}
+        cfg = self._make_cfg(
+            strategies=[
+                {"client_token": "tok_anthropic", "route_pool": [{"route_id": "r1", "weight": 1}]},
+                {"client_token": "tok_openai", "route_pool": [{"route_id": "r3", "weight": 1}]},
+            ],
+            routes=[self._make_anthropic_route("r1"),
+                    {"id": "r3", "tiers": {"t0": ["s2"]}}],
+            supplies=[self._make_anthropic_supply("s1"), openai_supply],
+        )
+        cands = iops.candidate_tokens(cfg, "anthropic")
+        self.assertEqual(len(cands), 1)
+        self.assertEqual(cands[0]["client_token"], "tok_anthropic")
+
+    def test_protocol_none_returns_all(self):
+        """protocol=None 时不过滤，返回所有候选。"""
+        openai_supply = {"id": "s2", "url": "https://api.openai.com/v1/chat/completions",
+                         "appkey": "sk-oai"}
+        cfg = self._make_cfg(
+            strategies=[
+                {"client_token": "tok_a", "route_pool": [{"route_id": "r1", "weight": 1}]},
+                {"client_token": "tok_b", "route_pool": [{"route_id": "r3", "weight": 1}]},
+            ],
+            routes=[self._make_anthropic_route("r1"),
+                    {"id": "r3", "tiers": {"t0": ["s2"]}}],
+            supplies=[self._make_anthropic_supply("s1"), openai_supply],
+        )
+        cands = iops.candidate_tokens(cfg, None)
+        self.assertEqual(len(cands), 2)
+
+    def test_route_pool_with_missing_route_skipped(self):
+        """route_pool 内 route_id 在 routes_map 不存在 → 跳过该 strategy。"""
+        cfg = self._make_cfg(
+            strategies=[{
+                "client_token": "tok_missing",
+                "route_pool": [{"route_id": "no_such_route", "weight": 1}],
+                "note": "",
+            }],
+            routes=[self._make_anthropic_route("r1")],
+            supplies=[self._make_anthropic_supply("s1")],
+        )
+        cands = iops.candidate_tokens(cfg, "anthropic")
+        self.assertEqual(cands, [])
+
+    def test_route_pool_multi_routes_uses_first_valid(self):
+        """route_pool 内多个 route_id → 取第一个合法 route 做协议推断。"""
+        cfg = self._make_cfg(
+            strategies=[{
+                "client_token": "tok_multi",
+                "route_pool": [
+                    {"route_id": "missing_r", "weight": 1},
+                    {"route_id": "r1", "weight": 1},
+                ],
+                "note": "multi pool",
+            }],
+            routes=[self._make_anthropic_route("r1")],
+            supplies=[self._make_anthropic_supply("s1")],
+        )
+        cands = iops.candidate_tokens(cfg, "anthropic")
+        self.assertEqual(len(cands), 1)
+        self.assertEqual(cands[0]["client_token"], "tok_multi")
+
+
 class TestPreviewConfirmWrite(unittest.TestCase):
 
     def setUp(self):

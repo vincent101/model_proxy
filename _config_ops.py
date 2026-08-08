@@ -280,7 +280,7 @@ def _extract_enum_candidates(text: str) -> "list[str] | None":
     return cands or None
 
 
-def _is_response_complete(raw: bytes, text_fixed: str) -> bool:
+def _is_response_complete(text_fixed: str) -> bool:
     """判断探测响应是否完整（未被截断）。主判据JSON完整性，其余作为参考。"""
     try:
         json.loads(text_fixed)
@@ -342,7 +342,7 @@ def probe_effort(supply: dict) -> "tuple[int | None, str, list[str] | None, bool
 
     text_fixed = _fix_mojibake(raw_bytes)
     regex_candidates = _extract_enum_candidates(text_fixed)
-    is_complete = _is_response_complete(raw_bytes, text_fixed)
+    is_complete = _is_response_complete(text_fixed)
 
     return status, text_fixed, regex_candidates, is_complete, None
 

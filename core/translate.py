@@ -171,10 +171,6 @@ def gen_conversation_id() -> str:
     return "conv_" + secrets.token_hex(16)
 
 
-def gen_tooluse_id() -> str:
-    return "toolu_" + secrets.token_hex(12)
-
-
 def gen_reasoning_id() -> str:
     return "rs_" + secrets.token_hex(16)      # reasoning item id
 
@@ -1211,7 +1207,7 @@ def _input_to_messages(input_items) -> list:
             flush_user()
             tool_use = {
                 "type": "tool_use",
-                "id": item.get("call_id") or gen_tooluse_id(),
+                "id": item.get("call_id") or gen_toolu_id(),
                 "name": item.get("name", ""),
                 "input": _safe_json_loads(item.get("arguments", "{}")),
             }

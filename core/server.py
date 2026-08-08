@@ -737,12 +737,6 @@ def resolve_strategy(strategies: list, client_token: str) -> "dict | None":
     return None
 
 
-def resolve_route(strategies: list, routes_map: dict, client_token: str) -> dict | None:
-    """阶段1：client_token → strategy → route_id → route。"""
-    s = resolve_strategy(strategies, client_token)
-    return routes_map.get(s.get("route_id")) if s else None
-
-
 def extract_route_candidates(strategy: "dict | None", session_key: "str | None",
                               routes_map: dict) -> list:
     """给定 strategy，返回按 session_hash 排好的 route 候选顺序列表（route dict 列表）。
@@ -845,7 +839,7 @@ def resolve_source_capability(strategy: "dict | None", tier: "str | None") -> Mo
     supply["reasoning_capability"] 同构，包一层 "reasoning_capability" 键后复用同一个
     ModelReasoningCapability.from_config 解析，不重复实现解析逻辑。
 
-    与 _MODEL_TIER_MAP/resolve_tier/resolve_route/select_supply 正交并存，不改动
+    与 _MODEL_TIER_MAP/resolve_tier/resolve_strategy/select_supply 正交并存，不改动
     既有 tier 路由逻辑。
     """
     tier_map = (strategy or {}).get("tiers_source_capability") if strategy else None
@@ -1034,13 +1028,6 @@ class ModelProxyHandler(BaseHTTPRequestHandler):
     通过 server 属性访问（ThreadingHTTPServer 持有引用）。
     """
 
-    # 静默 BrokenPipeError（拷贝 proxy.py）
-    def handle_error(self, request, client_address):
-        exc = sys.exc_info()[1]
-        if isinstance(exc, BrokenPipeError):
-            return
-        super().handle_error(request, client_address)
-
     # 屏蔽默认日志
     def log_message(self, fmt, *args):
         pass
@@ -1113,7 +1100,7 @@ class ModelProxyHandler(BaseHTTPRequestHandler):
             # budget 截断终态（status=200 + budget_truncated=1）不写 final_error，两者正交。
             "final_error": "",
             # OPT-10: attempt_errors 记 failover 失败明细（supply_id, reason），
-            # 仅 3 处 failover continue 前 append（不含 budget 重试的 4 处 continue）。
+            # 仅 2 处 failover continue 前 append（不含 budget 重试的 4 处 continue）。
             "attempt_errors": [],
         }
         t0 = time.monotonic()
@@ -1595,18 +1582,6 @@ class ModelProxyHandler(BaseHTTPRequestHandler):
                         502, [], error_body_for_source(source, 502, f"upstream error: {e}"))
                     self._acc["final_error"] = f"upstream net error: {e}"
                     return
-
-                # 成功拿到响应：若为冷却信号码且允许 failover，则冷却后继续
-                if failover == "on" and resp_status in _FAILOVER_STATUSES:
-                    resp.close()
-                    log.warning("cooldown+failover: supply=%s status=%s key_tail4=%s",
-                                supply_id, resp_status, appkey[-4:] if appkey else "")
-                    self._acc["failover"] = 1
-                    self._acc["attempt_errors"].append(
-                        (supply_id, f"cooldown_signal_{resp_status}"))
-                    cd.cooldown(supply_id, cd_seconds)
-                    tried_set.add(supply_id)
-                    continue
 
                 is_stream = isinstance(body_json, dict) and body_json.get("stream") is True
 

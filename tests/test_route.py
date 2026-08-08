@@ -1,9 +1,9 @@
 """三阶段路由匹配单测（脱网络，纯标准库 unittest）。
 
 覆盖新架构 route(家族模板) + strategies(token 绑定) 分层：
-resolve_route（token→strategy→route）、resolve_tier（model 精确查表）、
-select_supply_list（按 tier 取 supplies）、select_supply（列表签名 + cooling/tried
-跳过）、tier 内 failover、以及端到端串联。
+resolve_strategy（token→strategy）、extract_route_candidates（strategy→route 列表）、
+resolve_tier（model 精确查表）、select_supply_list（按 tier 取 supplies）、
+select_supply（列表签名 + cooling/tried 跳过）、tier 内 failover、以及端到端串联。
 
 运行：cd tools/model_proxy && python3 -m unittest tests.test_route
 """
@@ -16,7 +16,8 @@ import unittest
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from core.server import (  # noqa: E402
-    resolve_route,
+    resolve_strategy,
+    extract_route_candidates,
     resolve_tier,
     select_supply_list,
     select_supply,
@@ -53,24 +54,6 @@ def _routes_map():
             "opus": ["glm-opus-k1", "glm-opus-k0"],
         }, "failover": "on"},
     }
-
-
-class TestResolveRoute(unittest.TestCase):
-
-    def test_hit(self):
-        strategies = [{"client_token": "cc", "route_id": "claude"}]
-        rm = _routes_map()
-        route = resolve_route(strategies, rm, "cc")
-        self.assertIs(route, rm["claude"])
-
-    def test_token_missing(self):
-        strategies = [{"client_token": "cc", "route_id": "claude"}]
-        self.assertIsNone(resolve_route(strategies, _routes_map(), "other"))
-
-    def test_route_id_dangling(self):
-        # strategy 指向不存在的 route → None
-        strategies = [{"client_token": "cc", "route_id": "nope"}]
-        self.assertIsNone(resolve_route(strategies, _routes_map(), "cc"))
 
 
 class TestResolveTier(unittest.TestCase):
@@ -253,6 +236,11 @@ class TestDetectSourceCaseInsensitive(unittest.TestCase):
 
 
 class TestEndToEnd(unittest.TestCase):
+    """端到端：token → strategy → route 列表 → tier → supply 列表 → supply。
+
+    用 resolve_strategy + extract_route_candidates 替代已删的 resolve_route，
+    保持从 client_token 出发到最终选到 supply 的完整链路语义。
+    """
 
     def test_full_chain(self):
         strategies = [{"client_token": "cc", "route_id": "claude"}]
@@ -262,8 +250,11 @@ class TestEndToEnd(unittest.TestCase):
         }
         cd = _FakeCooldown()
 
-        route = resolve_route(strategies, rm, "cc")
-        self.assertIsNotNone(route)
+        strategy = resolve_strategy(strategies, "cc")
+        self.assertIsNotNone(strategy)
+        routes = extract_route_candidates(strategy, None, rm)
+        self.assertEqual(len(routes), 1)
+        route = routes[0]
         tier = resolve_tier("claude-opus")
         self.assertEqual(tier, "opus")
         supplies_list = select_supply_list(route, tier)

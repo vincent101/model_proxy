@@ -18,7 +18,8 @@ import re
 import sys
 from pathlib import Path
 
-from _config_ops import compact_config_json, confirm
+from _config_ops import compact_config_json, confirm, load_config
+from _format_ops import strategy_route_desc
 from core.reasoning.registry import resolve_protocol
 
 # ---------------------------------------------------------------------------
@@ -72,21 +73,33 @@ def detect_installed(name: str) -> bool:
 # strategy → 协议过滤候选 token
 # ---------------------------------------------------------------------------
 
-def load_config(path: str) -> dict:
-    with open(path, "r", encoding="utf-8") as f:
-        return json.load(f)
-
-
 def candidate_tokens(cfg: dict, protocol: str | None) -> list[dict]:
     """按协议过滤候选 client_token。protocol=None 时不过滤（hermes/openclaw 双协议可选）。
 
-    返回 [{"client_token":..., "route_id":..., "note":..., "protocol":...}, ...]
+    兼容 route_id 单值与 route_pool 两种写法：取 strategy 绑定的第一个合法 route
+    做协议推断。返回展示字段 route_desc 用 strategy_route_desc 生成兼容描述。
+
+    返回 [{"client_token":..., "route_desc":..., "note":..., "protocol":...}, ...]
     """
     routes_map = {r.get("id"): r for r in cfg.get("routes", [])}
     supply_map = {s.get("id"): s for s in cfg.get("supplies", [])}
     result = []
     for st in cfg.get("strategies", []):
-        route = routes_map.get(st.get("route_id"))
+        # 兼容 route_id 单值与 route_pool 两种写法，收集该 strategy 引用的所有 route_id
+        route_ids = []
+        if st.get("route_id"):
+            route_ids.append(st["route_id"])
+        for item in st.get("route_pool") or []:
+            if isinstance(item, dict) and item.get("route_id"):
+                route_ids.append(item["route_id"])
+        if not route_ids:
+            continue
+        # 取第一个合法 route 做协议推断（同一 strategy 内 route 理论上应同协议）
+        route = None
+        for rid in route_ids:
+            route = routes_map.get(rid)
+            if route is not None:
+                break
         if route is None:
             continue
         # 取该 route 任一 tier 里第一个 supply 的 protocol 作为该 token 的协议
@@ -110,7 +123,7 @@ def candidate_tokens(cfg: dict, protocol: str | None) -> list[dict]:
             continue
         result.append({
             "client_token": st.get("client_token"),
-            "route_id": st.get("route_id"),
+            "route_desc": strategy_route_desc(st),
             "note": st.get("note", "") or "",
             "protocol": tier_protocol,
         })
@@ -126,13 +139,13 @@ def choose_token(cfg: dict, protocol: str | None, sdk_label: str) -> str | None:
     if len(cands) == 1:
         c = cands[0]
         print(f"  [{sdk_label}] 唯一匹配 token: {c['client_token']} "
-              f"(route_id={c['route_id']}, note={c['note']})")
+              f"(route={c['route_desc']}, note={c['note']})")
         if input("  使用该 token? [Y/n]: ").strip().lower() in ("n", "no"):
             return None
         return c["client_token"]
     print(f"  [{sdk_label}] 协议匹配的候选 token:")
     for i, c in enumerate(cands):
-        print(f"    [{i}] {c['client_token']:16} (route_id={c['route_id']}, note={c['note']})")
+        print(f"    [{i}] {c['client_token']:16} (route={c['route_desc']}, note={c['note']})")
     raw = input("  选择序号: ").strip()
     if not raw.isdigit() or not (0 <= int(raw) < len(cands)):
         print("  Error: 无效序号，跳过该 SDK。")

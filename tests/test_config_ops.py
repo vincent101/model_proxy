@@ -54,18 +54,18 @@ class TestIsResponseComplete(unittest.TestCase):
 
     def test_complete_json_object(self):
         text = '{"error":{"message":"output_config.effort: Extra inputs are not permitted"}}'
-        self.assertTrue(_is_response_complete(text.encode("utf-8"), text))
+        self.assertTrue(_is_response_complete(text))
 
     def test_truncated_json_incomplete(self):
         # glm-52 截断类：故意不闭合的 JSON 片段
         text = ('{"type":"error","error":{"type":"invalid_request_error",'
                 '"message":"[1210][reasoning_effort 参数值非法，可选值为：'
                 'none、minimal、low、medium、high')
-        self.assertFalse(_is_response_complete(text.encode("utf-8"), text))
+        self.assertFalse(_is_response_complete(text))
 
     def test_complete_200_json(self):
         text = '{"id":"msg_1","type":"message","content":[{"type":"text","text":"ok"}]}'
-        self.assertTrue(_is_response_complete(text.encode("utf-8"), text))
+        self.assertTrue(_is_response_complete(text))
 
 
 class TestExtractEnumCandidates(unittest.TestCase):

@@ -542,12 +542,10 @@ def format_routes(routes: list[dict]) -> list[str]:
     return lines
 
 
-def format_strategies(strategies: list[dict], *, style: str,
-                      override_counts: dict[str, int] | None = None) -> list[str]:
+def format_strategies(strategies: list[dict], *, style: str) -> list[str]:
     """格式化 strategies。
 
-    style="menu": 保持现有单行 {tok} -> {rid} ({note})，不传 override_counts。
-        override_counts 参数保留以兼容调用方签名，menu 分支不使用。
+    style="menu": 保持现有单行 {tok} -> {rid} ({note})。
 
     style="status" 已下线（P0），明细全归菜单。
     """
