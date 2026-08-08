@@ -16,10 +16,10 @@ INSTALL_OPS="$SCRIPT_DIR/_install_ops.py"
 
 # ---- 帮助信息 ----
 print_help() {
-  cat <<EOF
+  cat <<'EOF'
 用法: model_proxy_cli.sh <子命令> [参数]
 
-status                            显示运行状态 + supplies/routes/cooldown 概览
+status                            显示运行状态 + supplies/routes/strategies/cooldown 概览；代理未运行时仍展示 config 静态段
 reload                            触发配置热重载（无条件清空所有 cooldown）
 
 supply                            打印 supply list 后进入交互菜单，可选操作：
@@ -37,11 +37,13 @@ route                             打印 route list 后进入交互菜单，可�
 
 strategy                          打印 strategy list 后进入交互菜单，可选操作：
                                     [a]dd  交互式新增 strategy 绑定（client_token -> route_id，写配置后 reload）
+                                          （仅录单值 route_id；route_pool/dispatch 写法请直接编辑 config 后 reload）
                                     [e]dit 交互式编辑 strategy 的 route_id/note/source 能力
+                                          （route_pool 写法仅可编辑 note/source 能力，route 不可经菜单改）
                                     [d]el  删除 strategy（二次确认，无下游引用检查）
                                     [q]uit 退出（回车亦可）
 
-switch <client_token> <route_id>  切换某 token 绑定的 route 家族（改 strategy.route_id 后 reload）
+switch <client_token> <route_id>  改 strategy.route_id 后 reload。仅支持单值写法；route_pool 写法会被拒绝，请直接编辑 config
 install                           交互式列出四个 SDK + 本机检测状态，选择安装（不选直接回车即为只看状态退出）
 on                                启动 model_proxy.py（已在监听则跳过）
 off                               停止 model_proxy.py（严格按脚本绝对路径匹配，绝不影响 v1 的 proxy.py）
@@ -58,6 +60,12 @@ stats [时间] [维度/过滤...]        读独立账本（不受日志截断影
                                       stats today supply=<id>         过滤单个 supply
                                       stats today route=claude supply 过滤 route 后按 supply 投影
                                     末尾附一行 max_ms（来自日志，受日志窗口限制，非账本口径）
+会话内指令（非 CLI 子命令，在对话里直接发送）:
+  $route                      查询当前 session 的生效 route 与 override
+  $route <route_id>           把当前 session 固定到指定 route（写 config/session_overrides.json）
+  $route reset                清除当前 session 的 override
+  ※ status strategies 段的 "N个session覆盖" 计数即来自 $route 写入的 sidecar
+
 --help / -h                       显示此帮助
 
 说明: supply/route/strategy/install 的增删改等操作只能通过对应一级入口进入交互菜单执行，
