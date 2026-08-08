@@ -613,7 +613,7 @@ def openai_to_anthropic_response(resp: dict, ctx: dict = None) -> dict:
                 "type": "text",
                 "text": _REASONING_FALLBACK_PREFIX + reasoning,
             })
-            logger.info("empty content fallback: filled reasoning_content into text block")
+            logger.warning("empty content fallback: filled reasoning_content into text block")
 
     # stop_reason 映射
     stop_reason = map_finish_reason(choice.get("finish_reason"))
@@ -635,7 +635,7 @@ def openai_to_anthropic_response(resp: dict, ctx: dict = None) -> dict:
 
     # content_filter_results：丢弃 + 记 log（§2.4）
     if resp.get("content_filter_results") or (choice.get("finish_reason") == "content_filter"):
-        logger.info("content_filter triggered (dropped from anthropic response)")
+        logger.warning("content_filter triggered (dropped from anthropic response)")
 
     return {
         "id": resp.get("id") or gen_msg_id(),

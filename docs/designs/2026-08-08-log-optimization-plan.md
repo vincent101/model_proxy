@@ -1,6 +1,6 @@
 ---
 type: design-decision
-status: pending
+status: confirmed
 target: "[[tools/model_proxy/core/server.py]]"
 tags: [architect, model_proxy, logging, optimization-plan]
 ---
@@ -201,7 +201,7 @@ budget_retry 自身**不引入"该记未记"的静默**（命中即 warn：放�
 
 - **实证已有音量**：当前 5044 行窗口 `budget_retry` 放大 warn **127 条**、`budget_truncated` **23 条**，占 WARNING 总量（2609）约 5.7%。单请求爬满 5 级 = 5 条放大 warn（实证轨迹 `16384→32768→65536→131072` 对应 (3/5)(4/5)(5/5)）+ 1 条截断 warn。
 - **与 ACCESS 冗余但有意可见**：逐步放大 warn（1190）的完整轨迹已并入 ACCESS 的 `budget_retried` 字段（`16000→32000,32000→64000`），形式上冗余；但逐步 warn 提供长耗时重试的**实时进度**（单轮 ds-flash 可达数百秒，等不到请求末的 ACCESS），且设计 §5a 把 budget_retried 高频定位为**"调用侧预算偏小/模型 thinking 量大"的运营信号，有意要可见**。
-- **治理建议（决策点）**：**不做 OPT-07 式时间窗限流**（会丢阶梯 progression，且违背设计意图）。两个可选：① 保持现状（逐步 WARNING，接受音量作为运营信号）；② 把放大 warn（1190）降 INFO（root 开 INFO 后，依赖 OPT-08），截断 warn（1179/1473/1521，终态、频率低 23 条）保持 WARNING 作告警。倾向②（音量与告警分级更清晰），列 P1 决策。
+- **治理建议（2026-08-08 用户拍板：保持 WARNING）**：**不做 OPT-07 式时间窗限流**（会丢阶梯 progression，且违背设计意图）。budget 放大 warn 保持 WARNING（接受音量作为运营信号，不降 INFO）；截断 warn 同保 WARNING。若未来嫌噪再议。
 
 ### 设计原因
 
@@ -247,7 +247,7 @@ budget_retry 自身**不引入"该记未记"的静默**（命中即 warn：放�
 
 | 项 | 内容 | 独立性 | 依赖 | 风险 | 工作量 | 优先级 |
 |---|---|---|---|---|---|---|
-| OPT-10 | **账本 schema v3（一次迁移做两件事）**：① bucket 加 `max_ms`（record 时 max 比较），CLI stats 的 max_ms 改从账本取、删日志 awk 段；② combo 加 `attempts`/`attempt_fail`：`_acc` 增 `attempt_errors: list[(supply_id, reason)]`，**3 处 failover continue（1429/1445/1458）前 append**（budget 重试的 4 处 continue 不 append，§问题5 影响节），record 遍历入账到对应 combo。**迁移与重启顺序（O-4 已核实机制）：先停旧进程→迁移→起新进程，避免旧进程写旧 schema 覆盖；`_load` 当前无迁移逻辑需新增 v2→v3 检测**。**旧桶迁移三选项（S-5）并列**：(a) 补近似值 `attempt_fail=fail`（口径虚高，README 注明）；(b) 旧桶补 0（历史 supply 失败率断档）；(c) **不迁移旧桶、新旧口径并存**——旧桶保持无 attempt 字段，`stats` 对缺字段桶显式标注"attempt 口径自 <迁移日> 起"，避免近似值污染历史真实性。需用户决策 | 独立 | 无 | 中：迁移口径需明示 + 进程重启顺序；CLI stats 段落重写；建议补迁移单测 | M-L | **P1** |
+| OPT-10 | **账本 schema v3（一次迁移做两件事）**：① bucket 加 `max_ms`（record 时 max 比较），CLI stats 的 max_ms 改从账本取、删日志 awk 段；② combo 加 `attempts`/`attempt_fail`：`_acc` 增 `attempt_errors: list[(supply_id, reason)]`，**3 处 failover continue（1429/1445/1458）前 append**（budget 重试的 4 处 continue 不 append，§问题5 影响节），record 遍历入账到对应 combo。**迁移与重启顺序（O-4 已核实机制）：先停旧进程→迁移→起新进程，避免旧进程写旧 schema 覆盖；`_load` 当前无迁移逻辑需新增 v2→v3 检测**。**旧桶迁移决策（2026-08-08 用户拍板：补 0）**：旧桶 combo 无 attempt 字段，迁移时补 `attempts=0`/`attempt_fail=0`，历史 supply 失败率自迁移日起算（断档但保真，不虚高）。README/账本注释注明口径切换日 | 独立 | 无 | 中：迁移口径需明示 + 进程重启顺序；CLI stats 段落重写；建议补迁移单测 | M-L | **P1** |
 | OPT-12 | **口径明示**：status=0 按 fail、builtin 以 `supply=(builtin)` 入账、budget 三字段只进 ACCESS 不入账（§5a）、budget_retry 流式 A2R/R2A 不检测的边界，一并写进 README | 独立 | 无 | 无 | S | P2 |
 
 ---

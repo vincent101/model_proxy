@@ -22,6 +22,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+import uuid
 from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -62,18 +63,38 @@ def _trim_log(path: Path, keep: int = 5000) -> None:
 
 
 _trim_log(LOG_FILE)
-logging.basicConfig(
-    level=logging.WARNING,
-    format="%(asctime)s %(levelname)s %(message)s",
-    handlers=[logging.FileHandler(LOG_FILE)],
-)
+
+# req_id 全链关联（OPT-01）：threading.local 存当前请求的 req_id，Filter 注入到每条
+# log record。适用前提（O-2 已核实）：所有 warn 与请求同线程（ThreadingHTTPServer、
+# 流式同步内联、无子线程派生）。若未来出现子线程写日志路径，Filter 取默认值 '-'，
+# req_id 链在该处断裂——届时需在子线程内手动 set/clear。
+_req_local = threading.local()
+
+
+class _ReqIdFilter(logging.Filter):
+    """从 _req_local 读 req_id 注入 record.req_id；非请求线程默认 '-'。"""
+
+    def filter(self, record):
+        record.req_id = getattr(_req_local, "req_id", None) or "-"
+        return True
+
+
+_req_filter = _ReqIdFilter()
+
+_root_handler = logging.FileHandler(LOG_FILE)
+_root_handler.setFormatter(logging.Formatter(
+    "%(asctime)s %(levelname)s req_id=%(req_id)s %(message)s"))
+_root_handler.addFilter(_req_filter)
+logging.basicConfig(level=logging.WARNING, handlers=[_root_handler])
 log = logging.getLogger(__name__)
 
 # access logger：单独 INFO 级别，复用同一日志文件、不向 root 传播（root 仍 WARNING，
 # 避免误收其他 INFO 噪声）。固定前缀 ACCESS，key=value 单行文本，与现有 WARNING 行
 # 风格一致，grep/awk 友好（见 docs/designs/2026-07-22-access-log-and-latency.md）。
 _access_handler = logging.FileHandler(LOG_FILE)
-_access_handler.setFormatter(logging.Formatter("%(asctime)s %(message)s"))
+_access_handler.setFormatter(logging.Formatter(
+    "%(asctime)s req_id=%(req_id)s %(message)s"))
+_access_handler.addFilter(_req_filter)
 access_log = logging.getLogger("model_proxy.access")
 access_log.setLevel(logging.INFO)
 access_log.addHandler(_access_handler)
@@ -947,20 +968,45 @@ class ModelProxyHandler(BaseHTTPRequestHandler):
     # ------------------------------------------------------------------
 
     def do_GET(self):
-        if self.path.startswith(_CONTROL_PATH_PREFIX):
-            self._dispatch_control("GET")
-        else:
-            self._forward_logged("GET")
+        _req_local.req_id = uuid.uuid4().hex[:8]
+        try:
+            if self.path.startswith(_CONTROL_PATH_PREFIX):
+                self._dispatch_control("GET")
+            else:
+                self._forward_logged("GET")
+        finally:
+            _req_local.req_id = None
 
     def do_POST(self):
-        if self.path.startswith(_CONTROL_PATH_PREFIX):
-            self._dispatch_control("POST")
-        else:
-            self._forward_logged("POST")
+        _req_local.req_id = uuid.uuid4().hex[:8]
+        try:
+            if self.path.startswith(_CONTROL_PATH_PREFIX):
+                self._dispatch_control("POST")
+            else:
+                self._forward_logged("POST")
+        finally:
+            _req_local.req_id = None
 
-    def do_PUT(self):    self._forward_logged("PUT")
-    def do_DELETE(self): self._forward_logged("DELETE")
-    def do_PATCH(self):  self._forward_logged("PATCH")
+    def do_PUT(self):
+        _req_local.req_id = uuid.uuid4().hex[:8]
+        try:
+            self._forward_logged("PUT")
+        finally:
+            _req_local.req_id = None
+
+    def do_DELETE(self):
+        _req_local.req_id = uuid.uuid4().hex[:8]
+        try:
+            self._forward_logged("DELETE")
+        finally:
+            _req_local.req_id = None
+
+    def do_PATCH(self):
+        _req_local.req_id = uuid.uuid4().hex[:8]
+        try:
+            self._forward_logged("PATCH")
+        finally:
+            _req_local.req_id = None
 
     # ------------------------------------------------------------------
     # access 日志：整请求一条，覆盖 _forward 的整个生命周期
@@ -981,6 +1027,9 @@ class ModelProxyHandler(BaseHTTPRequestHandler):
             # budget_truncated=1 为最终仍截断（含流式收口检测），stop_reason 为
             # 响应停止原因（能拿到才记，拿不到留空）。
             "budget_retried": "", "budget_truncated": 0, "stop_reason": "",
+            # OPT-04: final_error 记错误出口的短 reason（截断 80 字符、空格转下划线）。
+            # budget 截断终态（status=200 + budget_truncated=1）不写 final_error，两者正交。
+            "final_error": "",
         }
         t0 = time.monotonic()
         try:
@@ -992,12 +1041,13 @@ class ModelProxyHandler(BaseHTTPRequestHandler):
                 "ACCESS ms=%d status=%s source=%s route=%s tier=%s supply=%s "
                 "failover=%s attempts=%s usage_in=%s usage_out=%s token=%s session=%s "
                 "route_failover=%s builtin=%s budget_retried=%s budget_truncated=%s "
-                "stop_reason=%s",
+                "stop_reason=%s final_error=%s",
                 ms, a["status"], a["source"],
                 a["route"], a["tier"], a["supply"], a["failover"], a["attempts"],
                 a["usage_in"], a["usage_out"], a["token"], a["session"],
                 a["route_failover"], a["builtin"], a["budget_retried"],
-                a["budget_truncated"], a["stop_reason"])
+                a["budget_truncated"], a["stop_reason"],
+                a["final_error"][:80].replace(" ", "_"))
             try:
                 usage_totals.record(a, ms)
             except Exception:
@@ -1085,6 +1135,7 @@ class ModelProxyHandler(BaseHTTPRequestHandler):
         if not route_candidates:
             log.warning("no strategy/route matched: token_tail4=%s source=%s",
                         token[-4:] if token else "", source)
+            self._acc["final_error"] = "no strategy or route matched"
             self._write_buffered_response(
                 401, [], error_body_for_source(source, 401, "no strategy/route matched"))
             return
@@ -1094,6 +1145,7 @@ class ModelProxyHandler(BaseHTTPRequestHandler):
         if tier is None:
             log.warning("unknown model tier: model=%s pinned_route=%s",
                         request_model, route_candidates[0].get("id"))
+            self._acc["final_error"] = f"unknown model tier: {request_model}"
             self._write_buffered_response(
                 400, [], error_body_for_source(source, 400, f"unknown model tier: {request_model}"))
             return
@@ -1211,6 +1263,7 @@ class ModelProxyHandler(BaseHTTPRequestHandler):
                 self._write_buffered_response(
                     503, [], error_body_for_source(
                         source, 503, f"route {route.get('id')} missing tier {tier}"))
+                self._acc["final_error"] = f"route {route.get('id')} missing tier {tier}"
                 return
 
             failover = route.get("failover", "off")
@@ -1234,7 +1287,7 @@ class ModelProxyHandler(BaseHTTPRequestHandler):
                 try:
                     target = detect_target(supply)
                 except ValueError as e:
-                    log.warning("detect_target failed: supply=%s err=%s", supply_id, e)
+                    log.error("detect_target failed: supply=%s err=%s", supply_id, e)
                     self._write_buffered_response(
                         500, [], error_body_for_source(source, 500, str(e)))
                     return
@@ -1313,7 +1366,7 @@ class ModelProxyHandler(BaseHTTPRequestHandler):
                         openai_body, fwd_ctx = pt.anthropic_to_openai_request(
                             body_json or {}, reasoning_fields=reasoning_wire)
                     except Exception as e:
-                        log.warning("ANTHROPIC_TO_CHAT request translate failed: %s", e)
+                        log.error("ANTHROPIC_TO_CHAT request translate failed: %s", e)
                         self._write_buffered_response(
                             400, [], error_body_for_source(
                                 source, 400, f"proxy translate failed: {e}"))
@@ -1332,7 +1385,7 @@ class ModelProxyHandler(BaseHTTPRequestHandler):
                         responses_body, fwd_ctx = pt.anthropic_to_responses_request(
                             body_json or {}, reasoning_fields=reasoning_wire)
                     except Exception as e:
-                        log.warning("ANTHROPIC_TO_RESPONSES request translate failed: %s", e)
+                        log.error("ANTHROPIC_TO_RESPONSES request translate failed: %s", e)
                         self._write_buffered_response(
                             400, [], error_body_for_source(
                                 source, 400, f"proxy translate failed: {e}"))
@@ -1360,7 +1413,7 @@ class ModelProxyHandler(BaseHTTPRequestHandler):
                             body_json or {}, max_tokens_default=_mt_default,
                             reasoning_fields=reasoning_wire)
                     except Exception as e:
-                        log.warning("RESPONSES_TO_ANTHROPIC request translate failed: %s", e)
+                        log.error("RESPONSES_TO_ANTHROPIC request translate failed: %s", e)
                         self._write_buffered_response(
                             400, [], error_body_for_source(
                                 source, 400, f"proxy translate failed: {e}"))
@@ -1535,7 +1588,7 @@ class ModelProxyHandler(BaseHTTPRequestHandler):
                             openai_resp = json.loads(raw_resp_body)
                             anthropic_resp = pt.openai_to_anthropic_response(openai_resp, fwd_ctx)
                         except Exception as e:
-                            log.warning("ANTHROPIC_TO_CHAT response translate failed: %s", e)
+                            log.error("ANTHROPIC_TO_CHAT response translate failed: %s", e)
                             self._write_buffered_response(
                                 500, [], error_body_for_source(
                                     source, 500, f"proxy translate failed: {e}"))
@@ -1571,7 +1624,7 @@ class ModelProxyHandler(BaseHTTPRequestHandler):
                             anthropic_resp = pt.responses_to_anthropic_response(
                                 responses_resp, fwd_ctx)
                         except Exception as e:
-                            log.warning("ANTHROPIC_TO_RESPONSES response translate failed: %s", e)
+                            log.error("ANTHROPIC_TO_RESPONSES response translate failed: %s", e)
                             self._write_buffered_response(
                                 500, [], error_body_for_source(
                                     source, 500, f"proxy translate failed: {e}"))
@@ -1612,7 +1665,7 @@ class ModelProxyHandler(BaseHTTPRequestHandler):
                             anthropic_resp, target_model or "",
                             reasoning_effort=_r_effort, tools_echo=_tools_echo)
                     except Exception as e:
-                        log.warning("RESPONSES_TO_ANTHROPIC response translate failed: %s", e)
+                        log.error("RESPONSES_TO_ANTHROPIC response translate failed: %s", e)
                         self._write_buffered_response(
                             500, [], error_body_for_source(
                                 source, 500, f"proxy translate failed: {e}"))
@@ -1771,6 +1824,7 @@ class ModelProxyHandler(BaseHTTPRequestHandler):
             return
         request_token = self.headers.get("X-Proxy-Admin-Token", "")
         if not hmac.compare_digest(request_token, admin_token):
+            log.warning("admin.auth_fail: unauthorized control API access (token mismatch)")
             self._send_json(401, {"error": "unauthorized"})
             return
 
@@ -1979,7 +2033,7 @@ class ModelProxyHandler(BaseHTTPRequestHandler):
             # 上游连接中断/读取异常/adapter.feed 抛异常：200+chunked 头已发出，无法降级为
             # 非流式 error body，只能按正向规格 §5.1 补发一个 `event: error` 再体面收尾
             # （不调用 adapter.finalize()，避免在失败态下伪造 message_delta/message_stop）
-            log.warning("ANTHROPIC_TO_CHAT stream interrupted: %s", e)
+            log.error("ANTHROPIC_TO_CHAT stream interrupted: %s", e)
             try:
                 err_event = {
                     "type": "error",
@@ -2033,7 +2087,7 @@ class ModelProxyHandler(BaseHTTPRequestHandler):
         except Exception as e:
             # 上游连接中断/读取异常/adapter.feed 抛异常：200+chunked 头已发出，无法降级为
             # 非流式 error body，按反向规格 §5.1 补发一个 response.failed 事件再体面收尾
-            log.warning("RESPONSES_TO_ANTHROPIC stream interrupted: %s", e)
+            log.error("RESPONSES_TO_ANTHROPIC stream interrupted: %s", e)
             try:
                 self._write_sse_chunk(pt.responses_sse_bytes(
                     _responses_failed_event(adapter, f"stream interrupted: {e}")))
@@ -2082,7 +2136,7 @@ class ModelProxyHandler(BaseHTTPRequestHandler):
         except (BrokenPipeError, ConnectionResetError):
             pass
         except Exception as e:
-            log.warning("ANTHROPIC_TO_RESPONSES stream interrupted: %s", e)
+            log.error("ANTHROPIC_TO_RESPONSES stream interrupted: %s", e)
             try:
                 err_event = {
                     "type": "error",

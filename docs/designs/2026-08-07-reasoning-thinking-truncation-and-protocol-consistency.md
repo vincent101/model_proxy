@@ -205,6 +205,8 @@ for e in CanonicalEffort:
 
 ### ⑥ 协议一致性（确保同模型不同协议接入行为一致）
 
+> 2026-08-08 用户决策：**⑥b 一致性自检工具不做**（本轮以人工版双协议对比 + 40 探针实测替代，见"验证方式"与 frontmatter updated）；⑥a 对称性不变量保留，已由 ①a/①b 恢复并经全档探针验证。6b 原文保留以示追溯。
+
 **6a. 对称性作为强约束**：确立"同一 (target_model, canonical effort) 经任一协议转换后，到达上游的有效思考强度、以及回到客户端的 thinking 可见性，应行为一致"为 model_proxy 的不变量。①a/①b 是把当前违反该不变量的两处补齐。
 
 **6b. 一致性自检能力**：新增一个轻量自检路径——对同一 supply 的 anthropic / responses 两种协议入口，发同一探针（固定 prompt + 显式 canonical effort），比对两侧的 (a) 上游实际收到的 effort 档名 (b) 客户端是否收到 thinking 内容。可作为 `supply test`（CLI 既有 [t]est，README §5.5）的扩展子项"effort 一致性探测"，也可由评估体系在接入新模型时调用。本轮 glm 双协议对比就是人工版的这个探测，应工具化、自动化。
