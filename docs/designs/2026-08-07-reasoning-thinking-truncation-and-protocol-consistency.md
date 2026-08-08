@@ -375,3 +375,42 @@ for e in CanonicalEffort:
 - ⑤ 去掉 budget_raised，保留 budget_retried/budget_truncated + 可选 stop_reason；④b 触发频率语义从"③ 标定失准"改为"调用侧预算偏小/模型 thinking 量大"的运营信号。
 - ⑥ 不动。
 - 正文 ②-⑥、风险与权衡、验证方式已按本轮决策就地重写；两轮复核章节（针对 ① 及原 ②-⑥）保留原样作历史记录，其中涉 ②a/③/④b 边界的论断以本轮重写为准。
+
+---
+
+## 架构合理性审查（architect-xhigh，④b 落地前，2026-08-08）
+
+复核范围：server.py 请求处理+重试链路（1040-1470）、响应收口（1339-1453）、流式写回 helper（1763-1820）、ConfigStore（294-351）、_acc 初始化与 ACCESS（941-965）；translate.py 转换+兜底边界（415-482、489-548、1695-1734、971-999、map_finish_reason 180-184、_FINISH_REASON_MAP 64）；reasoning 三层模块头职责声明（ladder/capability/codecs）。结论均经代码实证。
+
+**总体判定：合理（④b 放 server.py 正确，无架构级硬伤），附 4 条 refinement 级调整（非 blocker）。**
+
+### 1. 改动文件：server.py 正确
+
+④b 本质是 HTTP 请求/响应编排——读原始上游响应、判重试、改 outgoing body 预算、在同 supply 内重发。这些全是 server.py 既有职责。reasoning 三层是显式纯模块（codecs 头"不依赖 registry/server/translate"、capability 头"不依赖 codecs/registry/server/translate"、ladder 头"零依赖"），不能承载 HTTP 重试编排；translate.py 是无状态转换（每次调用独立、无循环、无 supply/cooldown 态、无 HTTP），放重试会破坏其纯度。**server.py 是唯一正确落点。**
+
+### 2. 架构符合性：符合"重试/failover 编排"职责，不越界
+
+server.py 已承载全部重试编排：reasoning 语法重试（1290-1298 `continue`）、failover 冷却重试（1300-1306/1316-1322/1328-1335 `continue`）。④b 只是新增一个重试触发器，落在同一 `while True`（1117）内，复用同一 `continue` 幂等。响应收口处读协议特定字段判截断，与该层既有行为一致（usage 双字段读取 1351-1354 已同时认 anthropic `input_tokens` 与 chat `prompt_tokens`）。不越界。
+
+### 3. 截断检测位置：原始响应上判（转换前）——正确且被代码强制
+
+`openai_to_anthropic_response` 的 `_ENABLE_REASONING_FALLBACK`（translate.py:532-538）在 content 空时把 reasoning_content 填成 text block。转换后再判"无 text"恒为假，检测被兜底掩盖。故 chat 方向必须在原始 chat 响应上判；为统一，全 mode 都在原始响应上判。检测（server，编排决策）与兜底（translate，转换产出）是时序先后、不重叠的两件事：先判（不重试才）→ 转换+兜底。无职责重叠。
+
+### 4. 与语法重试的关系：复用机制 + 独立状态——正确
+
+两者共享的是**机制**（`continue` 重进 while、同 supply 重选、不 cooldown、不进 tried_set、复用 `_reasoning_cache_supply_id` remap 缓存），不是同一份状态。触发正交（400 语法拒绝 vs 200 截断）、可同请求先后发生（先 400 语法重试、后 200 预算重试），故状态必须独立——共享单一布尔会互相阻塞。耦合风险低：唯一共享可变项是循环本身与 remap 缓存，而 remap 输入（intent/两侧 cap）不被任一重试改变。有界性：语法重试布尔、预算重试计数（≤5）、failover tried_set 耗尽，while 循环必终止。同 supply 重选的确定性假设（select_supply 不依赖被重试改变的 cd/tried_set）与语法重试 1296-1298 注释所依赖的完全相同，④b 继承即正确。
+
+### 5. stamp 预算值：不破坏转换层 body 构建
+
+stamp 在 pt.* 请求转换器返回后、`json.dumps(send_body)` 前，覆写单一标量字段。转换器保持纯函数、零改动。这与既有"转换后覆写 model 字段"（1207-1208 / 1225-1226 / 1246-1247）是同一模式，属已确立惯例，不破坏分层。
+
+### 6. 总体判断：合理，无更优独立模块
+
+不抽独立 budget 治理模块：重试必须内联在 while 循环（循环抽不走）；预算起点依赖 remap 结果（②b 反向默认按 THINKING→16384/否则→4096，remap 结果只有 server 侧有，translate.py:1238 目前只收固定 `max_tokens_default=4096`），天然 server 侧；可抽的纯部分（截断判定、阶梯计算）体量小，单独立模块是过度设计，且违背"所有重试编排在 server.py"的既有先例。
+
+### 附 4 条 refinement（落地时并入，非方向修订）
+
+- **R1 截断判定建议抽成纯函数、落 translate.py**：判定是"协议响应形状"知识，而 translate.py 已持有截断信号词表（`map_finish_reason` 180-184、`_FINISH_REASON_MAP` 64 `"length"→"max_tokens"`），且判定消费的正是转换器同款原始响应。建议 `translate.py` 加纯谓词 `is_budget_truncated(target_protocol, raw_resp) -> bool`，server.py 收口处调用——避免 server.py 内联堆积 5 段协议解析。retries/阶梯/continue 编排仍留 server.py。**（server.py 内联亦可接受，此为清洁度优化，非硬伤。）**
+- **R2 PASSTHROUGH stamp 字段名需分协议**：落地清单"PASSTHROUGH 写 `body_json["max_tokens"]`"只覆盖 anth→anth 透传；responses→responses 透传的字段是 `max_output_tokens`。④a 检测表已含 responses→responses 透传，stamp 点必须同样按透传子协议分字段，否则该方向重试不生效。
+- **R3 `_budget_retries` 是计数器（int，≤5）不是布尔位**：与落地清单"计数"一致；避免按语法重试的布尔 `_reasoning_retried` 误实现成一次性。
+- **R4 明确 budget 状态跨 failover 的语义**：`_budget_retries`/`_budget_current` 声明于 1066（请求周期作用域），若爬升途中该 supply 返回 failover 状态码（1328-1335 触发 cooldown+换 supply），放大后的预算会被下一 supply 继承。这是合理语义（预算不足是模型属性，同 tier 换 supply 不必从起点重爬），但设计未点明，建议显式声明为有意行为。
