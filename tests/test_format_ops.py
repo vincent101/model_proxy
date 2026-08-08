@@ -376,29 +376,8 @@ class TestStatusFormatFromJson(unittest.TestCase):
             self.assertIn("s1", joined)
             self.assertIn("45s", joined)
 
-    def test_config_notices_orphan(self):
-        """orphan supply 出现在 config notices 段。"""
-        with tempfile.TemporaryDirectory() as td:
-            cfg_path = self._make_config(td, {
-                "default_cooldown_seconds": 60,
-                "supplies": [{"id": "s1"}, {"id": "orphan-sid"}],
-                "routes": [{"id": "r1", "tiers": {"opus": ["s1"], "sonnet": [], "haiku": []}}],
-                "strategies": [],
-            })
-            totals_path = self._make_totals(td)
-            data = {
-                "supplies": [{"id": "s1"}, {"id": "orphan-sid"}],
-                "routes": [], "strategies": [],
-                "cooldown": {}, "default_cooldown_seconds": 60,
-            }
-            lines = _format_status_from_json(data, cfg_path, totals_path)
-            joined = "\n".join(lines)
-            self.assertIn("config notices:", joined)
-            self.assertIn("orphan supplies:", joined)
-            self.assertIn("orphan-sid", joined)
-
     def test_config_count_row(self):
-        """config 计数行含 supplies/routes/strategies 数 + default_cooldown。"""
+        """config 计数行含 supplies/routes/strategies 数。"""
         with tempfile.TemporaryDirectory() as td:
             cfg_path = self._make_config(td)
             totals_path = self._make_totals(td)
@@ -411,7 +390,7 @@ class TestStatusFormatFromJson(unittest.TestCase):
             lines = _format_status_from_json(data, cfg_path, totals_path)
             joined = "\n".join(lines)
             self.assertIn("config: 2 supplies / 1 routes / 1 strategies", joined)
-            self.assertIn("default_cooldown=60s", joined)
+            self.assertNotIn("default_cooldown", joined)
 
     def test_all_zero_no_anomaly_sections(self):
         """全 0（无 cooldown/degraded/overrides/orphan/缺档）时无异常段。"""
@@ -440,7 +419,6 @@ class TestStatusFormatFromJson(unittest.TestCase):
             self.assertNotIn("degraded supplies", joined)
             self.assertNotIn("unmatched:", joined)
             self.assertNotIn("damaged routes:", joined)
-            self.assertNotIn("config notices:", joined)
 
     def test_damaged_routes_shown(self):
         """degraded supply 被某 route tier 引用时，damaged routes 段列出。"""
@@ -510,21 +488,6 @@ class TestStatusOffline(unittest.TestCase):
             self.assertNotIn("degraded supplies", joined)
             self.assertNotIn("fail 80.0%", joined)
 
-    def test_offline_config_notices_shown(self):
-        """停机时 config notices（orphan/缺档）静态照常展示。"""
-        with tempfile.TemporaryDirectory() as td:
-            cfg_path = self._make_config(td, {
-                "default_cooldown_seconds": 60,
-                "supplies": [{"id": "s1"}, {"id": "orphan-sid"}],
-                "routes": [{"id": "r1", "tiers": {"opus": ["s1"], "sonnet": [], "haiku": []}}],
-                "strategies": [],
-            })
-            totals_path = self._make_totals(td)
-            lines = _format_status_offline(cfg_path, totals_path)
-            joined = "\n".join(lines)
-            self.assertIn("config notices:", joined)
-            self.assertIn("orphan-sid", joined)
-
     def test_offline_config_count_row(self):
         """停机时 config 计数行照常。"""
         with tempfile.TemporaryDirectory() as td:
@@ -533,7 +496,7 @@ class TestStatusOffline(unittest.TestCase):
             lines = _format_status_offline(cfg_path, totals_path)
             joined = "\n".join(lines)
             self.assertIn("config: 1 supplies / 1 routes / 1 strategies", joined)
-            self.assertIn("default_cooldown=60s", joined)
+            self.assertNotIn("default_cooldown", joined)
 
     def test_offline_sidecar_overrides_counted(self):
         """停机时 sidecar overrides 静态可读并求和。"""
