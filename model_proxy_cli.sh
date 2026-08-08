@@ -130,7 +130,7 @@ cmd_status() {
   local pid
   pid=$(lsof -i :"$MODEL_PROXY_PORT" -sTCP:LISTEN -t 2>/dev/null)
   if [[ -z "$pid" ]]; then
-    echo "model_proxy: NOT running on port $MODEL_PROXY_PORT（以下展示 config 静态信息）"
+    echo "service NOT running on port $MODEL_PROXY_PORT（以下展示 config 静态信息）"
     python3 "$SCRIPT_DIR/_format_ops.py" status-offline "$CONFIG_FILE" "$TOTALS_FILE"
     return 1
   fi
@@ -151,16 +151,15 @@ cmd_status() {
     started="  (started $md $hm"
   fi
   config_mtime=$(stat -f "%Sm" -t "%m-%d %H:%M" "$CONFIG_FILE" 2>/dev/null)
-  local mtime_part=""
-  if [[ -n "$config_mtime" ]]; then
-    mtime_part=", config mtime $config_mtime"
-  fi
 
-  # 首行（bash 侧打印，信息全在 bash 侧）
+  # 首行（bash 侧打印，信息全在 bash 侧）；config mtime 另起一行
   if [[ -n "$started" ]]; then
-    echo "model_proxy: running on port $MODEL_PROXY_PORT  pid $pid$etime$started$mtime_part)"
+    echo "service running on port $MODEL_PROXY_PORT  pid $pid$etime$started)"
   else
-    echo "model_proxy: running on port $MODEL_PROXY_PORT  pid $pid$etime$mtime_part"
+    echo "service running on port $MODEL_PROXY_PORT  pid $pid$etime"
+  fi
+  if [[ -n "$config_mtime" ]]; then
+    echo "  config mtime $config_mtime"
   fi
 
   local out

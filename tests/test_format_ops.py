@@ -298,23 +298,6 @@ class TestStatusFormatFromJson(unittest.TestCase):
             self.assertIn("degraded supplies", joined)
             self.assertIn("fail 40.0% (2/5)", joined)
 
-    def test_unmatched_none_shown_when_fail(self):
-        """(none) supply 有 fail 时单列 unmatched 行。"""
-        with tempfile.TemporaryDirectory() as td:
-            cfg_path = self._make_config(td)
-            combos = {
-                "supply=(none)|route=(none)|strategy=(none)": {"requests": 5, "ok": 0, "fail": 5},
-            }
-            totals_path = self._make_totals(td, combos)
-            data = {
-                "supplies": [{"id": "s1"}], "routes": [], "strategies": [],
-                "cooldown": {}, "default_cooldown_seconds": 60,
-            }
-            lines = _format_status_from_json(data, cfg_path, totals_path)
-            joined = "\n".join(lines)
-            self.assertIn("unmatched:", joined)
-            self.assertIn("(none)", joined)
-
     def test_cooldown_listed(self):
         """有 cooldown 时列 supply 剩余秒。"""
         with tempfile.TemporaryDirectory() as td:

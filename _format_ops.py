@@ -561,15 +561,13 @@ def _format_status_from_json(data: dict, config_path: str, totals_path: str,
                              log_path: str | None = None) -> list[str]:
     """从 server status JSON + config + 账本 格式化 status 输出。
 
-    布局：health 行 → active sessions 段（在线时恒展示）→ 异常清单
-    （degraded/unmatched/cooldown/damaged/config notices）→ config 计数行。
-    全 0 时 health 行即"系统健康"，异常段不打印。
+    布局：health 行 → degraded supplies 段 → active sessions 段（在线时恒展示）
+    → cooldown 段 → config 计数行。全 0 时 health 行即"系统健康"，异常段不打印。
     """
     cooldown = data.get("cooldown", {})
     n_supplies = len(data.get("supplies", []))
     n_routes = len(data.get("routes", []))
     n_strategies = len(data.get("strategies", []))
-    default_cd = data.get("default_cooldown_seconds", "?")
 
     # overrides 求和
     overrides_count = sum(
@@ -577,7 +575,7 @@ def _format_status_from_json(data: dict, config_path: str, totals_path: str,
         for st in data.get("strategies", [])
     )
 
-    # config 读取（find_damaged_routes 需要）
+    # config 读取（_supply_refs 需要）
     with open(config_path, "r", encoding="utf-8") as f:
         cfg = json.load(f)
 
@@ -585,10 +583,6 @@ def _format_status_from_json(data: dict, config_path: str, totals_path: str,
     health = load_supply_health(totals_path)
     degraded = _compute_degraded(health)
     n_degraded = len(degraded)
-
-    # (none) unmatched
-    none_health = health.get("(none)")
-    none_fail = none_health.get("fail", 0) if none_health else 0
 
     n_cooldown = len(cooldown)
 
@@ -603,15 +597,10 @@ def _format_status_from_json(data: dict, config_path: str, totals_path: str,
     parts.append(f"overrides {overrides_count}")
     lines.append("health: " + " · ".join(parts))
 
-    # active sessions 段（在线时恒展示）
-    if log_path:
-        lines.append("")
-        lines.extend(_format_active_sessions(load_active_sessions(log_path)))
-
     # supply 引用标注（degraded/cooldown 行尾标出被哪个 route.tier(strategy) 引用）
     refs = _supply_refs(cfg)
 
-    # 异常清单（只列问题）
+    # degraded supplies 段（只列问题）
     if degraded:
         lines.append("")
         lines.append(f"degraded supplies (today fail%>{DEGRADED_FAIL_PCT:.0f}%, n>={DEGRADED_MIN_REQUESTS}):")
@@ -619,10 +608,10 @@ def _format_status_from_json(data: dict, config_path: str, totals_path: str,
             ref = ",".join(refs.get(d["id"], [])) or "未被引用"
             lines.append(f"  {_pad(d['id'], 24)} fail {d['fail_pct']:.1f}% ({d['fail']}/{d['requests']})  ← {ref}")
 
-    if none_fail > 0:
-        none_req = none_health.get("requests", 0)
+    # active sessions 段（在线时恒展示）
+    if log_path:
         lines.append("")
-        lines.append(f"unmatched: {none_req} req 今日全失败（supply=(none)，未匹配 strategy/route，多为 401）")
+        lines.extend(_format_active_sessions(load_active_sessions(log_path)))
 
     if cooldown:
         lines.append("")
