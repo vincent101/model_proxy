@@ -127,7 +127,7 @@ cmd_status() {
   pid=$(lsof -i :"$MODEL_PROXY_PORT" -sTCP:LISTEN -t 2>/dev/null)
   if [[ -z "$pid" ]]; then
     echo "service NOT running on port $MODEL_PROXY_PORT"
-    python3 "$SCRIPT_DIR/_format_ops.py" status-offline "$CONFIG_FILE" "$TOTALS_FILE" "$LOG_FILE"
+    echo "  config mtime $(stat -f "%Sm" -t "%m-%d %H:%M" "$CONFIG_FILE")"
     return 1
   fi
 

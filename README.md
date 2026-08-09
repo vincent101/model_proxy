@@ -51,7 +51,7 @@ ANTHROPIC_DEFAULT_HAIKU_MODEL=claude-haiku
 tools/model_proxy/model_proxy_cli.sh logs
 ```
 出现形如 `ACCESS ms=... status=200 source=anthropic route=claude tier=... supply=... token=...`
-的行即接入成功。想看运行状态与配置概览用 `model_proxy_cli.sh status`。
+的行即接入成功。想看运行状态用 `model_proxy_cli.sh status`。
 
 日常挂载：`tools/model_proxy/hooker/ensure_model_proxy.sh` 已注册到 SessionStart hook，
 每次开 Claude Code 会话自动拉起，一般无需手动 `on`（详见「启动与停止」）。
@@ -613,7 +613,7 @@ model_proxy_cli.sh status                            # 运行态健康总览：h
                                                       # + active sessions（30min 内活跃 session 的链路健康，
                                                       #   解析 ACCESS 日志：route(strategy) + 窗口内 tier/supply
                                                       #   分布占比，FAIL 行附 final_error + req_id）
-                                                      # + cooldown 明细 + config 计数；离线统一展示（仅 cooldown 显"未知"）
+                                                      # + cooldown 明细 + config 计数；离线只报进程态 + config mtime
 model_proxy_cli.sh reload                            # 触发配置热重载（无条件清空所有 cooldown）
 
 model_proxy_cli.sh supply                            # 打印 list 后进入交互菜单 [a]dd/[e]dit/[d]el/[t]est/[q]uit

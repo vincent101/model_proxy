@@ -21,7 +21,6 @@ from _format_ops import (
     DEGRADED_MIN_REQUESTS,
     _format_active_sessions,
     _format_status_from_json,
-    _format_status_offline,
     _supply_refs,
     display_width,
     format_routes,
@@ -378,77 +377,6 @@ class TestStatusFormatFromJson(unittest.TestCase):
             joined = "\n".join(lines)
             self.assertIn("s1", joined)
             self.assertIn("fail 80.0% (8/10)  ← r1(cc) opus", joined)
-
-
-# ---------------------------------------------------------------------------
-# _format_status_offline 降级
-# ---------------------------------------------------------------------------
-
-class TestStatusOffline(unittest.TestCase):
-
-    def _make_config(self, td, cfg_dict=None):
-        path = os.path.join(td, "config.json")
-        cfg = cfg_dict or {
-            "default_cooldown_seconds": 60,
-            "supplies": [{"id": "s1", "protocol": "anthropic", "appkey": "1234", "target_model": "m1"}],
-            "routes": [{"id": "r1", "tiers": {"opus": ["s1"], "sonnet": [], "haiku": []}, "failover": "on"}],
-            "strategies": [{"client_token": "cc", "route_id": "r1", "note": "n"}],
-        }
-        with open(path, "w", encoding="utf-8") as f:
-            json.dump(cfg, f)
-        return path
-
-    def _make_totals(self, td, combos=None):
-        path = os.path.join(td, "totals.json")
-        from datetime import datetime, timezone, timedelta
-        cst = timezone(timedelta(hours=8))
-        today = datetime.now(cst).strftime("%Y-%m-%d")
-        data = {"version": 3, "days": {today: {"combos": combos or {}}}}
-        with open(path, "w", encoding="utf-8") as f:
-            json.dump(data, f)
-        return path
-
-    def test_offline_unified_display(self):
-        """停机时与在线统一展示：cooldown 显 (未知)（内存态拿不到），degraded 读账本就绪。"""
-        with tempfile.TemporaryDirectory() as td:
-            cfg_path = self._make_config(td)
-            totals_path = self._make_totals(td, {
-                "supply=s1|route=r1|strategy=cc": {"requests": 10, "ok": 2, "fail": 8}
-            })
-            lines = _format_status_offline(cfg_path, totals_path)
-            joined = "\n".join(lines)
-            self.assertIn("health:", joined)
-            self.assertIn("cooldown (未知)/1", joined)
-            # 统一展示：degraded 段照常（读账本）
-            self.assertIn("degraded supplies", joined)
-            self.assertIn("fail 80.0%", joined)
-
-    def test_offline_config_count_row(self):
-        """停机时 config 计数行照常。"""
-        with tempfile.TemporaryDirectory() as td:
-            cfg_path = self._make_config(td)
-            totals_path = self._make_totals(td)
-            lines = _format_status_offline(cfg_path, totals_path)
-            joined = "\n".join(lines)
-            self.assertIn("config: 1 supplies / 1 routes / 1 strategies", joined)
-            self.assertNotIn("default_cooldown", joined)
-
-    def test_offline_sidecar_overrides_counted(self):
-        """停机时 sidecar overrides 静态可读并求和。"""
-        with tempfile.TemporaryDirectory() as td:
-            cfg_path = self._make_config(td, {
-                "default_cooldown_seconds": 60,
-                "supplies": [],
-                "routes": [],
-                "strategies": [{"client_token": "cc", "route_id": "r1"}],
-            })
-            totals_path = self._make_totals(td)
-            sidecar_path = os.path.join(td, "session_overrides.json")
-            with open(sidecar_path, "w", encoding="utf-8") as f:
-                json.dump({"cc": {"session-abc": {"route_id": "nation1", "last_seen": 0, "created": 0}}}, f)
-            lines = _format_status_offline(cfg_path, totals_path)
-            joined = "\n".join(lines)
-            self.assertIn("overrides 1", joined)
 
 
 # ---------------------------------------------------------------------------

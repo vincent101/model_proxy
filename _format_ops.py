@@ -3,15 +3,10 @@
 
 由 model_proxy_cli.sh 的 cmd_status 调用，也可被 _config_ops.py import。
 
-两个 CLI 入口：
+CLI 入口：
     python3 _format_ops.py status-format <config> <totals>   # stdin 读 server JSON
-    python3 _format_ops.py status-offline <config> <totals>  # 直读 config + sidecar
 
 格式化函数返回 list[str]（不直接 print），可被 unittest 覆盖。
-
-约束：本模块只允许 import stdlib + core.commands.SessionOverridesSidecar（status-offline
-取覆盖数用）。core.commands 必须保持纯 stdlib import 链——若未来 commands.py 引入重依赖，
-会拖慢每次 CLI status 调用（与当前 fork 一个 python3 的开销同级）。
 """
 
 import json
@@ -22,9 +17,6 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-
-# core.commands 必须保持纯 stdlib import 链（已核实）。若未来引入重依赖会拖慢 CLI status。
-from core.commands import SessionOverridesSidecar
 
 TIER_NAMES = ("opus", "sonnet", "haiku")
 
@@ -681,40 +673,9 @@ def _format_status_from_json(data: dict, config_path: str, totals_path: str,
     return lines
 
 
-def _format_status_offline(config_path: str, totals_path: str,
-                           log_path: str | None = None) -> list[str]:
-    """代理未运行时的统一展示：与在线布局一致。
-
-    degraded（账本）/active sessions（日志）/overrides（sidecar）/config 计数均不依赖
-    代理进程，照常展示；仅 cooldown（server 内存态）显 (未知)。退出码 1 由 cmd_status 保持。
-    """
-    cfg, cfg_err = _load_config_tolerant(config_path)
-    if cfg_err:
-        # 离线路径 config 是唯一数据源，损坏时只给错误行（不崩溃）
-        return [f"config: （{cfg_err}）"]
-
-    # overrides: sidecar 静态可读，注入 strategies 供统一格式化求和
-    sidecar_path = Path(config_path).parent / "session_overrides.json"
-    sidecar = SessionOverridesSidecar(sidecar_path)
-    strategies = []
-    for st in cfg.get("strategies", []):
-        st2 = dict(st)
-        st2["sidecar_overrides_count"] = sidecar.count_overrides_for(st.get("client_token", ""))
-        strategies.append(st2)
-
-    data = {
-        "supplies": cfg.get("supplies", []),
-        "routes": cfg.get("routes", []),
-        "strategies": strategies,
-        "cooldown": {},
-    }
-    return _format_status_from_json(data, config_path, totals_path, log_path,
-                                    cooldown_unknown=True)
-
-
 def main() -> None:
     if len(sys.argv) < 2:
-        sys.stderr.write("用法: _format_ops.py <status-format|status-offline> <config_file> <totals_file>\n")
+        sys.stderr.write("用法: _format_ops.py <status-format> <config_file> <totals_file>\n")
         sys.exit(1)
 
     subcmd = sys.argv[1]
@@ -738,20 +699,6 @@ def main() -> None:
             print(f"Error: {data['error']}")
             sys.exit(0)
         for line in _format_status_from_json(data, config_path, totals_path, log_path):
-            print(line)
-        sys.exit(0)
-
-    if subcmd == "status-offline":
-        if len(sys.argv) < 4:
-            sys.stderr.write("status-offline 需要 config_file 和 totals_file 参数\n")
-            sys.exit(1)
-        config_path = sys.argv[2]
-        totals_path = sys.argv[3]
-        log_path = sys.argv[4] if len(sys.argv) >= 5 else None
-        if not os.path.isfile(config_path):
-            sys.stderr.write(f"Error: config not found: {config_path}\n")
-            sys.exit(1)
-        for line in _format_status_offline(config_path, totals_path, log_path):
             print(line)
         sys.exit(0)
 
