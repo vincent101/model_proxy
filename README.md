@@ -541,7 +541,7 @@ root 开 INFO 安全前提：`BaseHTTPRequestHandler.log_message` 已屏蔽（pa
 
 ACCESS 访问日志：每个转发请求（不含 `/model_proxy/*` 控制端点）结束时记一条 INFO 级 `ACCESS`
 行，覆盖整个请求生命周期，字段为
-`req_id ms status source route tier supply failover attempts usage_in usage_out token session route_failover builtin budget_retried budget_truncated stop_reason final_error`
+`req_id ms status source route tier supply failover attempts usage_in usage_out token session route_failover builtin budget_retried budget_truncated stop_reason final_error nudge_rewritten`
 （`req_id` 为请求关联键；`ms` 为端到端耗时毫秒；`token` 为客户端 token 尾4位；`session` 为该
 请求解析出的 session_id 取不到为空串；`route_failover` 为 0/1 标记本次请求是否发生了「pin
 route 全挂后跨 route 兜底」，区别于同 route 内换 supply 的 `failover`；`builtin` 为空表示普通
@@ -550,7 +550,10 @@ route 全挂后跨 route 兜底」，区别于同 route 内换 supply 的 `failo
 轨迹（形如 `16000→32000`，多次逗号相接，空串=未发生），`budget_truncated=1` 为放大到上限仍截断
 或流式收口检测到截断（如实返回了截断响应），`stop_reason` 为响应停止原因（能拿到才记）；
 `final_error` 为终态错误摘要（仅真失败出口写，截断 80 字符、空白转下划线保 k=v 可解析，budget
-截断终态 status=200 不写 final_error，两者正交）。`budget_retried` 高频出现是「调用侧预算普遍
+截断终态 status=200 不写 final_error，两者正交）。`nudge_rewritten=1` 表示入站 body 中 claude CLI
+`thinking_only_retry` 注入的 nudge 文案被精确改写为更明确表述（未命中为空串）；语义边界为「入站
+body 命中即置位」——含被内建命令层拦截、未转发上游的命令请求，与是否实际转发无关，详见
+`docs/designs/2026-08-09-cli-thinking-only-nudge文案proxy改写.md`。`budget_retried` 高频出现是「调用侧预算普遍
 偏小/该模型 thinking 量大」的运营信号，提示调高调用侧起步 max_tokens 以减少重试浪费。
 
 translate 降级限流（OPT-07）：`core/translate.py` 的 14 处内容降级 WARNING（unsupported block
@@ -817,6 +820,10 @@ token 里选定）过滤候选 client_token；无匹配协议的 token 时提示
   `stop_reason` 不变（仍反映真实截断原因）。可用 `core/translate.py` 模块级常量
   `_ENABLE_REASONING_FALLBACK`（默认 True）整体关闭。
   - 与之互斥（2026-08-07 ①b-chat 镜像补齐）：content 非空时，`reasoning_content` 会镜像为 anthropic `thinking` block 置前（而非丢弃），content 本身是 text block；两路径严格互斥不双写。
+- 注入文案改写（2026-08-09 起）：anthropic source 请求转发前扫描全量 user 消息，精确匹配 claude CLI
+  `thinking_only_retry` 注入的 nudge 文案则改写为更明确的「harness 自动重试、非用户空消息」表述，
+  fail-open（不匹配原样透传）；命中时 ACCESS 日志记 `nudge_rewritten=1`，设计见
+  `docs/designs/2026-08-09-cli-thinking-only-nudge文案proxy改写.md`。
 - reasoning 强度映射：source/target 各自声明的档位能力做相对排名映射，非绝对锚定，详见
   「reasoning 强度映射（深入）」§ 6。
 - 输出预算自动放大重试（④b，2026-08-08 起）：非流式响应若「达到输出预算上限且正文缺失」
