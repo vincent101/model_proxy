@@ -87,18 +87,20 @@ def _rewrite_known_injected_texts(body: dict) -> bool:
     return dirty
 ```
 
-**改动 2：`_forward` 步骤 3（body 解析）之后插入调用**（当前 1168 行 `body_json = None` 之后、1169 行 `request_model = ...` 之前）：
+**改动 2：`_forward` 内、内建命令门控（1192 行）之前插入调用**（v1 方案原定在 1168 行 body 解析后，v2 微调到命令门控前，理由见下节"复用评估"——与既有前置处理视觉对齐、"先净化已知注入、再判命令"的顺序语义）：
 
 ```python
-        # 3.5 已知注入文案改写：CLI nudge 等，见函数注释。改写后重序列化 raw_body，
-        # 使 PASSTHROUGH 分支（send_body = raw_body，1436 行）在无其他 body 变更时
-        # 也能带出改写；re-dump 与既有 model 改写路径（1439 行）同款操作，安全。
+        # ---- 已知注入文案改写层（docs/designs/2026-08-09-cli-thinking-only-nudge文案proxy改写.md）----
+        # 插在 source 判定之后、内建命令门控之前：CLI nudge 等注入文案在此改写。
+        # 改写后重序列化 raw_body，使 PASSTHROUGH 分支（send_body = raw_body，1436 行）
+        # 在无其他 body 变更时也能带出改写；re-dump 与既有 model 改写路径（1439 行）同款操作，安全。
+        # fail-open：不匹配则原样透传。
         if isinstance(body_json, dict):
             if _rewrite_known_injected_texts(body_json):
                 raw_body = json.dumps(body_json, ensure_ascii=False).encode("utf-8")
 ```
 
-为什么放这里而不是 PASSTHROUGH 分支内：body_json 是所有四种转发模式（passthrough/to-chat/to-responses/反向）的共同输入，单点插入全覆盖；重赋值 raw_body 后，passthrough 的 `send_body = raw_body`（1436 行）自然带出改写，mode 分支零改动。
+为什么放这里而不是 PASSTHROUGH 分支内：body_json 是所有四种转发模式（passthrough/to-chat/to-responses/反向）的共同输入，单点插入全覆盖；重赋值 raw_body 后，passthrough 的 `send_body = raw_body`（1436 行）自然带出改写，mode 分支零改动。为什么提到命令门控前：与 1192 行既有门控形成"前置处理区"的统一视觉；且顺序上先净化注入文案、再做 `extract_last_user_message_content` 判定，语义更顺（无实际行为差异——命令解析只认 `$` 前缀，nudge 文案命中不了）。
 
 **改动 3：测试**（新增 tools/model_proxy/tests/test_nudge_rewrite.py）：
 - string 形态精确命中改写；text block 形态命中改写
@@ -106,6 +108,31 @@ def _rewrite_known_injected_texts(body: dict) -> bool:
 - 改写后 `_forward` 重序列化（可用现有 server 测试框架，或直接单测函数 + 人工核对插入点）
 
 验证命令：`cd tools/model_proxy && python3 -m pytest tests/ -x -q`（现有 478 测试须保持全绿）。
+
+### 复用评估（v2 新增）：能否复用内建命令（$route 门控）的"规则层能力"？
+
+**结论：无可复用的规则层——内建命令本身就是一段硬编码 if + 命令执行封装，且与 nudge 改写语义正交；不抽统一规则层，保持两个独立小 if。**
+
+内建命令设施的现状形态（精读 server.py:1184-1200 / 1801-1856 + commands.py 后如实记录）：
+
+- 门控点是一段硬编码 if（server.py:1192-1200）：source==anthropic + session_key 非空 + body_json 含 messages list + strategy 匹配 → `extract_last_user_message_content` → `parse_route_command`（$ 前缀、单行、≤2 token、fail-open）→ 命中则 `_handle_builtin_command` 消费请求、自造响应、**早返回不转发**。
+- 配套抽象（commands.py 的 `CommandContext/CommandResult/COMMAND_HANDLERS` 分发表）是**命令执行**封装，语义为"拦截-改道-本地应答"；分发表注释自述为"未来扩展命令预留"。
+- 周边设施：`SessionOverridesSidecar`（route override 热重载存储）、`extract_session_key`（session 哈希分派用）——均为 route 命令专用，nudge 改写无状态、用不上。
+
+两条规则的性质差异，决定它们不适合同一抽象：
+
+| 维度 | $ 门控 | nudge 改写 |
+|---|---|---|
+| 控制流 | intercept-and-respond（消费请求、早返回） | mutate-and-continue（改完放行、照常转发） |
+| 匹配范围 | 只取**最后一条** user 消息（"用户这轮打的话"，last_text_block 还有"只取末个 text 块"的特殊口径） | 扫**全量历史** user 消息（CLI 每次重放全量历史，旧 nudge 每条都要改） |
+| 匹配方式 | 结构解析（前缀/单行/token 数） | 整串全等 |
+| 前置依赖 | 需 session_key + strategy 就绪 | 只需 body 已解析 |
+
+`COMMAND_HANDLERS` 挂不进"改完放行"的动作（它的 action 语义是本地应答）；`extract_last_user_message_content`/`last_text_block` 的口径与 nudge 需要的全量扫描相反。强套统一抽象（如 `rules: list[(match, action)]`、action 分 intercept/rewrite）的代价：两规则的 match 输入不同，要么各自为政（抽象名存实亡），要么构造大而全的 RequestContext（为 2 条规则发明框架）；读代码的人还要在 rules 定义与循环骨架间跳读。**YAGNI：2 条正交规则，抽层收益≈0，反而更绕；第 3 条同类规则出现时（有 3 个样本才知道抽象该长什么样）再抽不迟。**
+
+v2 仅做的对齐性微调（非抽层）：插入点移到命令门控前，两处前置处理在代码里相邻、注释分区风格一致（"---- ... ----"横幅），后来人一眼看到"_forward 开头有两个前置处理"。
+
+**演进记录**：v1（2026-08-09 初版）插入点定在 1168 行 body 解析后；v2（同日，复用评估后）微调到 1192 行命令门控前，新增本节的复用评估结论。推荐方案本身（改动 1/2/3 的内容）无实质变化。
 
 ### 文案设计原则（为何这样写）
 
@@ -137,16 +164,44 @@ def _rewrite_known_injected_texts(body: dict) -> bool:
 | kimi 首次 thinking-only（模型/网关行为） | 不治（不可控，代价可忽略） |
 | CLI nudge 注入（上游特性） | 不治机制本身，改其文案使 kimi 正读 |
 | kimi 误读 nudge → "空消息"叙事循环（pattern A） | **治，本方案核心** |
-| kimi 误读 tool_result-only 轮（pattern B，占投诉大头） | **不治**——疑似网关在工具结果后补空 user 轮，proxy 改 nudge 鞭长莫及；改写 tool_result 内容风险高，明确不推荐 |
+| kimi 误读 tool_result-only 轮（pattern B，占投诉大头） | **不治**——E2 实验已证伪"网关系统性补空 user 轮"，触发条件未明（见实验实录）；改写 tool_result 内容风险高，明确不推荐 |
 | 根解 | 仍是主工作 session 切 claude route（前份调研报告建议 1） |
 
 kimi 改文案后不再误读的概率：无法事前定量。依据是误读三要素中（nudge 归因模糊 / 自身不可见轮在历史 / "(no content)" 训练先验），新文案显式消除第一个、文字对冲第三个；第二个仍在。故残留风险存在，用验证 E1 观察收敛情况。
+
+## E2 实验实录（2026-08-09 已执行，产物 /tmp/nudge-e2e/*.req.json|*.resp.json）
+
+| 细胞 | 路径 | 内容 | 结果 |
+|---|---|---|---|
+| A | proxy→nation(kimi) | 最小三元组：user 提问 → assistant thinking+tool_use → user tool_result | 阴性：正确复述工具结果 |
+| B | 直连网关→kimi（绕开 proxy，分离变量） | 同 A body | 阴性 |
+| C | 直连网关→claude-opus-5（格式对照） | 同 A body | 未执行成：429（AppId 0956 用量上限）；格式有效性由 A/B 正确回答旁证 |
+| D | proxy→nation | 6 轮 tool_use/tool_result 循环 | 阴性 |
+| D2 | proxy→nation | tool_result 为 TaskOutput 超时轮询（1a09afa5 投诉前导同款载荷） | 阴性：正确处理"任务仍在运行" |
+| F | proxy→nation | tool_result content 双 text block（Agent 结果真实形态） | 阴性 |
+| G2 | proxy→nation | 重放 2896beec 真实历史（重构 535 条消息、1.15MB、279K input tokens，截至首个投诉点 line 1305），5 次独立采样 | **5/5 阴性**，每次均正确总结 architect 评估（生产上 kimi 却声称"还没派出 agent/用户发空消息"） |
+
+**附带发现（G 首次 400 报文）**：网关错误原文 "an assistant message with 'tool_calls' must be followed by tool messages responding to each 'tool_call_id'... Bash:0"——证明 nation 网关内部把 anthropic 格式**再转换为 OpenAI chat 格式**（tool_calls/tool messages 措辞），且把工具 id 改名为 `{name}:{n}`。即 proxy 的 anthropic 透传只到网关，网关自己对 kimi 做二次协议转换。此事实与 pattern B 后续归因直接相关。
+
+G2 与生产的已知偏差：无 Claudian system prompt；工具 schema 为 dummy；非流式；9 个悬空 tool_use 注入了合成的 CC 标准中断文案（这些 tool_use 的结果因 transcript 分支结构未入链）。
+
+### 实验结论
+
+1. **"网关在 tool_result 后系统性补空 user 轮"假设证伪**：若系统性存在，535 条消息中几十处 tool_result 必触发，不可能 5/5 阴性。
+2. **Pattern B 最小复现失败，触发条件未明**。残余可能：低概率采样误读（5 次阴性不排除个位数百分比发生率）；依赖未复现变量（system prompt、流式、当日网关/模型版本——投诉集中 8/7-8/9，不排除上游当时版本退化、现已变化）。
+3. 单次阴性不能排除；但"最小三元组→多轮→超时轮询→多块结果→真实历史×5"全链阴性，说明 pattern B 不是确定性协议 artifact，而是低概率/条件性模型行为。
+
+### Pattern B 下一步建议
+
+- **症状嗅探落证**（可选、默认关闭的 proxy 小功能）：流式回传累积 text delta，流末匹配 "空消息/(no content)" 关键词，命中则把该请求 body + 响应文本落盘 debug 目录。把下一次实机发生变成硬证据（拿到网关真实入参），届时可持请求体向网关/kimi 方报障。复杂度中等，与 nudge 改写相互独立。
+- nudge 改写（pattern A）按本方案照常落地，不受实验结果影响。
+- 若切 claude route 后症状消失，pattern B 仅以嗅探监控观察即可，不再深挖。
 
 ## 验证方式
 
 - **E0（单元）**：pytest 全绿 + 新测试覆盖两形态/失配/异常输入。
 - **E1（实机，验证 pattern A 收敛）**：改后重启 proxy（`model_proxy_cli.sh` restart），在 nation session 正常工作；症状曾现后：① proxy log grep "nudge text rewritten" 确认拦截生效；② 对应 transcript 中 nudge 后 kimi 的 thinking 不再把 nudge 称为"空消息/(no content)"（注意 transcript 记录的是 CLI 原始文案，验证看 kimi 的回应文本）；③ 投诉频率对比基线（4eb3be5f 24 次/2 天、2896beec 30 次、1a09afa5 51 次）。
-- **E2（鉴别 pattern B 机制，curl 实验，强烈建议做）**：构造最小 anthropic 请求直发 nation route：user 文本 → assistant tool_use → user tool_result，问 kimi"最后一条用户消息的内容是什么"。若 kimi 答"空消息"之类 → 网关补空 user 轮假设坐实，pattern B 确凿在网关侧，拿实验记录向网关/kimi 提供方报障；若正常 → pattern B 与长上下文/历史复杂度相关，另行归因。
+- **E2（鉴别 pattern B 机制）**：已执行，见上方实录——假设证伪/未复现，结论以实录为准。
 - **E3（失配监控）**：CLI 升级后若症状复发，先 grep proxy log 确认 nudge 改写是否还在生效。
 
 ## 关联
