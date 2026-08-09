@@ -1,11 +1,13 @@
 ---
 type: design-decision
-status: pending
+status: done
 target: "[[tools/model_proxy]]"
 tags: [model_proxy, sidecar, bugfix, config-format]
 ---
 
 # sidecar 文件删除 bug 修复 + compact 格式扩展 routes.tiers
+
+> **注**：已落地（commit b99b304d 修复 + d4121336 compact 扩展）。
 
 > 两个独立小改动,合并一份方案。均为 [务实] 路径。
 

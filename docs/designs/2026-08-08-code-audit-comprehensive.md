@@ -1,12 +1,14 @@
 ---
 type: review
-status: draft
+status: done
 target: "[[tools/model_proxy]]"
 tags: [architect, model_proxy, code-audit, dead-code]
 created: 2026-08-08
 ---
 
 # model_proxy 全面代码审核（2026-08-08 多轮密集改动后）
+
+> **注**：全部发现已修复清零（2026-08-08/09：B1 install 修复、D1-D10 死代码清理、S1 日志隔离、S6/S7 文档注释、O8-O10；D11 保留未删）。
 
 ## 1. 背景与问题
 

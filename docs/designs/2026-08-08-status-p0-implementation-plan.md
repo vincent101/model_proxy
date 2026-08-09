@@ -1,6 +1,6 @@
 ---
 type: design-decision
-status: pending
+status: done
 target: "[[tools/model_proxy]]"
 tags:
   - architect
@@ -12,6 +12,8 @@ created: 2026-08-08 22:10:00
 ---
 
 # status P0 档实施方案（零 server 改动，CLI 侧落地）
+
+> **注**：已落地（2026-08-08）。后续精简轮删除了 orphan/config notices/unmatched/damaged routes 段展示，本文的异常清单设计部分被取代；最终形态以代码为准。
 
 > [务实] 路径：把 [[2026-08-08-status-content-redesign]] §6 P0 档落成可执行实施清单。
 > 范围已由用户拍板：① 做 P0；② degraded 阈值 fail%>30% 且样本≥5；③ STATUS preset 缩成计数行（明细全归菜单）。

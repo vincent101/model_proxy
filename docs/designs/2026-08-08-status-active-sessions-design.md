@@ -1,6 +1,6 @@
 ---
 type: design-decision
-status: pending
+status: done
 target: "[[tools/model_proxy]]"
 tags:
   - architect
@@ -12,6 +12,8 @@ created: 2026-08-08 23:00:00
 ---
 
 # status 新增"活跃 session 链路健康"展示设计
+
+> **注**：已落地（2026-08-08，含用户拍板的链路分布视图格式）。
 
 > [务实] 路径。接续 [[2026-08-08-status-p0-implementation-plan]]（已实施），在 status 健康仪表盘加一段：
 > **当前活跃 session（30min 内有请求）各自的链路是否正常**。

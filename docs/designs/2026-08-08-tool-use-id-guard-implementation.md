@@ -1,11 +1,13 @@
 ---
 type: design-decision
-status: draft
+status: shelved
 target: "[[tools/model_proxy]]"
 tags: [architect, model_proxy, anti-loop, id-guard, 务实, 实施方案]
 ---
 
 # A+B 档实施方案：tool_use id 守卫（检测 + 出站修复）
+
+> **注**：2026-08-08 用户拍板搁置——只为 kimi-k3 一个模型做 proxy 防护，成本/复杂度过高；主会话 agentic 负载供应侧规避（D 档）是更直接手段。
 
 > 用户已拍板做 A（观测告警）+ B（协议修复），[务实] 路径：最小改动、可灰度、可回滚。
 > 前置分析：[[2026-08-08-subagent-wakeup-chain-and-antiloop-feasibility]]（故障链路还原 + 分档建议）。

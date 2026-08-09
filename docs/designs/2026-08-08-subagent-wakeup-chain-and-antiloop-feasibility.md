@@ -1,11 +1,13 @@
 ---
 type: design-decision
-status: draft
+status: shelved
 target: "[[tools/model_proxy]]"
 tags: [architect, model_proxy, anti-loop, wakeup-chain, kimi-k3, 调研]
 ---
 
 # subagent 唤醒主会话链路还原 + modelproxy 拦截可行性评估
+
+> **注**：链路分析留存有价值；拦截/防护方案随 id-guard 一并搁置（2026-08-08 用户拍板）。
 
 > 调研/分析类文档。起因：2026-08-07 14:42–15:32 UTC 主会话（Claudian）故障——每次 subagent 跑完
 > tool_result 唤醒主会话，kimi-k3 就幻觉"用户发了空消息 (no content)"并重复派同一个 Agent 调用，

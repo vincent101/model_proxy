@@ -1,11 +1,13 @@
 ---
 type: evaluation
-status: draft
+status: done
 target: "[[tools/model_proxy]]"
 tags: [architect, model_proxy, cli, status, help]
 ---
 
 # CLI status / --help 展示评估（理想路径 · assessment）
+
+> **注**：评估发现已全部落地（CLI 改进方案两梯队 + status P0 重设计 + 后续多轮精简）。
 
 > [理想] 路径：不计改动成本，评估信息展示的结构化、合理性、一致性、可用性，给目标形态。
 > 评估基准：master 工作区运行态，2026-08-07 实测（代理在跑 18889；config = **25 supplies / 4 routes / 2 strategies**，cc/codex 全 route_pool 写法；`config/session_overrides.json` 不存在，override=0）。本次实测无 e2e 并发测试干扰，是三篇同题文档中最干净的基线。

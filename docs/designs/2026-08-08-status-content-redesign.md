@@ -13,6 +13,8 @@ created: 2026-08-08 20:30:00
 
 # status 子命令内容重构（理想路径 · 运行态优先）
 
+> **注**：P0 档已实施（经 2026-08-08-status-p0-implementation-plan 落地并后续精简）；P1（server 端 started_at 等）/P2 未实施。
+
 > [理想] 路径：不计改动成本，从运维实际使用场景出发，重新定义 status 这个"一眼概览"命令该展示什么。
 > 与 [[2026-08-08-cli-status-help-improvement-plan]]（已落地，格式层：单源化/紧凑/停机降级）正交——那篇改"怎么排版"，本篇改"展示什么内容"。不否定格式改进，是在其之上重定内容边界。
 > 核实基准：2026-08-08 master 工作区，代理在跑（pid 74845, port 18889）；config = 25 supplies / 6 routes / 4 strategies；账本 `.claude_model_proxy_totals.json` v3。
