@@ -1,6 +1,6 @@
 ---
 type: design-decision
-status: confirmed
+status: draft
 target: tools/model_proxy
 tags: [architect, model_proxy, in-band-command]
 ---
