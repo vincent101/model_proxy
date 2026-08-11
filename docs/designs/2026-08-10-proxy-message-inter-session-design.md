@@ -1,17 +1,21 @@
 ---
 type: design-decision
 status: draft
-version: 3
+version: 3.1
 target: "[[tools/model_proxy]]"
 tags: [architect, model_proxy, in-band-command, inter-session-message, bidirectional, remote-control, listen, response-splice]
 ---
 
-# `$message` 跨 session 消息互通与远程遥控方案设计（v3）
+# `$message` 跨 session 消息互通与远程遥控方案设计（v3.1）
 
 > [务实] 路径。在 model_proxy 现有命令框架上新增 `$message` 命令族，实现跨 session
 > 双向消息传递与远程遥控，所有投递经响应通道在 SDK 页面可见。核实基准：2026-08-11
 > master 工作区；core/server.py 代码实证；claude 2.1.197；隔离实测（/tmp/ups-hook-test、
-> /tmp/splice-test）。
+> /tmp/splice-test、/tmp/splice-test2）。
+>
+> v3.1 相对 v3：落回架构审核意见——listen 简化为滑动时间窗（无手动 off）、条件触发
+> 前置统一判断 + 分层落地、splice 多场景实测结论写入、请求注入抽独立函数、ACCESS
+> 日志 message 事件、splice 失败降级、b 通道先认领后注入、resume/fork 边角补全。
 
 ## 1. 背景与问题
 
@@ -21,7 +25,7 @@ tags: [architect, model_proxy, in-band-command, inter-session-message, bidirecti
 **场景链路（主场景：远程遥控 session-b 的 agent）**：
 
 1. B 在跑任务，人要离开 B 的机器。
-2. 离开前在 B 敲 `$message listen on` → B 进入"可远程联系"态。
+2. 离开前在 B 敲 `$message listen` → B 进入"可远程联系"态。
 3. 人到别处，经 IM 通道操作 session A。
 4. 在 A 用 `$message send to-agent <b-id> <内容>` 发指令/问进度。
 5. B 的 agent 收到后处理，用 `$message send to-agent <a-id> <回复>` 反向回 A。
@@ -86,24 +90,34 @@ listen 开关控制，非常开。
 ### 4c. 通道轮询：CronCreate `$message check`
 
 B 空闲但人离开时，没人敲 prompt → UserPromptSubmit 不触发、b 也没有请求可注入。
-靠 `$message listen on` 时 agent 自建的 CronCreate 轮询覆盖此状态。
+靠 `$message listen` 时 agent 自建的 CronCreate 轮询覆盖此状态。
 
 ### 4d. 通道 SessionStart：重开投递
 
 B 关闭后，消息留存。B 下次 resume/启动时 SessionStart hook 投递。
 
-## 5. listen 机制
+## 5. listen 机制（v3.1：滑动时间窗，无手动 off）
 
-`$message listen on|off` **不由 proxy 拦截**，由 B 的 agent（经 skill）处理。
+命令只留 `$message listen`（= listen on），**去掉 `listen off`**——无手动关闭场景，
+off 全自动。listen 状态信号 + 自动关闭用**滑动时间窗**：
 
-### 5.1 agent 侧动作（listen on）
+- `$message listen` → proxy 拦截记 `B.listen_until = now + 窗口`（窗口时长 ≥ 60min，
+  对齐 cron 自动停周期）；同时 agent 侧执行 CronCreate（双重动作）。
+- 每次 `$message check` 轮询 → proxy 刷新 `B.listen_until = now + 窗口`。
+- b 注入只在 `now < B.listen_until` 时触发。
+- cron 自动停（连续 6 空 = 60min 无轮询）→ 不再刷新 → 窗口超时 → b 自动关。
+  **按时间计算，无需显式 off 信号。**
 
-1. 调 `CronCreate` 注册一个每 10min 的 `$message check` 轮询：
-   - `durable: true`（防 B 重启丢失）。
-   - 连续 6 次空轮询自动停（=60min 无活动）。
-   - 自动停时通知 proxy 关 b 注入（listen 开关关闭）。
-2. 通知 proxy 对 B 开 b 注入通道（让 proxy 知道 B 处于 listen 态，可对 B 的
-   to-agent 消息走 mid-run 请求注入）。
+listen 命令由 proxy 拦截记录 `listen_until` + agent 侧执行 CronCreate——这解决原
+H1"proxy 不知道 listen 态"：proxy 在拦截 listen 时即写入窗口，b 注入判断纯看
+`listen_until`，不依赖任何额外 off 信号。
+
+### 5.1 双重动作
+
+`$message listen` 是双重动作：
+1. **proxy 拦截**：记 `B.listen_until = now + 窗口`，合成确认响应返回（不转发上游）。
+2. **agent 侧**（经 skill）：调 `CronCreate` 注册每 10min 的 `$message check` 轮询
+   （`durable: true` 防 B 重启丢失；连续 6 次空轮询自动停 = 60min 无活动）。
 
 ### 5.2 硬约束：proxy 推不进去
 
@@ -114,9 +128,10 @@ proxy **没法替存活 session 建轮询**：
 
 因此 listen 必须由 B 的 agent 自建轮询，这是**硬约束而非设计选择**。
 
-### 5.3 listen off
+### 5.3 自动关闭（无手动 off）
 
-agent 调 CronDelete 停轮询 + 通知 proxy 关 b 注入通道。
+listen 无手动关闭路径：cron 6 空自动停 → 不再 check → `listen_until` 不再刷新 →
+窗口超时 → b 注入自动失效。proxy 侧无需监听任何 off 信号，纯时间计算。
 
 ## 6. 投递机制（v3 核心：响应通道回执）
 
@@ -148,20 +163,39 @@ to-agent 消息注入请求转发模型后，proxy 在响应流**末尾追加一
 transcript 记录回执、stream-json 可见、续轮请求原样保留 splice text+tool_use、
 num_turns:2 success；对照组唯一差异是无回执。
 
-**工程路径**：PASSTHROUGH 流式从"字节透传 + 旁路嗅探"升级为"事件级透传 + 注入"——
-按 `\n\n` 切 SSE 事件块 → 解析 event_type → 累积 max index → 在 message_delta 前注入
-回执 block。已有 `_parse_anthropic_sse_block`（`server.py:2363+`）做事件解析；
-`OpenAIToAnthropicStreamAdapter`（`core/translate.py:716+`）的事件构造 helper 可复用。
-实现量中等，纯标准库，不引入新依赖。
+**条件触发（v3.1 前置统一判断）**：在 `server.py:1660` 附近前置统一判断一次
+（设 `self._splice_receipt`），各分支用各自机制注入。按难度分层落地：
 
-## 7. 请求注入约束（沿用既有先例）
+| 层 | 分支 | 机制 | 难度 |
+|---|---|---|---|
+| 先行 | 3b/4b 转换非流式 | dict `content.append(text block)` | 低 |
+| 次之 | 3a/4a 转换流式（ANTHROPIC_TO_CHAT/RESPONSES） | adapter 已事件级，finalize 前 `message_delta` 之前注入 text block（index=`cur_index+1`） | 低 |
+| 再次 | 1b PASSTHROUGH 非流式 | json.loads 后 content append 再 dumps | 低 |
+| 最后 | 1a PASSTHROUGH 流式 | 字节透传升级为事件级，复用 `_parse_anthropic_sse_block`（`server.py:2363+`），message_delta 前注入 | 高 |
+| 不做 | 5a/5b RESPONSES_TO_ANTHROPIC | responses 格式，B 的 CC 走 anthropic 不涉及 | 首版不支持，文档标注 |
 
-参照 `_rewrite_known_injected_texts`（`core/server.py:684-725`，在 `_forward` 内、
-source 门控后、转发前改请求 body）：**追加 text block 到最后一条 user 消息，不插新
-user message**。
+关键更正：转换分支（3a/4a）本就事件级，splice 不需要"字节透传升级"，只有 1a 是
+硬骨头。`OpenAIToAnthropicStreamAdapter`（`core/translate.py:716+`）的事件构造 helper
+（`_content_block_start_text` / `_content_block_delta_text` / `_content_block_stop` /
+`_message_delta_event` / `_message_stop_event`）可复用。实现量中等，纯标准库，
+不引入新依赖。
 
-既有 nudge 改写刻意选"原地改/追加"而非"插新消息"，理由：插新 user message 破坏
-role 交替（400）或改历史结构。v3 注入遵守同约束。
+**失败降级（O3）**：splice 注入时上游断 / 写入一半 CC 断 → 放弃回执即可（消息已注入
+请求转发、模型已看到，回执是锦上添花），不重投。
+
+## 7. 请求注入约束（v3.1：抽独立函数）
+
+请求注入抽独立函数 `_maybe_inject_message(body_json, session_key, listen_state)`，
+在命令拦截后、route 选择前调用。
+
+**与 `_rewrite_known_injected_texts` 的关系**：两者都是条件触发，但**不合并**——
+- 条件类型不同：`_rewrite_known_injected_texts` 是内容精确匹配（命中已知注入文本），
+  `_maybe_inject_message` 是状态判断（listen 态 + 有待投消息）。
+- 操作不同：前者原地改写既有 text block（`core/server.py:684-725`，在 `_forward`
+  内、source 门控后、转发前），后者追加新 text block。
+
+**注入约束**：参照 nudge 改写先例，**追加 text block 到最后一条 user 消息，不插新
+user message**。理由：插新 user message 破坏 role 交替（400）或改历史结构。
 
 ## 8. 双向回复
 
@@ -180,23 +214,41 @@ tool_result → 最终回复为第 2 轮），但 UserPromptSubmit hooklog 恰�
 **结论**：UserPromptSubmit hook **只在人提交 prompt 时触发，tool_result 续轮不触发**。
 依赖 UserPromptSubmit 覆盖 mid-run 不成立，b 通道不可省。此为已验证事实。
 
-### 9.2 splice 末尾追加 text block 可行
+### 9.2 splice 末尾追加 text block 可行（多场景实测）
 
-**实测口径**：2026-08-11，隔离目录 `/tmp/splice-test/`，独立最小中间层（不碰
-model_proxy 代码）。
+**实测口径**：2026-08-11，隔离目录 `/tmp/splice-test/`（基础场景）与
+`/tmp/splice-test2/`（扩展多场景），独立最小中间层（不碰 model_proxy 代码），
+每场景 splice 组 + 对照组。
 
-- **splice 组**：合成 anthropic SSE 流 = `message_start` →
+**基础场景**（tool_use 结尾 + 末尾 text 回执）：
+- splice 组合成 anthropic SSE 流 = `message_start` →
   `content_block_start(tool_use, index=0)` → `content_block_delta(input_json_delta, 0)`
   → `content_block_stop(0)` → **（splice 注入）**
   `content_block_start(text, index=1)` → `content_block_delta(text_delta, 1,
   "[收到 A 留言: hi]")` → `content_block_stop(1)` → `message_delta(stop_reason=tool_use)`
   → `message_stop`。
-- **对照组**：去掉 splice（纯 tool_use block）。
-- **结果**：splice 组 transcript line 8 记录回执、stream-json 可见、续轮请求原样保留
+- 结果：splice 组 transcript line 8 记录回执、stream-json 可见、续轮请求原样保留
   splice text+tool_use、num_turns:2 success；对照组唯一差异是无回执。
 
+**扩展实测（/tmp/splice-test2，5 场景全过，无硬障碍）**：
+
+| 场景 | 结果 |
+|---|---|
+| thinking+text+tool_use 交错 | 可行 |
+| 多 tool_use（3 个） | 可行 |
+| 大 delta 分片（48 个 1 字符 delta） | 可行，CC 正确拼接 |
+| index 跳跃（0→2→5→6） | 可行，CC 完全容忍非连续 |
+| 上游中途断流 | 不构成障碍——CC 优雅处理（不报错不卡死），未完成回执被丢弃但 tool_use 不受影响 |
+
+**实现层约束**：回执 block 的 `start→delta→stop` 必须完整发出后再发
+`message_delta`+`message_stop`。
+
+**附带发现**：CC 把同一响应的多个 content block 拆成多条独立 assistant transcript
+条目——回执是独立条目，可见性更好。
+
 **结论**：响应通道回执可落地。splice 回执由 proxy 确定性注入，**消除对 model echo
-（靠模型自觉复述）的依赖**。
+（靠模型自觉复述）的依赖**。合成实测已覆盖主要流式形态，但真实上游（非合成）端到端
+仍建议落地时回归（V7）。
 
 ### 9.3 nudge 改写先例
 
@@ -214,18 +266,27 @@ text，在 `_forward` 转发前。→ v3 请求注入复用此模式（但追加
 
 消息类型在 `$message send` 时可选指定，默认 query。
 
-## 11. 邮箱
+## 11. 邮箱（v3.1：目录口径 + 认领时机 + ACCESS 日志）
 
 **单 inbox + status 字段（pending/delivered）**，不设 agent-seen 中间态。
 
 ```
-inbox/<session-id>.jsonl          # proxy append；消息入口
-delivered/<session-id>.<ts>.jsonl # hook/check/splice 落 transcript 后归档
+config/messages/inbox/<session-id>.jsonl          # proxy append；消息入口
+config/messages/delivered/<session-id>.<ts>.jsonl # hook/check/splice 落 transcript 后归档
 ```
 
+- **目录口径**：与 `session_overrides.json` 同目录口径一致（都在 config/ 下）。
+  README 注明"config/ 混有配置与运行时状态两类文件"。
 - **简化理由**：b 一次性注入靠模型响应带下去，接受极少数"模型没接住"边角；若实测
   咬人再加 agent-seen 中间态。
-- maildir rename 原子认领去重（b/check/hook 竞态）。
+- **b 通道认领时机（先于注入）**：b 判断有 to-agent 待投后，**先 rename 认领
+  （mv 到 delivered/），再注入请求 + splice 回执**。否则 b 注入后 check 又认领
+  同一封信 → 重复投递。其他通道看到信已不在 inbox 自然跳过。
+- **ACCESS 日志 message 事件（O2）**：只记元数据不记内容（隐私 + 体积）：
+  - `message_sent`（from / to / type / len）
+  - `message_delivered`（channel = a / b / poll / sessionstart）
+  - `message_spliced`（index）
+  - `listen`（session, until）
 - ground-truth 审计靠 `delivered/` 归档 + ACCESS 日志。
 
 ## 12. 空轮询 transcript 卫生
@@ -253,7 +314,7 @@ delivered/<session-id>.<ts>.jsonl # hook/check/splice 落 transcript 后归档
 | `$message send to-agent <id> <内容>` | proxy 拦截 | 向目标 session 的 agent 投递消息 |
 | `$message send to-human <id> <内容>` | proxy 拦截 | 向目标 session 的人投递消息 |
 | `$message check` | proxy 拦截 | 统一手动/定时拉取，按类型路由（§6） |
-| `$message listen on\|off` | agent 执行 | CronCreate + 通知 proxy 开/关 b 注入 |
+| `$message listen` | proxy 拦截 + agent 执行 | proxy 记 `listen_until`（滑动窗口）；agent 侧 CronCreate 轮询（双重动作） |
 | `$message` | proxy 拦截 | 裸命令：发出消息投递状态 + inbox 待收 + help |
 
 ### 解析层约束
@@ -280,7 +341,9 @@ delivered/<session-id>.<ts>.jsonl # hook/check/splice 落 transcript 后归档
 | 5 | CronCreate 7 天自动过期 | 离开超 7 天要续 |
 | 6 | mid-run 注入有跑偏风险 | 靠消息类型标注缓释（§10） |
 | 7 | B 重启丢 session-only 轮询 | `durable:true` 缓解 |
-| 8 | splice 实测为合成固定响应 | 真实上游流式（index 跟踪、thinking 交错、多 tool_use）未覆盖，落地时需补测 |
+| 8 | splice 实测为合成响应 | 合成实测已覆盖主要流式形态（§9.2，5 场景全过），真实上游（非合成）端到端仍建议落地时回归（V7） |
+| 9 | resume 是否触发 SessionStart 未知 | V4 端到端须明确覆盖 `--resume` 场景确认 SessionStart 是否触发；若不触发，补 fallback（resume 后首次 UserPromptSubmit 顺带查 inbox） |
+| 10 | fork 后 listen 不继承 | fork 产生新 session_id，不继承原 session 的 listen 窗口和 cron。skill 文档提醒 agent fork 后需重新 `$message listen` |
 
 ### prompt-injection 面
 
@@ -316,8 +379,8 @@ in-band 命令机制——`$route` 与 `$message` 两族命令、listen 流程�
 **边界**：
 - skill **只通过 in-band 命令**与 proxy 交互（`$route` / `$message`），不直接碰
   proxy 内部（sidecar / inbox 文件 / server.py 对象 / 日志）。
-- listen on/off 由 agent 侧执行（CronCreate 轮询 + 发 `$message` 命令通知 proxy），
-  不由 proxy 拦截——skill 教 agent 自己完成这些动作。
+- listen 由 proxy 拦截（记 `listen_until`）+ agent 侧执行（CronCreate 轮询）双重
+  动作——skill 教 agent 自己完成 CronCreate 部分。
 - skill 是纯知识层，不持有 proxy 状态句柄；所有状态查询经 `$route` / `$message` 命令。
 
 ### 17.2 SKILL.md frontmatter description
@@ -346,14 +409,14 @@ SKILL.md
 │   ├── 取回执：$message check 或 $message 裸命令
 │   └── listen 收 B 回复（对称，A 也开 listen）
 ├── B 侧流程（收信方）
-│   ├── listen on：CronCreate 轮询 + 通知 proxy 开 b 注入
+│   ├── listen：$message listen（proxy 记 listen_until）+ CronCreate 轮询
 │   ├── 收信处理：识别注入包装 → 当远程指令处理
 │   └── 回复：$message send to-agent <from-id> <内容>
 ├── listen 机制
 │   ├── 硬约束：proxy 推不进存活 session（§5.2），必须 agent 自建轮询
-│   ├── listen on 动作：CronCreate(10min, durable:true) + 通知 proxy 开 b
-│   ├── listen off 动作：CronDelete + 通知 proxy 关 b
-│   └── 自动停：连续 6 次空轮询 → 自动停 + 通知 proxy 关 b
+│   ├── listen 动作：$message listen（proxy 记 listen_until）+ CronCreate(10min, durable:true)
+│   ├── 滑动窗口：每次 check 刷新 listen_until；无手动 off
+│   └── 自动关：连续 6 次空轮询（60min）→ cron 停 → 窗口超时 → b 自动关
 ├── 收信/发信/取回执处理
 │   ├── 收信（无信 / to-human）：proxy 合成完整响应，SDK 页面可见
 │   ├── 收信（to-agent / b）：注入请求 + splice 回执进响应流末尾
@@ -363,6 +426,7 @@ SKILL.md
 │   ├── 短 id 匹配：前缀唯一命中自动补全，多命中报错列候选
 │   ├── 消息类型：query（简答后继续）/ guidance（按此调整）
 │   ├── 轮询自动停：连续 6 次空轮询（60min 无活动）自动停
+│   ├── fork 后 listen 不继承：fork 产生新 session_id，需重新 $message listen
 │   └── 自环拒绝：from == to 拒绝
 └── 示例
     ├── A 侧：发信 → 取回执 → listen 收回复
@@ -398,36 +462,44 @@ SKILL.md
 
 **skill 创建是实施的最后一步**，排在所有功能代码之后：
 
-1. commands.py parse 分派 + handler（send / check / 裸命令）
-2. server.py 请求注入 + splice + check 路由 + listen 开关
+1. commands.py parse 分派 + handler（send / check / listen / 裸命令）
+2. server.py：`_maybe_inject_message` 独立函数 + splice 分层落地（条件触发
+   前置统一判断 `_splice_receipt`）+ check 路由 + listen 滑动窗口（`listen_until`
+   状态表）+ ACCESS 日志 message 事件
 3. hooker/deliver_messages.sh（UserPromptSubmit + SessionStart）
 4. _install_ops.py hook 管理泛化
 5. tests/ 单测
-6. README $message 小节 + 安全提示
+6. README $message 小节 + 安全提示 + config/ 混合配置/运行时状态说明
 7. **proxy skill 创建**（skill-creator 落地）
 
 ## 18. 影响面
 
 - `core/commands.py`：parse 函数新增 `$message` 前缀分派；`handle_message_send`、
-  `handle_message_check`、`handle_message_status`（裸命令）handler；help 文案。
-  listen on/off 不在 proxy 侧（agent 执行）。
+  `handle_message_check`、`handle_message_listen`（记 `listen_until` + 合成确认）、
+  `handle_message_status`（裸命令）handler；help 文案。
 - `core/server.py`：
-  - `CommandContext` 注入"见过的 session"表句柄；`_forward` 在无命令时也顺带记录
-    session last_seen。
-  - mid-run 请求注入逻辑（B listen 态时追加 text block 到最后 user 消息）。
+  - `CommandContext` 注入"见过的 session"表句柄 + `listen_until` 状态表；`_forward`
+    在无命令时也顺带记录 session last_seen。
+  - `_maybe_inject_message(body_json, session_key, listen_state)` 独立函数（§7）：
+    命令拦截后、route 选择前调用，与 `_rewrite_known_injected_texts` 不合并。
+  - 条件触发前置统一判断 `_splice_receipt`（`server.py:1660` 附近），分层落地
+    （§6.2 表）：3b/4b dict append / 3a/4a adapter 事件级 / 1b json 改写 / 1a
+    PASSTHROUGH 流式字节透传升级事件级（复用 `_parse_anthropic_sse_block`）；
+    5a/5b 首版不支持。
+  - splice 失败降级（O3）：上游断 / 写一半 CC 断 → 放弃回执，不重投（§6.2）。
   - `$message check` 拦截/按类型路由逻辑。
-  - PASSTHROUGH 流式路径（`_write_streaming_response`）从字节透传升级为事件级
-    透传 + 注入；新增 SSE 事件边界解析与 index 跟踪（复用
-    `_parse_anthropic_sse_block`）。
+  - ACCESS 日志 message 事件（§11）：`message_sent` / `message_delivered` /
+    `message_spliced` / `listen`，只记元数据。
 - 新增 `hooker/deliver_messages.sh`——UserPromptSubmit + SessionStart hook 脚本。
 - `_install_ops.py`：hook 管理泛化到本工具第 2 条 hook。
 - 新增 `proxy` skill（§17）——**实施的最后一步**，排在以上全部功能代码（commands.py
-  handler、server.py 注入/splice/check、hooker、_install_ops.py、单测、README）之后，
-  功能代码全部落地且单测通过后才用 skill-creator 创建。
+  handler、server.py 注入/splice/check/listen、hooker、_install_ops.py、单测、README）
+  之后，功能代码全部落地且单测通过后才用 skill-creator 创建。
 - `tests/`：parse `$message` 分派、send handler（写收件箱/短 id 匹配/自环/超长）、
   check 按类型路由（无信合成/to-human 合成/to-agent 注入+splice）、maildir rename
-  不丢消息的并发用例、listen 开关对 b 注入的控制、splice index 单调性。
-- README 加 `$message` 小节 + 安全提示。
+  不丢消息的并发用例、b 通道先认领后注入不重复投递（§11）、listen_until 窗口
+  （listen 记窗 / check 刷新 / 超时自动失效）对 b 注入的控制、splice index 单调性。
+- README 加 `$message` 小节 + 安全提示 + config/ 混合配置/运行时状态说明。
 
 ## 验证方式
 
@@ -437,25 +509,27 @@ SKILL.md
 - **单测**：parse `$message` 分派/回归（缺参、多行内容、句中提及不误命中）；send
   handler 写收件箱、短 id 唯一/多命中/零命中、自环拒绝、超长拒绝；check 按类型
   路由（无信合成"无"不调模型、to-human 合成返回、to-agent 注入+splice）；maildir
-  并发用例（append 与 hook mv 交叉，断言不丢不重）；listen on/off 对 b 注入通道
-  控制；splice index 单调性校验。
+  并发用例（append 与 hook mv 交叉，断言不丢不重）；b 通道先认领后注入不重复投递；
+  listen_until 窗口（listen 记窗 / check 刷新 / 超时自动失效）对 b 注入通道控制；
+  splice index 单调性校验。
 - **V1 端到端（CLI×CLI，通道 a）**：沙箱起两个 `claude --session-id`，A 发
   `$message send to-agent <B> hi`，断言：A 收回执；B 下一条 prompt 后 UserPromptSubmit
   hook 注入消息（B 的 transcript 可见包装文本）；inbox → delivered 归档。
-- **V2 mid-run 注入（通道 b）**：B `$message listen on` → B 跑长任务（tool 循环中）→
+- **V2 mid-run 注入（通道 b）**：B `$message listen` → B 跑长任务（tool 循环中）→
   A 发消息 → 断言 B 的下一个请求被 proxy 追加 text block 注入 → B 的响应末尾 splice
   回执可见 → B 的 agent 收到并处理。
-- **V3 轮询（通道 check）**：B `$message listen on` → B 空闲无人操作 → A 发消息 →
+- **V3 轮询（通道 check）**：B `$message listen` → B 空闲无人操作 → A 发消息 →
   断言 CronCreate 触发 `$message check` → proxy 按类型路由 → B 的 agent 处理 →
   B 用 `$message send to-agent <A>` 回复 → A 经 check/listen 收到。
-- **V4 离线投递（SessionStart）**：B 退出后 A 发消息 → B `--resume` → SessionStart
-  投递。
+- **V4 离线投递（SessionStart）**：B 退出后 A 发消息 → B `--resume` → **明确确认
+  SessionStart 是否触发**；若不触发，补 fallback（resume 后首次 UserPromptSubmit
+  顺带查 inbox）。
 - **V5 边界**：目标不存在（回执警示 + 消息留存）；短 id 前缀投递；自环拒绝；
   超长拒绝。
-- **V6 空轮询卫生**：连续 6 次空轮询后自动停 + 通知 proxy 关 b；检查 transcript
-  poll-pattern 行数；`/compact` 后 poll 痕迹被摘要掉。
-- **V7 splice 真实上游流式补测**：当前实测为合成固定响应（§9.2）；落地时需补测
-  真实上游流式（index 跟踪、thinking 交错、多 tool_use 场景）。
+- **V6 空轮询卫生**：连续 6 次空轮询后自动停 → `listen_until` 超时 → b 自动失效；
+  检查 transcript poll-pattern 行数；`/compact` 后 poll 痕迹被摘要掉。
+- **V7 splice 真实上游回归**：合成实测已覆盖主要流式形态（§9.2，5 场景全过），
+  V7 聚焦真实上游（非合成）端到端回归确认无差异。
 - **V8 Claudian 端到端**：临时改 user 层 settings 指向沙箱，Claudian tab 收/发
   各验一次，立即还原。
 - **回归**：`python3 -m unittest discover tests` 全绿；不含命令的消息照常转发
@@ -464,7 +538,7 @@ SKILL.md
 ## 关联
 
 - [[2026-08-11-proxy-message-splice-feasibility]]——splice 回执可行性调研，§9.2
-  实测证据的来源文档。
+  实测证据的来源文档（v3.1 §9.2 扩展多场景结论基于 /tmp/splice-test2 扩展实测）。
 - [[2026-08-09-proxy-command-namespace-design]]（`$proxy` 命名空间方案）——v3 显式
   取代该方向的"统一进 `$proxy` 命名空间"设计，`$message` 与 `$route` 并列为平级命令。
   该文档 status 仍为 draft 未落地，v3 不依赖它。
