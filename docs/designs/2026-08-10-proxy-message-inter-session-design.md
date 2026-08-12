@@ -1,9 +1,9 @@
 ---
 type: design-decision
-status: draft
+status: shelved
 version: 3.1
 target: "[[tools/model_proxy]]"
-tags: [architect, model_proxy, in-band-command, inter-session-message, bidirectional, remote-control, listen, response-splice]
+tags: [architect, model_proxy, in-band-command, inter-session-message, bidirectional, remote-control, listen, response-splice, superseded-by-cc-native]
 ---
 
 # `$message` 跨 session 消息互通与远程遥控方案设计（v3.1）
@@ -547,3 +547,97 @@ SKILL.md
 - [[2026-08-08-status-active-sessions-design]]（活跃 session 口径、短 id 惯例）
 - [[2026-07-22-install-manage-sessionstart-hook]]（hook 条目幂等管理先例）
 - [[2026-08-06-session-overrides-single-storage]]（sidecar 存储模式）
+
+---
+
+## 附录 A：CC 官方 cross-session messaging 调研与搁置决策（2026-08-12）
+
+### A.1 触发
+
+CC 2.1.224（2026-08-07）正式引入官方 cross-session messaging。本方案 v3.1 设计的
+核心场景（跨 session 双向消息、mid-run 投递、远程遥控）与官方功能高度重叠。经调研
+官方文档与系统 prompt 工具描述，确认官方功能覆盖面足够，故**搁置本自建方案**，待
+brew 版本更新到 ≥2.1.224 且解除禁用 env 后使用官方功能。
+
+### A.2 CC 官方能力全貌（2.1.224+）
+
+- **工具**：`ListAgents`（发现可达 session）+ `SendMessage`（按名字投递纯文本）。
+  Claude 自己调，用户自然语言触发（"告诉 payments 那个 session 我们改了什么"）。
+  slash 命令：`/list-agents`（`/peers`）、`/status`、`/rename`。
+- **寻址**：会话名（`/rename`、`--name`，否则按工作目录推导）；重名用 `[ref]` 短标识
+  消歧。`ListAgents` 自动发现同机 session。
+- **投递时机**：mid-turn 在两次工具调用间隙注入（不打断单个运行中工具）；空闲时
+  开新 turn。消息入队，接收方下一轮工具间隙排空。
+- **可见性**：以发送者身份进 conversation，transcript 可见（2.1.227+ 内联显示，
+  可折叠）。
+- **回复**：入站消息带 `from`，回复 = 把 `from` 复制为 `to`。包装为
+  `<cross-session-message from="...">`。
+- **信任**：`crossSessionInbound` accept/hold/refuse；按权限模式分类决定；held
+  默认 5min 过期；消息不能批权限、不能改配置、命令不执行。
+- **传输**：同机 Unix socket（`CLAUDE_CODE_MESSAGING_SOCKET`，owner-only）；跨机
+  Remote Control 经 Anthropic 服务器。
+- **限制**：纯文本；50 条未读/会话；限流；仅 macOS/Linux；Bedrock/Cloud 不可用；
+  四个隐私 env（`CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC`、`DISABLE_TELEMETRY`、
+  `DO_NOT_TRACK`、`DISABLE_GROWTHBOOK`）任一设置即静默禁用。
+- **来源**：`code.claude.com/docs/en/cross-session-messaging`、
+  `code.claude.com/docs/en/agent-teams`、`code.claude.com/docs/en/settings`、
+  GitHub `anthropics/claude-code` CHANGELOG v2.1.224/2.1.225。
+
+### A.3 与本方案 v3.1 的对比
+
+| 维度 | CC native（2.1.224+） | v3.1（本方案） |
+|---|---|---|
+| 架构层 | CC 客户端原生（socket） | model_proxy 代理层 |
+| mid-run 投递 | ✅ 工具调用间隙注入（不打断工具） | ✅ channel b 请求注入（下一请求） |
+| 空闲投递 | ✅ 开新 turn | ✅ channel a / poll |
+| 可见性 | transcript 内联可见 | response-splice 回执 + delivered 归档 + ACCESS 日志 |
+| 信任模型 | 成熟：accept/hold/refuse + 权限模式分类 + 不能批权限/改配置/执行命令 | 简单：包装标注 + 可见 + 归档 |
+| 会话发现 | ListAgents 自动发现同机 | session_registry 短 id 匹配 |
+| 跨机 | Remote Control（Anthropic 服务器） | model_proxy + IM 桥（自托管） |
+| 跨上游 | ❌ CC 内部，与上游无关 | ✅ 走 proxy，跨 glm/kimi/openai |
+| 版本依赖 | 需 2.1.224+ + 解除 4 个 env | 2.1.197 即可 |
+| 消息类型 / to-human | ❌ 纯文本，总给 agent | ✅ query/guidance + to-human 直达 |
+| 限流 | 50 条/会话、限流 | 无硬上限（2000 字符） |
+| 维护 | 官方 | 自维护 |
+
+### A.4 决策与理由
+
+官方功能覆盖了 v3.1 的核心场景，且 mid-run 投递更优雅（客户端工具间隙注入，不动
+请求体，无 index 跟踪/splice 正确性风险），信任模型更成熟。**搁置 v3.1 自建**，
+改用官方功能。
+
+搁置而非删除：本方案的设计推演、实测证据（UserPromptSubmit 只触发人 prompt、
+splice 5 场景、hooker stdout + resume 触发 SessionStart）、架构审核、plan v1.1
+仍有参考价值——若未来官方功能在以下窄场景不足，可重启自建：
+
+1. **跨上游**：官方 native 只在 CC 内部、与上游无关；若需跨 glm/kimi/openai 等
+   非 CC 客户端互通，v3.1 的 proxy 层方案不可替代。
+2. **自托管跨机**：官方跨机走 Anthropic 服务器（Remote Control）；若需完全自托管
+   不经 Anthropic 中转，v3.1 + IM 桥是替代。
+3. **proxy 侧审计**：官方只有 transcript 可见；v3.1 有 ACCESS 日志 + delivered
+   归档，审计更全。
+4. **消息类型 / to-human**：官方纯文本总给 agent；v3.1 区分 query/guidance、
+   to-human 直达不进模型。
+
+### A.5 启用官方功能的前置条件（待 brew 更新后执行）
+
+1. **升级 CC**：`brew upgrade claude-code` 当前只到 2.1.220（不足）；待 brew
+   `claude-code` cask 更新到 ≥2.1.224，或改用 `brew install --cask
+   claude-code@latest`（当前 2.1.226）/ native installer
+   （`curl -fsSL https://claude.ai/install.sh | bash`，自动后台更新到最新）。
+2. **解除禁用 env**：`~/.claude/settings.json` 第 5 行
+   `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: "1"` 会静默禁用 messaging——需删除
+   或置 0（注意：此举同时放开 telemetry/growthbook，权衡隐私）。
+3. **验证**：`/list-agents` 能识别即功能启用；`/status` 的 Peer address 显示
+   `uds:` 前缀即 socket 已绑。
+
+### A.6 相关物处置
+
+- **实施计划** [[2026-08-11-proxy-message-implementation-plan]]（plan v1.1）：同步
+  搁置，status 标 `shelved`。
+- **splice 可行性** [[2026-08-11-proxy-message-splice-feasibility]]：实测证据保留，
+  作为"若重启自建时的技术验证参考"。
+- **worktree `feat-proxy-message`**：可清理（`qw` 删除或 `git worktree remove`），
+  未合并的分支保留待重启。
+- **proxy skill**：v3.1 §17 设想的 `proxy` skill 暂不建；若启用官方功能后需要，可
+  建一个教 agent 用 `ListAgents`/`SendMessage` 的轻量 skill（非 v3.1 的自建命令族）。
