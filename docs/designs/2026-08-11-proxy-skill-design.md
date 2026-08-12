@@ -1,11 +1,16 @@
 ---
 type: design-decision
-status: draft
+status: shelved
 target: "[[2026-08-10-proxy-message-inter-session-design]]"
-tags: [architect, model_proxy, proxy-skill, in-band-command, skill-design]
+tags: [architect, model_proxy, proxy-skill, in-band-command, skill-design, superseded-by-cc-native]
 ---
 
 # proxy skill 设计与 v3 文档整合
+
+> ⚠️ **搁置（2026-08-12）**：CC 2.1.224+ 官方 cross-session messaging 覆盖本方案核心
+> 场景，自建方案搁置。详见 [[2026-08-10-proxy-message-inter-session-design]] 附录 A。
+> 若启用官方功能后需要，可建一个教 agent 用 `ListAgents`/`SendMessage` 的轻量 skill
+>（非本文档设想的 v3.1 自建命令族）。
 
 > [理想] 路径。设计名为 `proxy` 的 skill（非 `proxy-message`），覆盖 model_proxy 层的
 > 完整 in-band 命令机制；并将 skill 设计整合进 v3 设计文档作为实施的最后一步。

@@ -1,11 +1,15 @@
 ---
 type: design-decision
-status: draft
+status: shelved
 target: "[[2026-08-10-proxy-message-inter-session-design]]"
-tags: [architect, model_proxy, splice, sse, feasibility, inter-session-message]
+tags: [architect, model_proxy, splice, sse, feasibility, inter-session-message, superseded-by-cc-native]
 ---
 
 # `$message` splice 回执与命令收敛可行性调研
+
+> ⚠️ **搁置（2026-08-12）**：CC 2.1.224+ 官方 cross-session messaging 覆盖本方案核心
+> 场景，自建方案搁置。详见 [[2026-08-10-proxy-message-inter-session-design]] 附录 A。
+> 本文档的 splice 实测证据保留，作为"若重启自建时的技术验证参考"。
 
 > [务实] 路径。在 v2 设计（[[2026-08-10-proxy-message-inter-session-design]]）基础上
 > 调研两个细化方向的可行性，产出结论与 v2 更新建议清单（不重写 v2，只列建议）。
