@@ -6,12 +6,12 @@
 # 本脚本为唯一代理启动守卫，PID/锁/日志文件独立命名。
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-PID_FILE="/tmp/claude_model_proxy.pid"
-LOG="/tmp/claude_model_proxy_ensure.log"
+PID_FILE="/tmp/model_proxy.pid"
+LOG="/tmp/model_proxy_ensure.log"
 PORT="${MODEL_PROXY_PORT:-18889}"
 
 # mkdir 原子锁，防并发启动
-LOCKDIR="/tmp/claude_model_proxy_start.lock"
+LOCKDIR="/tmp/model_proxy_start.lock"
 if ! mkdir "$LOCKDIR" 2>/dev/null; then
   # 另一个实例正在处理，等它完成后检查结果
   sleep 1

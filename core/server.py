@@ -4,7 +4,7 @@ tools/model_proxy/core/server.py — 本地多协议路由代理主体
 多协议 AI 模型代理主程序：HTTP server、路由决策、转发编排、协议转换、控制 API。
 入口为 tools/model_proxy/model_proxy.py（thin wrapper 调用本模块 main()）。
 端口 18889、配置 tools/model_proxy/config/model_proxy_config.json（可用 MODEL_PROXY_CONFIG
-环境变量覆盖）、进程锁 /tmp/claude_model_proxy.lock、日志 tools/model_proxy/.claude_model_proxy.log。
+环境变量覆盖）、进程锁 /tmp/model_proxy.lock、日志 tools/model_proxy/.model_proxy.log。
 （v1 proxy.py 于 2026-07-24 下线删除，本模块为唯一代理实现。）
 
 仅使用 Python 标准库，不引入第三方依赖。
@@ -48,7 +48,7 @@ from .reasoning.registry import apply_fields, get_codec, resolve_protocol
 # ---------------------------------------------------------------------------
 
 # 日志固定落在包父目录 tools/model_proxy/（与 model_proxy_cli.sh 的 LOG_FILE 一致）
-LOG_FILE = Path(__file__).resolve().parent.parent / ".claude_model_proxy.log"
+LOG_FILE = Path(__file__).resolve().parent.parent / ".model_proxy.log"
 
 
 def _trim_log(path: Path, keep: int = 5000) -> None:
@@ -131,7 +131,7 @@ def _cst_now() -> datetime:
     return datetime.now(_CST)
 
 
-TOTALS_FILE = Path(__file__).resolve().parent.parent / ".claude_model_proxy_totals.json"
+TOTALS_FILE = Path(__file__).resolve().parent.parent / ".model_proxy_totals.json"
 KEEP_DAYS = 400  # 明细天桶保留窗口，超窗归档进 months_archive
 
 
@@ -324,7 +324,7 @@ _DEFAULT_CONFIG_PATH = Path(
     os.environ.get("MODEL_PROXY_CONFIG")
     or (Path(__file__).resolve().parent.parent / "config" / "model_proxy_config.json")
 )
-_LOCK_FILE = Path("/tmp/claude_model_proxy.lock")
+_LOCK_FILE = Path("/tmp/model_proxy.lock")
 
 # 控制路径前缀（v2，避免与 18888 的 /proxy 混淆）
 _CONTROL_PATH_PREFIX = "/model_proxy"
