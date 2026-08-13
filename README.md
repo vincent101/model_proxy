@@ -12,9 +12,6 @@ version: 0.9
 `/v1/messages`）、codex-cli（OpenAI Responses `/v1/responses`）等多个 SDK 接入，并可跨协议
 互相访问对方生态的模型——例如在 Claude Code 里实际调用 GPT，在 codex 里实际调用 Claude。
 
-v1（`tools/proxy.py`，端口 18888）已于 2026-07-24 下线，代码归档于
-`tools/model_proxy/history_versions/proxy-v1-archived-20260724.tar.gz`。
-
 ## 2. Quick Start
 
 三步让 Claude Code 通过本代理跑起来（假设已配好 `config/model_proxy_config.json`，
@@ -511,15 +508,15 @@ MODEL_PROXY_PORT=18889 python3 tools/model_proxy/model_proxy.py &
 
 `tools/model_proxy/hooker/ensure_model_proxy.sh` 已注册到 `.claude/settings.json` 的
 `hooks.SessionStart`，随 Claude Code 会话启动自动拉起（幂等：已运行则直接退出，未运行则启动
-并等待就绪最多 5 秒；PID 文件 `/tmp/claude_model_proxy.pid`、锁 `/tmp/claude_model_proxy_start.lock`）。
-v1 代理（18888）已于 2026-07-24 下线归档，不再涉及并行关系。这条 hook 的路径正确性由 `install` 流程负责
+并等待就绪最多 5 秒；PID 文件 `/tmp/model_proxy.pid`、锁 `/tmp/model_proxy_start.lock`，
+路径配置见 `config/runtime_paths.json`）。
+这条 hook 的路径正确性由 `install` 流程负责
 维护——`install` 每次运行都会检测 `SessionStart` 里是否存在一条正确指向当前 model_proxy 实际
 安装位置的 hook 条目，缺失/路径错误（如目录被移动过）时清理旧条目并预览确认后补齐，不需要
 手动同步维护这条硬编码路径。
 
 停止用 `model_proxy_cli.sh off`：只按本脚本同目录下 `model_proxy.py` 的绝对路径精确匹配进程，
-并额外反查监听该端口、命令行含 `model_proxy.py` 的 PID 兜底（v1 代理已于 2026-07-24 下线归档，
-不再存在该进程）。
+并额外反查监听该端口、命令行含 `model_proxy.py` 的 PID 兜底。
 
 ### 5.2 日志与观测
 

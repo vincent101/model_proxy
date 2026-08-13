@@ -1,7 +1,6 @@
 #!/bin/bash
 # model_proxy_cli.sh
 # 手动控制 model_proxy.py（http://127.0.0.1:18889/model_proxy/*）。
-# （v1 proxy.py/proxy_cli.sh 于 2026-07-24 下线删除，本脚本为唯一代理 CLI。）
 # 用法：model_proxy_cli.sh <子命令> [参数]
 
 MODEL_PROXY_PORT="${MODEL_PROXY_PORT:-18889}"
