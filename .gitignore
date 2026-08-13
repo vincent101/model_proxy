@@ -1,3 +1,5 @@
+# 修改 log/totals 路径时,需同步更新 config/runtime_paths.json + 此处
+# (runtime_paths.json 是真相源,此处无法从 config 读,是已知例外)
 .model_proxy.log
 .model_proxy_totals.json
 .model_proxy_totals.json.corrupt.*

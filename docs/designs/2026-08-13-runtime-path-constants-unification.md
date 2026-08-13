@@ -1,6 +1,6 @@
 ---
 type: design-decision
-status: draft
+status: confirmed
 target: tools/model_proxy
 tags: [architect, config, path-management]
 ---
@@ -315,7 +315,7 @@ load_hooker_paths
 - `.gitignore` 顶部注释提醒（§6）。
 - `runtime_paths.json` 的路径值默认与硬编码一致，不主动改就不会触发不对称。
 
-### 6. .gitignore 处理
+### 6. .gitignore 处理与第二真相源说明
 
 **.gitignore 无法从 config 读，这是纯文本文件的固有限制。接受".gitignore 仍需手动同步"这个例外。**
 
@@ -323,7 +323,26 @@ load_hooker_paths
 - `/tmp/` 下的文件（lock/pid/ensure_log/start_lock）不需要 .gitignore 条目——它们在仓库外。
 - 只有落在 model_proxy 目录内的文件需要 .gitignore 条目——当前只有 `log` 和 `totals`（及其 corrupt 备份）。
 
-**缓解措施**：在 `runtime_paths.json` 旁无注释能力（JSON），但在 `.gitignore` 顶部加注释提醒"修改 log/totals 路径时需同步更新 .gitignore"。当前 .gitignore 无需改动（路径名不变）。
+**缓解措施**：在 `.gitignore` 顶部加注释提醒"修改 log/totals 路径时需同步更新 .gitignore + runtime_paths.json"。
+
+**第二真相源（fallback 默认值）说明**：
+
+`runtime_paths.json` 是主真相源（json 存在时三方都从它读）。但 Python `_DEFAULT_PATHS`（server.py）和 Bash 各脚本的 defaults 字典（cli.sh/hooker.sh 的 `if [[ -z ]]` fallback）各自硬编码了与 json 相同的路径值，构成**第二真相源**。
+
+- **json 存在时**：fallback 是 dead code，不触发。改名只需改 json + .gitignore，主路径达成"单一真相源"。
+- **json 缺失时**（如故障排查删了 json）：fallback 生效，用硬编码默认值。若改名时只改 json 不改 fallback，此时会写旧路径。
+
+**改名时的完整清单**（以 log 改名为例）：
+
+| # | 文件 | 性质 | 必须改？ |
+|---|------|------|---------|
+| 1 | `config/runtime_paths.json` | 主真相源 | 是 |
+| 2 | `core/server.py` `_DEFAULT_PATHS` | fallback 默认值 | 是（保持兜底一致） |
+| 3 | `model_proxy_cli.sh` defaults + fallback | fallback 默认值 | 是（保持兜底一致） |
+| 4 | `hooker/ensure_model_proxy.sh` defaults + fallback | fallback 默认值 | 是（保持兜底一致） |
+| 5 | `.gitignore` | git 忽略规则 | 是 |
+
+严格说"改名只改一处"在主路径成立，但 fallback 默认值需同步——这是为了让兜底行为与主路径一致。若接受"json 缺失时用旧名"的妥协，可只改 json + .gitignore，但不推荐（会导致故障排查时行为不一致）。
 
 ### 7. 默认值表
 
