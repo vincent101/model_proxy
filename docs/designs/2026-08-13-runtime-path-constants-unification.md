@@ -1,11 +1,30 @@
 ---
 type: design-decision
-status: confirmed
+status: draft
 target: tools/model_proxy
 tags: [architect, config, path-management]
 ---
 
 # 运行时路径常量统一管理方案
+
+## 当前实施状态（2026-08-13，经 architect-max 复核修正）
+
+首次落地时 Bash 侧有变量名 bug（python 用 `k.upper()` 生成 `LOG`/`TOTALS`/`LOCK`，但 cli.sh 后续代码用 `$LOG_FILE`/`$TOTALS_FILE`/`$LOCK_FILE`，名字不匹配导致变量为空、服务启动失败 `No such file or directory`）。已回退。
+
+当前各文件状态：
+- `core/server.py`：**已落地且正确**（`resolve_runtime_paths` + `_DEFAULT_PATHS` + `init_logging(log_path)` + main() 调用链），import OK、`resolve_runtime_paths()` 输出正确、661 测试通过。**未回退，保留。**
+- `config/runtime_paths.json`：**已创建且正确**，保留。
+- `model_proxy_cli.sh`：**已回退到硬编码**，需按本方案 §4.1 重新落地。
+- `hooker/ensure_model_proxy.sh`：**已回退到硬编码**，需按本方案 §4.2 重新落地。
+
+**经 architect-max 复核修正的三个硬伤**：
+1. **变量名 bug**（首次事故根因）：python 输出改用显式映射表 `{config_key: shell_var_name}`，不用 `k.upper()`。
+2. **eval 兜底虚假安全网**：`|| fallback` 只在 python3 退出码非 0 时触发，兜不住 python 逻辑 bug（退出码 0 但变量名错）。改为 eval 后**显式校验关键变量非空**。
+3. **cli/server 读取不对称**：server 启动时读一次（不热重载），cli 每次调用都读。运行中改 json 会造成 server 写旧路径、cli 读新路径。已文档化为 §5 约束："修改 runtime_paths.json 后必须重启 server"。
+
+**其他修正**：删除 `MODEL_PROXY_PATHS` 环境变量（无明确需求，避免与 `MODEL_PROXY_CONFIG` 混淆）；cli.sh 映射删除冗余 `LOCK_FILE`（cli 不用进程锁，只 server 用）。
+
+**中间态风险（C12）**：当前 server.py 已读 runtime_paths.json，cli.sh/hooker.sh 仍用硬编码。因 json 值=默认值=硬编码值，目前一致；但若有人改 json 会立即不一致。**需尽快落地 Bash 侧消除此风险。**
 
 ## 背景与问题
 
@@ -166,10 +185,14 @@ _runtime_paths: dict[str, Path] | None = None
 cli.sh 已有 `get_admin_token()` 用 `python3 -c` 读 JSON 的模式。复用此模式读 `runtime_paths.json`，新增 `load_runtime_paths()` 函数：
 
 ```bash
-# config/paths 文件路径
-PATHS_FILE="${MODEL_PROXY_PATHS:-$SCRIPT_DIR/config/runtime_paths.json}"
+# paths 文件路径（固定，不提供 env 覆盖——runtime_paths.json 是基础设施路径，
+# 无"不同环境用不同路径文件"的需求，避免与 MODEL_PROXY_CONFIG 混淆）
+PATHS_FILE="$SCRIPT_DIR/config/runtime_paths.json"
 
 # ---- 从 runtime_paths.json 加载运行时路径（启动时执行一次）----
+# 注意：eval 注入的 shell 变量名必须与后续代码使用的变量名完全一致。
+# cli.sh 后续代码用 $LOG_FILE / $TOTALS_FILE（$LOCK_FILE 只 server.py 用，cli 不需要）。
+# 因此 python 输出用显式映射 {config_key: shell_var_name}，不能用 k.upper()。
 load_runtime_paths() {
   local base="$SCRIPT_DIR"
   eval "$(python3 -c "
@@ -181,27 +204,37 @@ try:
         paths = json.load(f)
 except Exception:
     paths = {}
+# config key -> cli.sh 变量名（必须与后续代码一致）
+mapping = {
+    'log': 'LOG_FILE',
+    'totals': 'TOTALS_FILE',
+}
 defaults = {
     'log': os.path.join(base, '.model_proxy.log'),
     'totals': os.path.join(base, '.model_proxy_totals.json'),
-    'lock': '/tmp/model_proxy.lock',
 }
-for k, d in defaults.items():
-    v = paths.get(k, d)
+for k, var in mapping.items():
+    v = paths.get(k, defaults[k])
     if not v.startswith('/'):
         v = os.path.join(base, v)
-    print(f'{k.upper()}=\"{v}\"')
-" "$base" "$PATHS_FILE" 2>/dev/null)" || {
-    # python 执行失败 → 回退默认值
+    print(f'{var}=\"{v}\"')
+" "$base" "$PATHS_FILE" 2>/dev/null)"
+  # eval 后校验关键变量非空——|| 兜底兜不住 python 逻辑 bug（退出码 0 但变量名错），
+  # 必须显式检查变量是否注入成功
+  if [[ -z "$LOG_FILE" || -z "$TOTALS_FILE" ]]; then
     LOG_FILE="$SCRIPT_DIR/.model_proxy.log"
     TOTALS_FILE="$SCRIPT_DIR/.model_proxy_totals.json"
-    LOCK_FILE="/tmp/model_proxy.lock"
-  }
+  fi
 }
 load_runtime_paths
 ```
 
-替换现有第 11-13 行的硬编码。后续代码中 `$LOG_FILE` / `$TOTALS_FILE` / `$LOCK_FILE` 变量名不变，只是来源从硬编码变为文件读取。
+替换现有第 11-13 行的硬编码（删掉 LOCK_FILE，cli.sh 不用进程锁）。后续代码中 `$LOG_FILE` / `$TOTALS_FILE` 变量名不变，只是来源从硬编码变为文件读取。
+
+**关键设计点**：
+- python 输出用显式映射表 `{log:LOG_FILE, totals:TOTALS_FILE}`，不能用 `k.upper()`（会生成 `LOG`/`TOTALS`，与后续代码的 `$LOG_FILE` 等不匹配，导致变量为空、服务启动失败——这是首次落地的真实事故根因）。
+- `eval` 后**显式校验变量非空**，不依赖 `||` 兜底（`||` 只在 python3 退出码非 0 时触发，兜不住 python 逻辑正确性 bug）。
+- 不引入 `MODEL_PROXY_PATHS` 环境变量——runtime_paths.json 是基础设施路径，无多环境需求，避免与 `MODEL_PROXY_CONFIG` 混淆。
 
 **性能**：每次 CLI 调用只起一次 python3 进程（约 50-80ms），cli.sh 本身就是交互工具，无性能问题。
 
@@ -210,7 +243,7 @@ load_runtime_paths
 hooker 需要的路径与 cli.sh 部分重叠（lock）+ 独有（pid/ensure_log/start_lock）。同样用 python3 读 `runtime_paths.json`：
 
 ```bash
-PATHS_FILE="${MODEL_PROXY_PATHS:-$SCRIPT_DIR/../config/runtime_paths.json}"
+PATHS_FILE="$SCRIPT_DIR/../config/runtime_paths.json"
 
 load_hooker_paths() {
   local base="$(cd "$SCRIPT_DIR/.." && pwd)"
@@ -223,26 +256,38 @@ try:
         paths = json.load(f)
 except Exception:
     paths = {}
+# config key -> hooker.sh 变量名
+mapping = {
+    'pid': 'PID_FILE',
+    'ensure_log': 'ENSURE_LOG',
+    'start_lock': 'START_LOCK',
+}
 defaults = {
     'pid': '/tmp/model_proxy.pid',
     'ensure_log': '/tmp/model_proxy_ensure.log',
     'start_lock': '/tmp/model_proxy_start.lock',
 }
-for k, d in defaults.items():
-    v = paths.get(k, d)
+for k, var in mapping.items():
+    v = paths.get(k, defaults[k])
     if not v.startswith('/'):
         v = os.path.join(base, v)
-    print(f'{k.upper()}=\"{v}\"')
-" "$base" "$PATHS_FILE" 2>/dev/null)" || {
+    print(f'{var}=\"{v}\"')
+" "$base" "$PATHS_FILE" 2>/dev/null)"
+  # eval 后校验关键变量非空（同 cli.sh，不依赖 || 兜底）
+  if [[ -z "$PID_FILE" || -z "$ENSURE_LOG" || -z "$START_LOCK" ]]; then
     PID_FILE="/tmp/model_proxy.pid"
     ENSURE_LOG="/tmp/model_proxy_ensure.log"
     START_LOCK="/tmp/model_proxy_start.lock"
-  }
+  fi
 }
 load_hooker_paths
 ```
 
-替换现有第 9-14 行硬编码。变量名从 `LOG`/`LOCKDIR` 改为 `ENSURE_LOG`/`START_LOCK`（语义更清晰，与 config key 对齐）。已核实无外部引用这些变量名，安全。
+替换现有第 9-14 行硬编码。变量名从 `LOG`/`LOCKDIR` 改为 `ENSURE_LOG`/`START_LOCK`（语义更清晰，与 config key 对齐）。已核实无外部引用这些变量名，安全。同样用显式映射表生成变量名，不能用 `k.upper()`。eval 后显式校验变量非空。
+
+**hooker.sh 变量改名涉及 6 处引用**（implementer 落地时需逐行核对）：
+- `$LOG` 3 处：定义行 10、使用行 38（nohup 重定向）、行 51（tail）
+- `$LOCKDIR` 3 处：定义行 14、使用行 15（mkdir）、行 20（trap rmdir）
 
 #### 4.3 为何不用 jq / grep/sed
 
@@ -250,7 +295,27 @@ load_hooker_paths
 - **grep/sed 提取 JSON**：脆弱，路径含特殊字符（空格/引号）时会断。
 - **python3 -c**：项目已依赖 python3（server.py / _config_ops.py / _format_ops.py / _install_ops.py 全是 Python），cli.sh 已有此模式（`get_admin_token()`）。零新增依赖，最可靠。
 
-### 5. .gitignore 处理
+### 5. cli/server 读取不对称约束
+
+**关键约束：修改 `runtime_paths.json` 后必须重启 server，不能只 reload。**
+
+读取时机的差异：
+- **server.py**：`main()` 启动时调一次 `resolve_runtime_paths()`，路径存入 `_runtime_paths`，此后不变（**不参与热重载**——这是有意决策，运行中改日志路径会丢失连续性，改锁路径会破坏进程锁）。
+- **cli.sh / hooker.sh**：每次调用都执行 `load_runtime_paths`，重新读 `runtime_paths.json`。
+
+**不对称后果**：运行中改 `runtime_paths.json` 的 `log` 路径 → server 继续写旧路径（内存里是旧值），cli.sh 读新路径 → **server 写 A 文件、cli 读 B 文件**，`cli.sh logs`/`status` 看不到数据。
+
+**为什么这样设计仍合理**：
+1. `runtime_paths.json` 是基础设施路径，改动频率极低（几乎只在初次配置时改一次）。
+2. server 不热重载路径是必要的——运行中切换日志文件会丢日志、切换锁文件会破坏进程互斥。
+3. cli 每次读是为了在 server 未运行时（`cli.sh on`/`off`、故障排查）也能拿到正确路径——这些场景恰恰是最需要路径常量的，不能依赖 server 在线。
+
+**文档化此约束**：在 `runtime_paths.json` 文件内无法加注释（JSON），但：
+- 本设计文档显式记录（本节）。
+- `.gitignore` 顶部注释提醒（§6）。
+- `runtime_paths.json` 的路径值默认与硬编码一致，不主动改就不会触发不对称。
+
+### 6. .gitignore 处理
 
 **.gitignore 无法从 config 读，这是纯文本文件的固有限制。接受".gitignore 仍需手动同步"这个例外。**
 
@@ -260,7 +325,7 @@ load_hooker_paths
 
 **缓解措施**：在 `runtime_paths.json` 旁无注释能力（JSON），但在 `.gitignore` 顶部加注释提醒"修改 log/totals 路径时需同步更新 .gitignore"。当前 .gitignore 无需改动（路径名不变）。
 
-### 6. 默认值表
+### 7. 默认值表
 
 | key | 默认值（runtime_paths.json 缺失时） | 与当前硬编码一致？ |
 |-----|------|---|
@@ -273,7 +338,7 @@ load_hooker_paths
 
 **向后兼容**：`runtime_paths.json` 不存在 → 全部回退默认值 → 行为与当前完全一致。
 
-### 7. 启动顺序与循环依赖（总结）
+### 8. 启动顺序与循环依赖（总结）
 
 完整启动序列（Python 侧 main()）：
 
@@ -288,7 +353,7 @@ load_hooker_paths
 
 循环依赖不存在：步骤 1 读取 `runtime_paths.json` 只做 `json.load`（标准库，不依赖日志），失败回退默认值（编译期常量）。步骤 2 的日志路径永远可用（要么来自文件，要么来自默认值）。
 
-### 8. 影响面
+### 9. 影响面
 
 | 文件 | 改动范围 | 说明 |
 |------|---------|------|
@@ -307,7 +372,7 @@ load_hooker_paths
 - **热重载安全**：paths 不参与热重载（`resolve_runtime_paths` 只在启动时调一次）。ConfigStore 的 `maybe_reload` 不影响已解析的运行时路径。
 - **hooker 变量改名**：`LOG`→`ENSURE_LOG`、`LOCKDIR`→`START_LOCK`。已核实无外部引用（_install_ops.py 引用的是脚本路径，非内部变量），安全。
 
-### 9. 与 repo-split 的关系
+### 10. 与 repo-split 的关系
 
 **建议此改动在 repo-split 之前做。**
 

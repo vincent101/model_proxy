@@ -47,8 +47,50 @@ from .reasoning.registry import apply_fields, get_codec, resolve_protocol
 # L0 基座
 # ---------------------------------------------------------------------------
 
-# 日志固定落在包父目录 tools/model_proxy/（与 model_proxy_cli.sh 的 LOG_FILE 一致）
-LOG_FILE = Path(__file__).resolve().parent.parent / ".model_proxy.log"
+# 运行时路径统一管理（单一真相源）：config/runtime_paths.json
+# 路径常量与业务配置分离，Python/Bash 都从该文件读。详见
+# docs/designs/2026-08-13-runtime-path-constants-unification.md
+_PACKAGE_DIR = Path(__file__).resolve().parent.parent  # model_proxy/
+_RUNTIME_PATHS_FILE = _PACKAGE_DIR / "config" / "runtime_paths.json"
+
+# 模块级默认值（供 _DEFAULT_PATHS 引用 + 测试 import 时不触碰文件）
+_LOG_FILE_DEFAULT = _PACKAGE_DIR / ".model_proxy.log"
+_TOTALS_FILE_DEFAULT = _PACKAGE_DIR / ".model_proxy_totals.json"
+_LOCK_FILE_DEFAULT = Path("/tmp/model_proxy.lock")
+
+_DEFAULT_PATHS = {
+    "log": str(_LOG_FILE_DEFAULT),
+    "totals": str(_TOTALS_FILE_DEFAULT),
+    "lock": str(_LOCK_FILE_DEFAULT),
+    "pid": "/tmp/model_proxy.pid",
+    "ensure_log": "/tmp/model_proxy_ensure.log",
+    "start_lock": "/tmp/model_proxy_start.lock",
+}
+
+# 运行时实际路径（main() 启动路径赋值，测试 import 时为 None）
+_runtime_paths: dict[str, Path] | None = None
+
+
+def resolve_runtime_paths(paths_file: Path = _RUNTIME_PATHS_FILE) -> dict[str, Path]:
+    """启动时一次性解析所有运行时路径。不参与热重载。
+
+    runtime_paths.json 缺失/corrupt → 全部回退默认值。
+    相对路径以 paths_file.parent.parent（即 model_proxy/）为基准。
+    """
+    paths = {}
+    base = paths_file.parent.parent  # model_proxy/
+    try:
+        with open(paths_file, "r", encoding="utf-8") as f:
+            raw_paths = json.load(f)
+    except (json.JSONDecodeError, OSError):
+        raw_paths = {}
+    for key, default in _DEFAULT_PATHS.items():
+        val = raw_paths.get(key, default)
+        p = Path(val)
+        if not p.is_absolute():
+            p = base / p
+        paths[key] = p
+    return paths
 
 
 def _trim_log(path: Path, keep: int = 5000) -> None:
@@ -89,8 +131,8 @@ access_log.setLevel(logging.INFO)
 access_log.propagate = False
 
 
-def init_logging() -> None:
-    """生产启动路径调用：截断日志 + 装配 root/access handler 到 LOG_FILE。
+def init_logging(log_path: Path) -> None:
+    """生产启动路径调用：截断日志 + 装配 root/access handler 到 log_path。
 
     仅在 main() 里调用一次。测试 import 本模块时不执行，root logger 无 FileHandler，
     测试产生的 log 行不会写入生产日志文件。
@@ -98,8 +140,8 @@ def init_logging() -> None:
     """
     if access_log.handlers:
         return
-    _trim_log(LOG_FILE)
-    root_handler = logging.FileHandler(LOG_FILE)
+    _trim_log(log_path)
+    root_handler = logging.FileHandler(log_path)
     root_handler.setFormatter(logging.Formatter(
         "%(asctime)s %(levelname)s req_id=%(req_id)s %(message)s"))
     root_handler.addFilter(_req_filter)
@@ -111,7 +153,7 @@ def init_logging() -> None:
     # root 开 INFO 安全前提（已核实）：BaseHTTPRequestHandler.log_message 已屏蔽
     # （pass），stdlib 默认请求日志不会刷屏；进程内 INFO 级调用方只有本模块运维事件 +
     # translate.py 两条降级日志（OPT-03 已提 WARNING）。
-    access_handler = logging.FileHandler(LOG_FILE)
+    access_handler = logging.FileHandler(log_path)
     access_handler.setFormatter(logging.Formatter(
         "%(asctime)s req_id=%(req_id)s %(message)s"))
     access_handler.addFilter(_req_filter)
@@ -131,7 +173,8 @@ def _cst_now() -> datetime:
     return datetime.now(_CST)
 
 
-TOTALS_FILE = Path(__file__).resolve().parent.parent / ".model_proxy_totals.json"
+# TOTALS_FILE 旧硬编码已移除，运行时路径由 resolve_runtime_paths() 解析，
+# 默认值见 _DEFAULT_PATHS["totals"]（即 _TOTALS_FILE_DEFAULT）。
 KEEP_DAYS = 400  # 明细天桶保留窗口，超窗归档进 months_archive
 
 
@@ -324,7 +367,8 @@ _DEFAULT_CONFIG_PATH = Path(
     os.environ.get("MODEL_PROXY_CONFIG")
     or (Path(__file__).resolve().parent.parent / "config" / "model_proxy_config.json")
 )
-_LOCK_FILE = Path("/tmp/model_proxy.lock")
+# _LOCK_FILE 旧硬编码已移除，运行时路径由 resolve_runtime_paths() 解析，
+# 默认值见 _DEFAULT_PATHS["lock"]（即 _LOCK_FILE_DEFAULT）。
 
 # 控制路径前缀（v2，避免与 18888 的 /proxy 混淆）
 _CONTROL_PATH_PREFIX = "/model_proxy"
@@ -2473,26 +2517,34 @@ def main():
     config_path = _DEFAULT_CONFIG_PATH
     port = int(os.environ.get("MODEL_PROXY_PORT", "18889"))
 
-    # 0. 装配日志 handler + 截断日志 + 实例化账本（S1：从模块级挪到启动路径，
-    # 避免测试 import 时触碰生产日志/账本文件）
-    init_logging()
-    global usage_totals
-    usage_totals = UsageTotalsStore(TOTALS_FILE)
+    # 0. 解析运行时路径（bootstrap，不依赖 ConfigStore；文件缺失/corrupt 回退默认值）
+    global _runtime_paths
+    _runtime_paths = resolve_runtime_paths()
 
-    # 进程级互斥锁：同一时刻只允许一个 model_proxy.py 实例运行
+    # 1. 装配日志 handler + 截断日志（S1：从模块级挪到启动路径，
+    # 避免测试 import 时触碰生产日志文件）
+    init_logging(_runtime_paths["log"])
+
+    # 2. 进程级互斥锁：同一时刻只允许一个 model_proxy.py 实例运行
+    # （flock 提前到 UsageTotalsStore 之前，B10 确认是改善）
     import fcntl
-    lock_fd = open(_LOCK_FILE, "w")
+    lock_path = _runtime_paths["lock"]
+    lock_fd = open(lock_path, "w")
     try:
         fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
     except OSError:
-        existing_pid = _LOCK_FILE.read_text().strip() if _LOCK_FILE.exists() else "unknown"
+        existing_pid = lock_path.read_text().strip() if lock_path.exists() else "unknown"
         log.warning("startup.lock_conflict existing_pid=%s", existing_pid)
         lock_fd.close()
         raise SystemExit(1)
     lock_fd.write(str(os.getpid()))
     lock_fd.flush()
 
-    # 1. 实例化 ConfigStore
+    # 3. 实例化账本（S1：从模块级挪到启动路径，避免测试 import 时触碰账本文件）
+    global usage_totals
+    usage_totals = UsageTotalsStore(_runtime_paths["totals"])
+
+    # 4. 实例化 ConfigStore
     config_store = ConfigStore(config_path, on_reload=None)
 
     # 2. 实例化 CooldownStore

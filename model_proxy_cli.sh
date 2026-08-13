@@ -8,10 +8,47 @@ MODEL_PROXY_PORT="${MODEL_PROXY_PORT:-18889}"
 MODEL_PROXY_BASE="http://127.0.0.1:${MODEL_PROXY_PORT}"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CONFIG_FILE="${MODEL_PROXY_CONFIG:-$SCRIPT_DIR/config/model_proxy_config.json}"
-LOG_FILE="$SCRIPT_DIR/.model_proxy.log"
-TOTALS_FILE="$SCRIPT_DIR/.model_proxy_totals.json"
-LOCK_FILE="/tmp/model_proxy.lock"
+PATHS_FILE="$SCRIPT_DIR/config/runtime_paths.json"
 CONFIG_OPS="$SCRIPT_DIR/_config_ops.py"
+
+# ---- 从 runtime_paths.json 加载运行时路径（启动时执行一次）----
+# 注意：eval 注入的 shell 变量名必须与后续代码使用的变量名完全一致。
+# cli.sh 后续代码用 $LOG_FILE / $TOTALS_FILE（$LOCK_FILE 只 server.py 用，cli 不需要）。
+# 因此 python 输出用显式映射 {config_key: shell_var_name}，不能用 k.upper()。
+load_runtime_paths() {
+  local base="$SCRIPT_DIR"
+  eval "$(python3 -c "
+import json, sys, os
+base = sys.argv[1]
+paths_file = sys.argv[2]
+try:
+    with open(paths_file) as f:
+        paths = json.load(f)
+except Exception:
+    paths = {}
+# config key -> cli.sh 变量名（必须与后续代码一致）
+mapping = {
+    'log': 'LOG_FILE',
+    'totals': 'TOTALS_FILE',
+}
+defaults = {
+    'log': os.path.join(base, '.model_proxy.log'),
+    'totals': os.path.join(base, '.model_proxy_totals.json'),
+}
+for k, var in mapping.items():
+    v = paths.get(k, defaults[k])
+    if not v.startswith('/'):
+        v = os.path.join(base, v)
+    print(f'{var}=\"{v}\"')
+" "$base" "$PATHS_FILE" 2>/dev/null)"
+  # eval 后校验关键变量非空——|| 兜底兜不住 python 逻辑 bug（退出码 0 但变量名错），
+  # 必须显式检查变量是否注入成功
+  if [[ -z "$LOG_FILE" || -z "$TOTALS_FILE" ]]; then
+    LOG_FILE="$SCRIPT_DIR/.model_proxy.log"
+    TOTALS_FILE="$SCRIPT_DIR/.model_proxy_totals.json"
+  fi
+}
+load_runtime_paths
 INSTALL_OPS="$SCRIPT_DIR/_install_ops.py"
 
 # ---- 帮助信息 ----
