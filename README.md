@@ -1,7 +1,10 @@
 ---
 created: 2026-07-17 18:52:18
+version: 0.9
 ---
 # model_proxy
+
+**Version: 0.9**
 
 ## 1. 这是什么
 
@@ -804,6 +807,7 @@ token 里选定）过滤候选 client_token；无匹配协议的 token 时提示
 
 ## 8. 当前状态 / 已知限制
 
+- model_proxy 已独立为 git repo（远端 `https://github.com/vincent101/model_proxy.git`），可独立 clone 使用。
 - 已支持五种协议组合的转发/转换：anthropic→anthropic、responses→responses（均字节透传，含
   thinking 方言自适应）、anthropic→chat、anthropic→responses、responses→anthropic（经
   `core/translate.py` 转换）。其余组合返回 501。

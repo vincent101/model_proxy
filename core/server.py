@@ -53,6 +53,11 @@ from .reasoning.registry import apply_fields, get_codec, resolve_protocol
 _PACKAGE_DIR = Path(__file__).resolve().parent.parent  # model_proxy/
 _RUNTIME_PATHS_FILE = _PACKAGE_DIR / "config" / "runtime_paths.json"
 
+# 版本号：VERSION 文件是单一真相源，tag/frontmatter 是镜像。
+# 模块级默认 "unknown"，main() 启动时读 VERSION 文件覆盖。
+_VERSION = "unknown"  # main() 启动时读 VERSION 文件覆盖
+_VERSION_FILE = _PACKAGE_DIR / "VERSION"
+
 # 模块级默认值（供 _DEFAULT_PATHS 引用 + 测试 import 时不触碰文件）
 _LOG_FILE_DEFAULT = _PACKAGE_DIR / ".model_proxy.log"
 _TOTALS_FILE_DEFAULT = _PACKAGE_DIR / ".model_proxy_totals.json"
@@ -2139,6 +2144,7 @@ class ModelProxyHandler(BaseHTTPRequestHandler):
             "strategies": strategies_out,
             "cooldown": cd.snapshot(),
             "unconfigured_codes": _snapshot_unconfigured_hits(),
+            "version": _VERSION,
         })
 
     def _handle_reload(self, cs: "ConfigStore", cd: "CooldownStore"):
@@ -2520,6 +2526,13 @@ def main():
     # 0. 解析运行时路径（bootstrap，不依赖 ConfigStore；文件缺失/corrupt 回退默认值）
     global _runtime_paths
     _runtime_paths = resolve_runtime_paths()
+
+    # 0.1 读 VERSION 文件覆盖模块级默认值（文件不存在保持 "unknown"，不阻断启动）
+    global _VERSION
+    try:
+        _VERSION = _VERSION_FILE.read_text(encoding="utf-8").strip()
+    except OSError:
+        pass  # 保持 "unknown"
 
     # 1. 装配日志 handler + 截断日志（S1：从模块级挪到启动路径，
     # 避免测试 import 时触碰生产日志文件）
