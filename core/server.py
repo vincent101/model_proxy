@@ -329,9 +329,6 @@ _LOCK_FILE = Path("/tmp/claude_model_proxy.lock")
 # 控制路径前缀（v2，避免与 18888 的 /proxy 混淆）
 _CONTROL_PATH_PREFIX = "/model_proxy"
 
-# 顶层默认冷却时长（秒）
-_DEFAULT_COOLDOWN_SECONDS = 300
-
 # 上游请求超时（秒），缺省 30min，对齐 API_TIMEOUT_MS；config 顶层
 # upstream_timeout_seconds 可覆盖
 _UPSTREAM_TIMEOUT_DEFAULT = 1800
@@ -376,7 +373,7 @@ class ConfigStore:
 
     热重载机制（mtime 比对、maybe_reload 双重检查、_reload_locked
     失败保留旧配置、reload 强制重载）拷贝自 proxy.py，getter 换成
-    新 schema（supplies/routes/admin_token/default_cooldown_seconds）。
+    新 schema（supplies/routes/admin_token/cooldown_rules）。
     """
 
     def __init__(
@@ -426,10 +423,6 @@ class ConfigStore:
         with self._lock:
             return str(self._config.get("admin_token", ""))
 
-    def get_default_cooldown(self) -> int:
-        with self._lock:
-            return int(self._config.get("default_cooldown_seconds", _DEFAULT_COOLDOWN_SECONDS))
-
     def get_upstream_timeout(self) -> int:
         with self._lock:
             return int(self._config.get("upstream_timeout_seconds", _UPSTREAM_TIMEOUT_DEFAULT))
@@ -445,6 +438,11 @@ class ConfigStore:
             "enabled": bool(cfg.get("enabled", True)),
             "max_retries": int(cfg.get("max_retries", _BUDGET_RETRY_MAX)),
         }
+
+    def get_cooldown_rules(self) -> list[dict]:
+        """顶层 cooldown_rules 策略组列表（浅拷贝）。无 cooldown_rules → 返回 []。"""
+        with self._lock:
+            return list(self._config.get("cooldown_rules", []))
 
     # ------------------------------------------------------------------
     # 热重载（拷贝 proxy.py 原样）
@@ -520,6 +518,7 @@ class ConfigStore:
         内的每请求重复告警。校验项：
         - route_id 与 route_pool 互斥：每个 strategy 最多告警一次
         - route_pool 非法项：每个 strategy 最多告警一次（聚合非法 route_id 列表）
+        - cooldown_rules 策略组格式校验（容错：非法策略组跳过 + log warning）
         容错语义：校验只告警，不影响加载成功（_reload_locked 仍返回 True）。
         """
         routes_map = {r["id"]: r for r in self._config.get("routes", [])
@@ -538,6 +537,36 @@ class ConfigStore:
             if invalid:
                 log.warning("config.validate: strategy=%s route_pool has invalid route_ids=%s",
                             ct, invalid)
+        self._validate_cooldown_rules(self._config.get("cooldown_rules", []), "top")
+
+    def _validate_cooldown_rules(self, rules: list, ctx: str) -> None:
+        """校验 cooldown_rules 策略组格式（容错：非法策略组跳过 + log warning，不阻断加载）。
+
+        每条 rule 必须有 errorcode（非空 list，元素为 int 或 "URLError" 字符串）
+        和 cooldown_seconds（正 int）。非法 rule log warning + 跳过，不阻断加载。
+        """
+        if not isinstance(rules, list):
+            log.warning("config.validate: %s cooldown_rules not a list, skipped", ctx)
+            return
+        for i, rule in enumerate(rules):
+            if not isinstance(rule, dict):
+                log.warning("config.validate: %s cooldown_rules[%d] not a dict, skipped",
+                            ctx, i)
+                continue
+            ec = rule.get("errorcode")
+            if not isinstance(ec, list) or not ec:
+                log.warning("config.validate: %s cooldown_rules[%d] errorcode missing/empty, skipped",
+                            ctx, i)
+                continue
+            for c in ec:
+                if not isinstance(c, int) and c != "URLError":
+                    log.warning("config.validate: %s cooldown_rules[%d] errorcode has invalid "
+                                "element %r (must be int or 'URLError'), skipped",
+                                ctx, i, c)
+            cs_val = rule.get("cooldown_seconds")
+            if not isinstance(cs_val, int) or cs_val <= 0:
+                log.warning("config.validate: %s cooldown_rules[%d] cooldown_seconds missing/invalid, skipped",
+                            ctx, i)
 
 
 # ---------------------------------------------------------------------------
@@ -590,9 +619,37 @@ class CooldownStore:
 # L2 路由决策（全新，纯函数 + 常量）
 # ---------------------------------------------------------------------------
 
-# 冷却触发状态码：参考 proxy.py 的 _FAILOVER_STATUSES（{401,403,429} ∪ 5xx）。
-# 测试场景坏 key 返回 401，必须包含 401 才能触发 cooldown + failover。
-_FAILOVER_STATUSES = frozenset([401, 403, 429]) | frozenset(range(500, 600))
+
+def resolve_cooldown_seconds(errorcode, cs: "ConfigStore") -> int | None:
+    """按 errorcode 查顶层 cooldown_rules，首条命中返回 cooldown_seconds，未命中返回 None。
+
+    errorcode: int(HTTP 状态码) 或 "URLError" 字符串。
+    无 supply 级覆盖，所有 supply 共用顶层策略组。
+    """
+    for rule in cs.get_cooldown_rules():
+        if errorcode in rule.get("errorcode", []):
+            return int(rule["cooldown_seconds"])
+    return None
+
+
+# 未配置策略的 errorcode 命中计数（线程安全，纯内存，重启清零）。
+# 让用户通过 /model_proxy/status 看到"哪些 code 撞了但没配策略"，据此补 cooldown_rules。
+_unconfigured_hits: dict[str, int] = {}
+_unconfigured_lock = threading.Lock()
+
+
+def _record_unconfigured(code) -> None:
+    """记录未命中 cooldown_rules 的 errorcode（int 或 "URLError"），全局计数。"""
+    key = str(code)
+    with _unconfigured_lock:
+        _unconfigured_hits[key] = _unconfigured_hits.get(key, 0) + 1
+
+
+def _snapshot_unconfigured_hits() -> dict[str, int]:
+    """返回当前 unconfigured_hits 快照（浅拷贝）。"""
+    with _unconfigured_lock:
+        return dict(_unconfigured_hits)
+
 
 # 组合分发模式（精确组合命名）
 PASSTHROUGH = "passthrough"
@@ -1298,7 +1355,6 @@ class ModelProxyHandler(BaseHTTPRequestHandler):
         self._acc["tier"] = tier
 
         supply_map = cs.get_supply_map()
-        default_cd = cs.get_default_cooldown()
 
         _reasoning_retried = False   # reasoning 语法重试只做一次，作用域覆盖整个请求周期
 
@@ -1597,8 +1653,6 @@ class ModelProxyHandler(BaseHTTPRequestHandler):
                     method=method,
                 )
 
-                cd_seconds = int(supply.get("cooldown_seconds", default_cd))
-
                 try:
                     resp = urllib.request.urlopen(req, timeout=cs.get_upstream_timeout())  # 缺省30min,对齐 API_TIMEOUT_MS
                     resp_status = resp.status
@@ -1624,16 +1678,20 @@ class ModelProxyHandler(BaseHTTPRequestHandler):
                                       # 重新算 reasoning_wire 时 select_variant 命中刚学到的偏好，
                                       # 自动改对语法后重发
 
-                    if failover == "on" and resp_status in _FAILOVER_STATUSES:
-                        log.warning("cooldown+failover: supply=%s status=%s key_tail4=%s",
-                                    supply_id, resp_status, appkey[-4:] if appkey else "")
+                    secs = resolve_cooldown_seconds(resp_status, cs)
+                    if failover == "on" and secs is not None:
+                        log.warning("cooldown+failover: supply=%s status=%s secs=%s",
+                                    supply_id, resp_status, secs)
                         self._acc["failover"] = 1
                         self._acc["attempt_errors"].append(
                             (supply_id, f"http_{resp_status}"))
-                        cd.cooldown(supply_id, cd_seconds)
+                        cd.cooldown(supply_id, secs)
                         tried_set.add(supply_id)
                         continue
-                    # 不 failover：按 source 协议包裹上游错误（阶段4 §5.2：不透传上游原始协议结构）
+                    # 未命中策略 → 透传 + 告警 + 累计 unconfigured_hits
+                    log.warning("unconfigured upstream status: supply=%s status=%s (not in cooldown_rules, passing through)",
+                                supply_id, resp_status)
+                    _record_unconfigured(resp_status)
                     upstream_msg = _extract_upstream_error_message(resp_body)
                     self._write_buffered_response(
                         resp_status, [],
@@ -1643,15 +1701,20 @@ class ModelProxyHandler(BaseHTTPRequestHandler):
                     self._acc["final_error"] = f"upstream_error {resp_status} {upstream_msg}"
                     return
                 except (urllib.error.URLError, OSError) as e:
-                    if failover == "on":
-                        log.warning("cooldown+failover(net): supply=%s err=%s key_tail4=%s",
-                                    supply_id, e, appkey[-4:] if appkey else "")
+                    secs = resolve_cooldown_seconds("URLError", cs)
+                    if failover == "on" and secs is not None:
+                        log.warning("cooldown+failover(net): supply=%s err=%s secs=%s",
+                                    supply_id, e, secs)
                         self._acc["failover"] = 1
                         self._acc["attempt_errors"].append(
                             (supply_id, f"net_error:{e}"))
-                        cd.cooldown(supply_id, cd_seconds)
+                        cd.cooldown(supply_id, secs)
                         tried_set.add(supply_id)
                         continue
+                    # 未配 URLError 策略 → 透传 502 + 告警
+                    log.warning("unconfigured net error: supply=%s err=%s (URLError not in cooldown_rules, passing through)",
+                                supply_id, e)
+                    _record_unconfigured("URLError")
                     self._write_buffered_response(
                         502, [], error_body_for_source(source, 502, f"upstream error: {e}"))
                     self._acc["final_error"] = f"upstream net error: {e}"
@@ -1841,10 +1904,12 @@ class ModelProxyHandler(BaseHTTPRequestHandler):
                 # 末候选只打条件行
                 log.warning("all supplies failed or cooling: route=%s tier=%s",
                             route.get("id"), tier)
+                errs = self._acc.get("attempt_errors") or []
+                err_summary = "; ".join(f"{sid}={reason}" for sid, reason in errs) if errs else "no attempts"
+                msg = f"all upstream supplies failed or cooling: {err_summary}"
                 self._write_buffered_response(
-                    503, [], error_body_for_source(
-                        source, 503, "all upstream supplies failed or cooling"))
-                self._acc["final_error"] = "all supplies failed or cooling"
+                    503, [], error_body_for_source(source, 503, msg))
+                self._acc["final_error"] = msg
                 return
 
     # ------------------------------------------------------------------
@@ -2029,7 +2094,7 @@ class ModelProxyHandler(BaseHTTPRequestHandler):
             "routes": cs.get_routes(),
             "strategies": strategies_out,
             "cooldown": cd.snapshot(),
-            "default_cooldown_seconds": cs.get_default_cooldown(),
+            "unconfigured_codes": _snapshot_unconfigured_hits(),
         })
 
     def _handle_reload(self, cs: "ConfigStore", cd: "CooldownStore"):

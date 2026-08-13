@@ -1,6 +1,10 @@
 {
   "admin_token": "<ADMIN_TOKEN_PLACEHOLDER>",
-  "default_cooldown_seconds": 300,
+  "cooldown_rules": [
+    {"errorcode": [401, 403, 429, 500, 502, 503, 504], "cooldown_seconds": 60},
+    {"errorcode": [402], "cooldown_seconds": 21600},
+    {"errorcode": ["URLError"], "cooldown_seconds": 60}
+  ],
   "upstream_timeout_seconds": 1800,
   "budget_retry": {"enabled": true, "max_retries": 5},
   "supplies": [

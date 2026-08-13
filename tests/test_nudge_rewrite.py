@@ -128,14 +128,14 @@ class _FakeConfig:
     def get_supply_map(self):
         return self._supply_map
 
-    def get_default_cooldown(self):
-        return 300
-
     def get_upstream_timeout(self):
         return 1800
 
     def get_budget_retry(self):
         return {"enabled": True, "max_retries": 5}
+
+    def get_cooldown_rules(self):
+        return []
 
 
 class _FakeCooldown:

@@ -85,14 +85,18 @@ class _FakeConfig:
     def get_supply_map(self):
         return self._supply_map
 
-    def get_default_cooldown(self):
-        return 300
-
     def get_upstream_timeout(self):
         return 1800
 
     def get_budget_retry(self):
         return self._budget_retry or {"enabled": True, "max_retries": 5}
+
+    def get_cooldown_rules(self):
+        return [
+            {"errorcode": [401, 403, 429, 500, 502, 503, 504], "cooldown_seconds": 60},
+            {"errorcode": [402], "cooldown_seconds": 21600},
+            {"errorcode": ["URLError"], "cooldown_seconds": 60},
+        ]
 
 
 class _FakeCooldown:
