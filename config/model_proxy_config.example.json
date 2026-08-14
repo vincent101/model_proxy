@@ -1,8 +1,8 @@
 {
   "admin_token": "<ADMIN_TOKEN_PLACEHOLDER>",
   "cooldown_rules": [
-    {"errorcode": [401, 403, 429, 500, 502, 503, 504], "cooldown_seconds": 60},
-    {"errorcode": [402], "cooldown_seconds": 21600},
+    {"errorcode": [429, 500, 502, 503, 504], "cooldown_seconds": 60},
+    {"errorcode": [401, 402, 403], "cooldown_seconds": 21600},
     {"errorcode": ["URLError"], "cooldown_seconds": 60}
   ],
   "upstream_timeout_seconds": 1800,

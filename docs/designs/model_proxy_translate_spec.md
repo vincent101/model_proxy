@@ -810,7 +810,7 @@ def sse_event_bytes(data: dict) -> bytes: ...
 > **与正向规格的关系**：Anthropic 侧字段定义（system / messages / content block / tools / thinking / stop_reason / usage / 流式事件序列）**不重抄**，一律引用 `本文档 Part 1（正向规格）`（下称"正向规格"）对应章节。本文档只精写 Responses 侧结构与两侧映射。
 >
 > **来源标注约定**：
-> - `[实测样本]`：从 `../samples/responses_api_samples.txt`（美团网关 `/v1/responses` 端点 2026-07-17 实测 4 个样本）逐字段查证
+> - `[实测样本]`：从 `../../tests/samples/responses_api_samples.txt`（美团网关 `/v1/responses` 端点 2026-07-17 实测 4 个样本）逐字段查证
 > - `[Part 1]`：Anthropic 侧字段定义引用本文档 Part 1（正向规格）
 > - `[Responses]`：OpenAI Responses API 官方语义（codex-cli 依赖）
 > - `[Anthropic]`：Anthropic Messages API 语义
@@ -1680,7 +1680,7 @@ elif mode == UNSUPPORTED:
 
 ## 附录：来源清单
 
-- `[实测样本]`：`tools/model_proxy/samples/responses_api_samples.txt`（美团网关 `/v1/responses` 端点 2026-07-17 实测）——样本1（非流式基础）、样本3（工具调用非流式）、样本2（流式文本 seq 0..10）、样本4（流式工具 seq 0..10）。Responses 侧所有字段结构、id 格式、事件序列、sequence_number 递增、wire format（单 data 行、无 [DONE]）均以此为准。
+- `[实测样本]`：`tests/samples/responses_api_samples.txt`（美团网关 `/v1/responses` 端点 2026-07-17 实测）——样本1（非流式基础）、样本3（工具调用非流式）、样本2（流式文本 seq 0..10）、样本4（流式工具 seq 0..10）。Responses 侧所有字段结构、id 格式、事件序列、sequence_number 递增、wire format（单 data 行、无 [DONE]）均以此为准。
 - `[Part 1]`：`tools/model_proxy/本文档 Part 1`——Anthropic 侧字段定义（§1.2 system、§1.3 messages/content block、§1.4 thinking/effort、§1.5 tools/input_schema、§1.6 tool_choice、§2.5 非流式响应结构、§3.1/§3.2 流式事件序列与各事件 JSON、§3.3 wire format、§5.1 Anthropic error 枚举）。
 - `[Responses]`：OpenAI Responses API 语义（codex-cli 依赖）——`instructions`/`input`(items: message/function_call/function_call_output)/`tools`(扁平 function)/`reasoning.effort`/`tool_choice`/`max_completion_tokens`。
 - `[Anthropic]`：Anthropic Messages API 语义——messages 分组、tool_use/tool_result block 对齐、max_tokens 必填。

@@ -293,14 +293,13 @@ tools/model_proxy/
 │       ├── capability.py              # ModelReasoningCapability + remap()（相对排名映射，唯一映射点）+ abstract_encode()
 │       ├── codecs.py                  # 各协议 decode / syntax_adapt（协议内 wire 语法适配）
 │       └── registry.py                # protocol → codec 单例 + apply_fields
-├── tests/                              # 单测
+├── tests/                              # 单测 + samples/（网关真实响应样本，供测试回归与规格核对）
 ├── docs/                              # 文档
 │   ├── CONFIG.md                      # 配置字段明细/protocol推断/route_pool/session override/supply test/stats账本
 │   ├── ARCHITECTURE.md                # 入站鉴权/协议识别/三阶段匹配/effort映射/出站转换/启停
 │   ├── REASONING.md                   # effort_enum语义/映射算法/off_alias/档名词/debug旁路
 │   ├── designs/               # 当期设计记录（含 model_proxy_translate_spec.md 协议转换活规格）
 │   └── archive/                       # 历史设计记录归档
-└── samples/                            # 实测样本（网关真实响应，供规格核对字段用）
 ```
 
 ## 附录B: 文档导航

@@ -1850,7 +1850,7 @@ class TestARResponse(unittest.TestCase):
 
 
 def _ar_text_stream_events():
-    """基于 samples/responses_api_samples.txt 样本2构造的文本流事件序列。"""
+    """基于 tests/samples/responses_api_samples.txt 样本2构造的文本流事件序列。"""
     return [
         ("response.created", {"response": {"id": "resp_c", "model": "gpt-5.6-sol"}}),
         ("response.in_progress", {"response": {"id": "resp_c"}}),
