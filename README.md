@@ -298,8 +298,7 @@ tools/model_proxy/
 │   ├── CONFIG.md                      # 配置字段明细/protocol推断/route_pool/session override/supply test/stats账本
 │   ├── ARCHITECTURE.md                # 入站鉴权/协议识别/三阶段匹配/effort映射/出站转换/启停
 │   ├── REASONING.md                   # effort_enum语义/映射算法/off_alias/档名词/debug旁路
-│   ├── model_proxy_translate_spec.md  # 协议转换活规格
-│   ├── designs/               # 当期设计记录
+│   ├── designs/               # 当期设计记录（含 model_proxy_translate_spec.md 协议转换活规格）
 │   └── archive/                       # 历史设计记录归档
 └── samples/                            # 实测样本（网关真实响应，供规格核对字段用）
 ```
@@ -311,6 +310,6 @@ tools/model_proxy/
 | CONFIG.md | 配置字段明细/protocol推断/route_pool/session override/supply test/stats账本 | docs/CONFIG.md |
 | ARCHITECTURE.md | 入站鉴权/协议识别/三阶段匹配/effort映射/出站转换/启停 | docs/ARCHITECTURE.md |
 | REASONING.md | effort_enum语义/映射算法/off_alias/档名词/debug旁路 | docs/REASONING.md |
-| 协议转换规格 | Anthropic⇄Chat/Responses⇄Anthropic 字段映射 | docs/model_proxy_translate_spec.md |
+| 协议转换规格 | Anthropic⇄Chat/Responses⇄Anthropic 字段映射 | docs/designs/model_proxy_translate_spec.md |
 | 设计记录 | 当期设计决策 | docs/designs/ |
 | 历史归档 | 已完成/已替代设计 | docs/archive/ |

@@ -28,7 +28,7 @@ content blocks/流式事件）的转换；reasoning 强度的解析与钳位由 
         非流式响应 responses_to_anthropic_response(resp, ctx=None) -> anthropic_dict
         流式       class ResponsesToAnthropicStreamAdapter: feed(event)->list, finalize()->list
 
-严格照 docs/model_proxy_translate_spec.md 的规格实现，字段映射不得自创。
+严格照 docs/designs/model_proxy_translate_spec.md 的规格实现，字段映射不得自创。
 纯标准库（json / hashlib / secrets / time），无网络 IO，可脱离 HTTP 单测。
 
 历史脚注：本文件由原 model_proxy_translate.py（§1/§2 正向）与
