@@ -106,7 +106,7 @@ class _FakeCooldown:
     def is_cooling(self, sid):
         return False
 
-    def cooldown(self, sid, secs):
+    def cooldown(self, sid, secs, reason=""):
         self.cooled.append(sid)
 
 

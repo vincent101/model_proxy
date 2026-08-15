@@ -305,13 +305,14 @@ class TestStatusFormatFromJson(unittest.TestCase):
             totals_path = self._make_totals(td)
             data = {
                 "supplies": [{"id": "s1"}], "routes": [], "strategies": [],
-                "cooldown": {"s1": 45}, "default_cooldown_seconds": 60,
+                "cooldown": {"s1": {"remain": 45, "reason": "http_429"}}, "default_cooldown_seconds": 60,
             }
             lines = _format_status_from_json(data, cfg_path, totals_path)
             joined = "\n".join(lines)
             self.assertIn("cooldown (剩余秒):", joined)
             self.assertIn("s1", joined)
             self.assertIn("45s", joined)
+            self.assertIn("http_429", joined)
 
     def test_config_count_row(self):
         """config 计数行含 supplies/routes/strategies 数。"""

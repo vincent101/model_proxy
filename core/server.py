@@ -631,6 +631,7 @@ class CooldownStore:
 
     def __init__(self):
         self._until: dict[str, float] = {}   # supply_id -> cooldown_until(epoch 秒)
+        self._reason: dict[str, str] = {}    # supply_id -> errorcode（当前冷却周期的触发原因）
         self._lock = threading.Lock()
 
     def is_cooling(self, supply_id: str) -> bool:
@@ -640,27 +641,34 @@ class CooldownStore:
             until = self._until.get(supply_id, 0.0)
             return now < until
 
-    def cooldown(self, supply_id: str, seconds: int) -> None:
-        """将 supply 置入冷却：until = now + seconds。"""
+    def cooldown(self, supply_id: str, seconds: int, reason: str = "") -> None:
+        """将 supply 置入冷却：until = now + seconds。reason 为触发此冷却的 errorcode（如 "http_429"）。"""
         until = time.time() + seconds
         with self._lock:
             self._until[supply_id] = until
+            if reason:
+                self._reason[supply_id] = reason
 
     def clear_all(self) -> None:
         """清空所有 supply 的冷却（仅手动 reload 调用，mtime 自动 reload 绝不调用）。"""
         with self._lock:
             self._until.clear()
+            self._reason.clear()
 
-    def snapshot(self) -> dict[str, float]:
-        """返回 supply_id -> 剩余秒（仅含仍在冷却中的 supply，用于 status 展示）。"""
+    def snapshot(self) -> dict[str, dict[str, float | str]]:
+        """返回 supply_id -> {"remain": 剩余秒, "reason": errorcode}（仅含仍在冷却中的 supply）。"""
         now = time.time()
         with self._lock:
             items = list(self._until.items())
-        result: dict[str, float] = {}
+            reasons = dict(self._reason)
+        result: dict[str, dict] = {}
         for supply_id, until in items:
             remaining = until - now
             if remaining > 0:
-                result[supply_id] = round(remaining, 1)
+                result[supply_id] = {
+                    "remain": round(remaining, 1),
+                    "reason": reasons.get(supply_id, ""),
+                }
         return result
 
 
@@ -1734,7 +1742,7 @@ class ModelProxyHandler(BaseHTTPRequestHandler):
                         self._acc["failover"] = 1
                         self._acc["attempt_errors"].append(
                             (supply_id, f"http_{resp_status}"))
-                        cd.cooldown(supply_id, secs)
+                        cd.cooldown(supply_id, secs, f"http_{resp_status}")
                         tried_set.add(supply_id)
                         continue
                     # 未命中策略 → 透传 + 告警 + 累计 unconfigured_hits
@@ -1757,7 +1765,7 @@ class ModelProxyHandler(BaseHTTPRequestHandler):
                         self._acc["failover"] = 1
                         self._acc["attempt_errors"].append(
                             (supply_id, f"net_error:{e}"))
-                        cd.cooldown(supply_id, secs)
+                        cd.cooldown(supply_id, secs, f"net_error:{e}")
                         tried_set.add(supply_id)
                         continue
                     # 未配 URLError 策略 → 透传 502 + 告警

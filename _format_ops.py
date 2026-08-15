@@ -659,9 +659,16 @@ def _format_status_from_json(data: dict, config_path: str, totals_path: str,
     if cooldown and not cooldown_unknown:
         lines.append("")
         lines.append("cooldown (剩余秒):")
-        for sid, remain in sorted(cooldown.items()):
+        for sid, info in sorted(cooldown.items()):
+            if isinstance(info, dict):
+                remain = info.get("remain", 0)
+                reason = info.get("reason", "")
+            else:
+                remain = info
+                reason = ""
             ref = ",".join(refs.get(sid, [])) or "未被引用"
-            lines.append(f"  {_pad(sid, 24)} {int(remain)}s  ← {ref}")
+            suffix = f" ({reason})" if reason else ""
+            lines.append(f"  {_pad(sid, 24)} {int(remain)}s  ← {ref}{suffix}")
 
     # config 计数行（config 损坏时显式提示而非崩溃）
     lines.append("")

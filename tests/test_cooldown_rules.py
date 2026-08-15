@@ -103,13 +103,15 @@ class _FakeCooldown:
     def __init__(self):
         self.cooled = []
         self.cooled_secs = []
+        self.cooled_reasons = []
 
     def is_cooling(self, sid):
         return False
 
-    def cooldown(self, sid, secs):
+    def cooldown(self, sid, secs, reason=""):
         self.cooled.append(sid)
         self.cooled_secs.append(secs)
+        self.cooled_reasons.append(reason)
 
     def snapshot(self):
         return {}
@@ -117,6 +119,7 @@ class _FakeCooldown:
     def clear_all(self):
         self.cooled.clear()
         self.cooled_secs.clear()
+        self.cooled_reasons.clear()
 
 
 class _FakePref:
@@ -219,6 +222,7 @@ class Test402CooldownFailover(unittest.TestCase):
         self.assertEqual(h._acc["failover"], 1)
         self.assertEqual(cd.cooled, ["s1"])
         self.assertEqual(cd.cooled_secs, [21600])
+        self.assertEqual(cd.cooled_reasons, ["http_402"])
         self.assertEqual(h._acc["status"], 200)
 
 
@@ -239,6 +243,7 @@ class TestURLErrorCooldownFailover(unittest.TestCase):
         self.assertEqual(h._acc["failover"], 1)
         self.assertEqual(cd.cooled, ["s1"])
         self.assertEqual(cd.cooled_secs, [60])
+        self.assertTrue(cd.cooled_reasons[0].startswith("net_error:"))
 
 
 # ---------------------------------------------------------------------------
