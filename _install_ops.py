@@ -16,6 +16,7 @@ import json
 import os
 import re
 import sys
+import urllib.request
 from pathlib import Path
 
 from _config_ops import compact_config_json, confirm, load_config
@@ -32,6 +33,17 @@ _CLAUDE_SETTINGS = _VAULT_ROOT / ".claude" / "settings.json"
 _HOOK_SCRIPT_REL = str(
     _MODEL_PROXY_DIR.relative_to(_VAULT_ROOT) / "hooker" / "ensure_model_proxy.sh"
 )  # 相对 vault 根，如 "tools/model_proxy/hooker/ensure_model_proxy.sh"
+
+# codex model catalog 模板（仓库内置，base_instructions 占位符）与目标路径
+_CODEX_CATALOG_TEMPLATE = _MODEL_PROXY_DIR / "assets" / "codex_catalog_template.json"
+_CODEX_CATALOG_TARGET = Path.home() / ".codex" / "model-catalogs" / "model_proxy_catalog.json"
+_CODEX_CATALOG_TOML_KEY = "model_catalog_json"
+_CODEX_CATALOG_TOML_VALUE = "~/.codex/model-catalogs/model_proxy_catalog.json"
+_PROMPT_MD_URL = "https://raw.githubusercontent.com/openai/codex/main/codex-rs/models-manager/prompt.md"
+_PROMPT_MD_TIMEOUT = 30  # 拉取超时秒数
+
+# Claude Code onboarding 状态文件（与 settings.json 不同文件，不混用）
+_CLAUDE_ONBOARDING = Path.home() / ".claude.json"
 
 # ---------------------------------------------------------------------------
 # SDK 元信息：协议 / 配置路径 / 检测方式
@@ -184,23 +196,31 @@ def preview_confirm_write(
 
     ts = datetime.datetime.now().strftime("%Y%m%d%H%M%S")
     bak_path = cfg_path.with_name(cfg_path.name + f".bak.{ts}")
-    print(f"  确认后将备份原文件到: {bak_path}")
+    has_original = cfg_path.exists()
+    if has_original:
+        print(f"  确认后将备份原文件到: {bak_path}")
+    else:
+        print(f"  [{sdk_label}] 原文件不存在，确认后将直接写入（无需备份）。")
 
     if not confirm("  确认执行以上改动?"):
         print("  已取消，未改动任何文件。")
         return False
 
-    try:
-        bak_path.write_bytes(cfg_path.read_bytes())
-    except OSError as e:
-        print(f"  Error: backup failed ({e})，中止，不改动 {cfg_path}")
-        return False
-    print(f"  Backup: {bak_path}")
+    if has_original:
+        try:
+            bak_path.write_bytes(cfg_path.read_bytes())
+        except OSError as e:
+            print(f"  Error: backup failed ({e})，中止，不改动 {cfg_path}")
+            return False
+        print(f"  Backup: {bak_path}")
 
     try:
         cfg_path.write_text(new_text, encoding="utf-8")
     except OSError as e:
-        print(f"  Error: 写入失败 ({e})，原文件已备份到 {bak_path}")
+        if cfg_path.exists():
+            print(f"  Error: 写入失败 ({e})，原文件已备份到 {bak_path}")
+        else:
+            print(f"  Error: 写入失败 ({e})")
         return False
 
     for line in success_msg_lines:
@@ -359,6 +379,58 @@ def base_url_for(port: str) -> str:
     return f"http://localhost:{port}/"
 
 
+def _ensure_onboarding_completed(onboarding_path: "Path | None" = None) -> None:
+    """确保 ~/.claude.json 含 hasCompletedOnboarding=true，跳过 Claude Code
+    官方 onboarding/登录引导。新机器首次 install 后直接可用。
+
+    分支（详见设计文档 ~/.claude.json 各分支处理表）：
+    - 文件不存在 → 写入最小文件 {"hasCompletedOnboarding": true}
+    - 文件存在 + JSON 可解析 + hasCompletedOnboarding 已为 true → 跳过
+    - 文件存在 + JSON 可解析 + hasCompletedOnboarding 为 false 或缺失 → merge 写入 true
+    - 文件存在 + JSON 解析失败 → 降级打印手动片段
+
+    onboarding_path 默认 None 时运行时读取模块级 _CLAUDE_ONBOARDING（同
+    ensure_session_hook 的默认参数设计，支持 patch 模块常量做测试）。
+    """
+    if onboarding_path is None:
+        onboarding_path = _CLAUDE_ONBOARDING
+
+    if not onboarding_path.exists():
+        new_text = json.dumps(
+            {"hasCompletedOnboarding": True}, indent=2, ensure_ascii=False
+        ) + "\n"
+        preview_confirm_write(onboarding_path, "", new_text, "claude(onboarding)", [
+            "已写入 ~/.claude.json: hasCompletedOnboarding=true",
+            "Claude Code 首次启动将跳过官方 onboarding/登录引导。",
+        ])
+        return
+
+    old_text = onboarding_path.read_text(encoding="utf-8")
+    try:
+        cfg = json.loads(old_text)
+    except (json.JSONDecodeError, ValueError) as e:
+        print(f"  [claude(onboarding)] {onboarding_path} 解析失败: {e}")
+        print(f"  请手动在 {onboarding_path} 中添加: "
+              f'"hasCompletedOnboarding": true')
+        return
+
+    if cfg.get("hasCompletedOnboarding") is True:
+        print(f"  [claude(onboarding)] hasCompletedOnboarding 已为 true，跳过。")
+        return
+
+    if cfg.get("hasCompletedOnboarding") is False:
+        print(f"  [claude(onboarding)] 检测到 hasCompletedOnboarding=false，"
+              f"将覆盖为 true（install 目的即接入 model_proxy，"
+              f"保留 false 会被 onboarding 拦截）。")
+
+    cfg["hasCompletedOnboarding"] = True
+    new_text = json.dumps(cfg, indent=2, ensure_ascii=False) + "\n"
+    preview_confirm_write(onboarding_path, old_text, new_text, "claude(onboarding)", [
+        "已写入 ~/.claude.json: hasCompletedOnboarding=true",
+        "Claude Code 首次启动将跳过官方 onboarding/登录引导。",
+    ])
+
+
 def install_claude(token: str, port: str) -> None:
     cfg_path = SDKS["claude"]["config_path"]
     base_url = base_url_for(port)
@@ -370,6 +442,9 @@ def install_claude(token: str, port: str) -> None:
   "ANTHROPIC_DEFAULT_HAIKU_MODEL": "claude-haiku",
   "ANTHROPIC_DEFAULT_SONNET_MODEL": "claude-sonnet",
   "ANTHROPIC_DEFAULT_OPUS_MODEL": "claude-opus"
+
+同时在 ~/.claude.json 中添加（跳过官方 onboarding/登录引导）：
+  {{"hasCompletedOnboarding": true}}
 """)
         return
     old_text = cfg_path.read_text(encoding="utf-8")
@@ -385,6 +460,100 @@ def install_claude(token: str, port: str) -> None:
         f"已写入：ANTHROPIC_BASE_URL={base_url} ANTHROPIC_AUTH_TOKEN={token}",
         "请重启 Claude Code 生效。",
     ])
+    _ensure_onboarding_completed()
+
+
+def _install_catalog_asset(
+    template_path: "Path | None" = None,
+    target_path: "Path | None" = None,
+) -> bool:
+    """安装 codex model catalog 到 ~/.codex/model-catalogs/。
+
+    读仓库模板（base_instructions 为占位符 __PROMPT_MD__）→ 从网络拉 codex 官方
+    prompt.md 全文 → 替换占位符 → 写入目标文件。
+
+    网络失败时降级：不写 catalog 文件、install_codex 不加 model_catalog_json 行，
+    codex 保留 metadata warning 但能用 fallback 正常运行。
+
+    返回 True=装成功/已是最新，False=失败/取消/模板不存在。
+
+    template_path/target_path 默认 None 时运行时读取模块级常量
+    （同 ensure_session_hook 的默认参数设计，支持 patch 模块常量做测试）。
+    """
+    if template_path is None:
+        template_path = _CODEX_CATALOG_TEMPLATE
+    if target_path is None:
+        target_path = _CODEX_CATALOG_TARGET
+
+    # 1. 读仓库模板
+    if not template_path.exists():
+        print(f"  [codex catalog] Warning: 模板 {template_path} 不存在，跳过 catalog 安装。")
+        return False
+
+    template = json.loads(template_path.read_text(encoding="utf-8"))
+
+    # 2. 拉 prompt.md
+    try:
+        prompt_content = urllib.request.urlopen(
+            _PROMPT_MD_URL, timeout=_PROMPT_MD_TIMEOUT
+        ).read().decode("utf-8")
+    except (urllib.request.URLError, OSError, TimeoutError) as e:
+        print(f"  [codex catalog] Warning: 拉取 prompt.md 失败（{e}），"
+              f"跳过 catalog 安装，codex 将保留 metadata warning 但能用 fallback 正常运行，"
+              f"网络恢复后重跑 install 补上。")
+        return False
+
+    # 3. 拼装：替换占位符（base_instructions + instructions_template 两处都替换）
+    for m in template.get("models", []):
+        m["base_instructions"] = prompt_content
+        if m.get("model_messages") and m["model_messages"].get("instructions_template") is not None:
+            m["model_messages"]["instructions_template"] = prompt_content
+
+    # 4. 确保目录存在
+    target_path.parent.mkdir(parents=True, exist_ok=True)
+
+    # 5. 序列化
+    new_bytes = json.dumps(template, ensure_ascii=False, indent=2).encode("utf-8")
+
+    # 6. 目标不存在 → confirm → 写入
+    if not target_path.exists():
+        size_kb = len(new_bytes) / 1024
+        print(f"  [codex catalog] 将写入 {target_path}（约 {size_kb:.0f}KB）")
+        if not confirm("  确认写入 catalog 文件?"):
+            print("  已取消，未写入 catalog 文件。")
+            return False
+        target_path.write_bytes(new_bytes)
+        print(f"  [codex catalog] 已写入 {target_path}")
+        return True
+
+    # 7. 目标存在 + bytes 相同 → 跳过
+    if target_path.read_bytes() == new_bytes:
+        print(f"  [codex catalog] {target_path} 已是最新，跳过。")
+        return True
+
+    # 8. 目标存在 + bytes 不同 → confirm → 备份 → 覆盖
+    size_kb = len(new_bytes) / 1024
+    print(f"  [codex catalog] {target_path} 内容有变更（新文件约 {size_kb:.0f}KB）")
+    if not confirm("  确认覆盖 catalog 文件?"):
+        print("  已取消，catalog 文件不变。")
+        return False
+
+    ts = datetime.datetime.now().strftime("%Y%m%d%H%M%S")
+    bak_path = target_path.with_name(target_path.name + f".bak.{ts}")
+    target_path.rename(bak_path)
+    target_path.write_bytes(new_bytes)
+    print(f"  [codex catalog] 已备份旧文件到 {bak_path}")
+    print(f"  [codex catalog] 已写入 {target_path}")
+    return True
+
+
+def _set_top_key_static(text: str, key: str, value: str) -> str:
+    """TOML 顶层 key 存在则替换，不存在则在文件头追加。"""
+    pattern = re.compile(rf"^{key}\s*=.*$", re.MULTILINE)
+    line = f'{key} = "{value}"'
+    if pattern.search(text):
+        return pattern.sub(line, text, count=1)
+    return line + "\n" + text
 
 
 def install_codex(token: str, port: str) -> None:
@@ -393,9 +562,11 @@ def install_codex(token: str, port: str) -> None:
     不触碰其他已存在的 provider 段。
 
     base_url 拼到 /v1 层级（不含 /responses），wire_api="responses" 由 codex 自己
-    拼 /responses 后缀——这一拼接规则依据本项目 server.py detect_source() 对
-    /v1/responses 路径后缀的识别逻辑反推，未逐字核对 codex 官方文档字段名，
-    如实际接入报 404/400 请核对 codex 官方 config.toml 文档调整 base_url 层级。
+    拼 /responses 后缀——已对 codex 0.145.0 官方 config-reference 逐字核对确认：
+    base_url 含 /v1 不含 /responses（codex 自拼后缀）、wire_api="responses" 是官方
+    唯一合法值且默认即此、env_key 走环境变量、experimental_bearer_token 是官方
+    dev-only 直填 token 字段。依据来源：learn.chatgpt.com/codex/config-reference
+    与 config-sample。
     """
     cfg_path = SDKS["codex"]["config_path"]
     base_url = base_url_for(port).rstrip("/") + "/v1"
@@ -409,20 +580,28 @@ def install_codex(token: str, port: str) -> None:
         f'[model_providers.{provider_name}]\n'
         f'base_url = "{base_url}"\n'
         f'wire_api = "responses"\n'
-        f'env_key = "{env_key}"\n'
+        f'experimental_bearer_token = "{token}"\n'
+        f'# env_key = "{env_key}"  # 备选：改用环境变量时注释掉上一行 bearer_token、取消此行注释并 export {env_key}="{token}"\n'
     )
 
     if not cfg_path.exists():
-        print_manual_snippet("codex", f"""\
-在 {cfg_path} 中添加：
-
-model = "{model_label}"
-model_provider = "{provider_name}"
-
-{provider_block}
-并在启动 codex 前设置环境变量（appkey 用途，这里用 model_proxy 的 client_token）：
-  export {env_key}="{token}"
-""")
+        new_text = (
+            f'model = "{model_label}"\n'
+            f'model_provider = "{provider_name}"\n'
+            f'\n'
+            f'{provider_block}'
+        )
+        wrote = preview_confirm_write(cfg_path, "", new_text, "codex", [
+            f"已写入：model_provider={provider_name} base_url={base_url}",
+            "已用 experimental_bearer_token 直填（dev-only），免 export；"
+            f"若需改走环境变量，见 config 内 env_key 注释",
+        ])
+        if wrote:
+            if _install_catalog_asset():
+                cur = cfg_path.read_text(encoding="utf-8")
+                cur = _set_top_key_static(cur, _CODEX_CATALOG_TOML_KEY, _CODEX_CATALOG_TOML_VALUE)
+                cfg_path.write_text(cur, encoding="utf-8")
+                print(f"  已在 config.toml 补写 {_CODEX_CATALOG_TOML_KEY} 行")
         return
 
     old_text = cfg_path.read_text(encoding="utf-8")
@@ -439,21 +618,24 @@ model_provider = "{provider_name}"
         text += "\n" + provider_block
 
     # 顶层 model / model_provider：存在则替换，不存在则在文件头追加
-    def _set_top_key(t: str, key: str, value: str) -> str:
-        pattern = re.compile(rf"^{key}\s*=.*$", re.MULTILINE)
-        line = f'{key} = "{value}"'
-        if pattern.search(t):
-            return pattern.sub(line, t, count=1)
-        return line + "\n" + t
+    text = _set_top_key_static(text, "model", model_label)
+    text = _set_top_key_static(text, "model_provider", provider_name)
 
-    text = _set_top_key(text, "model", model_label)
-    text = _set_top_key(text, "model_provider", provider_name)
+    # catalog 装成功才加/改 model_catalog_json 行；失败则保留现有行不动
+    catalog_ok = _install_catalog_asset()
+    if catalog_ok:
+        text = _set_top_key_static(text, _CODEX_CATALOG_TOML_KEY, _CODEX_CATALOG_TOML_VALUE)
+    else:
+        if re.search(rf'^{re.escape(_CODEX_CATALOG_TOML_KEY)}\s*=', text, re.MULTILINE):
+            print(f"  catalog 装失败，保留现有 {_CODEX_CATALOG_TOML_KEY} 行"
+                  f"（指向旧文件，网络恢复后重跑 install 更新）")
+
     new_text = text
 
     preview_confirm_write(cfg_path, old_text, new_text, "codex", [
         f"已写入：model_provider={provider_name} base_url={base_url}",
-        f"请在启动 codex 前设置环境变量: export {env_key}=\"{token}\"",
-        "（appkey 不写入配置文件本体，走环境变量注入）",
+        "已用 experimental_bearer_token 直填（dev-only），免 export；"
+        f"若需改走环境变量，见 config 内 env_key 注释",
     ])
 
 

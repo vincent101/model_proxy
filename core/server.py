@@ -1201,6 +1201,9 @@ class ModelProxyHandler(BaseHTTPRequestHandler):
     通过 server 属性访问（ThreadingHTTPServer 持有引用）。
     """
 
+    protocol_version = "HTTP/1.1"
+    timeout = 30
+
     # 屏蔽默认日志
     def log_message(self, fmt, *args):
         pass
@@ -2306,8 +2309,14 @@ class ModelProxyHandler(BaseHTTPRequestHandler):
             self.wfile.write(b"0\r\n\r\n")
             self.wfile.flush()
         except (BrokenPipeError, ConnectionResetError):
-            # 客户端已断开，写不进去也无所谓，静默即可
-            pass
+            # 客户端断连：仍尝试 finalize 收尾（幂等，write 失败无所谓）
+            try:
+                for ev in adapter.finalize():
+                    self._write_sse_chunk(pt.anthropic_sse_bytes(ev))
+                self.wfile.write(b"0\r\n\r\n")
+                self.wfile.flush()
+            except (BrokenPipeError, ConnectionResetError, OSError):
+                pass
         except Exception as e:
             # 上游连接中断/读取异常/adapter.feed 抛异常：200+chunked 头已发出，无法降级为
             # 非流式 error body，只能按正向规格 §5.1 补发一个 `event: error` 再体面收尾
@@ -2361,8 +2370,14 @@ class ModelProxyHandler(BaseHTTPRequestHandler):
             self.wfile.write(b"0\r\n\r\n")
             self.wfile.flush()
         except (BrokenPipeError, ConnectionResetError):
-            # 客户端已断开，写不进去也无所谓，静默即可
-            pass
+            # 客户端断连：仍尝试 finalize 收尾（幂等，write 失败无所谓）
+            try:
+                for ev in adapter.finalize():
+                    self._write_sse_chunk(pt.responses_sse_bytes(ev))
+                self.wfile.write(b"0\r\n\r\n")
+                self.wfile.flush()
+            except (BrokenPipeError, ConnectionResetError, OSError):
+                pass
         except Exception as e:
             # 上游连接中断/读取异常/adapter.feed 抛异常：200+chunked 头已发出，无法降级为
             # 非流式 error body，按反向规格 §5.1 补发一个 response.failed 事件再体面收尾
@@ -2413,7 +2428,14 @@ class ModelProxyHandler(BaseHTTPRequestHandler):
             self.wfile.write(b"0\r\n\r\n")
             self.wfile.flush()
         except (BrokenPipeError, ConnectionResetError):
-            pass
+            # 客户端断连：仍尝试 finalize 收尾（幂等，write 失败无所谓）
+            try:
+                for ev in adapter.finalize():
+                    self._write_sse_chunk(pt.anthropic_sse_bytes(ev))
+                self.wfile.write(b"0\r\n\r\n")
+                self.wfile.flush()
+            except (BrokenPipeError, ConnectionResetError, OSError):
+                pass
         except Exception as e:
             log.error("ANTHROPIC_TO_RESPONSES stream interrupted: %s", e)
             try:

@@ -210,6 +210,47 @@ class TestPreviewConfirmWrite(unittest.TestCase):
         baks = list(self.cfg_path.parent.glob("settings.json.bak.*"))
         self.assertEqual(len(baks), 1)
 
+    def test_no_original_file_skips_backup_and_writes(self):
+        """原文件不存在（old_text=""）时跳过备份、直接写入，不产生 .bak 文件。"""
+        new_text = json.dumps({"env": {"ANTHROPIC_BASE_URL": "http://x/"}}) + "\n"
+        # 不创建 self.cfg_path，模拟首次写入
+
+        with patch("_install_ops.confirm", return_value=True):
+            result = iops.preview_confirm_write(
+                self.cfg_path, "", new_text, "claude", ["ok"]
+            )
+
+        self.assertTrue(result)
+        self.assertEqual(self.cfg_path.read_text(encoding="utf-8"), new_text)
+        baks = list(self.cfg_path.parent.glob("settings.json.bak.*"))
+        self.assertEqual(len(baks), 0)
+
+    def test_no_original_file_confirm_no_creates_nothing(self):
+        """原文件不存在 + 用户不确认 → 不创建文件、不产生备份。"""
+        new_text = json.dumps({"env": {"ANTHROPIC_BASE_URL": "http://x/"}}) + "\n"
+
+        with patch("_install_ops.confirm", return_value=False):
+            result = iops.preview_confirm_write(
+                self.cfg_path, "", new_text, "claude", ["ok"]
+            )
+
+        self.assertFalse(result)
+        self.assertFalse(self.cfg_path.exists())
+        baks = list(self.cfg_path.parent.glob("settings.json.bak.*"))
+        self.assertEqual(len(baks), 0)
+
+    def test_empty_old_text_diff_displays_all_additions(self):
+        """old_text="" 时 unified_diff 应正常输出（全部为新增行），不报错。"""
+        new_text = 'model = "claude-sonnet"\nmodel_provider = "model_proxy"\n'
+
+        with patch("_install_ops.confirm", return_value=True):
+            result = iops.preview_confirm_write(
+                self.cfg_path, "", new_text, "codex", ["ok"]
+            )
+
+        self.assertTrue(result)
+        self.assertEqual(self.cfg_path.read_text(encoding="utf-8"), new_text)
+
 
 class TestInstallClaudeFileNotExists(unittest.TestCase):
 
@@ -220,19 +261,440 @@ class TestInstallClaudeFileNotExists(unittest.TestCase):
                  patch("_install_ops.print_manual_snippet") as mock_snippet:
                 iops.install_claude("tok", "8000")
             mock_snippet.assert_called_once()
+            # snippet 内容含 hasCompletedOnboarding 提示
+            snippet_text = mock_snippet.call_args[0][1]
+            self.assertIn("hasCompletedOnboarding", snippet_text)
             self.assertFalse(fake_home_cfg.exists())
+
+
+class TestEnsureOnboardingCompleted(unittest.TestCase):
+    """_ensure_onboarding_completed 各分支用例，全部用 tempfile 模拟
+    ~/.claude.json，绝不碰真实文件。"""
+
+    def setUp(self):
+        self._tmpdir = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmpdir.cleanup)
+        self.onboarding_path = Path(self._tmpdir.name) / ".claude.json"
+
+    def test_file_not_exists_creates_minimal(self):
+        """文件不存在 + confirm=True → 建文件 {"hasCompletedOnboarding": true}，无 .bak。"""
+        with patch("_install_ops.confirm", return_value=True):
+            iops._ensure_onboarding_completed(self.onboarding_path)
+        self.assertTrue(self.onboarding_path.exists())
+        written = json.loads(self.onboarding_path.read_text(encoding="utf-8"))
+        self.assertTrue(written["hasCompletedOnboarding"])
+        baks = list(self.onboarding_path.parent.glob(".claude.json.bak.*"))
+        self.assertEqual(len(baks), 0)
+
+    def test_file_not_exists_confirm_no_creates_nothing(self):
+        """文件不存在 + confirm=False → 文件不存在，无 .bak。"""
+        with patch("_install_ops.confirm", return_value=False):
+            iops._ensure_onboarding_completed(self.onboarding_path)
+        self.assertFalse(self.onboarding_path.exists())
+        baks = list(self.onboarding_path.parent.glob(".claude.json.bak.*"))
+        self.assertEqual(len(baks), 0)
+
+    def test_already_true_skips(self):
+        """文件存在 + hasCompletedOnboarding=true → confirm 不被调用，文件不变。"""
+        original = json.dumps({"hasCompletedOnboarding": True}, indent=2) + "\n"
+        self.onboarding_path.write_text(original, encoding="utf-8")
+        with patch("_install_ops.confirm") as mock_confirm:
+            iops._ensure_onboarding_completed(self.onboarding_path)
+            mock_confirm.assert_not_called()
+        self.assertEqual(self.onboarding_path.read_text(encoding="utf-8"), original)
+        baks = list(self.onboarding_path.parent.glob(".claude.json.bak.*"))
+        self.assertEqual(len(baks), 0)
+
+    def test_missing_key_adds_and_preserves_others(self):
+        """文件存在 + 缺 hasCompletedOnboarding 键 + 有其他键 → 补 true，其他键保留，有 .bak。"""
+        original_cfg = {
+            "mcpServers": {"foo": {"command": "bar"}},
+            "projects": {"/tmp/proj": {"allowedTools": ["Read"]}},
+        }
+        original = json.dumps(original_cfg, indent=2, ensure_ascii=False) + "\n"
+        self.onboarding_path.write_text(original, encoding="utf-8")
+        with patch("_install_ops.confirm", return_value=True):
+            iops._ensure_onboarding_completed(self.onboarding_path)
+        written = json.loads(self.onboarding_path.read_text(encoding="utf-8"))
+        self.assertTrue(written["hasCompletedOnboarding"])
+        # 其他键结构保留
+        self.assertEqual(written["mcpServers"], original_cfg["mcpServers"])
+        self.assertEqual(written["projects"], original_cfg["projects"])
+        baks = list(self.onboarding_path.parent.glob(".claude.json.bak.*"))
+        self.assertEqual(len(baks), 1)
+
+    def test_false_overwritten_to_true(self):
+        """文件存在 + hasCompletedOnboarding=false → confirm=True 覆盖为 true，有 .bak。"""
+        original = json.dumps({"hasCompletedOnboarding": False}, indent=2) + "\n"
+        self.onboarding_path.write_text(original, encoding="utf-8")
+        with patch("_install_ops.confirm", return_value=True):
+            iops._ensure_onboarding_completed(self.onboarding_path)
+        written = json.loads(self.onboarding_path.read_text(encoding="utf-8"))
+        self.assertTrue(written["hasCompletedOnboarding"])
+        baks = list(self.onboarding_path.parent.glob(".claude.json.bak.*"))
+        self.assertEqual(len(baks), 1)
+
+    def test_false_confirm_no_unchanged(self):
+        """文件存在 + hasCompletedOnboarding=false + confirm=False → 文件不变，无 .bak。"""
+        original = json.dumps({"hasCompletedOnboarding": False}, indent=2) + "\n"
+        self.onboarding_path.write_text(original, encoding="utf-8")
+        with patch("_install_ops.confirm", return_value=False):
+            iops._ensure_onboarding_completed(self.onboarding_path)
+        self.assertEqual(self.onboarding_path.read_text(encoding="utf-8"), original)
+        baks = list(self.onboarding_path.parent.glob(".claude.json.bak.*"))
+        self.assertEqual(len(baks), 0)
+
+    def test_invalid_json_degrades_no_write(self):
+        """文件存在但非合法 JSON → 不调 confirm，不写入，打印手动片段。"""
+        self.onboarding_path.write_text("not valid json {{{", encoding="utf-8")
+        original_bytes = self.onboarding_path.read_bytes()
+        with patch("_install_ops.confirm") as mock_confirm, \
+             patch("builtins.print") as mock_print:
+            iops._ensure_onboarding_completed(self.onboarding_path)
+            mock_confirm.assert_not_called()
+        self.assertEqual(self.onboarding_path.read_bytes(), original_bytes)
+        baks = list(self.onboarding_path.parent.glob(".claude.json.bak.*"))
+        self.assertEqual(len(baks), 0)
+        # 打印了手动片段提示
+        printed = " ".join(str(c) for c, _ in mock_print.call_args_list)
+        self.assertIn("hasCompletedOnboarding", printed)
+
+    def test_default_arg_reads_module_constant(self):
+        """不传 onboarding_path，patch 模块级 _CLAUDE_ONBOARDING → 走默认参数分支读到临时路径。"""
+        with patch("_install_ops._CLAUDE_ONBOARDING", self.onboarding_path), \
+             patch("_install_ops.confirm", return_value=True):
+            iops._ensure_onboarding_completed()  # 不传参
+        self.assertTrue(self.onboarding_path.exists())
+        written = json.loads(self.onboarding_path.read_text(encoding="utf-8"))
+        self.assertTrue(written["hasCompletedOnboarding"])
 
 
 class TestInstallCodexFileNotExists(unittest.TestCase):
 
-    def test_missing_file_prints_snippet_and_creates_nothing(self):
+    def test_missing_file_writes_via_preview_confirm_write(self):
+        """首次文件不存在时不再走 print_manual_snippet，而是直接调
+        preview_confirm_write 写入（old_text=""），确认后文件被创建，
+        内容含 experimental_bearer_token 直填 token，且无备份文件。
+        mock _install_catalog_asset 返回 True，追加断言 config.toml 含
+        model_catalog_json 行。"""
         with tempfile.TemporaryDirectory() as td:
             fake_cfg = Path(td) / "config.toml"
             with patch.dict(iops.SDKS["codex"], {"config_path": fake_cfg}), \
-                 patch("_install_ops.print_manual_snippet") as mock_snippet:
-                iops.install_codex("tok", "8000")
-            mock_snippet.assert_called_once()
+                 patch("_install_ops.confirm", return_value=True), \
+                 patch("_install_ops.print_manual_snippet") as mock_snippet, \
+                 patch("_install_ops._install_catalog_asset", return_value=True) as mock_catalog:
+                iops.install_codex("codex", "8000")
+            mock_snippet.assert_not_called()
+            mock_catalog.assert_called_once()
+            self.assertTrue(fake_cfg.exists())
+            content = fake_cfg.read_text(encoding="utf-8")
+            self.assertIn('experimental_bearer_token = "codex"', content)
+            self.assertIn('wire_api = "responses"', content)
+            self.assertIn('model = "claude-sonnet"', content)
+            self.assertIn('model_provider = "model_proxy"', content)
+            self.assertIn('# env_key =', content)
+            self.assertIn('model_catalog_json', content)
+            # 首次写入，无原文件，不应产生备份
+            baks = list(fake_cfg.parent.glob("config.toml.bak.*"))
+            self.assertEqual(len(baks), 0)
+
+    def test_missing_file_confirm_no_creates_nothing(self):
+        """首次文件不存在 + 用户不确认 → 不创建文件、不产生备份。
+        追加断言：catalog 未调用（config.toml 没写入就不会调 catalog）。"""
+        with tempfile.TemporaryDirectory() as td:
+            fake_cfg = Path(td) / "config.toml"
+            with patch.dict(iops.SDKS["codex"], {"config_path": fake_cfg}), \
+                 patch("_install_ops.confirm", return_value=False), \
+                 patch("_install_ops._install_catalog_asset") as mock_catalog:
+                iops.install_codex("codex", "8000")
             self.assertFalse(fake_cfg.exists())
+            baks = list(fake_cfg.parent.glob("config.toml.bak.*"))
+            self.assertEqual(len(baks), 0)
+            mock_catalog.assert_not_called()
+
+    def test_missing_file_catalog_fetch_fails_no_catalog_key(self):
+        """首次写入 + catalog 装失败（网络失败）→ config.toml 写入成功但
+        不含 model_catalog_json 行。"""
+        with tempfile.TemporaryDirectory() as td:
+            fake_cfg = Path(td) / "config.toml"
+            with patch.dict(iops.SDKS["codex"], {"config_path": fake_cfg}), \
+                 patch("_install_ops.confirm", return_value=True), \
+                 patch("_install_ops._install_catalog_asset", return_value=False):
+                iops.install_codex("codex", "8000")
+            self.assertTrue(fake_cfg.exists())
+            content = fake_cfg.read_text(encoding="utf-8")
+            self.assertNotIn("model_catalog_json", content)
+
+
+class TestInstallCatalogAsset(unittest.TestCase):
+    """_install_catalog_asset 各分支用例，全部用 tempfile，绝不碰真实
+    ~/.codex/；mock urllib.request.urlopen 控制网络结果。"""
+
+    def setUp(self):
+        self._tmpdir = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmpdir.cleanup)
+        self.template_path = Path(self._tmpdir.name) / "template.json"
+        self.target_path = Path(self._tmpdir.name) / "target.json"
+        # 写一个最小模板
+        self.template_data = {
+            "_codex_version": "0.145.0",
+            "models": [
+                {"slug": "claude-opus", "base_instructions": "__PROMPT_MD__",
+                 "model_messages": {"instructions_template": "__PROMPT_MD__"}},
+                {"slug": "claude-sonnet", "base_instructions": "__PROMPT_MD__",
+                 "model_messages": {"instructions_template": "__PROMPT_MD__"}},
+                {"slug": "claude-haiku", "base_instructions": "__PROMPT_MD__",
+                 "model_messages": {"instructions_template": "__PROMPT_MD__"}},
+            ],
+        }
+        self.template_path.write_text(
+            json.dumps(self.template_data, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+
+    def _mock_urlopen(self, prompt_content="FAKE_PROMPT_MD_CONTENT"):
+        """构造一个 mock urlopen，返回含 prompt_content 的响应。"""
+        from io import BytesIO
+        resp = BytesIO(prompt_content.encode("utf-8"))
+        m = patch("urllib.request.urlopen", return_value=resp)
+        return m
+
+    def test_template_not_exists_warns_and_skips(self):
+        """仓库模板不存在 → 打 warning，return False，不创建目标文件。"""
+        bad_template = Path(self._tmpdir.name) / "no_such.json"
+        with patch("builtins.print") as mock_print:
+            result = iops._install_catalog_asset(
+                template_path=bad_template, target_path=self.target_path
+            )
+        self.assertFalse(result)
+        self.assertFalse(self.target_path.exists())
+        printed = " ".join(str(c) for c, _ in mock_print.call_args_list)
+        self.assertIn("不存在", printed)
+
+    def test_prompt_md_fetch_fails_degrades(self):
+        """模板存在 + mock urlopen 抛 URLError → 降级 warning，return False，
+        不写目标文件。"""
+        from urllib.error import URLError
+        with patch("urllib.request.urlopen", side_effect=URLError("mock network fail")), \
+             patch("builtins.print") as mock_print:
+            result = iops._install_catalog_asset(
+                template_path=self.template_path, target_path=self.target_path
+            )
+        self.assertFalse(result)
+        self.assertFalse(self.target_path.exists())
+        printed = " ".join(str(c) for c, _ in mock_print.call_args_list)
+        self.assertIn("拉取 prompt.md 失败", printed)
+
+    def test_target_not_exists_writes(self):
+        """模板存在 + prompt 拉取成功 + 目标不存在 + confirm=True →
+        mkdir + 写入，内容含 prompt.md 全文，无 .bak，return True。"""
+        prompt = "FAKE_PROMPT_MD_CONTENT"
+        with self._mock_urlopen(prompt), \
+             patch("_install_ops.confirm", return_value=True):
+            result = iops._install_catalog_asset(
+                template_path=self.template_path, target_path=self.target_path
+            )
+        self.assertTrue(result)
+        self.assertTrue(self.target_path.exists())
+        written = json.loads(self.target_path.read_text(encoding="utf-8"))
+        self.assertEqual(
+            written["models"][0]["base_instructions"], prompt
+        )
+        self.assertEqual(
+            written["models"][1]["base_instructions"], prompt
+        )
+        self.assertEqual(
+            written["models"][2]["base_instructions"], prompt
+        )
+        self.assertEqual(
+            written["models"][0]["model_messages"]["instructions_template"], prompt
+        )
+        self.assertEqual(
+            written["models"][1]["model_messages"]["instructions_template"], prompt
+        )
+        self.assertEqual(
+            written["models"][2]["model_messages"]["instructions_template"], prompt
+        )
+        baks = list(self.target_path.parent.glob("*.bak.*"))
+        self.assertEqual(len(baks), 0)
+
+    def test_target_not_exists_confirm_no_creates_nothing(self):
+        """目标不存在 + confirm=False → 不创建文件，无 .bak，return False。"""
+        with self._mock_urlopen(), \
+             patch("_install_ops.confirm", return_value=False):
+            result = iops._install_catalog_asset(
+                template_path=self.template_path, target_path=self.target_path
+            )
+        self.assertFalse(result)
+        self.assertFalse(self.target_path.exists())
+        baks = list(self.target_path.parent.glob("*.bak.*"))
+        self.assertEqual(len(baks), 0)
+
+    def test_target_same_content_skips(self):
+        """目标存在 + bytes 相同（拼装后）→ 不调 confirm，文件不变，
+        无 .bak，return True。"""
+        prompt = "FAKE_PROMPT_MD_CONTENT"
+        # 预先构造与拼装结果完全一致的目标文件
+        expected = json.loads(self.template_path.read_text(encoding="utf-8"))
+        for m in expected["models"]:
+            m["base_instructions"] = prompt
+            if m.get("model_messages") and m["model_messages"].get("instructions_template") is not None:
+                m["model_messages"]["instructions_template"] = prompt
+        expected_bytes = json.dumps(expected, ensure_ascii=False, indent=2).encode("utf-8")
+        self.target_path.write_bytes(expected_bytes)
+
+        with self._mock_urlopen(prompt), \
+             patch("_install_ops.confirm") as mock_confirm:
+            result = iops._install_catalog_asset(
+                template_path=self.template_path, target_path=self.target_path
+            )
+            mock_confirm.assert_not_called()
+        self.assertTrue(result)
+        self.assertEqual(self.target_path.read_bytes(), expected_bytes)
+        baks = list(self.target_path.parent.glob("*.bak.*"))
+        self.assertEqual(len(baks), 0)
+
+    def test_target_different_content_backs_up_and_overwrites(self):
+        """目标存在 + bytes 不同 + confirm=True → 备份 .bak + 覆盖，return True。"""
+        old_content = '{"old": true}'
+        self.target_path.write_text(old_content, encoding="utf-8")
+        with self._mock_urlopen(), \
+             patch("_install_ops.confirm", return_value=True):
+            result = iops._install_catalog_asset(
+                template_path=self.template_path, target_path=self.target_path
+            )
+        self.assertTrue(result)
+        baks = list(self.target_path.parent.glob("*.bak.*"))
+        self.assertEqual(len(baks), 1)
+        self.assertEqual(baks[0].read_text(encoding="utf-8"), old_content)
+        written = json.loads(self.target_path.read_text(encoding="utf-8"))
+        self.assertEqual(
+            written["models"][0]["base_instructions"], "FAKE_PROMPT_MD_CONTENT"
+        )
+        self.assertEqual(
+            written["models"][0]["model_messages"]["instructions_template"], "FAKE_PROMPT_MD_CONTENT"
+        )
+
+    def test_target_different_content_confirm_no_unchanged(self):
+        """目标存在 + bytes 不同 + confirm=False → 文件不变，无 .bak，return False。"""
+        old_content = '{"old": true}'
+        self.target_path.write_text(old_content, encoding="utf-8")
+        with self._mock_urlopen(), \
+             patch("_install_ops.confirm", return_value=False):
+            result = iops._install_catalog_asset(
+                template_path=self.template_path, target_path=self.target_path
+            )
+        self.assertFalse(result)
+        self.assertEqual(self.target_path.read_text(encoding="utf-8"), old_content)
+        baks = list(self.target_path.parent.glob("*.bak.*"))
+        self.assertEqual(len(baks), 0)
+
+    def test_default_arg_reads_module_constant(self):
+        """不传参，patch 模块级常量 → 走默认参数分支读到临时路径。"""
+        prompt = "FAKE_PROMPT_MD_CONTENT"
+        with self._mock_urlopen(prompt), \
+             patch("_install_ops.confirm", return_value=True), \
+             patch("_install_ops._CODEX_CATALOG_TEMPLATE", self.template_path), \
+             patch("_install_ops._CODEX_CATALOG_TARGET", self.target_path):
+            result = iops._install_catalog_asset()
+        self.assertTrue(result)
+        self.assertTrue(self.target_path.exists())
+        written = json.loads(self.target_path.read_text(encoding="utf-8"))
+        self.assertEqual(
+            written["models"][0]["base_instructions"], prompt
+        )
+        self.assertEqual(
+            written["models"][0]["model_messages"]["instructions_template"], prompt
+        )
+
+
+class TestInstallCodexExistingFile(unittest.TestCase):
+    """install_codex 在 config.toml 已存在场景下的端到端用例。
+    全部用 tempfile 模拟配置文件，mock _install_catalog_asset 控制 catalog 结果。"""
+
+    def _make_config(self, td, extra_lines=""):
+        """构造一份已有 config.toml，含 provider 段但不含/含 catalog 行。"""
+        cfg = Path(td) / "config.toml"
+        content = (
+            'model = "old-model"\n'
+            'model_provider = "old-provider"\n'
+            '\n'
+            '[model_providers.old-provider]\n'
+            'base_url = "http://old"\n'
+        )
+        if extra_lines:
+            content = extra_lines + content
+        cfg.write_text(content, encoding="utf-8")
+        return cfg
+
+    def test_existing_file_adds_catalog_key(self):
+        """config.toml 已存在 + 无 model_catalog_json 行 + mock catalog 返回 True
+        + confirm=True → 写入后含 model_catalog_json 行。"""
+        with tempfile.TemporaryDirectory() as td:
+            cfg = self._make_config(td)
+            with patch.dict(iops.SDKS["codex"], {"config_path": cfg}), \
+                 patch("_install_ops.confirm", return_value=True), \
+                 patch("_install_ops._install_catalog_asset", return_value=True):
+                iops.install_codex("codex", "8000")
+            content = cfg.read_text(encoding="utf-8")
+            self.assertIn("model_catalog_json", content)
+            self.assertIn("~/.codex/model-catalogs/model_proxy_catalog.json", content)
+            self.assertIn('model = "claude-sonnet"', content)
+            self.assertIn('model_provider = "model_proxy"', content)
+
+    def test_existing_file_replaces_catalog_key(self):
+        """config.toml 已存在 + 已有 model_catalog_json 行（旧值）+ mock catalog
+        返回 True + confirm=True → 写入后 model_catalog_json 值=新路径。"""
+        with tempfile.TemporaryDirectory() as td:
+            cfg = self._make_config(
+                td,
+                extra_lines='model_catalog_json = "/old/path/catalog.json"\n'
+            )
+            with patch.dict(iops.SDKS["codex"], {"config_path": cfg}), \
+                 patch("_install_ops.confirm", return_value=True), \
+                 patch("_install_ops._install_catalog_asset", return_value=True):
+                iops.install_codex("codex", "8000")
+            content = cfg.read_text(encoding="utf-8")
+            self.assertIn("~/.codex/model-catalogs/model_proxy_catalog.json", content)
+            self.assertNotIn("/old/path/catalog.json", content)
+
+    def test_existing_file_catalog_fails_keeps_old_key(self):
+        """config.toml 已存在 + 已有 model_catalog_json 行 + mock catalog 返回 False
+        + confirm=True → 该行保留不动（指向旧文件），打提示。"""
+        with tempfile.TemporaryDirectory() as td:
+            old_catalog_line = 'model_catalog_json = "/old/path/catalog.json"\n'
+            cfg = self._make_config(td, extra_lines=old_catalog_line)
+            with patch.dict(iops.SDKS["codex"], {"config_path": cfg}), \
+                 patch("_install_ops.confirm", return_value=True), \
+                 patch("_install_ops._install_catalog_asset", return_value=False), \
+                 patch("builtins.print") as mock_print:
+                iops.install_codex("codex", "8000")
+            content = cfg.read_text(encoding="utf-8")
+            self.assertIn("/old/path/catalog.json", content)
+            printed = " ".join(str(c) for c, _ in mock_print.call_args_list)
+            self.assertIn("保留现有", printed)
+
+    def test_existing_file_catalog_fails_no_key_not_added(self):
+        """config.toml 已存在 + 无 model_catalog_json 行 + mock catalog 返回 False
+        + confirm=True → 不加 model_catalog_json 行。"""
+        with tempfile.TemporaryDirectory() as td:
+            cfg = self._make_config(td)
+            with patch.dict(iops.SDKS["codex"], {"config_path": cfg}), \
+                 patch("_install_ops.confirm", return_value=True), \
+                 patch("_install_ops._install_catalog_asset", return_value=False):
+                iops.install_codex("codex", "8000")
+            content = cfg.read_text(encoding="utf-8")
+            self.assertNotIn("model_catalog_json", content)
+
+    def test_existing_file_confirm_no_no_catalog_install(self):
+        """config.toml 已存在 + confirm=False → catalog 未安装。"""
+        with tempfile.TemporaryDirectory() as td:
+            cfg = self._make_config(td)
+            with patch.dict(iops.SDKS["codex"], {"config_path": cfg}), \
+                 patch("_install_ops.confirm", return_value=False), \
+                 patch("_install_ops._install_catalog_asset") as mock_catalog:
+                iops.install_codex("codex", "8000")
+            mock_catalog.assert_called_once()
 
 
 class TestInstallOpenclawFileNotExists(unittest.TestCase):
@@ -255,13 +717,16 @@ class TestInstallClaudeExistingFileFlow(unittest.TestCase):
             cfg_path = Path(td) / "settings.json"
             cfg_path.write_text(json.dumps({"env": {}}, indent=2) + "\n", encoding="utf-8")
             with patch.dict(iops.SDKS["claude"], {"config_path": cfg_path}), \
-                 patch("_install_ops.confirm", return_value=True):
+                 patch("_install_ops.confirm", return_value=True), \
+                 patch("_install_ops._ensure_onboarding_completed") as mock_onboarding:
                 iops.install_claude("mytoken", "9000")
             written = json.loads(cfg_path.read_text(encoding="utf-8"))
             self.assertEqual(written["env"]["ANTHROPIC_AUTH_TOKEN"], "mytoken")
             self.assertEqual(written["env"]["ANTHROPIC_BASE_URL"], "http://localhost:9000/")
             baks = list(cfg_path.parent.glob("settings.json.bak.*"))
             self.assertEqual(len(baks), 1)
+            # settings.json 写入后无条件调用了 _ensure_onboarding_completed
+            mock_onboarding.assert_called_once()
 
     def test_confirm_no_leaves_original_untouched(self):
         with tempfile.TemporaryDirectory() as td:
@@ -269,11 +734,14 @@ class TestInstallClaudeExistingFileFlow(unittest.TestCase):
             original = json.dumps({"env": {}}, indent=2) + "\n"
             cfg_path.write_text(original, encoding="utf-8")
             with patch.dict(iops.SDKS["claude"], {"config_path": cfg_path}), \
-                 patch("_install_ops.confirm", return_value=False):
+                 patch("_install_ops.confirm", return_value=False), \
+                 patch("_install_ops._ensure_onboarding_completed") as mock_onboarding:
                 iops.install_claude("mytoken", "9000")
             self.assertEqual(cfg_path.read_text(encoding="utf-8"), original)
             baks = list(cfg_path.parent.glob("settings.json.bak.*"))
             self.assertEqual(len(baks), 0)
+            # settings.json 被取消后仍无条件调用了 onboarding（install_claude 不判断写入结果）
+            mock_onboarding.assert_called_once()
 
 
 # ---------------------------------------------------------------------------

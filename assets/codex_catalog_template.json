@@ -1,0 +1,208 @@
+{
+  "_codex_version": "0.145.0",
+  "_source": "codex-rs/models-manager/prompt.md (install时拉取) + protocol/src/openai_models.rs",
+  "models": [
+    {
+      "slug": "claude-opus",
+      "display_name": "Claude Opus (via model_proxy)",
+      "description": "model_proxy opus tier",
+      "default_reasoning_level": "high",
+      "supported_reasoning_levels": [
+        {
+          "effort": "low",
+          "description": "Low reasoning effort"
+        },
+        {
+          "effort": "medium",
+          "description": "Medium reasoning effort"
+        },
+        {
+          "effort": "high",
+          "description": "High reasoning effort"
+        },
+        {
+          "effort": "xhigh",
+          "description": "Extra-high reasoning effort"
+        },
+        {
+          "effort": "max",
+          "description": "Maximum reasoning effort"
+        }
+      ],
+      "shell_type": "default",
+      "visibility": "list",
+      "supported_in_api": true,
+      "priority": 50,
+      "availability_nux": null,
+      "upgrade": null,
+      "base_instructions": "__PROMPT_MD__",
+      "model_messages": {
+        "instructions_template": "__PROMPT_MD__",
+        "instructions_variables": null,
+        "approvals": null,
+        "auto_review": null,
+        "permissions": null
+      },
+      "support_verbosity": false,
+      "default_verbosity": null,
+      "apply_patch_tool_type": "freeform",
+      "truncation_policy": {
+        "mode": "bytes",
+        "limit": 10000
+      },
+      "supports_parallel_tool_calls": false,
+      "experimental_supported_tools": [],
+      "effective_context_window_percent": 95,
+      "include_skills_usage_instructions": false,
+      "supports_reasoning_summary_parameter": true,
+      "default_reasoning_summary": "auto",
+      "web_search_tool_type": "text",
+      "supports_image_detail_original": false,
+      "context_window": 1000000,
+      "max_context_window": 1000000,
+      "auto_compact_token_limit": null,
+      "input_modalities": [
+        "text",
+        "image"
+      ],
+      "supports_search_tool": false,
+      "use_responses_lite": false,
+      "auto_review_model_override": null,
+      "tool_mode": null,
+      "multi_agent_version": null
+    },
+    {
+      "slug": "claude-sonnet",
+      "display_name": "Claude Sonnet (via model_proxy)",
+      "description": "model_proxy sonnet tier",
+      "default_reasoning_level": "medium",
+      "supported_reasoning_levels": [
+        {
+          "effort": "low",
+          "description": "Low reasoning effort"
+        },
+        {
+          "effort": "medium",
+          "description": "Medium reasoning effort"
+        },
+        {
+          "effort": "high",
+          "description": "High reasoning effort"
+        },
+        {
+          "effort": "xhigh",
+          "description": "Extra-high reasoning effort"
+        },
+        {
+          "effort": "max",
+          "description": "Maximum reasoning effort"
+        }
+      ],
+      "shell_type": "default",
+      "visibility": "list",
+      "supported_in_api": true,
+      "priority": 50,
+      "availability_nux": null,
+      "upgrade": null,
+      "base_instructions": "__PROMPT_MD__",
+      "model_messages": {
+        "instructions_template": "__PROMPT_MD__",
+        "instructions_variables": null,
+        "approvals": null,
+        "auto_review": null,
+        "permissions": null
+      },
+      "support_verbosity": false,
+      "default_verbosity": null,
+      "apply_patch_tool_type": "freeform",
+      "truncation_policy": {
+        "mode": "bytes",
+        "limit": 10000
+      },
+      "supports_parallel_tool_calls": false,
+      "experimental_supported_tools": [],
+      "effective_context_window_percent": 95,
+      "include_skills_usage_instructions": false,
+      "supports_reasoning_summary_parameter": true,
+      "default_reasoning_summary": "auto",
+      "web_search_tool_type": "text",
+      "supports_image_detail_original": false,
+      "context_window": 1000000,
+      "max_context_window": 1000000,
+      "auto_compact_token_limit": null,
+      "input_modalities": [
+        "text",
+        "image"
+      ],
+      "supports_search_tool": false,
+      "use_responses_lite": false,
+      "auto_review_model_override": null,
+      "tool_mode": null,
+      "multi_agent_version": null
+    },
+    {
+      "slug": "claude-haiku",
+      "display_name": "Claude Haiku (via model_proxy)",
+      "description": "model_proxy haiku tier (ds-flash)",
+      "default_reasoning_level": "medium",
+      "supported_reasoning_levels": [
+        {
+          "effort": "low",
+          "description": "Low reasoning effort"
+        },
+        {
+          "effort": "medium",
+          "description": "Medium reasoning effort"
+        },
+        {
+          "effort": "high",
+          "description": "High reasoning effort"
+        },
+        {
+          "effort": "max",
+          "description": "Maximum reasoning effort"
+        }
+      ],
+      "shell_type": "default",
+      "visibility": "list",
+      "supported_in_api": true,
+      "priority": 50,
+      "availability_nux": null,
+      "upgrade": null,
+      "base_instructions": "__PROMPT_MD__",
+      "model_messages": {
+        "instructions_template": "__PROMPT_MD__",
+        "instructions_variables": null,
+        "approvals": null,
+        "auto_review": null,
+        "permissions": null
+      },
+      "support_verbosity": false,
+      "default_verbosity": null,
+      "apply_patch_tool_type": "freeform",
+      "truncation_policy": {
+        "mode": "bytes",
+        "limit": 10000
+      },
+      "supports_parallel_tool_calls": false,
+      "experimental_supported_tools": [],
+      "effective_context_window_percent": 95,
+      "include_skills_usage_instructions": false,
+      "supports_reasoning_summary_parameter": true,
+      "default_reasoning_summary": "auto",
+      "web_search_tool_type": "text",
+      "supports_image_detail_original": false,
+      "context_window": 200000,
+      "max_context_window": 200000,
+      "auto_compact_token_limit": null,
+      "input_modalities": [
+        "text"
+      ],
+      "supports_search_tool": false,
+      "use_responses_lite": false,
+      "auto_review_model_override": null,
+      "tool_mode": null,
+      "multi_agent_version": null
+    }
+  ]
+}
