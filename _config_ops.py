@@ -83,6 +83,50 @@ _ROUTE_POOL_OBJECT = re.compile(
     re.DOTALL,
 )
 
+# 正则6：压 routes 数组里的每条 route 对象成单行（含嵌套 tiers）
+# 匹配完整 route 对象结构（id/tiers/failover）。必须在正则3 之后执行——
+# 先把 tiers 下各 tier 数组压成单行，本正则对整块 replace \n 才能得到全单行结果。
+# tiers 内部无 "},"（tier 行以 "]," 结尾），非贪婪 .*? 停在 tiers 对象闭合处。
+# 脆性：route 对象加字段或 failover 缺失会失配、回退多行（不报错不丢数据）。
+_ROUTE_OBJECT = re.compile(
+    r'\{\s*\n\s*"id":\s*"[^"]+",\s*\n\s*"tiers":\s*\{.*?\},\s*\n\s*"failover":\s*"[^"]+"\s*\n\s*\}',
+    re.DOTALL,
+)
+
+# 正则7：压 strategies 数组里的每条 strategy 对象成单行（含嵌套 route_pool/tiers_source_capability）
+# 匹配完整 strategy 对象结构（client_token/route_pool 或 route_id 单值两种写法/
+# tiers_source_capability/note，note 可选）。
+# 键序锚定（与正则4 supply 同风格）：client_token → route_pool|route_id →
+# tiers_source_capability → note；键序漂移（如 dict 追加把 route_pool 排到尾部）会失配、
+# 回退多行（不报错不丢数据）。
+# 必须在正则2/正则5 之后执行——tier 对象与 route_pool 对象先压单行，本正则才能整块匹配。
+# tiers_source_capability 的 \{.*?\}, 依赖回溯跨过 tier 行尾的 "},"，停在其对象闭合处
+# （haiku 为末键无逗号，其后的 "}," 即 tiers_source_capability 闭合）。
+# 脆性：strategy 对象加字段（note 外）或键序漂移会失配、回退多行（不报错不丢数据）。
+_STRATEGY_OBJECT = re.compile(
+    r'\{\s*\n\s*"client_token":\s*"[^"]+",\s*\n\s*'
+    r'(?:"route_pool":\s*\[.*?\]|"route_id":\s*"[^"]+"),'
+    r'\s*\n\s*"tiers_source_capability":\s*\{.*?\},(?:\s*\n\s*"note":\s*"[^"]*")?\s*\n\s*\}',
+    re.DOTALL,
+)
+
+# 正则8：压 cooldown_rules 数组里的每条规则对象成单行（含嵌套 errorcode 数字数组）
+# 键序锚定：errorcode → cooldown_seconds。
+# 脆性：规则对象加字段或键序漂移会失配、回退多行（不报错不丢数据）。
+_COOLDOWN_RULE_OBJECT = re.compile(
+    r'\{\s*\n\s*"errorcode":\s*\[[^\]]*\],\s*\n\s*"cooldown_seconds":\s*\d+\s*\n\s*\}',
+    re.DOTALL,
+)
+
+# 正则9：压 budget_retry 顶层对象成单行（保留 "budget_retry": 键前缀）
+# 键序锚定：enabled → max_retries。
+# 脆性：加字段或键序漂移会失配、回退多行（不报错不丢数据）。
+_BUDGET_RETRY_OBJECT = re.compile(
+    r'("budget_retry":\s*)\{\s*\n\s*"enabled":\s*(?:true|false),'
+    r'\s*\n\s*"max_retries":\s*\d+\s*\n\s*\}',
+    re.DOTALL,
+)
+
 
 def compact_config_json(obj) -> str:
     """生成 config 文本：indent=2 多行，但以下结构压成单行（与用户手改格式一致）：
@@ -91,10 +135,19 @@ def compact_config_json(obj) -> str:
     3. routes.tiers 下的 supply id 数组，含多元素（正则3）
     4. supplies 数组里的每条 supply 对象，含嵌套 reasoning_capability（正则4）
     5. strategies.route_pool 下的 {route_id, weight} 对象（正则5）
+    6. routes 数组里的每条 route 对象，含嵌套 tiers（正则6）
+    7. strategies 数组里的每条 strategy 对象，含嵌套 route_pool 或 route_id 单值、
+       tiers_source_capability（正则7）
+    8. cooldown_rules 数组里的每条规则对象，含嵌套 errorcode 数字数组（正则8）
+    9. budget_retry 顶层对象（正则9）
 
-    顺序敏感：正则1 → 正则2 → 正则3 → 正则4 → 正则5。
+    顺序敏感：正则1 → 正则2 → 正则3 → 正则4 → 正则5 → 正则6 → 正则7 →
+    正则8 → 正则9。
     正则4 必须在正则1 后执行（effort_enum 先单行才能匹配到完整 supply 对象）。
     正则5 独立，不依赖前面正则的结果。
+    正则6 必须在正则3 后执行（tier 数组先单行，route 对象整块压行才完整）。
+    正则7 必须在正则2/正则5 后执行（tier 对象与 route_pool 对象先单行）。
+    正则8/正则9 独立，不依赖其他正则的结果。
 
     读取侧用 json.load 无感知，本函数只影响文本外观。
 
@@ -135,6 +188,24 @@ def compact_config_json(obj) -> str:
         lambda m: '{"route_id":"' + m.group(1) + '","weight":' + m.group(2) + '}',
         text
     )
+
+    # 正则6：压 routes 数组里的每条 route 对象成单行（此时 tiers 内部已单行）
+    text = _ROUTE_OBJECT.sub(lambda m: m.group(0)
+                             .replace('\n', '').replace('  ', ''), text)
+
+    # 正则7：压 strategies 数组里的每条 strategy 对象成单行
+    # （此时 route_pool 对象与 tier 对象已单行）
+    text = _STRATEGY_OBJECT.sub(lambda m: m.group(0)
+                                .replace('\n', '').replace('  ', ''), text)
+
+    # 正则8：压 cooldown_rules 数组里的每条规则对象成单行
+    text = _COOLDOWN_RULE_OBJECT.sub(lambda m: m.group(0)
+                                     .replace('\n', '').replace('  ', ''), text)
+
+    # 正则9：压 budget_retry 顶层对象成单行（保留键前缀）
+    text = _BUDGET_RETRY_OBJECT.sub(
+        lambda m: m.group(1) + m.group(0)[len(m.group(1)):]
+        .replace('\n', '').replace('  ', ''), text)
 
     return text
 

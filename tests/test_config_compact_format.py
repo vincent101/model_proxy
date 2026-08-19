@@ -22,9 +22,14 @@ def _make_full_cfg():
     """构造一个含 effort_enum / tiers_source_capability / supplies / routes 的完整 config 样本。
 
     supplies 里的对象含完整字段（id/url/protocol/appkey/target_model/reasoning_capability），
-    routes.tiers 含多元素和单元素数组。
+    routes.tiers 含多元素和单元素数组。含 cooldown_rules 与 budget_retry（正则8/9 用）。
     """
     return {
+        "cooldown_rules": [
+            {"errorcode": [429, 500, 502, 503, 504], "cooldown_seconds": 60},
+            {"errorcode": [401, 402, 403], "cooldown_seconds": 21600},
+        ],
+        "budget_retry": {"enabled": True, "max_retries": 5},
         "supplies": [
             {"id": "s1", "url": "http://x", "protocol": "anthropic", "appkey": "k1",
              "target_model": "m1",
@@ -56,18 +61,24 @@ def _make_full_cfg_with_route_pool():
     """构造一个含 route_pool（多 route）的完整 config 样本，用于 route_pool 紧凑格式测试。
 
     在 _make_full_cfg 基础上加一个 route r2，strategy tok1 改用 route_pool（含 r1 + r2 两条）。
+    strategy 键序按 _STRATEGY_OBJECT 锚定序重建：client_token/route_pool/
+    tiers_source_capability/note（dict 追加会把 route_pool 排到尾部，破坏键序锚定）。
     """
     cfg = _make_full_cfg()
     cfg["routes"].append(
         {"id": "r2", "tiers": {"opus": ["s2"], "sonnet": ["s1"], "haiku": ["s1"]},
          "failover": "off"}
     )
-    tok1 = cfg["strategies"][0]
-    tok1.pop("route_id")
-    tok1["route_pool"] = [
-        {"route_id": "r1", "weight": 1},
-        {"route_id": "r2", "weight": 2},
-    ]
+    old = cfg["strategies"][0]
+    cfg["strategies"][0] = {
+        "client_token": old["client_token"],
+        "route_pool": [
+            {"route_id": "r1", "weight": 1},
+            {"route_id": "r2", "weight": 2},
+        ],
+        "tiers_source_capability": old["tiers_source_capability"],
+        "note": old["note"],
+    }
     return cfg
 
 
@@ -119,10 +130,59 @@ class TestCompactFormat(unittest.TestCase):
         self.assertIn('"haiku": []', text)
 
     def test_routes_array_remains_multiline(self):
-        """routes 数组本身仍应多行展开（每条 route 是大对象，不压行）。"""
+        """routes 数组本身仍应多行展开（数组框架多行，每条 route 对象单行，见正则6）。"""
         text = compact_config_json(_make_full_cfg())
         # routes 数组应跨行（含换行后的 "id"）
         self.assertRegex(text, r'"routes":\s*\[\s*\n\s*\{')
+
+    def test_route_object_single_line(self):
+        """routes 数组里每条 route 对象应被压成单行（含嵌套 tiers，正则6）。"""
+        text = compact_config_json(_make_full_cfg_with_route_pool())
+        self.assertIn(
+            '{"id": "r1","tiers": {"opus": ["s1","s2"],"sonnet": ["s2"],"haiku": []},'
+            '"failover": "on"}',
+            text)
+        self.assertIn(
+            '{"id": "r2","tiers": {"opus": ["s2"],"sonnet": ["s1"],"haiku": ["s1"]},'
+            '"failover": "off"}',
+            text)
+
+    def test_strategy_object_single_line_route_pool_form(self):
+        """route_pool 形式的 strategy 对象应被压成单行（正则7）。"""
+        text = compact_config_json(_make_full_cfg_with_route_pool())
+        self.assertIn(
+            '{"client_token": "tok1","route_pool": [{"route_id":"r1","weight":1},'
+            '{"route_id":"r2","weight":2}],"tiers_source_capability": '
+            '{"opus": {"effort_enum": ["low","medium","high","xhigh","max"]},'
+            '"sonnet": {"effort_enum": ["low","medium","high","xhigh","max"]},',
+            text)
+
+    def test_strategy_object_single_line_route_id_form(self):
+        """route_id 单值形式（旧写法）的 strategy 对象也应被压成单行（正则7 二选一分支）。"""
+        text = compact_config_json(_make_full_cfg())
+        self.assertIn(
+            '{"client_token": "tok1","route_id": "r1","tiers_source_capability": '
+            '{"opus": {"effort_enum": ["low","medium","high","xhigh","max"]},'
+            '"sonnet": {"effort_enum": ["low","medium","high","xhigh","max"]},'
+            '"haiku": {"effort_enum": ["low","medium","high","max"]}},"note": "test strategy"}',
+            text)
+
+    def test_cooldown_rule_object_single_line(self):
+        """cooldown_rules 数组里每条规则对象应被压成单行（含嵌套 errorcode 数字数组，正则8）。"""
+        text = compact_config_json(_make_full_cfg())
+        self.assertIn(
+            '{"errorcode": [429,500,502,503,504],"cooldown_seconds": 60}',
+            text)
+        self.assertIn(
+            '{"errorcode": [401,402,403],"cooldown_seconds": 21600}',
+            text)
+
+    def test_budget_retry_object_single_line(self):
+        """budget_retry 顶层对象应被压成单行（保留键前缀，正则9）。"""
+        text = compact_config_json(_make_full_cfg())
+        self.assertIn(
+            '"budget_retry": {"enabled": true,"max_retries": 5}',
+            text)
 
     # 2. 数据无损
     def test_data_roundtrip(self):
