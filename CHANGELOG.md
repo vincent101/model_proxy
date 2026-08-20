@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.10 (2026-08-20)
+- CLI status cooldown 列表展示每个 supply 的触发 errorcode（http_429/net_error:...）
+- codex 接入全链路：ModelProxyHandler 升 HTTP/1.1（修 HTTP/1.0+chunked 非标组合致
+  codex hyper 流式断连）；install_claude 补 ~/.claude.json hasCompletedOnboarding；
+  install_codex 补 provider name/experimental_bearer_token/model_catalog_json
+  （仓库模板 + install 时拉网络 prompt.md 拼装 + 网络失败降级）
+- config 紧凑格式器扩展：route/strategy/cooldown_rules/budget_retry 整对象单行
+  （正则6-9，键序锚定，失配回退多行不丢数据）
+
 ## 0.9 (2026-08-13)
 - 首个正式版本（model_proxy 从 vault 拆出为独立 git repo）
 - 新增 cooldown_rules 策略组（按 errorcode 分组冷却 + failover，URLError sentinel）
