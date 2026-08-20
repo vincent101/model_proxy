@@ -1,10 +1,10 @@
 ---
 created: 2026-07-17 18:52:18
-version: 0.9
+version: 0.10
 ---
 # model_proxy
 
-**Version: 0.9**
+**Version: 0.10**
 
 ## 1. 这是什么
 
@@ -193,14 +193,16 @@ token→route 绑定。
 - **claude**（Claude Code，Anthropic 协议）：写 `~/.claude/settings.json` 的
   `env.ANTHROPIC_BASE_URL`/`ANTHROPIC_AUTH_TOKEN`，并补齐三个档位环境变量
   （`ANTHROPIC_DEFAULT_OPUS_MODEL`/`_SONNET_MODEL`/`_HAIKU_MODEL` 固定填
-  `claude-opus`/`claude-sonnet`/`claude-haiku`）。
+  `claude-opus`/`claude-sonnet`/`claude-haiku`）；同时确保 `~/.claude.json` 含
+  `hasCompletedOnboarding=true`（新机器跳过官方登录引导）。
 - **codex**（codex-cli，Responses 协议）：写 `~/.codex/config.toml` 的
-  `[model_providers.model_proxy]` 段（`base_url`/`wire_api="responses"`/`env_key`）及顶层
-  `model`/`model_provider`；appkey 走环境变量 `MODEL_PROXY_CODEX_TOKEN` 注入，不写入配置文件。
-  codex 的 base_url 拼到 `/v1` 层级、由 `wire_api="responses"` 让 codex 自拼 `/responses`
-  后缀——此拼法依据本项目 `detect_source` 对 `/v1/responses` 尾缀的识别反推，**未逐字核对
-  codex 官方 config.toml 文档字段名**。实际接入若报 404/400，请核对 codex 官方文档调整
-  base_url 层级。
+  `[model_providers.model_proxy]` 段（`base_url`/`wire_api="responses"`/`experimental_bearer_token`
+  直填，dev-only 免 export；`env_key = "MODEL_PROXY_CODEX_TOKEN"` 以注释形式保留作备选）及顶层
+  `model`/`model_provider`（provider name `model_proxy` 必填，顶层键须指向它）。
+  `model_catalog_json` 由仓库模板 `assets/codex_catalog_template.json` + install 时在线拉取
+  codex 官方 `prompt.md` 拼装；网络失败降级：不写 catalog 文件、不加 `model_catalog_json`
+  行，install 不阻断。base_url 拼法已对 codex 0.145.0 官方 config-reference 逐字核对
+  （见「已知限制」）。
 - **hermes**（协议按 `api_mode` 决定）：标准库无 yaml 解析器，为避免破坏现有文件结构，统一打印
   `custom_providers` 配置片段供手动粘贴到 `~/.hermes/config.yaml`。
 - **openclaw**（协议按 `api` 决定）：写 `~/.openclaw/openclaw.json` 的
@@ -258,8 +260,9 @@ token 里选定）过滤候选 client_token；无匹配协议的 token 时提示
   - **已知限制：仅非流式生效**。流式响应字节即时下发客户端、发出后无法回追，流式只在收口
     处检测记 `budget_truncated` 日志不重试——流式场景仍需调用侧给足起步预算（流式检测覆盖
     anthropic 透传与 chat 方向；responses 协议流式 adapter 未持有 incomplete 状态，不检测）。
-- codex install 写入的 base_url 层级未逐字核对 codex 官方文档，实际接入报 404/400 时需按官方
-  文档调整（详见「SDK 接入」）。
+- codex install 写入的 base_url 层级已对 codex 0.145.0 官方 config-reference 逐字核对确认：
+  `base_url` 含 `/v1` 不含 `/responses`，由 `wire_api="responses"` 让 codex 自拼 `/responses`
+  后缀（详见「SDK 接入」）。
 - 错误路径加固：不支持的协议组合、上游 4xx/5xx、流式中途中断均按客户端协议包裹成合法的 error
   响应/事件，不会让客户端挂死。
 - 只在 Claude Code 会话启动时（SessionStart hook）拉起一次，会话运行期间进程崩溃不会自动

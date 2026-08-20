@@ -134,6 +134,14 @@ MODEL_PROXY_PORT=18889 python3 tools/model_proxy/model_proxy.py &
 停止用 `model_proxy_cli.sh off`：只按本脚本同目录下 `model_proxy.py` 的绝对路径精确匹配进程，
 并额外反查监听该端口、命令行含 `model_proxy.py` 的 PID 兜底。
 
+### HTTP 协议层行为（2026-08-20 起）
+
+`ModelProxyHandler.protocol_version = "HTTP/1.1"` + `timeout = 30`——修复此前 HTTP/1.0 响应
+头 + chunked 传输体的非标组合导致的 codex（Rust hyper）流式读取断连；HTTP/1.1 要求响应具备
+`Content-Length` 或 chunked 终止符，全部响应路径已满足。另：三个转换流式方法的
+`except BrokenPipeError` 分支均补调 `adapter.finalize()`（幂等收尾），客户端断连时上游
+适配器状态机正常收口。
+
 > 日志级别、ACCESS 字段、translate 限流、token 统计等运维内容见
 > `docs/designs/2026-07-22-access-log-and-latency.md`、
 > `docs/designs/2026-07-23-usage-totals-ledger.md`、
