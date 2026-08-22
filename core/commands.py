@@ -371,8 +371,8 @@ class SessionOverridesSidecar:
             except OSError:
                 pass
 
-            log.info("sidecar.write token_tail4=%s session=%s action=%s target_route=%s",
-                     client_token[-4:] if client_token else "",
+            log.info("sidecar.write token=%s session=%s action=%s target_route=%s",
+                     client_token or "",
                      session_id, action, target_route_id or "")
             return {"cleaned": cleaned}
 

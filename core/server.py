@@ -1545,7 +1545,10 @@ class ModelProxyHandler(BaseHTTPRequestHandler):
 
         # 2. client_token（Authorization: Bearer 优先，回退 x-api-key，见 extract_client_token 注释）
         token = extract_client_token(self.headers)
-        self._acc["token"] = token[-4:] if token else ""
+        # client_token 只是路由查表键（无密钥校验语义，见 extract_client_token），记全名。
+        # 历史行的尾4位值不做迁移/反查：旧行滚动消失，跨协议聚合段只认带 operation
+        # 字段的新格式行（存量行均无 operation，不受混合期影响）。
+        self._acc["token"] = token or ""
 
         # 3. 解析 body 拿 model
         body_json: dict[str, Any] | None = None
@@ -1621,8 +1624,8 @@ class ModelProxyHandler(BaseHTTPRequestHandler):
             sidecar.touch(strategy.get("client_token", ""), session_key)
 
         if not route_candidates:
-            log.warning("no strategy/route matched: token_tail4=%s source=%s",
-                        token[-4:] if token else "", source)
+            log.warning("no strategy/route matched: token=%s source=%s",
+                        token or "", source)
             self._acc["final_error"] = "no strategy or route matched"
             self._write_buffered_response(
                 401, [], error_body_for_source(source, 401, "no strategy/route matched"))
