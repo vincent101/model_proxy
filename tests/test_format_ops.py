@@ -127,11 +127,11 @@ class TestProtocolConversionTraffic(unittest.TestCase):
                 "supply": "s", "target_protocol": "responses", "conversion_kind": "a2r",
                 "rejected_501": 0, "empty": 0, "success": 0, "other_failure": 0}
         cases = [
-            ({"n": 2, "rejected_501": 2}, "2次·全501"),
-            ({"n": 3, "empty": 2, "success": 1}, "3次·2空"),
-            ({"n": 4, "rejected_501": 1, "other_failure": 2, "success": 1}, "4次·3失败"),
-            ({"n": 5, "empty": 2, "other_failure": 1, "success": 2}, "5次·2空·1失败"),
-            ({"n": 2, "success": 2}, "2次"),
+            ({"n": 2, "rejected_501": 2}, "n=2 · all-501"),
+            ({"n": 3, "empty": 2, "success": 1}, "n=3 · 2 empty"),
+            ({"n": 4, "rejected_501": 1, "other_failure": 2, "success": 1}, "n=4 · 3 failed"),
+            ({"n": 5, "empty": 2, "other_failure": 1, "success": 2}, "n=5 · 2 empty, 1 failed"),
+            ({"n": 2, "success": 2}, "n=2"),
         ]
         for updates, suffix in cases:
             item = {**base, **updates}

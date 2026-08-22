@@ -302,24 +302,25 @@ def load_protocol_conversion_traffic(log_path: str, hints: list[dict] | None, *,
 def _format_protocol_conversion_traffic(items: list[dict]) -> list[str]:
     if not items:
         return []
-    lines = ["跨协议链路（近7天）:"]
+    lines = ["protocol conversions (last 7d):"]
     for x in items:
         n = x["n"]
         if x["rejected_501"] == n:
-            summary = "全501"
+            summary = "all-501"
         else:
             parts = []
             if x["empty"]:
-                parts.append(f"{x['empty']}空")
+                parts.append(f"{x['empty']} empty")
             failures = x["rejected_501"] + x["other_failure"]
             if failures:
-                parts.append(f"{failures}失败")
-            summary = "·".join(parts)
-        suffix = f"·{summary}" if summary else ""
+                parts.append(f"{failures} failed")
+            summary = ", ".join(parts)
+        suffix = f" · {summary}" if summary else ""
         lines.append(
-            f"⚠ {x['token']}[{x['source']}] → {x['route']}.{x['tier']} → "
-            f"{x['supply']}[{x['target_protocol']}] ({x['conversion_kind']}) {n}次{suffix}")
-    lines.append("跨协议链路有语义损失风险，优先用同协议原生接口直连")
+            f"  ⚠ {x['token']}[{x['source']}] → {x['route']}.{x['tier']} → "
+            f"{x['supply']}[{x['target_protocol']}] ({x['conversion_kind']}) n={n}{suffix}")
+    lines.append("  hint: cross-protocol paths risk semantic loss; "
+                 "prefer same-protocol native endpoints")
     return lines
 
 
