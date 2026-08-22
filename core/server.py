@@ -42,6 +42,17 @@ from .commands import (
 from .reasoning.capability import AbstractKind, ModelReasoningCapability, abstract_encode, remap
 from .reasoning.ladder import CanonicalEffort
 from .reasoning.registry import apply_fields, get_codec, resolve_protocol
+from .protocol_hints import (
+    OP_CHAT_COMPLETIONS,
+    OP_COUNT_TOKENS,
+    OP_MESSAGES,
+    OP_RESPONSES,
+    OP_UNKNOWN,
+    PROTOCOL_HINT_WINDOW_DAYS,
+    build_protocol_conversion_hints,
+    operation_compatible,
+    protocol_conversion_kind,
+)
 
 # ---------------------------------------------------------------------------
 # L0 基座
@@ -98,16 +109,47 @@ def resolve_runtime_paths(paths_file: Path = _RUNTIME_PATHS_FILE) -> dict[str, P
     return paths
 
 
-def _trim_log(path: Path, keep: int = 5000) -> None:
-    """启动时截断日志，只保留最后 keep 行。"""
+def _trim_log(path: Path, *, now: datetime | None = None,
+              keep_days: int = PROTOCOL_HINT_WINDOW_DAYS + 1) -> None:
+    """按记录时间保留日志；续行跟随最近一条可解析时间戳记录。"""
+    if not path.exists():
+        return
+    cutoff = (now or datetime.now()) - timedelta(days=keep_days)
+    fd = None
+    tmp = None
     try:
-        if not path.exists():
-            return
-        lines = path.read_bytes().splitlines(keepends=True)
-        if len(lines) > keep:
-            path.write_bytes(b"".join(lines[-keep:]))
-    except OSError:
-        pass
+        fd, tmp = tempfile.mkstemp(dir=str(path.parent), suffix=".logtrim")
+        found_timestamp = False
+        keep_record = False
+        with open(path, "r", encoding="utf-8", errors="replace") as src, \
+                os.fdopen(fd, "w", encoding="utf-8") as dst:
+            fd = None
+            for line in src:
+                try:
+                    ts = datetime.strptime(line[:23], "%Y-%m-%d %H:%M:%S,%f")
+                except ValueError:
+                    if keep_record:
+                        dst.write(line)
+                    continue
+                found_timestamp = True
+                keep_record = ts >= cutoff
+                if keep_record:
+                    dst.write(line)
+        if found_timestamp:
+            os.replace(tmp, path)
+            tmp = None
+        else:
+            log.warning("log trim skipped: no parseable timestamp in %s", path)
+    except OSError as e:
+        log.warning("log trim failed, preserving original: %s", e)
+    finally:
+        if fd is not None:
+            os.close(fd)
+        if tmp is not None:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
 
 
 # req_id 全链关联（OPT-01）：threading.local 存当前请求的 req_id，Filter 注入到每条
@@ -839,6 +881,20 @@ def _rewrite_known_injected_texts(body: dict) -> bool:
     return dirty
 
 
+def detect_operation(path: str) -> str:
+    """按规范化精确路径识别操作，不从 body 猜测。"""
+    clean = urllib.parse.urlparse(path).path.rstrip("/").lower()
+    if clean.endswith("/v1/messages/count_tokens"):
+        return OP_COUNT_TOKENS
+    if clean.endswith("/v1/messages"):
+        return OP_MESSAGES
+    if clean.endswith("/v1/responses"):
+        return OP_RESPONSES
+    if clean.endswith("/chat/completions"):
+        return OP_CHAT_COMPLETIONS
+    return OP_UNKNOWN
+
+
 def detect_source(path: str, body: dict | None) -> str:
     """识别入站 source 协议。
 
@@ -847,7 +903,8 @@ def detect_source(path: str, body: dict | None) -> str:
     """
     clean = path.split("?", 1)[0].rstrip("/")
     clean_lower = clean.lower()
-    if clean_lower.endswith("/v1/messages"):
+    if (clean_lower.endswith("/v1/messages")
+            or clean_lower.endswith("/v1/messages/count_tokens")):
         return "anthropic"
     if clean_lower.endswith("/v1/responses"):
         return "responses"
@@ -863,6 +920,24 @@ def detect_source(path: str, body: dict | None) -> str:
                 return "anthropic"
             return "chat"
     return "unknown"
+
+
+def build_target_url(supply_url: str, request_path: str, operation: str) -> str:
+    """构造终态 URL；count_tokens 只接受 messages 端点并追加一次后缀。"""
+    parsed = urllib.parse.urlsplit(supply_url)
+    base_path = parsed.path.rstrip("/")
+    if operation == OP_COUNT_TOKENS:
+        lower = base_path.lower()
+        if lower.endswith("/count_tokens"):
+            raise ValueError("count_tokens supply url must not include /count_tokens")
+        if not lower.endswith("/v1/messages"):
+            raise ValueError("count_tokens supply url must end with /v1/messages")
+        base_path += "/count_tokens"
+    request_query = _sanitize_forward_query(request_path).removeprefix("?")
+    merged_query = urllib.parse.urlencode(
+        urllib.parse.parse_qsl(parsed.query) + urllib.parse.parse_qsl(request_query))
+    return urllib.parse.urlunsplit(
+        (parsed.scheme, parsed.netloc, base_path, merged_query, parsed.fragment))
 
 
 def _sanitize_forward_query(path: str) -> str:
@@ -1041,6 +1116,21 @@ def select_supply(supplies: list, supply_map: dict, cooldown: "CooldownStore",
             continue
         return supply_map[sid]
     return None
+
+
+def select_supply_for_operation(supplies: list, supply_map: dict, cooldown: "CooldownStore",
+                                operation: str, failover: str) -> tuple[dict | None, str | None]:
+    """选择 operation 兼容 supply；第二项为已解析 target，None 表示无兼容项。"""
+    for sid in supplies:
+        supply = supply_map.get(sid)
+        if supply is None or cooldown.is_cooling(sid):
+            continue
+        target = detect_target(supply)
+        if operation_compatible(operation, target):
+            return supply, target
+        if failover != "on":
+            return None, None
+    return None, None
 
 
 def detect_target(supply: dict) -> str:
@@ -1268,8 +1358,9 @@ class ModelProxyHandler(BaseHTTPRequestHandler):
         ACCESS 记录（见 _write_* 里的 hasattr 守卫）。
         """
         self._acc = {
-            "status": 0, "source": "", "route": "", "tier": "",
-            "supply": "", "failover": 0, "attempts": 0, "token": "",
+            "status": 0, "source": "", "operation": "", "route": "", "tier": "",
+            "supply": "", "target_protocol": "", "conversion_kind": "",
+            "failover": 0, "attempts": 0, "token": "",
             "usage_in": 0, "usage_out": 0,
             "strategy": "", "session": "", "route_failover": 0,
             "builtin": "",
@@ -1294,12 +1385,14 @@ class ModelProxyHandler(BaseHTTPRequestHandler):
             a = self._acc
             ms = int((time.monotonic() - t0) * 1000)
             access_log.info(
-                "ACCESS ms=%d status=%s source=%s route=%s tier=%s supply=%s "
-                "failover=%s attempts=%s usage_in=%s usage_out=%s token=%s session=%s "
+                "ACCESS ms=%d status=%s source=%s operation=%s route=%s tier=%s supply=%s "
+                "target_protocol=%s conversion_kind=%s failover=%s attempts=%s "
+                "usage_in=%s usage_out=%s token=%s session=%s "
                 "route_failover=%s builtin=%s budget_retried=%s budget_truncated=%s "
                 "stop_reason=%s final_error=%s nudge_rewritten=%s",
-                ms, a["status"], a["source"],
-                a["route"], a["tier"], a["supply"], a["failover"], a["attempts"],
+                ms, a["status"], a["source"], a["operation"],
+                a["route"], a["tier"], a["supply"],
+                a["target_protocol"], a["conversion_kind"], a["failover"], a["attempts"],
                 a["usage_in"], a["usage_out"], a["token"], a["session"],
                 a["route_failover"], a["builtin"], a["budget_retried"],
                 a["budget_truncated"], a["stop_reason"],
@@ -1314,6 +1407,131 @@ class ModelProxyHandler(BaseHTTPRequestHandler):
     # ------------------------------------------------------------------
     # 转发编排（阶段1：纯透传路由 + cooldown + failover）
     # ------------------------------------------------------------------
+
+    def _forward_count_tokens(self, method: str, cs: "ConfigStore", cd: "CooldownStore",
+                              route: dict, tier: str, supply_map: dict,
+                              body_json: dict | None) -> None:
+        """count_tokens 独立非 SSE 转发，不进入生成请求 codec/translator/预算链。"""
+        supplies = select_supply_list(route, tier) or []
+        failover = route.get("failover", "off")
+        remaining = list(supplies)
+        while remaining:
+            try:
+                supply, target = select_supply_for_operation(
+                    remaining, supply_map, cd, OP_COUNT_TOKENS, failover)
+            except ValueError as e:
+                self._acc["final_error"] = str(e)
+                self._write_buffered_response(
+                    500, [], error_body_for_source("anthropic", 500, str(e)))
+                return
+            if supply is None:
+                if self._acc["attempts"]:
+                    errs = self._acc.get("attempt_errors") or []
+                    summary = "; ".join(f"{s}={e}" for s, e in errs) or "all attempts failed"
+                    msg = f"all upstream supplies failed or cooling: {summary}"
+                    status = 503
+                else:
+                    msg = "count_tokens requires an anthropic supply"
+                    status = 501
+                self._acc["final_error"] = msg
+                self._write_buffered_response(
+                    status, [], error_body_for_source("anthropic", status, msg))
+                return
+            sid = supply.get("id", "")
+            self._acc["supply"] = sid
+            self._acc["attempts"] += 1
+            self._acc["target_protocol"] = target
+            self._acc["conversion_kind"] = protocol_conversion_kind("anthropic", target)
+            try:
+                target_url = build_target_url(supply.get("url", ""), self.path, OP_COUNT_TOKENS)
+            except ValueError as e:
+                self._acc["final_error"] = str(e)
+                self._write_buffered_response(500, [], error_body_for_source("anthropic", 500, str(e)))
+                return
+            outgoing = dict(body_json or {})
+            if supply.get("target_model") and "model" in outgoing:
+                outgoing["model"] = supply["target_model"]
+            outgoing.pop("stream", None)
+            send_body = json.dumps(outgoing, ensure_ascii=False).encode("utf-8")
+            appkey = supply.get("appkey", "")
+            headers = {k: v for k, v in self.headers.items()
+                       if k.lower() not in {"host", "content-length", "authorization", "x-api-key"}}
+            headers.update({"Authorization": f"Bearer {appkey}", "x-api-key": appkey,
+                            "Content-Type": "application/json", "Content-Length": str(len(send_body))})
+            req = urllib.request.Request(target_url, data=send_body, headers=headers, method=method)
+            try:
+                resp = urllib.request.urlopen(req, timeout=cs.get_upstream_timeout())
+                status = resp.status
+                resp_headers = list(resp.getheaders())
+                resp_body = resp.read()
+                resp.close()
+            except urllib.error.HTTPError as e:
+                status = e.code
+                resp_headers = list(e.headers.items())
+                resp_body = e.read()
+                secs = resolve_cooldown_seconds(status, cs)
+                if failover == "on" and secs is not None:
+                    self._acc["failover"] = 1
+                    self._acc["attempt_errors"].append((sid, f"http_{status}"))
+                    cd.cooldown(sid, secs, f"http_{status}")
+                    remaining = [x for x in remaining if x != sid]
+                    self._acc["supply"] = ""
+                    self._acc["target_protocol"] = ""
+                    self._acc["conversion_kind"] = ""
+                    continue
+                try:
+                    parsed = json.loads(resp_body)
+                except (json.JSONDecodeError, ValueError):
+                    parsed = None
+                valid_error = (isinstance(parsed, dict) and parsed.get("type") == "error"
+                               and isinstance(parsed.get("error"), dict)
+                               and isinstance(parsed["error"].get("type"), str)
+                               and isinstance(parsed["error"].get("message"), str))
+                if valid_error:
+                    self._write_buffered_response(status, resp_headers, resp_body)
+                else:
+                    msg = _extract_upstream_error_message(resp_body)
+                    self._write_buffered_response(
+                        status, [], error_body_for_source("anthropic", status, msg or "upstream error"))
+                self._acc["final_error"] = f"upstream_error {status}"
+                return
+            except (urllib.error.URLError, OSError) as e:
+                secs = resolve_cooldown_seconds("URLError", cs)
+                if failover == "on" and secs is not None:
+                    self._acc["failover"] = 1
+                    self._acc["attempt_errors"].append((sid, f"net_error:{e}"))
+                    cd.cooldown(sid, secs, f"net_error:{e}")
+                    remaining = [x for x in remaining if x != sid]
+                    self._acc["supply"] = ""
+                    self._acc["target_protocol"] = ""
+                    self._acc["conversion_kind"] = ""
+                    continue
+                self._acc["final_error"] = f"upstream net error: {e}"
+                self._write_buffered_response(
+                    502, [], error_body_for_source("anthropic", 502, f"upstream error: {e}"))
+                return
+            try:
+                parsed = json.loads(resp_body)
+            except (json.JSONDecodeError, ValueError):
+                parsed = None
+            if not (isinstance(parsed, dict) and type(parsed.get("input_tokens")) is int
+                    and parsed["input_tokens"] >= 0):
+                self._acc["final_error"] = "invalid count_tokens response"
+                self._write_buffered_response(
+                    502, [], error_body_for_source("anthropic", 502, "invalid count_tokens response"))
+                return
+            self._write_buffered_response(status, resp_headers, resp_body)
+            return
+        if self._acc["attempts"]:
+            errs = self._acc.get("attempt_errors") or []
+            summary = "; ".join(f"{sid}={reason}" for sid, reason in errs) or "all attempts failed"
+            msg = f"all upstream supplies failed or cooling: {summary}"
+            status = 503
+        else:
+            msg = "count_tokens requires an available anthropic supply"
+            status = 501
+        self._acc["final_error"] = msg
+        self._write_buffered_response(status, [], error_body_for_source("anthropic", status, msg))
 
     def _forward(self, method: str):
         cs: ConfigStore = self.server.config_store
@@ -1342,6 +1560,8 @@ class ModelProxyHandler(BaseHTTPRequestHandler):
         # 4. source 协议识别
         source = detect_source(self.path, body_json)
         self._acc["source"] = source
+        operation = detect_operation(self.path)
+        self._acc["operation"] = operation
 
         # 5. 三阶段匹配：strategy → route候选列表（session_hash分配 + B选项跨route兜底）
         #    → tier → supplies 列表
@@ -1356,7 +1576,7 @@ class ModelProxyHandler(BaseHTTPRequestHandler):
         # 改写后重序列化 raw_body，使 PASSTHROUGH 分支（send_body = raw_body，1436 行）
         # 在无其他 body 变更时也能带出改写；re-dump 与既有 model 改写路径（1439 行）同款操作，安全。
         # fail-open：不匹配则原样透传。
-        if source == "anthropic" and isinstance(body_json, dict):
+        if operation == OP_MESSAGES and source == "anthropic" and isinstance(body_json, dict):
             if _rewrite_known_injected_texts(body_json):
                 raw_body = json.dumps(body_json, ensure_ascii=False).encode("utf-8")
                 self._acc["nudge_rewritten"] = "1"   # 语义：入站 body 命中改写（含未转发的命令请求）
@@ -1369,7 +1589,7 @@ class ModelProxyHandler(BaseHTTPRequestHandler):
         # 命令，回退原逻辑，最终按现状 401，行为不变）。
         sidecar: SessionOverridesSidecar = self.server.sidecar_store
         sidecar.maybe_reload()
-        if (source == "anthropic" and session_key and strategy is not None
+        if (operation == OP_MESSAGES and source == "anthropic" and session_key and strategy is not None
                 and isinstance(body_json, dict) and isinstance(body_json.get("messages"), list)):
             last_user_content = extract_last_user_message_content(body_json)
             is_cmd, cmd_arg = ((False, None) if last_user_content is None
@@ -1420,6 +1640,12 @@ class ModelProxyHandler(BaseHTTPRequestHandler):
         self._acc["tier"] = tier
 
         supply_map = cs.get_supply_map()
+
+        if operation == OP_COUNT_TOKENS:
+            route = route_candidates[0]
+            self._acc["route"] = route.get("id", "")
+            self._forward_count_tokens(method, cs, cd, route, tier, supply_map, body_json)
+            return
 
         _reasoning_retried = False   # reasoning 语法重试只做一次，作用域覆盖整个请求周期
 
@@ -1561,6 +1787,8 @@ class ModelProxyHandler(BaseHTTPRequestHandler):
                         500, [], error_body_for_source(source, 500, str(e)))
                     return
                 mode = pick_translator(source, target)
+                self._acc["target_protocol"] = target
+                self._acc["conversion_kind"] = protocol_conversion_kind(source, target)
 
                 if mode == UNSUPPORTED:
                     log.warning("request.reject source=%s target=%s mode=UNSUPPORTED",
@@ -2178,6 +2406,9 @@ class ModelProxyHandler(BaseHTTPRequestHandler):
             "strategies": strategies_out,
             "cooldown": cd.snapshot(),
             "unconfigured_codes": _snapshot_unconfigured_hits(),
+            "protocol_conversion_hints": build_protocol_conversion_hints({
+                "supplies": supplies, "routes": cs.get_routes(),
+            }),
             "version": _VERSION,
         })
 

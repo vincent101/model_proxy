@@ -17,6 +17,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from core.protocol_hints import PROTOCOL_HINT_WINDOW_DAYS
 
 TIER_NAMES = ("opus", "sonnet", "haiku")
 
@@ -232,6 +233,12 @@ def parse_access_line(line: str) -> dict | None:
         "req_id": req_id,
         "status": fields.get("status", ""),
         "source": fields.get("source", ""),
+        "operation": fields.get("operation", ""),
+        "target_protocol": fields.get("target_protocol", ""),
+        "conversion_kind": fields.get("conversion_kind", ""),
+        "usage_in": fields.get("usage_in", ""),
+        "usage_out": fields.get("usage_out", ""),
+        "token": fields.get("token", ""),
         "route": fields.get("route", ""),
         "tier": fields.get("tier", ""),
         "supply": fields.get("supply", ""),
@@ -241,6 +248,79 @@ def parse_access_line(line: str) -> dict | None:
         "builtin": fields.get("builtin", ""),
         "final_error": fields.get("final_error", ""),
     }
+
+
+def load_protocol_conversion_traffic(log_path: str, hints: list[dict] | None, *,
+                                     now: datetime | None = None,
+                                     window_days: int = PROTOCOL_HINT_WINDOW_DAYS) -> list[dict]:
+    """流式扫描窗口内新格式 ACCESS，聚合当前配置仍存在的跨协议链路。"""
+    if not hints or not log_path or not os.path.isfile(log_path):
+        return []
+    now = now or datetime.now()
+    start = now - timedelta(days=window_days)
+    valid = {(h.get("route"), h.get("tier"), h.get("supply"), h.get("source"))
+             for h in hints}
+    aggs: dict[tuple, dict] = {}
+    try:
+        with open(log_path, "r", encoding="utf-8", errors="replace") as f:
+            for line in f:
+                p = parse_access_line(line)
+                if not p or p["ts"] < start:
+                    continue
+                if not all(p.get(k) for k in ("operation", "target_protocol", "conversion_kind")):
+                    continue
+                if (p["builtin"] or p["operation"] == "count_tokens"
+                        or p["conversion_kind"] == "passthrough"
+                        or p["operation"] not in {"messages", "responses", "chat_completions"}):
+                    continue
+                if (p["route"], p["tier"], p["supply"], p["source"]) not in valid:
+                    continue
+                key = (p["token"], p["source"], p["route"], p["tier"], p["supply"],
+                       p["target_protocol"], p["conversion_kind"])
+                a = aggs.setdefault(key, {"n": 0, "rejected_501": 0, "empty": 0,
+                                          "success": 0, "other_failure": 0})
+                a["n"] += 1
+                if p["status"] == "501":
+                    a["rejected_501"] += 1
+                elif p["status"] == "200":
+                    try:
+                        usage_out = int(p["usage_out"] or 0)
+                    except ValueError:
+                        usage_out = 0
+                    a["success" if usage_out > 0 else "empty"] += 1
+                else:
+                    a["other_failure"] += 1
+    except OSError:
+        return []
+    result = []
+    names = ("token", "source", "route", "tier", "supply", "target_protocol", "conversion_kind")
+    for key, agg in aggs.items():
+        result.append({**dict(zip(names, key)), **agg})
+    return sorted(result, key=lambda x: (-x["n"], tuple(x[k] for k in names)))
+
+
+def _format_protocol_conversion_traffic(items: list[dict]) -> list[str]:
+    if not items:
+        return []
+    lines = ["跨协议链路（近7天）:"]
+    for x in items:
+        n = x["n"]
+        if x["rejected_501"] == n:
+            summary = "全501"
+        else:
+            parts = []
+            if x["empty"]:
+                parts.append(f"{x['empty']}空")
+            failures = x["rejected_501"] + x["other_failure"]
+            if failures:
+                parts.append(f"{failures}失败")
+            summary = "·".join(parts)
+        suffix = f"·{summary}" if summary else ""
+        lines.append(
+            f"⚠ {x['token']}[{x['source']}] → {x['route']}.{x['tier']} → "
+            f"{x['supply']}[{x['target_protocol']}] ({x['conversion_kind']}) {n}次{suffix}")
+    lines.append("跨协议链路有语义损失风险，优先用同协议原生接口直连")
+    return lines
 
 
 def _short_supply(sid: str) -> str:
@@ -655,6 +735,14 @@ def _format_status_from_json(data: dict, config_path: str, totals_path: str,
     if log_path:
         lines.append("")
         lines.extend(_format_active_sessions(load_active_sessions(log_path), cfg))
+
+    hints = data.get("protocol_conversion_hints")
+    if log_path and hints is not None:
+        conversion_lines = _format_protocol_conversion_traffic(
+            load_protocol_conversion_traffic(log_path, hints))
+        if conversion_lines:
+            lines.append("")
+            lines.extend(conversion_lines)
 
     if cooldown and not cooldown_unknown:
         lines.append("")
