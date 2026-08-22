@@ -1061,6 +1061,11 @@ def pick_translator(source: str, target: str) -> str:
     return _TRANSLATOR_TABLE.get((source, target), UNSUPPORTED)
 
 
+def translation_error_for_upstream(error: dict | None) -> "pt.TranslationError":
+    """统一上游业务错误分类；供非流状态码与流内错误事件共用。"""
+    return pt.classify_upstream_error(error)
+
+
 def error_body_for_source(source: str, http_status: int, message: str) -> bytes:
     """按 source 协议构造合法 error body（基础版，阶段4 再完善上游错误包裹）。
 
@@ -1857,6 +1862,12 @@ class ModelProxyHandler(BaseHTTPRequestHandler):
                         try:
                             openai_resp = json.loads(raw_resp_body)
                             anthropic_resp = pt.openai_to_anthropic_response(openai_resp, fwd_ctx)
+                        except pt.TranslationError as e:
+                            log.error("ANTHROPIC_TO_CHAT response translate failed: %s", e)
+                            self._write_buffered_response(
+                                e.http_status, [], error_body_for_source(
+                                    source, e.http_status, f"proxy translate failed: {e}"))
+                            return
                         except Exception as e:
                             log.error("ANTHROPIC_TO_CHAT response translate failed: %s", e)
                             self._write_buffered_response(
@@ -1893,6 +1904,12 @@ class ModelProxyHandler(BaseHTTPRequestHandler):
                             responses_resp = json.loads(raw_resp_body)
                             anthropic_resp = pt.responses_to_anthropic_response(
                                 responses_resp, fwd_ctx)
+                        except pt.TranslationError as e:
+                            log.error("ANTHROPIC_TO_RESPONSES response translate failed: %s", e)
+                            self._write_buffered_response(
+                                e.http_status, [], error_body_for_source(
+                                    source, e.http_status, f"proxy translate failed: {e}"))
+                            return
                         except Exception as e:
                             log.error("ANTHROPIC_TO_RESPONSES response translate failed: %s", e)
                             self._write_buffered_response(
@@ -1934,6 +1951,12 @@ class ModelProxyHandler(BaseHTTPRequestHandler):
                         responses_resp = pt.anthropic_to_responses_response(
                             anthropic_resp, target_model or "",
                             reasoning_effort=_r_effort, tools_echo=_tools_echo)
+                    except pt.TranslationError as e:
+                        log.error("RESPONSES_TO_ANTHROPIC response translate failed: %s", e)
+                        self._write_buffered_response(
+                            e.http_status, [], error_body_for_source(
+                                source, e.http_status, f"proxy translate failed: {e}"))
+                        return
                     except Exception as e:
                         log.error("RESPONSES_TO_ANTHROPIC response translate failed: %s", e)
                         self._write_buffered_response(
@@ -2299,8 +2322,10 @@ class ModelProxyHandler(BaseHTTPRequestHandler):
                         break
                     try:
                         chunk = json.loads(payload)
-                    except (json.JSONDecodeError, ValueError):
-                        continue
+                    except (json.JSONDecodeError, ValueError) as e:
+                        raise pt.TranslationError(
+                            f"malformed Chat SSE frame: {e}", source_type="chat",
+                            reason="malformed_stream") from e
                     for ev in adapter.feed(chunk):
                         self._write_sse_chunk(pt.anthropic_sse_bytes(ev))
             # 流结束：收尾（[DONE] 或上游断流都走 finalize，幂等）
@@ -2309,25 +2334,18 @@ class ModelProxyHandler(BaseHTTPRequestHandler):
             self.wfile.write(b"0\r\n\r\n")
             self.wfile.flush()
         except (BrokenPipeError, ConnectionResetError):
-            # 客户端断连：仍尝试 finalize 收尾（幂等，write 失败无所谓）
-            try:
-                for ev in adapter.finalize():
-                    self._write_sse_chunk(pt.anthropic_sse_bytes(ev))
-                self.wfile.write(b"0\r\n\r\n")
-                self.wfile.flush()
-            except (BrokenPipeError, ConnectionResetError, OSError):
-                pass
+            # 客户端断连不是上游 EOF：不 finalize、不制造失败终态、不触发 failover。
+            pass
         except Exception as e:
-            # 上游连接中断/读取异常/adapter.feed 抛异常：200+chunked 头已发出，无法降级为
-            # 非流式 error body，只能按正向规格 §5.1 补发一个 `event: error` 再体面收尾
-            # （不调用 adapter.finalize()，避免在失败态下伪造 message_delta/message_stop）
             log.error("ANTHROPIC_TO_CHAT stream interrupted: %s", e)
             try:
-                err_event = {
-                    "type": "error",
-                    "error": {"type": "api_error", "message": f"stream interrupted: {e}"},
-                }
-                self._write_sse_chunk(pt.anthropic_sse_bytes(err_event))
+                if not (getattr(adapter, "_finalized", False)
+                        or getattr(adapter, "_failed", False)):
+                    err_event = {
+                        "type": "error",
+                        "error": {"type": "api_error", "message": f"stream interrupted: {e}"},
+                    }
+                    self._write_sse_chunk(pt.anthropic_sse_bytes(err_event))
                 self.wfile.write(b"0\r\n\r\n")
                 self.wfile.flush()
             except (BrokenPipeError, ConnectionResetError, OSError):
@@ -2354,14 +2372,20 @@ class ModelProxyHandler(BaseHTTPRequestHandler):
                 while b"\n\n" in buf:
                     block, buf = buf.split(b"\n\n", 1)
                     ev_type, ev_data = self._parse_anthropic_sse_block(block)
+                    if ev_type is None and ev_data is None:
+                        continue  # SSE 注释/keep-alive 帧
                     if ev_type is None:
-                        continue
+                        raise pt.TranslationError("malformed SSE frame", reason="malformed_stream")
                     for ev in adapter.feed(ev_type, ev_data):
                         self._write_sse_chunk(pt.responses_sse_bytes(ev))
             # 处理 buffer 残余块（末尾可能无空行）
             if buf.strip():
                 ev_type, ev_data = self._parse_anthropic_sse_block(buf)
-                if ev_type is not None:
+                if ev_type is None and ev_data is None:
+                    pass  # SSE 注释/keep-alive 帧
+                elif ev_type is None:
+                    raise pt.TranslationError("malformed SSE frame", reason="malformed_stream")
+                else:
                     for ev in adapter.feed(ev_type, ev_data):
                         self._write_sse_chunk(pt.responses_sse_bytes(ev))
             # 流意外结束（无 message_stop）时补收尾，幂等
@@ -2370,21 +2394,17 @@ class ModelProxyHandler(BaseHTTPRequestHandler):
             self.wfile.write(b"0\r\n\r\n")
             self.wfile.flush()
         except (BrokenPipeError, ConnectionResetError):
-            # 客户端断连：仍尝试 finalize 收尾（幂等，write 失败无所谓）
-            try:
-                for ev in adapter.finalize():
-                    self._write_sse_chunk(pt.responses_sse_bytes(ev))
-                self.wfile.write(b"0\r\n\r\n")
-                self.wfile.flush()
-            except (BrokenPipeError, ConnectionResetError, OSError):
-                pass
+            # 客户端断连不是上游 EOF。
+            pass
         except Exception as e:
             # 上游连接中断/读取异常/adapter.feed 抛异常：200+chunked 头已发出，无法降级为
             # 非流式 error body，按反向规格 §5.1 补发一个 response.failed 事件再体面收尾
             log.error("RESPONSES_TO_ANTHROPIC stream interrupted: %s", e)
             try:
-                self._write_sse_chunk(pt.responses_sse_bytes(
-                    _responses_failed_event(adapter, f"stream interrupted: {e}")))
+                if not (getattr(adapter, "completed", False)
+                        or getattr(adapter, "failed", False)):
+                    self._write_sse_chunk(pt.responses_sse_bytes(
+                        _responses_failed_event(adapter, f"stream interrupted: {e}")))
                 self.wfile.write(b"0\r\n\r\n")
                 self.wfile.flush()
             except (BrokenPipeError, ConnectionResetError, OSError):
@@ -2412,14 +2432,20 @@ class ModelProxyHandler(BaseHTTPRequestHandler):
                 while b"\n\n" in buf:
                     block, buf = buf.split(b"\n\n", 1)
                     ev_type, ev_data = self._parse_anthropic_sse_block(block)
+                    if ev_type is None and ev_data is None:
+                        continue  # SSE 注释/keep-alive 帧
                     if ev_type is None:
-                        continue
+                        raise pt.TranslationError("malformed SSE frame", reason="malformed_stream")
                     for ev in adapter.feed(ev_type, ev_data):
                         self._write_sse_chunk(pt.anthropic_sse_bytes(ev))
             # 处理 buffer 残余块（末尾可能无空行）
             if buf.strip():
                 ev_type, ev_data = self._parse_anthropic_sse_block(buf)
-                if ev_type is not None:
+                if ev_type is None and ev_data is None:
+                    pass  # SSE 注释/keep-alive 帧
+                elif ev_type is None:
+                    raise pt.TranslationError("malformed SSE frame", reason="malformed_stream")
+                else:
                     for ev in adapter.feed(ev_type, ev_data):
                         self._write_sse_chunk(pt.anthropic_sse_bytes(ev))
             # 流意外结束（无 response.completed）时补收尾，幂等
@@ -2428,22 +2454,18 @@ class ModelProxyHandler(BaseHTTPRequestHandler):
             self.wfile.write(b"0\r\n\r\n")
             self.wfile.flush()
         except (BrokenPipeError, ConnectionResetError):
-            # 客户端断连：仍尝试 finalize 收尾（幂等，write 失败无所谓）
-            try:
-                for ev in adapter.finalize():
-                    self._write_sse_chunk(pt.anthropic_sse_bytes(ev))
-                self.wfile.write(b"0\r\n\r\n")
-                self.wfile.flush()
-            except (BrokenPipeError, ConnectionResetError, OSError):
-                pass
+            # 客户端断连不是上游 EOF：不 finalize、不制造失败终态、不触发 failover。
+            pass
         except Exception as e:
             log.error("ANTHROPIC_TO_RESPONSES stream interrupted: %s", e)
             try:
-                err_event = {
-                    "type": "error",
-                    "error": {"type": "api_error", "message": f"stream interrupted: {e}"},
-                }
-                self._write_sse_chunk(pt.anthropic_sse_bytes(err_event))
+                if not (getattr(adapter, "_completed", False)
+                        or getattr(adapter, "_failed", False)):
+                    err_event = {
+                        "type": "error",
+                        "error": {"type": "api_error", "message": f"stream interrupted: {e}"},
+                    }
+                    self._write_sse_chunk(pt.anthropic_sse_bytes(err_event))
                 self.wfile.write(b"0\r\n\r\n")
                 self.wfile.flush()
             except (BrokenPipeError, ConnectionResetError, OSError):
@@ -2527,7 +2549,7 @@ class ModelProxyHandler(BaseHTTPRequestHandler):
         try:
             data = json.loads(payload)
         except (json.JSONDecodeError, ValueError):
-            return None, None
+            return None, {}  # 有 data 但 JSON 非法；区别于合法注释帧 (None, None)
         if ev_type is None and isinstance(data, dict):
             ev_type = data.get("type")
         return ev_type, data

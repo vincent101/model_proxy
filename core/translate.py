@@ -51,6 +51,9 @@ import json
 import logging
 import secrets
 import time
+from dataclasses import dataclass
+from enum import Enum
+from typing import Any
 
 logger = logging.getLogger(__name__)                       # 正向/反向侧日志
 
@@ -114,13 +117,118 @@ _rl = _RateLimitedLogger()
 # OpenAI 工具名上限（正向规格 §1.5.1）
 OPENAI_MAX_TOOL_NAME_LENGTH = 64
 
-# stop_reason 映射表（正向规格 §2.2）
-_FINISH_REASON_MAP = {
-    "stop": "end_turn",
-    "length": "max_tokens",
-    "tool_calls": "tool_use",
-    "content_filter": "end_turn",
+
+class TerminalStatus(str, Enum):
+    OPEN = "open"
+    COMPLETED = "completed"
+    INCOMPLETE = "incomplete"
+    REFUSED = "refused"
+    PAUSED = "paused"
+    FAILED = "failed"
+
+
+@dataclass(frozen=True)
+class TerminalState:
+    status: TerminalStatus
+    reason: str
+
+
+class TranslationError(Exception):
+    """协议转换失败；携带 HTTP 与 failover 决策所需的稳定分类。"""
+
+    def __init__(self, message: str, *, phase: str = "response", path: str = "",
+                 source_type: str = "", reason: str = "upstream_error",
+                 error_type: str = "", error_code: Any = None,
+                 http_status: int = 502, retry_class: str = "none"):
+        super().__init__(message)
+        self.phase = phase
+        self.path = path
+        self.source_type = source_type
+        self.reason = reason
+        self.error_type = error_type
+        self.error_code = error_code
+        self.http_status = http_status
+        self.retry_class = retry_class
+
+
+_ANTHROPIC_TERMINALS = {
+    "end_turn": TerminalState(TerminalStatus.COMPLETED, "end_turn"),
+    "stop_sequence": TerminalState(TerminalStatus.COMPLETED, "end_turn"),
+    "tool_use": TerminalState(TerminalStatus.COMPLETED, "tool_use"),
+    "max_tokens": TerminalState(TerminalStatus.INCOMPLETE, "max_tokens"),
+    "refusal": TerminalState(TerminalStatus.REFUSED, "refusal"),
+    "pause_turn": TerminalState(TerminalStatus.PAUSED, "pause_turn"),
+    "model_context_window_exceeded": TerminalState(
+        TerminalStatus.FAILED, "model_context_window_exceeded"),
 }
+_RESPONSES_TERMINALS = {
+    "completed": TerminalState(TerminalStatus.COMPLETED, "end_turn"),
+    "failed": TerminalState(TerminalStatus.FAILED, "upstream_error"),
+    "cancelled": TerminalState(TerminalStatus.FAILED, "upstream_error"),
+}
+_FINISH_REASON_MAP = {
+    "stop": TerminalState(TerminalStatus.COMPLETED, "end_turn"),
+    "length": TerminalState(TerminalStatus.INCOMPLETE, "max_tokens"),
+    "tool_calls": TerminalState(TerminalStatus.COMPLETED, "tool_use"),
+    "content_filter": TerminalState(TerminalStatus.REFUSED, "refusal"),
+}
+
+
+def map_anthropic_terminal(stop_reason) -> TerminalState:
+    state = _ANTHROPIC_TERMINALS.get(stop_reason)
+    if state is None:
+        raise TranslationError(
+            f"unknown Anthropic stop_reason: {stop_reason!r}", path="stop_reason",
+            source_type="anthropic", reason=f"unknown:{stop_reason}")
+    return state
+
+
+def map_responses_terminal(status, incomplete_reason=None) -> TerminalState:
+    if status == "incomplete":
+        if incomplete_reason == "max_output_tokens":
+            return TerminalState(TerminalStatus.INCOMPLETE, "max_tokens")
+        return TerminalState(TerminalStatus.FAILED, f"unknown:{incomplete_reason}")
+    state = _RESPONSES_TERMINALS.get(status)
+    if state is None:
+        raise TranslationError(
+            f"unknown Responses status: {status!r}", path="status",
+            source_type="responses", reason=f"unknown:{status}")
+    return state
+
+
+def map_chat_terminal(finish_reason) -> TerminalState:
+    state = _FINISH_REASON_MAP.get(finish_reason)
+    if state is None:
+        raise TranslationError(
+            f"unknown Chat finish_reason: {finish_reason!r}", path="choices[0].finish_reason",
+            source_type="chat", reason=f"unknown:{finish_reason}")
+    return state
+
+
+def classify_upstream_error(error: dict | None) -> TranslationError:
+    err = error if isinstance(error, dict) else {}
+    error_type = str(err.get("type") or "")
+    code = err.get("code")
+    message = str(err.get("message") or "upstream request failed")
+    key = f"{error_type} {code or ''}".lower()
+    if any(x in key for x in ("invalid", "validation", "bad_request")):
+        status, retry = 400, "none"
+    elif any(x in key for x in ("auth", "unauthorized")):
+        status, retry = 401, "configured"
+    elif any(x in key for x in ("permission", "forbidden")):
+        status, retry = 403, "configured"
+    elif any(x in key for x in ("rate", "quota")):
+        status, retry = 429, "configured"
+    elif any(x in key for x in ("overload", "unavailable")):
+        status, retry = 503, "configured"
+    elif any(x in key for x in ("internal", "server_error")):
+        status, retry = 502, "configured"
+    elif any(x in key for x in ("capability", "unsupported")):
+        status, retry = 422, "capability_mismatch"
+    else:
+        status, retry = 502, "none"
+    return TranslationError(message, source_type="upstream", error_type=error_type,
+                            error_code=code, http_status=status, retry_class=retry)
 
 # reasoning_content 空回答兜底：content 空但 reasoning_content 非空时，把思考内容填进
 # text block，避免客户端收到空 content 数组。可整体关闭（改此常量）。
@@ -230,10 +338,8 @@ def truncate_tool_name(name: str) -> str:
 # ============================================================
 
 def map_finish_reason(finish) -> str:
-    """OpenAI finish_reason → Anthropic stop_reason。null/其他 → end_turn。"""
-    if finish is None:
-        return "end_turn"
-    return _FINISH_REASON_MAP.get(finish, "end_turn")
+    """Chat finish_reason → Anthropic stop_reason；null/未知值显式失败。"""
+    return map_chat_terminal(finish).reason
 
 
 # ============================================================
@@ -623,7 +729,18 @@ def anthropic_to_openai_request(body: dict, reasoning_fields: "dict | None" = No
 # ============================================================
 
 def openai_to_anthropic_response(resp: dict, ctx: dict = None) -> dict:
-    """OpenAI 非流式响应 → Anthropic 响应 dict（补齐必需字段）。"""
+    """Chat 非流式响应 → Anthropic；严格校验 envelope 与终态。"""
+    if not isinstance(resp, dict):
+        raise TranslationError("Chat response must be an object", source_type="chat",
+                               reason="malformed_response")
+    if isinstance(resp.get("error"), dict):
+        raise classify_upstream_error(resp.get("error"))
+    if not isinstance(resp.get("choices"), list) or not resp["choices"]:
+        raise TranslationError("Chat response.choices must be a non-empty array", path="choices",
+                               source_type="chat", reason="malformed_response")
+    if not isinstance(resp["choices"][0], dict) or not isinstance(resp["choices"][0].get("message"), dict):
+        raise TranslationError("Chat choice.message must be an object", path="choices[0].message",
+                               source_type="chat", reason="malformed_response")
     ctx = ctx or {}
     tool_name_mapping = ctx.get("tool_name_mapping", {})
     request_model = ctx.get("request_model", "")
@@ -745,6 +862,7 @@ class OpenAIToAnthropicStreamAdapter:
         self.message_id = gen_msg_id()
         self.openai_index_to_anthropic_index = {}
         self._finalized = False
+        self._failed = False
         self.reasoning_buf = ""              # 累积 delta.reasoning_content
         self.produced_content_block = False  # 是否产出过 text/tool block（不含 reasoning 累积）
         self.thinking_emitted = False        # ①b-chat：reasoning_buf 是否已镜像为 thinking block
@@ -863,8 +981,19 @@ class OpenAIToAnthropicStreamAdapter:
     # ---- 核心：feed（§3.4） ----
 
     def feed(self, openai_chunk: dict) -> list:
-        """喂一个 OpenAI chunk，返回 0..N 个 Anthropic 事件 dict。"""
+        """喂一个 Chat chunk，返回 0..N 个 Anthropic 事件 dict。"""
         events = []
+        if self._finalized or self._failed:
+            return events
+        if not isinstance(openai_chunk, dict):
+            raise TranslationError("Chat SSE payload must be an object", source_type="chat",
+                                   reason="malformed_stream")
+        if isinstance(openai_chunk.get("error"), dict):
+            self._failed = True
+            err = classify_upstream_error(openai_chunk["error"])
+            return [{"type": "error", "error": {
+                "type": "invalid_request_error" if err.http_status < 500 else "api_error",
+                "message": str(err)}}]
 
         # (0) 首次：发 message_start（+ 紧跟一个 ping）
         if not self.sent_message_start:
@@ -982,6 +1111,12 @@ class OpenAIToAnthropicStreamAdapter:
         if self._finalized:
             return []
         self._finalized = True
+        if self._failed:
+            return []
+        if self.final_stop_reason is None:
+            self._failed = True
+            return [{"type": "error", "error": {"type": "api_error",
+                    "message": "Chat stream ended before finish_reason"}}]
         events = []
         # 若流内一个 chunk 都没喂过，也要保证 message_start 已发
         if not self.sent_message_start:
@@ -1270,10 +1405,23 @@ def _anthropic_usage_to_responses(usage: dict) -> dict:
 
 def anthropic_to_responses_response(resp: dict, model: str,
                                     reasoning_effort=None, tools_echo=None) -> dict:
-    """把 Anthropic 非流式响应转换成 Responses 响应（反向规格 §2）。
-
-    reasoning_effort / tools_echo 为请求侧回显值（缺省 None / []）。
-    """
+    """把 Anthropic 非流式响应转换成 Responses 响应。"""
+    if not isinstance(resp, dict):
+        raise TranslationError("Anthropic response must be an object", source_type="anthropic",
+                               reason="malformed_response")
+    if resp.get("type") == "error" or isinstance(resp.get("error"), dict):
+        err = classify_upstream_error(resp.get("error"))
+        return _responses_terminal_response(model, TerminalStatus.FAILED, err,
+                                            reasoning_effort, tools_echo)
+    if not isinstance(resp.get("content"), list):
+        raise TranslationError("Anthropic response.content must be an array", path="content",
+                               source_type="anthropic", reason="malformed_response")
+    state = map_anthropic_terminal(resp.get("stop_reason"))
+    if state.status in (TerminalStatus.REFUSED, TerminalStatus.PAUSED, TerminalStatus.FAILED):
+        err = TranslationError(f"Anthropic response ended: {state.reason}",
+                               source_type="anthropic", reason=state.reason)
+        return _responses_terminal_response(model, TerminalStatus.FAILED, err,
+                                            reasoning_effort, tools_echo)
     output = []
     for block in resp.get("content", []) or []:
         if not isinstance(block, dict):
@@ -1321,11 +1469,12 @@ def anthropic_to_responses_response(resp: dict, model: str,
         # 其他 block 忽略
 
     now = int(time.time())
-    return {
+    response_status = "incomplete" if state.status == TerminalStatus.INCOMPLETE else "completed"
+    result = {
         "id": gen_response_id(),
         "object": "response",
         "created_at": now,
-        "status": "completed",                   # 反向规格 §2.2：首版统一 completed
+        "status": response_status,
         "background": False,
         "completed_at": now,
         "model": model,
@@ -1340,6 +1489,27 @@ def anthropic_to_responses_response(resp: dict, model: str,
         "truncation": "disabled",
         "usage": _anthropic_usage_to_responses(resp.get("usage")),
         "metadata": {},
+    }
+    if response_status == "incomplete":
+        result["incomplete_details"] = {"reason": "max_output_tokens"}
+        result["completed_at"] = None
+    return result
+
+
+def _responses_terminal_response(model: str, status: TerminalStatus, error: TranslationError,
+                                 reasoning_effort=None, tools_echo=None) -> dict:
+    now = int(time.time())
+    return {
+        "id": gen_response_id(), "object": "response", "created_at": now,
+        "status": "failed", "background": False, "completed_at": None, "model": model,
+        "output": [], "parallel_tool_calls": True,
+        "reasoning": {"effort": reasoning_effort, "summary": None},
+        "service_tier": "default", "store": True,
+        "text": {"format": {"type": "text"}, "verbosity": "medium"},
+        "tool_choice": "auto", "tools": tools_echo or [], "truncation": "disabled",
+        "usage": _anthropic_usage_to_responses({}), "metadata": {},
+        "error": {"type": error.error_type or "server_error", "code": error.error_code,
+                  "message": str(error)},
     }
 
 
@@ -1372,6 +1542,7 @@ class AnthropicToResponsesStreamAdapter:
         self.conversation_id = gen_conversation_id()
         self.sent_created = False
         self.completed = False
+        self.failed = False
 
         self.output_index = -1
         self.cur_item_kind = None                # "message" | "function_call" | "reasoning"
@@ -1446,6 +1617,11 @@ class AnthropicToResponsesStreamAdapter:
 
     def feed(self, event_type: str, data: dict) -> list:
         events: list = []
+        if self.completed or self.failed:
+            return events
+        if not isinstance(data, dict):
+            raise TranslationError("Anthropic SSE payload must be an object", source_type="anthropic",
+                                   reason="malformed_stream")
         data = data or {}
         self._ensure_created(events)
 
@@ -1519,23 +1695,46 @@ class AnthropicToResponsesStreamAdapter:
             # 流式场景 message_delta.usage 目前观察到的结构不含 thinking 明细，
             # 防御性读取：真实有值时自然带出，无值维持 0（不臆造）。
             self.usage_reasoning = _extract_reasoning_tokens(usage) or self.usage_reasoning
-            self.final_stop_reason = (data.get("delta") or {}).get("stop_reason")
+            stop_reason = (data.get("delta") or {}).get("stop_reason")
+            if stop_reason is not None:
+                self.final_stop_reason = stop_reason
 
         elif event_type == "message_stop":
-            self._emit_completed(events)
+            try:
+                state = map_anthropic_terminal(self.final_stop_reason)
+            except TranslationError as exc:
+                self._emit_failed(events, exc)
+            else:
+                if state.status == TerminalStatus.COMPLETED:
+                    self._emit_completed(events)
+                elif state.status == TerminalStatus.INCOMPLETE:
+                    self._emit_incomplete(events)
+                else:
+                    self._emit_failed(events, TranslationError(
+                        f"Anthropic stream ended: {state.reason}", source_type="anthropic",
+                        reason=state.reason))
+
+        elif event_type == "error":
+            self._emit_failed(events, classify_upstream_error(data.get("error")))
 
         elif event_type == "ping":
-            pass                                 # Responses 无 ping，丢弃
+            pass                                 # Responses 无 ping，显式 allowlist
+
+        else:
+            raise TranslationError(f"unknown Anthropic stream event: {event_type!r}",
+                                   source_type="anthropic", reason=f"unknown:{event_type}")
 
         return events
 
     def finalize(self) -> list:
-        """流意外结束时补收尾。若尚未发过 completed 则补一个 response.completed。"""
+        """无 message_stop 的 EOF 必须 response.failed。"""
         events: list = []
-        if not self.sent_created:
-            return events                        # 连 created 都没发，无从收尾
-        if not self.completed:
-            self._emit_completed(events)
+        if self.completed or self.failed:
+            return events
+        self._ensure_created(events)
+        self._emit_failed(events, TranslationError(
+            "Anthropic stream ended before message_stop", source_type="anthropic",
+            reason="unexpected_eof"))
         return events
 
     def usage_tuple(self) -> tuple[int, int, int]:
@@ -1694,7 +1893,7 @@ class AnthropicToResponsesStreamAdapter:
     # ---- 收尾 ----
 
     def _emit_completed(self, events: list) -> None:
-        if self.completed:
+        if self.completed or self.failed:
             return
         events.append(self._emit({
             "type": "response.completed",
@@ -1702,6 +1901,23 @@ class AnthropicToResponsesStreamAdapter:
                                        with_completed_at=True, with_usage=True),
         }))
         self.completed = True
+
+    def _emit_incomplete(self, events: list) -> None:
+        if self.completed or self.failed:
+            return
+        response = self._skeleton("incomplete", "default", with_usage=True)
+        response["incomplete_details"] = {"reason": "max_output_tokens"}
+        events.append(self._emit({"type": "response.incomplete", "response": response}))
+        self.completed = True
+
+    def _emit_failed(self, events: list, error: TranslationError) -> None:
+        if self.completed or self.failed:
+            return
+        response = self._skeleton("failed", "default", with_usage=True)
+        response["error"] = {"type": error.error_type or "server_error",
+                             "code": error.error_code, "message": str(error)}
+        events.append(self._emit({"type": "response.failed", "response": response}))
+        self.failed = True
 
 
 # ############################################################################
@@ -1937,7 +2153,28 @@ def _extract_reasoning_thinking_text(item: dict) -> str:
 
 
 def responses_to_anthropic_response(resp: dict, ctx: dict = None) -> dict:
-    """Responses 非流式响应 → Anthropic 响应 dict（缺失字段容错）。"""
+    """Responses 非流式响应 → Anthropic 响应；失败终态绝不伪装成功。"""
+    if not isinstance(resp, dict):
+        raise TranslationError("Responses response must be an object", path="$",
+                               source_type="responses", reason="malformed_response")
+    # 部分兼容网关省略 status；具备合法 output 时视为 completed。
+    status = resp.get("status", "completed")
+    state = map_responses_terminal(
+        status, (resp.get("incomplete_details") or {}).get("reason"))
+    if state.status == TerminalStatus.FAILED:
+        err = resp.get("error") or {}
+        classified = classify_upstream_error(err)
+        classified.reason = state.reason
+        if status == "incomplete" and not err:
+            raise TranslationError(
+                f"Responses response incomplete: {state.reason}", source_type="responses",
+                reason=state.reason, http_status=classified.http_status,
+                retry_class=classified.retry_class)
+        raise classified
+    output_value = resp.get("output")
+    if not isinstance(output_value, list):
+        raise TranslationError("Responses response.output must be an array", path="output",
+                               source_type="responses", reason="malformed_response")
     ctx = ctx or {}
     tool_name_mapping = ctx.get("tool_name_mapping", {})
     request_model = ctx.get("request_model", "")
@@ -1973,9 +2210,14 @@ def responses_to_anthropic_response(resp: dict, ctx: dict = None) -> dict:
             thinking = _extract_reasoning_thinking_text(item)
             if thinking:
                 content_blocks.append({"type": "thinking", "thinking": thinking})
-        # 其他 type 忽略
+        else:
+            raise TranslationError(f"unknown Responses output item type: {it!r}", path="output[].type",
+                                   source_type="responses", reason=f"unknown:{it}")
 
-    stop_reason = "tool_use" if has_tool_use else "end_turn"
+    if state.status == TerminalStatus.INCOMPLETE:
+        stop_reason = "max_tokens"
+    else:
+        stop_reason = "tool_use" if has_tool_use else "end_turn"
 
     u = resp.get("usage") or {}
     anthropic_usage = {
@@ -2034,6 +2276,7 @@ class ResponsesToAnthropicStreamAdapter:
         self.message_id = gen_msg_id()
         self._finalized = False
         self._completed = False
+        self._failed = False
         self.usage_reasoning = 0
 
     # ---- 事件构造 helper（复用 Anthropic 事件形态） ----
@@ -2138,6 +2381,11 @@ class ResponsesToAnthropicStreamAdapter:
 
     def feed(self, event_type: str, data: dict) -> list:
         events: list = []
+        if self._completed or self._failed:
+            return events
+        if not isinstance(data, dict):
+            raise TranslationError("Responses SSE payload must be an object", source_type="responses",
+                                   reason="malformed_stream")
         data = data or {}
 
         if event_type in ("response.created", "response.in_progress"):
@@ -2220,26 +2468,57 @@ class ResponsesToAnthropicStreamAdapter:
                              "response.content_part.added"):
             pass                                      # delta 已累积内容，忽略
 
-        elif event_type == "response.completed":
+        elif event_type in ("response.completed", "response.incomplete"):
             resp = data.get("response") or {}
+            status = resp.get("status") or event_type.removeprefix("response.")
+            state = map_responses_terminal(
+                status, (resp.get("incomplete_details") or {}).get("reason"))
+            if state.status == TerminalStatus.FAILED:
+                events.extend(self._emit_error(classify_upstream_error(resp.get("error") or {
+                    "type": "server_error", "message": f"Responses ended: {state.reason}"})))
+                return events
             u = resp.get("usage") or {}
             if u.get("input_tokens") is not None:
                 self.input_tokens = u.get("input_tokens") or 0
             if u.get("output_tokens") is not None:
                 self.output_tokens = u.get("output_tokens") or 0
             self.usage_reasoning = _extract_reasoning_tokens(u) or self.usage_reasoning
-            if self.final_stop_reason is None:
+            if state.status == TerminalStatus.INCOMPLETE:
+                self.final_stop_reason = "max_tokens"
+            elif self.final_stop_reason is None:
                 self.final_stop_reason = "tool_use" if self.cur_type == "tool_use" else "end_turn"
             events.extend(self._emit_finish())
 
-        elif event_type == "response.failed":
-            events.extend(self._emit_finish())
+        elif event_type in ("response.failed", "error"):
+            container = data.get("response") or data
+            events.extend(self._emit_error(classify_upstream_error(container.get("error") or container)))
+
+        elif event_type not in {
+                "response.reasoning_summary_part.added", "response.reasoning_summary_part.done",
+                "response.function_call_arguments.done", "response.content_part.added",
+                "response.content_part.done", "response.output_item.done",
+                "response.output_text.done", "response.reasoning_text.done",
+                "response.reasoning_summary_text.done"}:
+            raise TranslationError(f"unknown Responses stream event: {event_type!r}",
+                                   source_type="responses", reason=f"unknown:{event_type}")
 
         return events
 
+    def _emit_error(self, error: TranslationError) -> list:
+        if self._completed or self._failed:
+            return []
+        self._failed = True
+        return [{
+            "type": "error",
+            "error": {
+                "type": "invalid_request_error" if error.http_status < 500 else "api_error",
+                "message": str(error),
+            },
+        }]
+
     def _emit_finish(self) -> list:
         events: list = []
-        if self._completed:
+        if self._completed or self._failed:
             return events
         self._ensure_message_start(events)
         if self.block_open:
@@ -2255,9 +2534,11 @@ class ResponsesToAnthropicStreamAdapter:
         if self._finalized:
             return []
         self._finalized = True
-        if self._completed:
+        if self._completed or self._failed:
             return []
-        return self._emit_finish()
+        return self._emit_error(TranslationError(
+            "Responses stream ended before a terminal event", source_type="responses",
+            reason="unexpected_eof"))
 
     def usage_tuple(self) -> tuple[int, int, int]:
         """统一 usage 读取接口：返回 (usage_in, usage_out, usage_reasoning)。

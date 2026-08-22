@@ -69,9 +69,11 @@ class TestHelpers(unittest.TestCase):
         self.assertEqual(pt.map_finish_reason("stop"), "end_turn")
         self.assertEqual(pt.map_finish_reason("length"), "max_tokens")
         self.assertEqual(pt.map_finish_reason("tool_calls"), "tool_use")
-        self.assertEqual(pt.map_finish_reason("content_filter"), "end_turn")
-        self.assertEqual(pt.map_finish_reason(None), "end_turn")
-        self.assertEqual(pt.map_finish_reason("weird"), "end_turn")
+        self.assertEqual(pt.map_finish_reason("content_filter"), "refusal")
+        with self.assertRaises(pt.TranslationError):
+            pt.map_finish_reason(None)
+        with self.assertRaises(pt.TranslationError):
+            pt.map_finish_reason("weird")
 
     def test_image_to_data_url(self):
         self.assertEqual(
@@ -402,7 +404,7 @@ class TestResponseTranslate(unittest.TestCase):
     def test_finish_reason_content_filter(self):
         resp = {"choices": [{"message": {"content": "x"}, "finish_reason": "content_filter"}],
                 "content_filter_results": {"hate": {"filtered": True}}}
-        self.assertEqual(pt.openai_to_anthropic_response(resp, {})["stop_reason"], "end_turn")
+        self.assertEqual(pt.openai_to_anthropic_response(resp, {})["stop_reason"], "refusal")
 
     def test_invalid_json_arguments_downgrade(self):
         resp = {"choices": [{"message": {"tool_calls": [{
@@ -697,12 +699,11 @@ class TestStreamMixed(unittest.TestCase):
         self.assertTrue(len(first) > 0)
         self.assertEqual(second, [])          # 重复 finalize 不重发
 
-    def test_empty_stream_still_valid(self):
-        """一个 chunk 都没喂就 finalize，仍产出合法序列。"""
+    def test_empty_stream_is_error(self):
+        """一个 chunk 都没喂就 EOF，显式失败。"""
         ad = pt.OpenAIToAnthropicStreamAdapter({}, "m")
         events = ad.finalize()
-        self.assertEqual(types_of(events),
-                         ["message_start", "ping", "message_delta", "message_stop"])
+        self.assertEqual(types_of(events), ["error"])
 
     def test_input_tokens_backfill_from_first_chunk(self):
         chunks = [
@@ -1100,7 +1101,7 @@ def test_B_tool_use_response():
 def test_B_thinking_to_reasoning_item():
     resp = {"content": [{"type": "thinking", "thinking": "让我想想"},
                         {"type": "text", "text": "答案"}],
-            "usage": {"input_tokens": 5, "output_tokens": 3}}
+            "stop_reason": "end_turn", "usage": {"input_tokens": 5, "output_tokens": 3}}
     out = pt.anthropic_to_responses_response(resp, model="m")
     eq(len(out["output"]), 2, "B thinking 转 reasoning item，output 含 2 项")
     reasoning_item, message_item = out["output"]
@@ -1117,7 +1118,7 @@ def test_B_thinking_to_reasoning_item():
 def test_B_thinking_empty_text_summary_empty():
     resp = {"content": [{"type": "thinking", "thinking": ""},
                         {"type": "text", "text": "答案"}],
-            "usage": {"input_tokens": 5, "output_tokens": 3}}
+            "stop_reason": "end_turn", "usage": {"input_tokens": 5, "output_tokens": 3}}
     out = pt.anthropic_to_responses_response(resp, model="m")
     eq(out["output"][0]["summary"], [], "B thinking 正文空串 summary=[]（不伪造占位文字）")
 
@@ -1125,7 +1126,7 @@ def test_B_thinking_empty_text_summary_empty():
 def test_B_redacted_thinking_summary_empty():
     resp = {"content": [{"type": "redacted_thinking", "data": "encrypted-blob"},
                         {"type": "text", "text": "答案"}],
-            "usage": {"input_tokens": 5, "output_tokens": 3}}
+            "stop_reason": "end_turn", "usage": {"input_tokens": 5, "output_tokens": 3}}
     out = pt.anthropic_to_responses_response(resp, model="m")
     reasoning_item = out["output"][0]
     eq(reasoning_item["type"], "reasoning", "B redacted_thinking 也转 reasoning item")
@@ -1136,21 +1137,21 @@ def test_B_redacted_thinking_summary_empty():
 def test_B_reasoning_tokens_multi_path():
     # 路径1：output_tokens_details.thinking_tokens
     out1 = pt.anthropic_to_responses_response(
-        {"content": [], "usage": {"input_tokens": 1, "output_tokens": 2,
+        {"content": [], "stop_reason": "end_turn", "usage": {"input_tokens": 1, "output_tokens": 2,
                                    "output_tokens_details": {"thinking_tokens": 7}}},
         model="m")
     eq(out1["usage"]["output_tokens_details"]["reasoning_tokens"], 7,
        "B reasoning_tokens 读取 output_tokens_details.thinking_tokens")
     # 路径2：output_tokens_details.reasoning_tokens
     out2 = pt.anthropic_to_responses_response(
-        {"content": [], "usage": {"input_tokens": 1, "output_tokens": 2,
+        {"content": [], "stop_reason": "end_turn", "usage": {"input_tokens": 1, "output_tokens": 2,
                                    "output_tokens_details": {"reasoning_tokens": 9}}},
         model="m")
     eq(out2["usage"]["output_tokens_details"]["reasoning_tokens"], 9,
        "B reasoning_tokens 读取 output_tokens_details.reasoning_tokens")
     # 路径3：顶层 thinking_tokens
     out3 = pt.anthropic_to_responses_response(
-        {"content": [], "usage": {"input_tokens": 1, "output_tokens": 2, "thinking_tokens": 5}},
+        {"content": [], "stop_reason": "end_turn", "usage": {"input_tokens": 1, "output_tokens": 2, "thinking_tokens": 5}},
         model="m")
     eq(out3["usage"]["output_tokens_details"]["reasoning_tokens"], 5,
        "B reasoning_tokens 读取顶层 thinking_tokens")
@@ -1160,10 +1161,10 @@ def test_B_reasoning_tokens_multi_path():
 
 def test_B_tools_echo():
     tools = [{"type": "function", "name": "f", "description": "d", "parameters": {}}]
-    out = pt.anthropic_to_responses_response({"content": [], "usage": {}}, model="m",
+    out = pt.anthropic_to_responses_response({"content": [], "stop_reason": "end_turn", "usage": {}}, model="m",
                                             tools_echo=tools)
     eq(out["tools"], tools, "B tools 回显请求")
-    out2 = pt.anthropic_to_responses_response({"content": [], "usage": {}}, model="m")
+    out2 = pt.anthropic_to_responses_response({"content": [], "stop_reason": "end_turn", "usage": {}}, model="m")
     eq(out2["tools"], [], "B 无 tools 回显为 []")
 
 
@@ -1479,7 +1480,7 @@ def test_C_finalize_incomplete():
         ("content_block_delta", {"delta": {"type": "text_delta", "text": "半句"}}),
         # 无 content_block_stop / message_delta / message_stop
     ])
-    eq(evs[-1]["type"], "response.completed", "C finalize 补 response.completed 收尾")
+    eq(evs[-1]["type"], "response.failed", "C 无 message_stop EOF 显式 failed")
     _assert_seq_contiguous(evs, "C finalize 收尾")
 
 
@@ -1738,7 +1739,7 @@ class TestARResponse(unittest.TestCase):
     def test_ar_text_response(self):
         resp = {"id": "resp_x", "output": [
             {"type": "message", "content": [{"type": "output_text", "text": "答案"}]}],
-            "usage": {"input_tokens": 5, "output_tokens": 3}}
+            "stop_reason": "end_turn", "usage": {"input_tokens": 5, "output_tokens": 3}}
         ar = pt.responses_to_anthropic_response(resp, {"request_model": "m"})
         self.assertEqual(ar["content"], [{"type": "text", "text": "答案"}])
         self.assertEqual(ar["stop_reason"], "end_turn")
@@ -2000,14 +2001,14 @@ class TestARStream(unittest.TestCase):
 
     def test_ar_empty_stream_valid_finish(self):
         adapter = pt.ResponsesToAnthropicStreamAdapter({}, "m")
-        # 只有 created，无内容，无 completed → finalize 补收尾
+        # 只有 created，无协议终态 → finalize 显式失败
         evs = _run_ar_stream(adapter, [
             ("response.created", {"response": {"id": "r"}}),
         ])
         types = [e["type"] for e in evs]
         self.assertIn("message_start", types)
-        self.assertEqual(types[-1], "message_stop")
-        self.assertIn("message_delta", types)
+        self.assertEqual(types[-1], "error")
+        self.assertNotIn("message_stop", types)
 
     def test_ar_incomplete_stream_finalize(self):
         adapter = pt.ResponsesToAnthropicStreamAdapter({}, "m")
@@ -2018,9 +2019,8 @@ class TestARStream(unittest.TestCase):
             ("response.output_text.delta", {"delta": "半句"}),
         ])
         types = [e["type"] for e in evs]
-        self.assertEqual(types[-1], "message_stop")
-        # 开着的 text block 被 finalize 收掉
-        self.assertIn("content_block_stop", types)
+        self.assertEqual(types[-1], "error")
+        self.assertNotIn("message_stop", types)
 
     def test_ar_reasoning_stream_from_glm_sample(self):
         """①b 流式回传：glm 真实 SSE 样本（reasoning_text.delta 通道）→ thinking block。"""

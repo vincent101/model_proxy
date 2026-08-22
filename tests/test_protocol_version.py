@@ -73,11 +73,11 @@ class TestSSEChunkedHasTransferEncoding(unittest.TestCase):
         self.assertEqual(te_headers[0], "chunked")
 
 
-class TestBrokenPipeFinalizeCalled(unittest.TestCase):
-    """客户端断连(BrokenPipe)时，adapter.finalize 仍被调用。"""
+class TestBrokenPipeDoesNotFinalize(unittest.TestCase):
+    """客户端断连不应被误判为上游 EOF。"""
 
-    def test_responses_stream_finalize_on_broken_pipe(self):
-        """_write_responses_stream: wfile.write 抛 BrokenPipeError 后 finalize 被调。"""
+    def test_responses_stream_does_not_finalize_on_broken_pipe(self):
+        """_write_responses_stream 断连后不调用 finalize。"""
         h = _make_handler()
         # wfile.write 在 _write_sse_chunk 第一次写 chunk size 时就抛
         h.wfile = MagicMock()
@@ -98,11 +98,10 @@ class TestBrokenPipeFinalizeCalled(unittest.TestCase):
         # 调 _write_responses_stream；BrokenPipe 应在 _write_sse_chunk 内触发
         h._write_responses_stream(upstream_resp, adapter)
 
-        # 断言 finalize 被调
-        adapter.finalize.assert_called()
+        adapter.finalize.assert_not_called()
 
-    def test_translated_stream_finalize_on_broken_pipe(self):
-        """_write_translated_stream: 同上，用 anthropic_sse_bytes 路径。"""
+    def test_translated_stream_does_not_finalize_on_broken_pipe(self):
+        """客户端断连不应被误判为上游 EOF。"""
         h = _make_handler()
         h.wfile = MagicMock()
         h.wfile.write.side_effect = BrokenPipeError("client gone")
@@ -119,10 +118,10 @@ class TestBrokenPipeFinalizeCalled(unittest.TestCase):
 
         h._write_translated_stream(upstream_resp, adapter)
 
-        adapter.finalize.assert_called()
+        adapter.finalize.assert_not_called()
 
-    def test_translated_stream_from_responses_finalize_on_broken_pipe(self):
-        """_write_translated_stream_from_responses: 同上。"""
+    def test_translated_stream_from_responses_does_not_finalize_on_broken_pipe(self):
+        """Responses 转换流客户端断连不应被误判为上游 EOF。"""
         h = _make_handler()
         h.wfile = MagicMock()
         h.wfile.write.side_effect = BrokenPipeError("client gone")
@@ -139,7 +138,7 @@ class TestBrokenPipeFinalizeCalled(unittest.TestCase):
 
         h._write_translated_stream_from_responses(upstream_resp, adapter)
 
-        adapter.finalize.assert_called()
+        adapter.finalize.assert_not_called()
 
 
 if __name__ == "__main__":
