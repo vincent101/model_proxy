@@ -2114,7 +2114,7 @@ class ModelProxyHandler(BaseHTTPRequestHandler):
 
                 # ---- 按 mode 分派写回 ----
                 if mode == PASSTHROUGH:
-                    # 流式已由统一 probe 分支提前返回；此处仅处理非流式透传。
+                    # PASSTHROUGH 流式已在即时提交分支返回；此处仅处理非流式透传。
                     resp_body = resp.read()
                     if _maybe_budget_retry(resp_body, target, supply_id):
                         resp.close()
@@ -2528,6 +2528,7 @@ class ModelProxyHandler(BaseHTTPRequestHandler):
                     self._record_stream_error(pt.TranslationError(
                         f"upstream read failed: {exc}", reason="upstream_read_error"))
                     log.warning("passthrough upstream read failed: %s", exc)
+                    self.close_connection = True
                     return
                 if not chunk:
                     break
@@ -2558,6 +2559,7 @@ class ModelProxyHandler(BaseHTTPRequestHandler):
         except (BrokenPipeError, ConnectionResetError, OSError):
             if hasattr(self, "_acc"):
                 self._acc["stream_integrity"] = "client_disconnect"
+            self.close_connection = True
             log.info("passthrough client disconnected")
         finally:
             resp.close()

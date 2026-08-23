@@ -110,6 +110,7 @@ class TestPassthroughObserver(unittest.TestCase):
             200, [], _FakeUpstreamResp([prefix, ConnectionResetError("rst")]), "anthropic")
         self.assertEqual(_decode_chunked(h.wfile.getvalue()), prefix)
         self.assertEqual(h._acc["terminal_reason"], "upstream_read_error")
+        self.assertTrue(h.close_connection)
 
     def test_eof_repair_client_disconnect_is_swallowed(self):
         class DisconnectingFile:
@@ -126,6 +127,7 @@ class TestPassthroughObserver(unittest.TestCase):
         h = _make_handler(DisconnectingFile())
         h._write_streaming_response(200, [], _FakeUpstreamResp([]), "anthropic")
         self.assertEqual(h._acc["stream_integrity"], "client_disconnect")
+        self.assertTrue(h.close_connection)
 
 
 if __name__ == "__main__":
