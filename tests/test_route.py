@@ -112,6 +112,12 @@ class TestSelectSupply(unittest.TestCase):
         cd = _FakeCooldown(cooling={"k0"})
         self.assertIsNone(select_supply(["k0"], supply_map, cd, set()))
 
+    def test_select_supply_honors_request_wide_stream_exclusion(self):
+        supply_map = {"k0": {"id": "k0"}, "k1": {"id": "k1"}}
+        cd = _FakeCooldown()
+        supply = select_supply(["k0", "k1"], supply_map, cd, set(), {"k0"})
+        self.assertEqual(supply["id"], "k1")
+
     def test_failover_skip_cooling(self):
         # tier 内 failover：k1 在 cooling → 返回 k0
         supply_map = {"k0": {"id": "k0"}, "k1": {"id": "k1"}}

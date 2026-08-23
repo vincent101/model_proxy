@@ -114,7 +114,7 @@ class TestWriteStreamingResponseCrossChunk(unittest.TestCase):
 
     def test_anthropic_marker_split_across_chunk_boundary(self):
         sse = (b'event:message_start\ndata:{"type":"message_start"}\n\n'
-               b'event:message_delta\ndata:{"type":"message_delta","delta":{},'
+               b'event:message_delta\ndata:{"type":"message_delta","delta":{"stop_reason":"end_turn"},'
                b'"usage":{"input_tokens":16,"output_tokens":50}}\n\n'
                b'event:message_stop\ndata:{"type":"message_stop"}\n\n')
         idx = sse.find(b"message_delta")
@@ -150,7 +150,10 @@ class TestWriteStreamingResponseCrossChunk(unittest.TestCase):
         h._write_streaming_response(200, [], resp, "anthropic")
         self.assertEqual(h._acc["usage_in"], 5)
         self.assertEqual(h._acc["usage_out"], 9)
-        self.assertEqual(_decode_chunked(h.wfile.getvalue()), sse)
+        wire = _decode_chunked(h.wfile.getvalue())
+        self.assertTrue(wire.startswith(sse))
+        self.assertIn(b"event: error", wire)
+        self.assertEqual(h._acc["stream_integrity"], "invalid")
 
     def test_residual_block_without_trailing_double_newline_still_sniffed(self):
         """上游最后一个事件块未以 \n\n 收尾，靠 finally 里的残余块补检兜底。"""
@@ -161,7 +164,10 @@ class TestWriteStreamingResponseCrossChunk(unittest.TestCase):
         h._write_streaming_response(200, [], resp, "anthropic")
         self.assertEqual(h._acc["usage_in"], 3)
         self.assertEqual(h._acc["usage_out"], 4)
-        self.assertEqual(_decode_chunked(h.wfile.getvalue()), sse)
+        wire = _decode_chunked(h.wfile.getvalue())
+        self.assertTrue(wire.startswith(sse))
+        self.assertIn(b"event: error", wire)
+        self.assertEqual(h._acc["terminal_reason"], "unexpected_eof")
 
     def test_no_source_keeps_usage_zero_and_forwarding_unaffected(self):
         """source="" （非 PASSTHROUGH 场景理论上不会传 source，但防御性验证不崩不误判）。"""
@@ -176,7 +182,7 @@ class TestWriteStreamingResponseCrossChunk(unittest.TestCase):
     def test_multiple_chunks_many_small_reads(self):
         """模拟多个远小于 8192 的 chunk（比单次 8192 更极端的碎片化），usage 仍被正确嗅探。"""
         sse = (b'event:content_block_delta\ndata:{"type":"content_block_delta","delta":{"text":"a"}}\n\n'
-               b'event:message_delta\ndata:{"type":"message_delta","usage":{"input_tokens":10,"output_tokens":20}}\n\n'
+               b'event:message_delta\ndata:{"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"input_tokens":10,"output_tokens":20}}\n\n'
                b'event:message_stop\ndata:{"type":"message_stop"}\n\n')
         # 拆成很多个 3 字节的小 chunk，制造大量跨边界场景
         chunks = [sse[i:i + 3] for i in range(0, len(sse), 3)]

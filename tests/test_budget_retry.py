@@ -522,7 +522,8 @@ class TestStreamingNoRetry(unittest.TestCase):
         m = _run(h, [_FakeResp(sse), _FakeResp(_chat_good())])
         self.assertEqual(m.call_count, 1)            # 流式不重试
         self.assertEqual(h._acc["budget_retried"], "")
-        self.assertEqual(h._acc["budget_truncated"], 1)
+        # 转换路径不借用 PASSTHROUGH 的 stream_content 标记，避免虚标截断。
+        self.assertEqual(h._acc["budget_truncated"], 0)
         self.assertEqual(h._acc["stop_reason"], "max_tokens")   # length 已映射
 
 

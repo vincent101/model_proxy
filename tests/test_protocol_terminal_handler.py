@@ -228,5 +228,135 @@ class TestOtherDirections(unittest.TestCase):
         self.assertTrue(upstream.closed)
 
 
+class TestPassthroughTailErrors(unittest.TestCase):
+    def test_terminal_then_upstream_rst_stays_valid_and_chunked_ends(self):
+        payload = b''.join([
+            b'event: message_delta\ndata: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{}}\n\n',
+            b'event: message_stop\ndata: {"type":"message_stop"}\n\n',
+        ])
+        h = _Handler()
+        h._acc.update({"usage_in": 0, "usage_out": 0})
+        h._write_streaming_response(
+            200, [], _Upstream(payload, ConnectionResetError("rst")), "anthropic")
+        self.assertEqual(h._acc["stream_integrity"], "valid")
+        self.assertEqual(h._acc["terminal_status"], "completed")
+        self.assertTrue(h.wfile.getvalue().endswith(b"0\r\n\r\n"))
+
+    def test_unconfirmed_then_upstream_rst_is_invalid_error(self):
+        payload = b'event: message_start\ndata: {"type":"message_start","message":{"usage":{}}}\n\n'
+        h = _Handler()
+        h._acc.update({"usage_in": 0, "usage_out": 0})
+        h._write_streaming_response(
+            200, [], _Upstream(payload, ConnectionResetError("rst")), "anthropic")
+        self.assertEqual(h._acc["stream_integrity"], "invalid")
+        self.assertIn(b"event: error", _decode_chunked(h.wfile.getvalue()))
+
+
+class TestStreamProbe(unittest.TestCase):
+    def test_empty_stream_fails_before_commit(self):
+        h = _Handler()
+        result = h._probe_upstream_stream(_Upstream(b""), "passthrough", "anthropic")
+        self.assertFalse(result.ok)
+        self.assertEqual(result.error.reason, "empty_stream")
+        self.assertEqual(h.headers_sent, [])
+
+    def test_probe_connection_reset_is_retryable_failure(self):
+        class RstUpstream(_Upstream):
+            def read(self, _n=-1):
+                raise ConnectionResetError("rst")
+        h = _Handler()
+        result = h._probe_upstream_stream(RstUpstream(b""), "passthrough", "anthropic")
+        self.assertFalse(result.ok)
+        self.assertEqual(result.error.reason, "network_error")
+        self.assertEqual(result.error.http_status, 502)
+
+    def test_first_business_event_stops_without_waiting_for_eof(self):
+        class BlockingTail(_Upstream):
+            def read(self, _n=-1):
+                if not self.done:
+                    self.done = True
+                    return b'event: message_start\ndata: {"type":"message_start","message":{"usage":{}}}\n\n'
+                raise AssertionError("probe read past first event")
+        h = _Handler()
+        result = h._probe_upstream_stream(BlockingTail(b""), "passthrough", "anthropic")
+        self.assertTrue(result.ok)
+        self.assertGreaterEqual(result.first_event_ms, 0)
+
+    def test_responses_probe_without_event_line(self):
+        h = _Handler()
+        payload = b'data: {"type":"response.created","response":{"status":"in_progress"}}\n\n'
+        adapter = pt.ResponsesToAnthropicStreamAdapter({}, "m")
+        result = h._probe_upstream_stream(_Upstream(payload), "anthropic_to_responses",
+                                          "responses", adapter)
+        self.assertTrue(result.ok)
+        self.assertIn(b"message_start", result.encoded_prefix)
+
+    def test_chat_done_is_valid_after_finish_reason(self):
+        h = _Handler()
+        payload = (b'data: {"choices":[{"delta":{},"finish_reason":"stop"}]}\n\n'
+                   b'data: [DONE]\n\n')
+        adapter = pt.OpenAIToAnthropicStreamAdapter({}, "m")
+        result = h._probe_upstream_stream(_Upstream(payload), "anthropic_to_chat",
+                                          "chat", adapter)
+        self.assertTrue(result.ok)
+
+    def test_total_buffer_budget(self):
+        h = _Handler()
+        old = h._STREAM_PROBE_MAX_BYTES
+        h._STREAM_PROBE_MAX_BYTES = 8
+        try:
+            result = h._probe_upstream_stream(_Upstream(b': heartbeat too large'),
+                                              "passthrough", "anthropic")
+        finally:
+            h._STREAM_PROBE_MAX_BYTES = old
+        self.assertFalse(result.ok)
+        self.assertEqual(result.error.reason, "frame_too_large")
+
+
+class TestSSEFramerAndPassthroughTracker(unittest.TestCase):
+    def test_crlf_multiline_comment_and_type_fallback(self):
+        framer = pt.SSEFramer()
+        events = framer.feed(
+            b': ping\r\n\r\ndata: {"type":"response.created",\r\ndata: "response":{"status":"in_progress"}}\r\n\r\n')
+        self.assertTrue(events[0].is_comment)
+        self.assertEqual(events[1].event_type, "response.created")
+
+    def test_event_data_type_conflict_is_malformed(self):
+        with self.assertRaises(pt.TranslationError) as ctx:
+            pt.SSEFramer().feed(
+                b'event: response.created\ndata: {"type":"response.completed"}\n\n')
+        self.assertEqual(ctx.exception.reason, "malformed_stream")
+
+    def test_unknown_anthropic_nonterminal_and_pause_turn(self):
+        acc = {}
+        tracker = pt.PassthroughTerminalTracker("anthropic", acc)
+        framer = pt.SSEFramer()
+        wire = b''.join([
+            b'event: future_ping\ndata: {"type":"future_ping"}\n\n',
+            b'event: message_start\ndata: {"type":"message_start","message":{"usage":{"input_tokens":7}}}\n\n',
+            b'event: message_delta\ndata: {"type":"message_delta","delta":{"stop_reason":"pause_turn"},"usage":{"output_tokens":3}}\n\n',
+            b'event: message_stop\ndata: {"type":"message_stop"}\n\n'])
+        for event in framer.feed(wire):
+            tracker.feed(event)
+        state = tracker.finalize()
+        self.assertEqual(state.status, pt.TerminalStatus.PAUSED)
+        self.assertEqual((acc["usage_in"], acc["usage_out"]), (7, 3))
+
+    def test_responses_without_event_line_completes(self):
+        tracker = pt.PassthroughTerminalTracker("responses", {})
+        events = pt.SSEFramer().feed(
+            b'data: {"type":"response.created","response":{"status":"in_progress"}}\n\n'
+            b'data: {"type":"response.completed","response":{"status":"completed"}}\n\n')
+        for event in events:
+            tracker.feed(event)
+        self.assertEqual(tracker.finalize().status, pt.TerminalStatus.COMPLETED)
+
+    def test_empty_stream_is_invalid(self):
+        tracker = pt.PassthroughTerminalTracker("anthropic", {})
+        with self.assertRaises(pt.TranslationError) as ctx:
+            tracker.finalize()
+        self.assertEqual(ctx.exception.reason, "empty_stream")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

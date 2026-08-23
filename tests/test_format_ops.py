@@ -593,6 +593,14 @@ class TestParseAccessLine(unittest.TestCase):
         self.assertEqual(r["session"], "")  # 缺失字段
         self.assertEqual(r["route"], "")
 
+    def test_stream_integrity_fields(self):
+        line = self._make_line() + (" response_committed=1 stream_integrity=invalid"
+                                    " terminal_status=open terminal_reason=empty_stream first_event_ms=12")
+        r = parse_access_line(line)
+        self.assertEqual(r["stream_integrity"], "invalid")
+        self.assertEqual(r["terminal_reason"], "empty_stream")
+        self.assertEqual(r["first_event_ms"], "12")
+
     def test_route_failover_not_mistaken_for_failover(self):
         """route_failover= 含子串 failover=——精确 key 匹配不误命中。"""
         line = self._make_line(failover="0", route_failover="1")

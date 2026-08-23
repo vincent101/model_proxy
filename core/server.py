@@ -24,6 +24,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import uuid
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -245,13 +246,14 @@ def _atomic_write_json(path: Path, obj: dict) -> None:
 
 def _zero_bucket() -> dict:
     """天桶/月归档/total 顶层的零值结构。OPT-10: 新增 max_ms。"""
-    return {"requests": 0, "ok": 0, "fail": 0, "sum_ms": 0, "max_ms": 0, "combos": {}}
+    return {"requests": 0, "ok": 0, "fail": 0, "client_disconnect": 0,
+            "sum_ms": 0, "max_ms": 0, "combos": {}}
 
 
 def _zero_combo() -> dict:
     """combos 单条目的零值结构（不存 sum_ms，见方案 §1）。
     OPT-10: 新增 attempts/attempt_fail（failover 口径，不含 budget 重试）。"""
-    return {"requests": 0, "ok": 0, "fail": 0,
+    return {"requests": 0, "ok": 0, "fail": 0, "client_disconnect": 0,
             "usage_in": 0, "usage_out": 0,
             "attempts": 0, "attempt_fail": 0}
 
@@ -329,8 +331,14 @@ class UsageTotalsStore:
             total_bucket = self._data.setdefault("total", _zero_bucket())
 
             combo_key = self._combo_key(acc)
-            ok = 1 if acc.get("status") == 200 else 0
-            fail = 0 if ok else 1
+            integrity = acc.get("stream_integrity")
+            disconnected = 1 if integrity == "client_disconnect" else 0
+            if integrity:
+                ok = 1 if acc.get("status") == 200 and integrity == "valid" else 0
+                fail = 1 if integrity == "invalid" or acc.get("status") != 200 else 0
+            else:
+                ok = 1 if acc.get("status") == 200 else 0
+                fail = 0 if ok else 1
             usage_in = acc.get("usage_in", 0) or 0
             usage_out = acc.get("usage_out", 0) or 0
             # OPT-10: attempts = ACCESS 的 attempts 字段（含 failover + budget 重试），
@@ -342,6 +350,7 @@ class UsageTotalsStore:
                 bucket["requests"] += 1
                 bucket["ok"] += ok
                 bucket["fail"] += fail
+                bucket["client_disconnect"] = bucket.get("client_disconnect", 0) + disconnected
                 bucket["sum_ms"] += ms
                 # OPT-10: max_ms（bucket 级，跨 combo）
                 if ms > bucket.get("max_ms", 0):
@@ -350,6 +359,7 @@ class UsageTotalsStore:
                 combo["requests"] += 1
                 combo["ok"] += ok
                 combo["fail"] += fail
+                combo["client_disconnect"] = combo.get("client_disconnect", 0) + disconnected
                 combo["usage_in"] += usage_in
                 combo["usage_out"] += usage_out
                 # OPT-10: attempts/attempt_fail（combo 级）
@@ -374,6 +384,8 @@ class UsageTotalsStore:
             month_bucket["requests"] += oldest_bucket.get("requests", 0)
             month_bucket["ok"] += oldest_bucket.get("ok", 0)
             month_bucket["fail"] += oldest_bucket.get("fail", 0)
+            month_bucket["client_disconnect"] = (month_bucket.get("client_disconnect", 0)
+                                                  + oldest_bucket.get("client_disconnect", 0))
             month_bucket["sum_ms"] += oldest_bucket.get("sum_ms", 0)
             # OPT-10: max_ms 归档取 max
             old_max = oldest_bucket.get("max_ms", 0)
@@ -385,6 +397,8 @@ class UsageTotalsStore:
                 dest["requests"] += combo_val.get("requests", 0)
                 dest["ok"] += combo_val.get("ok", 0)
                 dest["fail"] += combo_val.get("fail", 0)
+                dest["client_disconnect"] = (dest.get("client_disconnect", 0)
+                                             + combo_val.get("client_disconnect", 0))
                 dest["usage_in"] += combo_val.get("usage_in", 0)
                 dest["usage_out"] += combo_val.get("usage_out", 0)
                 # OPT-10: attempts/attempt_fail 归档累加
@@ -1101,14 +1115,15 @@ def select_supply_list(route: dict, tier: str) -> list | None:
 
 
 def select_supply(supplies: list, supply_map: dict, cooldown: "CooldownStore",
-                  tried_set: set) -> dict | None:
+                  tried_set: set, excluded_set: set | None = None) -> dict | None:
     """从 supplies 列表有序取第一个「未冷却且未试过」的 supply。
 
     跳过 cooling 的、tried_set 里已试的、以及 supply_map 中不存在的 id。
     返回 supply dict（非 id），无可用则 None。
     """
+    excluded_set = excluded_set or set()
     for sid in supplies:
-        if sid in tried_set:
+        if sid in tried_set or sid in excluded_set:
             continue
         if sid not in supply_map:
             continue
@@ -1151,9 +1166,37 @@ def pick_translator(source: str, target: str) -> str:
     return _TRANSLATOR_TABLE.get((source, target), UNSUPPORTED)
 
 
+@dataclass
+class StreamProbeResult:
+    ok: bool
+    mode: str
+    source: str
+    raw_prefix: bytes = b""
+    encoded_prefix: bytes = b""
+    framer: Any = None
+    consumer: Any = None
+    error: "pt.TranslationError | None" = None
+    bytes_read: int = 0
+    first_event_ms: int | None = None
+
+
 def translation_error_for_upstream(error: dict | None) -> "pt.TranslationError":
     """统一上游业务错误分类；供非流状态码与流内错误事件共用。"""
     return pt.classify_upstream_error(error)
+
+
+def stream_error_event_for_source(source: str, error: "pt.TranslationError") -> bytes:
+    """按客户端协议生成流内失败事件，不伪造成功终态。"""
+    message = str(error)
+    if source == "anthropic":
+        return pt.anthropic_sse_bytes({
+            "type": "error", "error": {"type": "api_error", "message": message}})
+    if source == "responses":
+        return pt.responses_sse_bytes({
+            "type": "response.failed",
+            "response": {"status": "failed", "error": {
+                "type": "server_error", "message": message}}})
+    return b"data: " + json.dumps({"error": {"message": message}}).encode() + b"\n\n"
 
 
 def error_body_for_source(source: str, http_status: int, message: str) -> bytes:
@@ -1377,6 +1420,8 @@ class ModelProxyHandler(BaseHTTPRequestHandler):
             # nudge 改写观测：入站 body 命中已知 SDK 注入文案改写时置 "1"
             # （含 $route 等未转发请求——命中即置位，属预期）。
             "nudge_rewritten": "",
+            "response_committed": 0, "stream_integrity": "",
+            "terminal_status": "", "terminal_reason": "", "first_event_ms": "",
         }
         t0 = time.monotonic()
         try:
@@ -1389,7 +1434,8 @@ class ModelProxyHandler(BaseHTTPRequestHandler):
                 "target_protocol=%s conversion_kind=%s failover=%s attempts=%s "
                 "usage_in=%s usage_out=%s token=%s session=%s "
                 "route_failover=%s builtin=%s budget_retried=%s budget_truncated=%s "
-                "stop_reason=%s final_error=%s nudge_rewritten=%s",
+                "stop_reason=%s final_error=%s nudge_rewritten=%s response_committed=%s "
+                "stream_integrity=%s terminal_status=%s terminal_reason=%s first_event_ms=%s",
                 ms, a["status"], a["source"], a["operation"],
                 a["route"], a["tier"], a["supply"],
                 a["target_protocol"], a["conversion_kind"], a["failover"], a["attempts"],
@@ -1397,7 +1443,8 @@ class ModelProxyHandler(BaseHTTPRequestHandler):
                 a["route_failover"], a["builtin"], a["budget_retried"],
                 a["budget_truncated"], a["stop_reason"],
                 re.sub(r"\s+", "_", a["final_error"][:80]),
-                a["nudge_rewritten"])
+                a["nudge_rewritten"], a["response_committed"], a["stream_integrity"],
+                a["terminal_status"], a["terminal_reason"], a["first_event_ms"])
             if usage_totals is not None:
                 try:
                     usage_totals.record(a, ms)
@@ -1651,6 +1698,9 @@ class ModelProxyHandler(BaseHTTPRequestHandler):
             return
 
         _reasoning_retried = False   # reasoning 语法重试只做一次，作用域覆盖整个请求周期
+        stream_failed_supply_ids: set[str] = set()
+        last_retryable_error: dict | None = None
+        saw_stream_timeout = False
 
         # raw_intent 必须在循环外、基于客户端原始 body_json 只 decode 一次。
         # body_json 在循环体内会被原地改写（model 改写为 target_model、reasoning_wire
@@ -1772,7 +1822,8 @@ class ModelProxyHandler(BaseHTTPRequestHandler):
             route_exhausted = False
 
             while True:
-                supply = select_supply(supplies_list, supply_map, cd, tried_set)
+                supply = select_supply(supplies_list, supply_map, cd, tried_set,
+                                       stream_failed_supply_ids)
                 if supply is None:
                     log.warning("all supplies failed or cooling: route=%s tier=%s",
                                 route.get("id"), tier)
@@ -1954,6 +2005,8 @@ class ModelProxyHandler(BaseHTTPRequestHandler):
                     resp_status = resp.status
                 except urllib.error.HTTPError as e:
                     resp_status = e.code
+                    last_retryable_error = {"kind": "http", "reason": f"http_{resp_status}",
+                                            "http_status": resp_status, "supply_id": supply_id}
                     resp_headers = list(e.headers.items())
                     resp_body = e.read()
 
@@ -1997,6 +2050,8 @@ class ModelProxyHandler(BaseHTTPRequestHandler):
                     self._acc["final_error"] = f"upstream_error {resp_status} {upstream_msg}"
                     return
                 except (urllib.error.URLError, OSError) as e:
+                    last_retryable_error = {"kind": "network", "reason": "network_error",
+                                            "http_status": 502, "supply_id": supply_id}
                     secs = resolve_cooldown_seconds("URLError", cs)
                     if failover == "on" and secs is not None:
                         log.warning("cooldown+failover(net): supply=%s err=%s secs=%s",
@@ -2018,48 +2073,78 @@ class ModelProxyHandler(BaseHTTPRequestHandler):
 
                 is_stream = isinstance(body_json, dict) and body_json.get("stream") is True
 
+                # 四条流路径统一首事件预读；成功后才提交，失败可换 supply。
+                if is_stream:
+                    if mode == PASSTHROUGH:
+                        adapter = None
+                    elif mode == ANTHROPIC_TO_CHAT:
+                        adapter = pt.OpenAIToAnthropicStreamAdapter(fwd_ctx, target_model or "")
+                    elif mode == ANTHROPIC_TO_RESPONSES:
+                        adapter = pt.ResponsesToAnthropicStreamAdapter(fwd_ctx, target_model or "")
+                    else:
+                        _r_effort = ((body_json or {}).get("reasoning") or {}).get("effort")
+                        _tools_echo = (body_json or {}).get("tools") or []
+                        adapter = pt.AnthropicToResponsesStreamAdapter(
+                            model=target_model or "",
+                            ctx={"tools": _tools_echo, "reasoning_effort": _r_effort})
+                    probe = self._probe_upstream_stream(
+                        resp, mode, source, adapter, cs.get_upstream_timeout())
+                    if not probe.ok:
+                        resp.close()
+                        err = probe.error or pt.TranslationError("stream probe failed")
+                        self._acc["first_event_ms"] = probe.first_event_ms
+                        stream_failed_supply_ids.add(supply_id)
+                        tried_set.add(supply_id)
+                        self._acc["attempt_errors"].append((supply_id, f"stream_{err.reason}"))
+                        last_retryable_error = {"kind": "stream", "reason": err.reason,
+                                                "http_status": err.http_status,
+                                                "supply_id": supply_id}
+                        saw_stream_timeout = saw_stream_timeout or err.reason == "first_event_timeout"
+                        if failover == "on":
+                            self._acc["failover"] = 1
+                            continue
+                        self._acc["final_error"] = err.reason
+                        self._write_buffered_response(
+                            err.http_status, [], error_body_for_source(source, err.http_status, str(err)))
+                        return
+                    self._commit_and_write_probed_stream(
+                        probe, resp, list(resp.getheaders()), cs.get_upstream_timeout())
+                    adapter = probe.consumer
+                    if mode != PASSTHROUGH:
+                        self._acc["usage_in"], self._acc["usage_out"], _ = adapter.usage_tuple()
+                        self._acc["stop_reason"] = getattr(adapter, "final_stop_reason", "") or ""
+                    if (mode == PASSTHROUGH
+                            and self._acc.get("stop_reason") in (
+                                "max_tokens", "incomplete:max_output_tokens")
+                            and not self._acc.get("stream_content")):
+                        self._acc["budget_truncated"] = 1
+                    return
+
                 # ---- 按 mode 分派写回 ----
                 if mode == PASSTHROUGH:
-                    # 透传：流式 chunked，非流式 buffered
-                    if is_stream:
-                        self._write_streaming_response(
-                            resp_status, list(resp.getheaders()), resp, source)
-                        # ④b 流式不重试（字节已下发客户端无法回追），仅收口检测记日志：
-                        # stop_reason 与 stream_content 由 _sniff_passthrough_usage 旁路填
-                        if (self._acc.get("stop_reason") in ("max_tokens", "incomplete:max_output_tokens")
-                                and not self._acc.get("stream_content")):
-                            self._acc["budget_truncated"] = 1
-                            log.warning(
-                                "budget_truncated(stream,不重试): supply=%s stop=%s",
-                                supply_id, self._acc.get("stop_reason"))
-                    else:
-                        resp_body = resp.read()
-                        # ④b 截断检测（原始透传 body 上判）；命中且可爬 → 放大预算重进循环
-                        if _maybe_budget_retry(resp_body, target, supply_id):
-                            resp.close()
-                            continue
-                        try:
-                            _pj = json.loads(resp_body) or {}
-                            _pu = _pj.get("usage") or {}
-                            # anthropic 侧: input_tokens/output_tokens；
-                            # chat/openai 侧: prompt_tokens/completion_tokens
-                            self._acc["usage_in"] = _pu.get(
-                                "input_tokens", _pu.get("prompt_tokens", 0)) or 0
-                            self._acc["usage_out"] = _pu.get(
-                                "output_tokens", _pu.get("completion_tokens", 0)) or 0
-                            # ⑤ 可选 stop_reason：anthropic 形态取 stop_reason，
-                            # responses 形态取 status（incomplete 时带 reason）
-                            _st = _pj.get("stop_reason") or ""
-                            if not _st and _pj.get("status"):
-                                _reason = (_pj.get("incomplete_details") or {}).get("reason")
-                                _st = (f"{_pj['status']}:{_reason}" if _reason
-                                       else str(_pj["status"]))
-                            self._acc["stop_reason"] = _st
-                        except Exception:
-                            pass   # 解析失败不影响透传主流程，usage 记 0
-                        self._write_buffered_response(
-                            resp_status, list(resp.getheaders()), resp_body)
+                    # 流式已由统一 probe 分支提前返回；此处仅处理非流式透传。
+                    resp_body = resp.read()
+                    if _maybe_budget_retry(resp_body, target, supply_id):
                         resp.close()
+                        continue
+                    try:
+                        _pj = json.loads(resp_body) or {}
+                        _pu = _pj.get("usage") or {}
+                        self._acc["usage_in"] = _pu.get(
+                            "input_tokens", _pu.get("prompt_tokens", 0)) or 0
+                        self._acc["usage_out"] = _pu.get(
+                            "output_tokens", _pu.get("completion_tokens", 0)) or 0
+                        _st = _pj.get("stop_reason") or ""
+                        if not _st and _pj.get("status"):
+                            _reason = (_pj.get("incomplete_details") or {}).get("reason")
+                            _st = (f"{_pj['status']}:{_reason}" if _reason
+                                   else str(_pj["status"]))
+                        self._acc["stop_reason"] = _st
+                    except Exception:
+                        pass
+                    self._write_buffered_response(
+                        resp_status, list(resp.getheaders()), resp_body)
+                    resp.close()
                     return
 
                 if mode == ANTHROPIC_TO_CHAT:
@@ -2221,8 +2306,15 @@ class ModelProxyHandler(BaseHTTPRequestHandler):
                 errs = self._acc.get("attempt_errors") or []
                 err_summary = "; ".join(f"{sid}={reason}" for sid, reason in errs) if errs else "no attempts"
                 msg = f"all upstream supplies failed or cooling: {err_summary}"
+                if saw_stream_timeout:
+                    final_status = 504
+                elif last_retryable_error and last_retryable_error.get("kind") == "stream":
+                    final_status = 502
+                else:
+                    # 纯 HTTP/网络失败保持既有全耗尽 503 语义。
+                    final_status = 503
                 self._write_buffered_response(
-                    503, [], error_body_for_source(source, 503, msg))
+                    final_status, [], error_body_for_source(source, final_status, msg))
                 self._acc["final_error"] = msg
                 return
 
@@ -2433,52 +2525,293 @@ class ModelProxyHandler(BaseHTTPRequestHandler):
     # ------------------------------------------------------------------
 
     _SKIP_RESP_HEADERS = {"transfer-encoding", "content-length"}
+    _STREAM_PROBE_TIMEOUT = 30.0
+    _STREAM_PROBE_MAX_BYTES = 262144
 
-    def _write_streaming_response(self, status: int, headers: list[tuple[str, str]], resp, source: str = "") -> None:
-        """流式回写上游响应，使用 chunked 编码（组合1/2 透传）。
+    @staticmethod
+    def _set_upstream_read_timeout(resp, timeout: float) -> None:
+        """集中封装 urllib HTTPResponse 的底层 socket timeout 切换。"""
+        fp = getattr(resp, "fp", None)
+        raw = getattr(fp, "raw", None)
+        sock = getattr(raw, "_sock", None)
+        if sock is not None and hasattr(sock, "settimeout"):
+            sock.settimeout(timeout)
 
-        source 非空时（PASSTHROUGH 流式），转发之后旁路嗅探 SSE 里的 usage 事件
-        写入 self._acc，透传字节本身不受影响（§7 方案）。
-        """
-        if hasattr(self, "_acc"):
-            self._acc["status"] = status
-        self.send_response(status)
-        for hname, hval in headers:
-            if hname.lower() in self._SKIP_RESP_HEADERS:
-                continue
-            self.send_header(hname, hval)
-        self.send_header("Transfer-Encoding", "chunked")
-        self.end_headers()
-        sniff_buf = b""                      # 新增：usage 嗅探 buffer
+    def _probe_upstream_stream(self, resp, mode: str, source: str, adapter=None,
+                               upstream_timeout: float = 1800) -> StreamProbeResult:
+        """预读到首个合法业务 SSE 事件；失败时尚未提交客户端响应。"""
+        started = time.monotonic()
+        framer = pt.SSEFramer()
+        raw = bytearray()
+        encoded = bytearray()
+        consumer = (pt.PassthroughTerminalTracker(source, self._acc)
+                    if mode == PASSTHROUGH else adapter)
+        self._set_upstream_read_timeout(resp, self._STREAM_PROBE_TIMEOUT)
         try:
             while True:
-                chunk = resp.read(8192)
+                elapsed = time.monotonic() - started
+                if elapsed >= self._STREAM_PROBE_TIMEOUT:
+                    raise pt.TranslationError("first stream event timed out",
+                                              reason="first_event_timeout", http_status=504,
+                                              retry_class="configured")
+                self._set_upstream_read_timeout(resp, self._STREAM_PROBE_TIMEOUT - elapsed)
+                try:
+                    chunk = resp.read(4096)
+                except TimeoutError as exc:
+                    raise pt.TranslationError("first stream event timed out",
+                                              reason="first_event_timeout", http_status=504,
+                                              retry_class="configured") from exc
+                except OSError as exc:
+                    raise pt.TranslationError(f"stream probe network error: {exc}",
+                                              reason="network_error", http_status=502,
+                                              retry_class="configured") from exc
+                if not chunk:
+                    tail_events = framer.finish()
+                    business = False
+                    for event in tail_events:
+                        if not event.is_comment:
+                            business = True
+                            self._probe_consume_event(mode, event, consumer, encoded)
+                    if mode == PASSTHROUGH:
+                        consumer.finalize()
+                    else:
+                        consumer.finalize()
+                        if self._adapter_failed(consumer):
+                            raise pt.TranslationError("stream ended without terminal",
+                                                      reason="unexpected_eof")
+                    if not business:
+                        raise pt.TranslationError("empty stream", reason="empty_stream")
+                    ms = int((time.monotonic() - started) * 1000)
+                    return StreamProbeResult(True, mode, source, bytes(raw), bytes(encoded),
+                                             framer, consumer, bytes_read=len(raw), first_event_ms=ms)
+                raw.extend(chunk)
+                events = framer.feed(chunk, max_events=1)
+                if len(raw) + len(encoded) > self._STREAM_PROBE_MAX_BYTES:
+                    raise pt.TranslationError("stream probe buffer exceeded",
+                                              reason="frame_too_large")
+                while events:
+                    event = events[0]
+                    if not event.is_comment:
+                        self._probe_consume_event(mode, event, consumer, encoded)
+                        if (mode == PASSTHROUGH and consumer.confirmed
+                                and consumer.terminal.status == pt.TerminalStatus.FAILED) \
+                                or (mode != PASSTHROUGH and self._adapter_failed(consumer)):
+                            raise pt.TranslationError("upstream stream failed", reason="upstream_error")
+                        self._set_upstream_read_timeout(resp, upstream_timeout)
+                        ms = int((time.monotonic() - started) * 1000)
+                        return StreamProbeResult(True, mode, source, bytes(raw), bytes(encoded),
+                                                 framer, consumer, bytes_read=len(raw), first_event_ms=ms)
+                    events = framer.feed(b"", max_events=1)
+        except pt.TranslationError as exc:
+            return StreamProbeResult(False, mode, source, bytes(raw), bytes(encoded),
+                                     framer, consumer, exc, len(raw),
+                                     int((time.monotonic() - started) * 1000))
+
+    @staticmethod
+    def _probe_consume_event(mode: str, event, consumer, encoded: bytearray) -> None:
+        if mode == PASSTHROUGH:
+            consumer.feed(event)
+            return
+        if event.is_done:
+            outputs = consumer.finalize()
+        elif mode == ANTHROPIC_TO_CHAT:
+            outputs = consumer.feed(event.data)
+        elif mode == ANTHROPIC_TO_RESPONSES:
+            outputs = consumer.feed(event.event_type, event.data)
+        else:  # RESPONSES_TO_ANTHROPIC
+            outputs = consumer.feed(event.event_type, event.data)
+        serializer = (pt.responses_sse_bytes if mode == RESPONSES_TO_ANTHROPIC
+                      else pt.anthropic_sse_bytes)
+        for output in outputs:
+            encoded.extend(serializer(output))
+
+    def _commit_and_write_probed_stream(self, result: StreamProbeResult, resp,
+                                        headers: list[tuple[str, str]], upstream_timeout: float) -> None:
+        self._acc["first_event_ms"] = result.first_event_ms
+        if result.mode == PASSTHROUGH:
+            self._write_streaming_response(200, headers, resp, result.source,
+                                           prefix=result.raw_prefix,
+                                           framer=result.framer, tracker=result.consumer)
+            return
+        self._begin_sse_chunked()
+        self._acc["response_committed"] = 1
+        try:
+            if result.encoded_prefix:
+                self._write_sse_chunk(result.encoded_prefix)
+            done = False
+            for event in result.framer.feed(b""):
+                if event.is_comment:
+                    continue
+                if event.is_done:
+                    outputs = result.consumer.finalize()
+                    done = True
+                else:
+                    outputs = self._adapter_outputs(result.mode, result.consumer, event)
+                for output in outputs:
+                    self._write_sse_chunk(self._serialize_converted(result.mode, output))
+                if done:
+                    break
+            while not done:
+                chunk = resp.read(4096)
                 if not chunk:
                     break
-                # —— 转发在前、无条件（行为一字未改）——
-                size_line = f"{len(chunk):X}\r\n".encode("ascii")
-                self.wfile.write(size_line)
-                self.wfile.write(chunk)
-                self.wfile.write(b"\r\n")
-                # —— 嗅探在后、纯旁路，异常绝不影响转发 ——
-                try:
-                    sniff_buf += chunk
-                    while b"\n\n" in sniff_buf:
-                        block, sniff_buf = sniff_buf.split(b"\n\n", 1)
-                        self._sniff_passthrough_usage(block, source)
-                except Exception:
-                    pass
+                for event in result.framer.feed(chunk):
+                    if event.is_comment:
+                        continue
+                    if event.is_done:
+                        outputs = result.consumer.finalize()
+                        done = True
+                    else:
+                        outputs = self._adapter_outputs(result.mode, result.consumer, event)
+                    for output in outputs:
+                        self._write_sse_chunk(self._serialize_converted(result.mode, output))
+                    if done:
+                        break
+            if not done:
+                for event in result.framer.finish():
+                    if not event.is_comment:
+                        for output in self._adapter_outputs(result.mode, result.consumer, event):
+                            self._write_sse_chunk(self._serialize_converted(result.mode, output))
+                for output in result.consumer.finalize():
+                    self._write_sse_chunk(self._serialize_converted(result.mode, output))
+            terminal = self._adapter_terminal_state(result.consumer)
+            self._record_stream_terminal(terminal)
             self.wfile.write(b"0\r\n\r\n")
             self.wfile.flush()
         except (BrokenPipeError, ConnectionResetError):
-            pass
+            self._acc["stream_integrity"] = "client_disconnect"
+        except Exception as exc:
+            if self._adapter_has_terminal(result.consumer):
+                terminal = self._adapter_terminal_state(result.consumer)
+                self._record_stream_terminal(terminal)
+            else:
+                err = exc if isinstance(exc, pt.TranslationError) else pt.TranslationError(
+                    f"stream interrupted: {exc}", reason="unexpected_eof")
+                self._record_stream_error(err)
+                try:
+                    self._write_sse_chunk(stream_error_event_for_source(result.source, err))
+                    self.wfile.write(b"0\r\n\r\n")
+                    self.wfile.flush()
+                except (BrokenPipeError, ConnectionResetError, OSError):
+                    pass
         finally:
-            try:
-                if sniff_buf.strip():
-                    self._sniff_passthrough_usage(sniff_buf.strip(), source)
-            except Exception:
-                pass
             resp.close()
+
+    @staticmethod
+    def _adapter_outputs(mode: str, adapter, event) -> list:
+        if mode == ANTHROPIC_TO_CHAT:
+            return adapter.feed(event.data)
+        return adapter.feed(event.event_type, event.data)
+
+    @staticmethod
+    def _serialize_converted(mode: str, output: dict) -> bytes:
+        return (pt.responses_sse_bytes(output) if mode == RESPONSES_TO_ANTHROPIC
+                else pt.anthropic_sse_bytes(output))
+
+    @staticmethod
+    def _adapter_failed(adapter) -> bool:
+        return bool(getattr(adapter, "_failed", False) or getattr(adapter, "failed", False))
+
+    @staticmethod
+    def _adapter_has_terminal(adapter) -> bool:
+        return bool(getattr(adapter, "_finalized", False) or getattr(adapter, "_failed", False)
+                    or getattr(adapter, "completed", False) or getattr(adapter, "failed", False)
+                    or getattr(adapter, "_completed", False))
+
+    @staticmethod
+    def _adapter_terminal_state(adapter) -> "pt.TerminalState":
+        state = getattr(adapter, "terminal", None) or getattr(adapter, "_terminal", None)
+        if isinstance(state, pt.TerminalState):
+            return state
+        reason = (getattr(adapter, "final_stop_reason", None) or
+                  ("upstream_error" if (getattr(adapter, "_failed", False)
+                                        or getattr(adapter, "failed", False)) else "end_turn"))
+        try:
+            if reason in ("end_turn", "stop_sequence", "tool_use", "max_tokens", "refusal", "pause_turn"):
+                return pt.map_anthropic_terminal(reason)
+        except pt.TranslationError:
+            pass
+        status = pt.TerminalStatus.FAILED if "error" in reason else pt.TerminalStatus.COMPLETED
+        return pt.TerminalState(status, reason)
+
+    def _write_streaming_response(self, status: int, headers: list[tuple[str, str]], resp,
+                                  source: str = "", *, prefix: bytes = b"",
+                                  framer=None, tracker=None) -> None:
+        """PASSTHROUGH 原始字节回放；旁路严格跟踪协议终态。"""
+        if hasattr(self, "_acc"):
+            self._acc["status"] = status
+            self._acc["response_committed"] = 1
+        self.send_response(status)
+        for hname, hval in headers:
+            if hname.lower() not in self._SKIP_RESP_HEADERS:
+                self.send_header(hname, hval)
+        self.send_header("Transfer-Encoding", "chunked")
+        self.end_headers()
+        framer = framer or (pt.SSEFramer() if source else None)
+        tracker = tracker or (pt.PassthroughTerminalTracker(
+            source, getattr(self, "_acc", {})) if source else None)
+        integrity_error = None
+        upstream_read_error = None
+        try:
+            if prefix:
+                self._write_sse_chunk(prefix)
+            # probe 可能在一个 read 中读到多个事件，只消费了首事件；续写先排空 framer。
+            if framer is not None:
+                for event in framer.feed(b""):
+                    tracker.feed(event)
+            while True:
+                try:
+                    chunk = resp.read(8192)
+                except OSError as exc:
+                    upstream_read_error = exc
+                    break
+                if not chunk:
+                    break
+                self._write_sse_chunk(chunk)
+                if integrity_error is None and framer is not None:
+                    try:
+                        for event in framer.feed(chunk):
+                            tracker.feed(event)
+                    except pt.TranslationError as exc:
+                        integrity_error = exc
+            if upstream_read_error is not None:
+                if tracker is not None and tracker.confirmed:
+                    self._record_stream_terminal(tracker.terminal)
+                else:
+                    integrity_error = pt.TranslationError(
+                        f"stream interrupted: {upstream_read_error}", reason="unexpected_eof")
+            elif integrity_error is None and framer is not None:
+                try:
+                    for event in framer.finish():
+                        tracker.feed(event)
+                    terminal = tracker.finalize()
+                    self._record_stream_terminal(terminal)
+                except pt.TranslationError as exc:
+                    integrity_error = exc
+            if integrity_error is not None:
+                self._record_stream_error(integrity_error)
+                self._write_sse_chunk(stream_error_event_for_source(source, integrity_error))
+            self.wfile.write(b"0\r\n\r\n")
+            self.wfile.flush()
+        except (BrokenPipeError, ConnectionResetError):
+            # 上游 read 异常已在 read 点捕获；这里只可能来自客户端写。
+            if hasattr(self, "_acc"):
+                self._acc["stream_integrity"] = "client_disconnect"
+        finally:
+            resp.close()
+
+    def _record_stream_terminal(self, terminal: "pt.TerminalState") -> None:
+        if hasattr(self, "_acc"):
+            self._acc["stream_integrity"] = "valid"
+            self._acc["terminal_status"] = terminal.status.value
+            self._acc["terminal_reason"] = terminal.reason
+
+    def _record_stream_error(self, error: "pt.TranslationError") -> None:
+        if hasattr(self, "_acc"):
+            self._acc["stream_integrity"] = "invalid"
+            self._acc["terminal_status"] = "open"
+            self._acc["terminal_reason"] = error.reason
+            self._acc["final_error"] = error.reason
 
     def _write_buffered_response(self, status: int, headers: list[tuple[str, str]], body: bytes) -> None:
         """回写已完整读取的 buffer 响应（非流式 / 错误响应用）。"""

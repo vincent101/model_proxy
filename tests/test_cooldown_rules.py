@@ -25,6 +25,7 @@ from unittest.mock import patch
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+from core import translate as pt  # noqa: E402
 from core.server import (  # noqa: E402
     ModelProxyHandler,
     resolve_cooldown_seconds,
@@ -208,6 +209,33 @@ def _run(h, upstream_queue):
 # ---------------------------------------------------------------------------
 # 1. 402 命中策略 → failover + cooldown 21600s
 # ---------------------------------------------------------------------------
+
+class TestExhaustedFinalStatus(unittest.TestCase):
+    def test_http_only_exhaustion_stays_503(self):
+        ns, _ = _make_server([_supply("s1")], ["s1"])
+        h = _make_handler(ns)
+        _run(h, [_http_error(429, b'{"error":{"message":"busy"}}')])
+        self.assertEqual(h._responses[-1][0], 503)
+
+    def test_stream_integrity_exhaustion_is_502(self):
+        ns, _ = _make_server([_supply("s1")], ["s1"])
+        body = {"model": "claude-opus", "max_tokens": 100, "stream": True,
+                "messages": [{"role": "user", "content": "hi"}]}
+        h = _make_handler(ns, body)
+        _run(h, [_FakeResp(b"")])
+        self.assertEqual(h._responses[-1][0], 502)
+
+    def test_first_event_timeout_exhaustion_is_504(self):
+        ns, _ = _make_server([_supply("s1")], ["s1"])
+        body = {"model": "claude-opus", "max_tokens": 100, "stream": True,
+                "messages": [{"role": "user", "content": "hi"}]}
+        h = _make_handler(ns, body)
+        timeout = pt.TranslationError("timeout", reason="first_event_timeout", http_status=504)
+        with patch.object(h, "_probe_upstream_stream", return_value=SimpleNamespace(
+                ok=False, error=timeout, first_event_ms=30000)):
+            _run(h, [_FakeResp(b"unused")])
+        self.assertEqual(h._responses[-1][0], 504)
+
 
 class Test402CooldownFailover(unittest.TestCase):
 

@@ -133,6 +133,187 @@ class TerminalState:
     reason: str
 
 
+@dataclass(frozen=True)
+class SSEEvent:
+    raw: bytes
+    event_type: str | None
+    data: Any
+    is_comment: bool = False
+    is_done: bool = False
+
+
+class SSEFramer:
+    """增量 SSE framing；保留原始字节并严格解析业务事件。"""
+
+    def __init__(self):
+        self._buffer = bytearray()
+        self.saw_business_event = False
+
+    @property
+    def buffered_bytes(self) -> int:
+        return len(self._buffer)
+
+    def feed(self, chunk: bytes, *, max_events: int | None = None) -> list[SSEEvent]:
+        self._buffer.extend(chunk)
+        events = []
+        while max_events is None or len(events) < max_events:
+            raw = bytes(self._buffer)
+            lf = raw.find(b"\n\n")
+            crlf = raw.find(b"\r\n\r\n")
+            candidates = [(lf, 2), (crlf, 4)]
+            candidates = [(p, n) for p, n in candidates if p >= 0]
+            if not candidates:
+                break
+            pos, sep_len = min(candidates)
+            block = bytes(self._buffer[:pos])
+            framed = bytes(self._buffer[:pos + sep_len])
+            del self._buffer[:pos + sep_len]
+            event = self._parse(block, framed)
+            if event is not None:
+                if not event.is_comment:
+                    self.saw_business_event = True
+                events.append(event)
+        return events
+
+    def finish(self) -> list[SSEEvent]:
+        if not self._buffer or not bytes(self._buffer).strip():
+            self._buffer.clear()
+            return []
+        block = bytes(self._buffer)
+        self._buffer.clear()
+        # 完整末尾事件可无空行；只有 event/data 字段才视为完整。
+        if not any(line.lstrip().startswith((b"event:", b"data:"))
+                   for line in block.splitlines()):
+            if all(not line.strip() or line.lstrip().startswith(b":")
+                   for line in block.splitlines()):
+                return [SSEEvent(block, None, None, is_comment=True)]
+            raise TranslationError("malformed trailing SSE frame", reason="malformed_stream")
+        return [self._parse(block, block)]
+
+    @staticmethod
+    def _parse(block: bytes, raw: bytes) -> SSEEvent | None:
+        event_type = None
+        data_lines = []
+        has_field = False
+        only_comments = True
+        for line in block.splitlines():
+            line = line.rstrip(b"\r")
+            if not line:
+                continue
+            if line.startswith(b":"):
+                continue
+            only_comments = False
+            if line.startswith(b"event:"):
+                has_field = True
+                event_type = line[6:].lstrip().decode("utf-8", "replace")
+            elif line.startswith(b"data:"):
+                has_field = True
+                value = line[5:]
+                if value.startswith(b" "):
+                    value = value[1:]
+                data_lines.append(value)
+        if only_comments or not has_field:
+            return SSEEvent(raw, None, None, is_comment=True)
+        if not data_lines:
+            raise TranslationError("SSE event has no data", reason="malformed_stream")
+        payload = b"\n".join(data_lines)
+        if payload == b"[DONE]":
+            return SSEEvent(raw, event_type, None, is_done=True)
+        try:
+            data = json.loads(payload)
+        except (json.JSONDecodeError, ValueError) as exc:
+            raise TranslationError("malformed SSE JSON", reason="malformed_stream") from exc
+        data_type = data.get("type") if isinstance(data, dict) else None
+        if event_type and data_type and event_type != data_type:
+            raise TranslationError("SSE event/data type conflict", reason="malformed_stream")
+        resolved = event_type or data_type
+        # Chat Completions 的 data JSON 没有 type；由消费方按协议校验。
+        return SSEEvent(raw, resolved, data)
+
+
+class PassthroughTerminalTracker:
+    """PASSTHROUGH 协议终态与 usage 旁路跟踪器。"""
+
+    def __init__(self, source: str, acc: dict | None = None):
+        self.source = source
+        self.acc = acc if acc is not None else {}
+        self.terminal = TerminalState(TerminalStatus.OPEN, "")
+        self.confirmed = False
+        self.saw_business_event = False
+        self._anthropic_candidate: TerminalState | None = None
+
+    def feed(self, event: SSEEvent) -> None:
+        if event.is_comment:
+            return
+        self.saw_business_event = True
+        if event.is_done:
+            if self.source != "chat":
+                raise TranslationError("unexpected [DONE]", reason="malformed_stream")
+            if self._anthropic_candidate is None:
+                raise TranslationError("[DONE] before finish_reason", reason="missing_stop_reason")
+            self.terminal = self._anthropic_candidate
+            self.confirmed = True
+            return
+        data = event.data if isinstance(event.data, dict) else {}
+        typ = event.event_type or ""
+        if self.source in ("anthropic", "responses") and not typ:
+            raise TranslationError("SSE event type missing", reason="malformed_stream")
+        if self.source == "anthropic":
+            if typ == "message_start":
+                usage = ((data.get("message") or {}).get("usage") or {})
+                self._usage(usage)
+            elif typ == "message_delta":
+                self._usage(data.get("usage") or {})
+                reason = (data.get("delta") or {}).get("stop_reason")
+                if reason is not None:
+                    self._anthropic_candidate = map_anthropic_terminal(reason)
+                    self.acc["stop_reason"] = reason
+            elif typ == "message_stop":
+                if self._anthropic_candidate is None:
+                    raise TranslationError("message_stop before stop_reason", reason="missing_stop_reason")
+                self.terminal = self._anthropic_candidate
+                self.confirmed = True
+            elif typ == "error":
+                self.terminal = TerminalState(TerminalStatus.FAILED, "upstream_error")
+                self.confirmed = True
+            elif typ == "content_block_start":
+                if (data.get("content_block") or {}).get("type") in ("text", "tool_use"):
+                    self.acc["stream_content"] = 1
+            # 未知非终态事件原样容忍。
+        elif self.source == "responses":
+            if typ in ("response.completed", "response.incomplete"):
+                response = data.get("response") or {}
+                status = response.get("status") or typ.split(".", 1)[1]
+                details = response.get("incomplete_details") or {}
+                self.terminal = map_responses_terminal(status, details.get("reason"))
+                self.confirmed = True
+                self._usage(response.get("usage") or {})
+                self.acc["stop_reason"] = status
+            elif typ in ("response.failed", "response.error", "error"):
+                self.terminal = TerminalState(TerminalStatus.FAILED, "upstream_error")
+                self.confirmed = True
+            elif typ == "response.output_item.added":
+                if (data.get("item") or {}).get("type") in ("message", "function_call"):
+                    self.acc["stream_content"] = 1
+        else:
+            raise TranslationError(f"unsupported stream source: {self.source}", reason="malformed_stream")
+
+    def _usage(self, usage: dict) -> None:
+        if usage.get("input_tokens") is not None:
+            self.acc["usage_in"] = usage.get("input_tokens") or 0
+        if usage.get("output_tokens") is not None:
+            self.acc["usage_out"] = usage.get("output_tokens") or 0
+        details = usage.get("output_tokens_details") or {}
+        if details.get("reasoning_tokens") is not None:
+            self.acc["usage_reasoning"] = details.get("reasoning_tokens") or 0
+
+    def finalize(self) -> TerminalState:
+        if self.confirmed:
+            return self.terminal
+        reason = "unexpected_eof" if self.saw_business_event else "empty_stream"
+        raise TranslationError(f"stream ended without terminal: {reason}", reason=reason)
+
+
 class TranslationError(Exception):
     """协议转换失败；携带 HTTP 与 failover 决策所需的稳定分类。"""
 

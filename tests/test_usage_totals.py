@@ -72,7 +72,8 @@ class TestUsageTotalsStoreRecord(unittest.TestCase):
         self.assertEqual(data["version"], 3)
         self.assertIn("since", data)
         self.assertEqual(data["keep_days"], 400)
-        self.assertEqual(data["total"], {"requests": 0, "ok": 0, "fail": 0, "sum_ms": 0, "max_ms": 0, "combos": {}})
+        self.assertEqual(data["total"], {"requests": 0, "ok": 0, "fail": 0,
+                         "client_disconnect": 0, "sum_ms": 0, "max_ms": 0, "combos": {}})
         self.assertEqual(data["months_archive"], {})
         self.assertEqual(data["days"], {})
         # record 前文件不落盘（只在 record 时才写）
@@ -90,6 +91,18 @@ class TestUsageTotalsStoreRecord(unittest.TestCase):
         expected_key = "supply=claude-sonnet-sankuai-0956|route=claude|strategy=cc"
         self.assertIn(expected_key, combos)
         self.assertEqual(combos[expected_key]["requests"], 1)
+
+    def test_client_disconnect_is_separate_from_ok_and_fail(self):
+        store = UsageTotalsStore(self.path)
+        acc = _acc()
+        acc["stream_integrity"] = "client_disconnect"
+        store.record(acc, 50)
+        bucket = store._data["total"]
+        combo = next(iter(bucket["combos"].values()))
+        self.assertEqual((bucket["ok"], bucket["fail"], bucket["client_disconnect"]),
+                         (0, 0, 1))
+        self.assertEqual((combo["ok"], combo["fail"], combo["client_disconnect"]),
+                         (0, 0, 1))
 
     def test_none_dims_use_placeholder(self):
         store = UsageTotalsStore(self.path)
