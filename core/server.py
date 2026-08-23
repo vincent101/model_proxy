@@ -2525,7 +2525,6 @@ class ModelProxyHandler(BaseHTTPRequestHandler):
     # ------------------------------------------------------------------
 
     _SKIP_RESP_HEADERS = {"transfer-encoding", "content-length"}
-    _STREAM_PROBE_TIMEOUT = 30.0
     _STREAM_PROBE_MAX_BYTES = 262144
 
     @staticmethod
@@ -2539,22 +2538,25 @@ class ModelProxyHandler(BaseHTTPRequestHandler):
 
     def _probe_upstream_stream(self, resp, mode: str, source: str, adapter=None,
                                upstream_timeout: float = 1800) -> StreamProbeResult:
-        """预读到首个合法业务 SSE 事件；失败时尚未提交客户端响应。"""
+        """预读到首个合法业务 SSE 事件；失败时尚未提交客户端响应。
+
+        首事件超时对齐 upstream_timeout（单一超时真相源），慢热上游不再被 30s 截断。
+        """
         started = time.monotonic()
         framer = pt.SSEFramer()
         raw = bytearray()
         encoded = bytearray()
         consumer = (pt.PassthroughTerminalTracker(source, self._acc)
                     if mode == PASSTHROUGH else adapter)
-        self._set_upstream_read_timeout(resp, self._STREAM_PROBE_TIMEOUT)
+        self._set_upstream_read_timeout(resp, upstream_timeout)
         try:
             while True:
                 elapsed = time.monotonic() - started
-                if elapsed >= self._STREAM_PROBE_TIMEOUT:
+                if elapsed >= upstream_timeout:
                     raise pt.TranslationError("first stream event timed out",
                                               reason="first_event_timeout", http_status=504,
                                               retry_class="configured")
-                self._set_upstream_read_timeout(resp, self._STREAM_PROBE_TIMEOUT - elapsed)
+                self._set_upstream_read_timeout(resp, upstream_timeout - elapsed)
                 try:
                     chunk = resp.read(4096)
                 except TimeoutError as exc:

@@ -4,6 +4,7 @@ import io
 import json
 import os
 import sys
+import time
 import unittest
 from types import SimpleNamespace
 
@@ -298,6 +299,29 @@ class TestStreamProbe(unittest.TestCase):
         adapter = pt.OpenAIToAnthropicStreamAdapter({}, "m")
         result = h._probe_upstream_stream(_Upstream(payload), "anthropic_to_chat",
                                           "chat", adapter)
+        self.assertTrue(result.ok)
+
+    def test_first_event_timeout_follows_upstream_timeout(self):
+        class SlowComments(_Upstream):
+            def read(self, _n=-1):
+                time.sleep(0.08)
+                return b': ping\n\n'
+        h = _Handler()
+        result = h._probe_upstream_stream(SlowComments(b""), "passthrough", "anthropic",
+                                          upstream_timeout=0.05)
+        self.assertFalse(result.ok)
+        self.assertEqual(result.error.reason, "first_event_timeout")
+        self.assertEqual(result.error.http_status, 504)
+
+    def test_large_upstream_timeout_allows_slow_first_event(self):
+        class SlowFirstEvent(_Upstream):
+            def read(self, _n=-1):
+                time.sleep(0.05)
+                return (b'event: message_start\n'
+                        b'data: {"type":"message_start","message":{"usage":{}}}\n\n')
+        h = _Handler()
+        result = h._probe_upstream_stream(SlowFirstEvent(b""), "passthrough", "anthropic",
+                                          upstream_timeout=30.0)
         self.assertTrue(result.ok)
 
     def test_total_buffer_budget(self):
