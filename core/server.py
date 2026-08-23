@@ -678,6 +678,39 @@ class ConfigStore:
 # L1 状态：CooldownStore（全新，错误信号驱动，纯内存，不写盘）
 # ---------------------------------------------------------------------------
 
+class StreamHealthStore:
+    """流完整性连续失败旁路计数；首版固定只观测，不执行冷却。"""
+
+    enforcement = False
+    window_seconds = 600
+    threshold = 3
+
+    def __init__(self):
+        self._state: dict[str, dict[str, float | int]] = {}
+        self._lock = threading.Lock()
+
+    def record(self, supply_id: str, integrity: str) -> None:
+        if not supply_id or integrity not in {"valid", "invalid"}:
+            return
+        now = time.time()
+        with self._lock:
+            if integrity == "valid":
+                self._state.pop(supply_id, None)
+                return
+            current = self._state.get(supply_id)
+            count = (int(current["consecutive"]) + 1
+                     if current and now - float(current["last_at"]) <= self.window_seconds else 1)
+            self._state[supply_id] = {"consecutive": count, "last_at": now}
+
+    def snapshot(self) -> dict:
+        now = time.time()
+        with self._lock:
+            items = {sid: dict(value) for sid, value in self._state.items()
+                     if now - float(value["last_at"]) <= self.window_seconds}
+        return {"enforcement": self.enforcement, "window_seconds": self.window_seconds,
+                "threshold": self.threshold, "supplies": items}
+
+
 class CooldownStore:
     """按 supply 记录冷却截止时间。
 
@@ -1426,8 +1459,32 @@ class ModelProxyHandler(BaseHTTPRequestHandler):
         t0 = time.monotonic()
         try:
             self._forward(method)
+        except (BrokenPipeError, ConnectionResetError):
+            self._acc["stream_integrity"] = "client_disconnect"
+            log.info("client disconnected before request completion")
+        except Exception as exc:
+            a = self._acc
+            a["final_error"] = "internal_escape"
+            log.exception("request internal escape: %s", type(exc).__name__)
+            if not a.get("response_committed"):
+                try:
+                    self._write_buffered_response(
+                        502, [], error_body_for_source(
+                            a.get("source") or "anthropic", 502, "internal proxy error"))
+                except (BrokenPipeError, ConnectionResetError, OSError):
+                    a["stream_integrity"] = "client_disconnect"
+            else:
+                self.close_connection = True
         finally:
             a = self._acc
+            if a.get("response_committed") and not a.get("stream_integrity"):
+                a["stream_integrity"] = "invalid"
+                a["terminal_status"] = a.get("terminal_status") or "open"
+                a["terminal_reason"] = a.get("terminal_reason") or "internal_escape"
+                a["final_error"] = a.get("final_error") or "internal_escape"
+            health = getattr(self.server, "stream_health_store", None)
+            if health is not None:
+                health.record(a.get("supply", ""), a.get("stream_integrity", ""))
             ms = int((time.monotonic() - t0) * 1000)
             access_log.info(
                 "ACCESS ms=%d status=%s source=%s operation=%s route=%s tier=%s supply=%s "
@@ -1698,7 +1755,7 @@ class ModelProxyHandler(BaseHTTPRequestHandler):
             return
 
         _reasoning_retried = False   # reasoning 语法重试只做一次，作用域覆盖整个请求周期
-        stream_failed_supply_ids: set[str] = set()
+        stream_failed_supply_ids: set[str] = set()  # 第二步删除：行为切换后恒空
         last_retryable_error: dict | None = None
         saw_stream_timeout = False
 
@@ -2073,49 +2130,12 @@ class ModelProxyHandler(BaseHTTPRequestHandler):
 
                 is_stream = isinstance(body_json, dict) and body_json.get("stream") is True
 
-                # 四条流路径统一首事件预读；成功后才提交，失败可换 supply。
-                if is_stream:
-                    if mode == PASSTHROUGH:
-                        adapter = None
-                    elif mode == ANTHROPIC_TO_CHAT:
-                        adapter = pt.OpenAIToAnthropicStreamAdapter(fwd_ctx, target_model or "")
-                    elif mode == ANTHROPIC_TO_RESPONSES:
-                        adapter = pt.ResponsesToAnthropicStreamAdapter(fwd_ctx, target_model or "")
-                    else:
-                        _r_effort = ((body_json or {}).get("reasoning") or {}).get("effort")
-                        _tools_echo = (body_json or {}).get("tools") or []
-                        adapter = pt.AnthropicToResponsesStreamAdapter(
-                            model=target_model or "",
-                            ctx={"tools": _tools_echo, "reasoning_effort": _r_effort})
-                    probe = self._probe_upstream_stream(
-                        resp, mode, source, adapter, cs.get_upstream_timeout())
-                    if not probe.ok:
-                        resp.close()
-                        err = probe.error or pt.TranslationError("stream probe failed")
-                        self._acc["first_event_ms"] = probe.first_event_ms
-                        stream_failed_supply_ids.add(supply_id)
-                        tried_set.add(supply_id)
-                        self._acc["attempt_errors"].append((supply_id, f"stream_{err.reason}"))
-                        last_retryable_error = {"kind": "stream", "reason": err.reason,
-                                                "http_status": err.http_status,
-                                                "supply_id": supply_id}
-                        saw_stream_timeout = saw_stream_timeout or err.reason == "first_event_timeout"
-                        if failover == "on":
-                            self._acc["failover"] = 1
-                            continue
-                        self._acc["final_error"] = err.reason
-                        self._write_buffered_response(
-                            err.http_status, [], error_body_for_source(source, err.http_status, str(err)))
-                        return
-                    self._commit_and_write_probed_stream(
-                        probe, resp, list(resp.getheaders()), cs.get_upstream_timeout())
-                    adapter = probe.consumer
-                    if mode != PASSTHROUGH:
-                        self._acc["usage_in"], self._acc["usage_out"], _ = adapter.usage_tuple()
-                        self._acc["stop_reason"] = getattr(adapter, "final_stop_reason", "") or ""
-                    if (mode == PASSTHROUGH
-                            and self._acc.get("stop_reason") in (
-                                "max_tokens", "incomplete:max_output_tokens")
+                # HTTP 2xx 后立即提交；流内失败不再切换 supply。
+                if is_stream and mode == PASSTHROUGH:
+                    self._write_streaming_response(
+                        resp_status, list(resp.getheaders()), resp, source)
+                    if (self._acc.get("stop_reason") in (
+                            "max_tokens", "incomplete:max_output_tokens")
                             and not self._acc.get("stream_content")):
                         self._acc["budget_truncated"] = 1
                     return
@@ -2156,14 +2176,7 @@ class ModelProxyHandler(BaseHTTPRequestHandler):
                         # ⑤ 可选 stop_reason（final_stop_reason 已经 map_finish_reason
                         # 映射，"length"→"max_tokens"）
                         self._acc["stop_reason"] = adapter.final_stop_reason or ""
-                        # ④b 流式不重试（字节已下发），仅收口检测记日志：
-                        # produced_content_block 不计 reasoning 累积/兜底填充，语义即
-                        # 「真实正文是否产出」，与 is_budget_truncated 的「正文缺失」同义
-                        if (adapter.final_stop_reason == "max_tokens"
-                                and not adapter.produced_content_block):
-                            self._acc["budget_truncated"] = 1
-                            log.warning(
-                                "budget_truncated(stream,不重试): supply=%s", supply_id)
+                        # 跨协议流维持既有观测语义：不做 PASSTHROUGH 截断标记。
                     else:
                         try:
                             raw_resp_body = resp.read()
@@ -2500,6 +2513,8 @@ class ModelProxyHandler(BaseHTTPRequestHandler):
             "routes": cs.get_routes(),
             "strategies": strategies_out,
             "cooldown": cd.snapshot(),
+            "stream_health": getattr(
+                self.server, "stream_health_store", StreamHealthStore()).snapshot(),
             "unconfigured_codes": _snapshot_unconfigured_hits(),
             "protocol_conversion_hints": build_protocol_conversion_hints({
                 "supplies": supplies, "routes": cs.get_routes(),
@@ -2737,9 +2752,8 @@ class ModelProxyHandler(BaseHTTPRequestHandler):
         return pt.TerminalState(status, reason)
 
     def _write_streaming_response(self, status: int, headers: list[tuple[str, str]], resp,
-                                  source: str = "", *, prefix: bytes = b"",
-                                  framer=None, tracker=None) -> None:
-        """PASSTHROUGH 原始字节回放；旁路严格跟踪协议终态。"""
+                                  source: str = "") -> None:
+        """PASSTHROUGH 即时字节转发；observer 仅在正常 EOF 后决定是否补 error。"""
         if hasattr(self, "_acc"):
             self._acc["status"] = status
             self._acc["response_committed"] = 1
@@ -2749,56 +2763,46 @@ class ModelProxyHandler(BaseHTTPRequestHandler):
                 self.send_header(hname, hval)
         self.send_header("Transfer-Encoding", "chunked")
         self.end_headers()
-        framer = framer or (pt.SSEFramer() if source else None)
-        tracker = tracker or (pt.PassthroughTerminalTracker(
-            source, getattr(self, "_acc", {})) if source else None)
-        integrity_error = None
-        upstream_read_error = None
+        observer = pt.PassthroughStreamObserver(source, getattr(self, "_acc", {})) if source else None
         try:
-            if prefix:
-                self._write_sse_chunk(prefix)
-            # probe 可能在一个 read 中读到多个事件，只消费了首事件；续写先排空 framer。
-            if framer is not None:
-                for event in framer.feed(b""):
-                    tracker.feed(event)
             while True:
                 try:
                     chunk = resp.read(8192)
                 except OSError as exc:
-                    upstream_read_error = exc
-                    break
+                    self._record_stream_error(pt.TranslationError(
+                        f"upstream read failed: {exc}", reason="upstream_read_error"))
+                    log.warning("passthrough upstream read failed: %s", exc)
+                    return
                 if not chunk:
                     break
                 self._write_sse_chunk(chunk)
-                if integrity_error is None and framer is not None:
-                    try:
-                        for event in framer.feed(chunk):
-                            tracker.feed(event)
-                    except pt.TranslationError as exc:
-                        integrity_error = exc
-            if upstream_read_error is not None:
-                if tracker is not None and tracker.confirmed:
-                    self._record_stream_terminal(tracker.terminal)
-                else:
-                    integrity_error = pt.TranslationError(
-                        f"stream interrupted: {upstream_read_error}", reason="unexpected_eof")
-            elif integrity_error is None and framer is not None:
-                try:
-                    for event in framer.finish():
-                        tracker.feed(event)
-                    terminal = tracker.finalize()
-                    self._record_stream_terminal(terminal)
-                except pt.TranslationError as exc:
-                    integrity_error = exc
-            if integrity_error is not None:
-                self._record_stream_error(integrity_error)
-                self._write_sse_chunk(stream_error_event_for_source(source, integrity_error))
+                if observer is not None:
+                    observer.feed(chunk)
+            if observer is None:
+                self.wfile.write(b"0\r\n\r\n")
+                self.wfile.flush()
+                return
+            result = observer.finish()
+            self._acc["first_event_ms"] = (result.first_event_ms
+                                             if result.first_event_ms is not None else "")
+            if result.kind == "terminal":
+                self._record_stream_terminal(result.terminal_state)
+            elif result.kind == "observer_error":
+                self._acc["stream_integrity"] = "observer_error"
+                self._acc["terminal_status"] = "open"
+                self._acc["terminal_reason"] = "observer_error"
+                log.warning("passthrough observer failed: source=%s", source)
+            else:
+                err = pt.TranslationError(
+                    f"stream ended without terminal: {result.reason}", reason=result.reason)
+                self._record_stream_error(err)
+                self._write_sse_chunk(stream_error_event_for_source(source, err))
             self.wfile.write(b"0\r\n\r\n")
             self.wfile.flush()
-        except (BrokenPipeError, ConnectionResetError):
-            # 上游 read 异常已在 read 点捕获；这里只可能来自客户端写。
+        except (BrokenPipeError, ConnectionResetError, OSError):
             if hasattr(self, "_acc"):
                 self._acc["stream_integrity"] = "client_disconnect"
+            log.info("passthrough client disconnected")
         finally:
             resp.close()
 
@@ -2847,6 +2851,7 @@ class ModelProxyHandler(BaseHTTPRequestHandler):
         """
         if hasattr(self, "_acc"):
             self._acc["status"] = 200
+            self._acc["response_committed"] = 1
         self.send_response(200)
         self.send_header("Content-Type", "text/event-stream")
         self.send_header("Cache-Control", "no-cache")
@@ -2900,9 +2905,11 @@ class ModelProxyHandler(BaseHTTPRequestHandler):
             # 流结束：收尾（[DONE] 或上游断流都走 finalize，幂等）
             for ev in adapter.finalize():
                 self._write_sse_chunk(pt.anthropic_sse_bytes(ev))
+            self._record_stream_terminal(self._adapter_terminal_state(adapter))
             self.wfile.write(b"0\r\n\r\n")
             self.wfile.flush()
         except (BrokenPipeError, ConnectionResetError):
+            self._acc["stream_integrity"] = "client_disconnect"
             # 客户端断连不是上游 EOF：不 finalize、不制造失败终态、不触发 failover。
             pass
         except Exception as e:
@@ -3020,9 +3027,11 @@ class ModelProxyHandler(BaseHTTPRequestHandler):
             # 流意外结束（无 response.completed）时补收尾，幂等
             for ev in adapter.finalize():
                 self._write_sse_chunk(pt.anthropic_sse_bytes(ev))
+            self._record_stream_terminal(self._adapter_terminal_state(adapter))
             self.wfile.write(b"0\r\n\r\n")
             self.wfile.flush()
         except (BrokenPipeError, ConnectionResetError):
+            self._acc["stream_integrity"] = "client_disconnect"
             # 客户端断连不是上游 EOF：不 finalize、不制造失败终态、不触发 failover。
             pass
         except Exception as e:
@@ -3183,6 +3192,7 @@ def main():
 
     # 2. 实例化 CooldownStore
     cooldown_store = CooldownStore()
+    stream_health_store = StreamHealthStore()
 
     # 2.5 实例化 SyntaxPreferenceStore（reasoning 语法偏好，取代旧 _THINKING_FMT_CACHE）
     pref_store = SyntaxPreferenceStore()
@@ -3195,6 +3205,7 @@ def main():
     server = ThreadingHTTPServer(("127.0.0.1", port), ModelProxyHandler)
     server.config_store = config_store    # type: ignore[attr-defined]
     server.cooldown_store = cooldown_store  # type: ignore[attr-defined]
+    server.stream_health_store = stream_health_store  # type: ignore[attr-defined]
     server.pref_store = pref_store        # type: ignore[attr-defined]
     server.sidecar_store = sidecar_store  # type: ignore[attr-defined]
 

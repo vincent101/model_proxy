@@ -230,27 +230,26 @@ class TestOtherDirections(unittest.TestCase):
 
 
 class TestPassthroughTailErrors(unittest.TestCase):
-    def test_terminal_then_upstream_rst_stays_valid_and_chunked_ends(self):
+    def test_terminal_then_normal_eof_stays_valid_and_chunked_ends(self):
         payload = b''.join([
             b'event: message_delta\ndata: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{}}\n\n',
             b'event: message_stop\ndata: {"type":"message_stop"}\n\n',
         ])
         h = _Handler()
         h._acc.update({"usage_in": 0, "usage_out": 0})
-        h._write_streaming_response(
-            200, [], _Upstream(payload, ConnectionResetError("rst")), "anthropic")
+        h._write_streaming_response(200, [], _Upstream(payload), "anthropic")
         self.assertEqual(h._acc["stream_integrity"], "valid")
         self.assertEqual(h._acc["terminal_status"], "completed")
         self.assertTrue(h.wfile.getvalue().endswith(b"0\r\n\r\n"))
 
-    def test_unconfirmed_then_upstream_rst_is_invalid_error(self):
+    def test_unconfirmed_then_upstream_rst_closes_without_synthetic_error(self):
         payload = b'event: message_start\ndata: {"type":"message_start","message":{"usage":{}}}\n\n'
         h = _Handler()
         h._acc.update({"usage_in": 0, "usage_out": 0})
         h._write_streaming_response(
             200, [], _Upstream(payload, ConnectionResetError("rst")), "anthropic")
         self.assertEqual(h._acc["stream_integrity"], "invalid")
-        self.assertIn(b"event: error", _decode_chunked(h.wfile.getvalue()))
+        self.assertEqual(_decode_chunked(h.wfile.getvalue()), payload)
 
 
 class TestStreamProbe(unittest.TestCase):

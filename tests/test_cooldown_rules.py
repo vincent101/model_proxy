@@ -217,24 +217,17 @@ class TestExhaustedFinalStatus(unittest.TestCase):
         _run(h, [_http_error(429, b'{"error":{"message":"busy"}}')])
         self.assertEqual(h._responses[-1][0], 503)
 
-    def test_stream_integrity_exhaustion_is_502(self):
-        ns, _ = _make_server([_supply("s1")], ["s1"])
+    def test_empty_stream_commits_without_failover(self):
+        ns, cd = _make_server([_supply("s1"), _supply("s2")], ["s1", "s2"])
         body = {"model": "claude-opus", "max_tokens": 100, "stream": True,
                 "messages": [{"role": "user", "content": "hi"}]}
         h = _make_handler(ns, body)
-        _run(h, [_FakeResp(b"")])
-        self.assertEqual(h._responses[-1][0], 502)
-
-    def test_first_event_timeout_exhaustion_is_504(self):
-        ns, _ = _make_server([_supply("s1")], ["s1"])
-        body = {"model": "claude-opus", "max_tokens": 100, "stream": True,
-                "messages": [{"role": "user", "content": "hi"}]}
-        h = _make_handler(ns, body)
-        timeout = pt.TranslationError("timeout", reason="first_event_timeout", http_status=504)
-        with patch.object(h, "_probe_upstream_stream", return_value=SimpleNamespace(
-                ok=False, error=timeout, first_event_ms=30000)):
-            _run(h, [_FakeResp(b"unused")])
-        self.assertEqual(h._responses[-1][0], 504)
+        m = _run(h, [_FakeResp(b"")])
+        self.assertEqual(m.call_count, 1)
+        self.assertEqual(h._acc["response_committed"], 1)
+        self.assertEqual(h._acc["stream_integrity"], "invalid")
+        self.assertEqual(h._acc["terminal_reason"], "empty_stream")
+        self.assertEqual(cd.cooled, [])
 
 
 class Test402CooldownFailover(unittest.TestCase):

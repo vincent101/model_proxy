@@ -231,6 +231,55 @@ class SSEFramer:
         return SSEEvent(raw, resolved, data)
 
 
+@dataclass(frozen=True)
+class ObservationResult:
+    kind: str
+    terminal_state: TerminalState | None
+    reason: str
+    first_event_ms: int | None
+
+
+class PassthroughStreamObserver:
+    """只读旁路观察器；任何解析异常均止于内部，不影响字节转发。"""
+
+    def __init__(self, source: str, acc: dict | None = None):
+        self._framer = SSEFramer()
+        self._tracker = PassthroughTerminalTracker(source, acc)
+        self._started = time.monotonic()
+        self._first_event_ms: int | None = None
+        self._error: Exception | None = None
+
+    def feed(self, chunk: bytes) -> None:
+        if self._error is not None:
+            return
+        try:
+            for event in self._framer.feed(chunk):
+                if not event.is_comment and self._first_event_ms is None:
+                    self._first_event_ms = int((time.monotonic() - self._started) * 1000)
+                self._tracker.feed(event)
+        except Exception as exc:
+            self._error = exc
+
+    def finish(self) -> ObservationResult:
+        if self._error is None:
+            try:
+                for event in self._framer.finish():
+                    if not event.is_comment and self._first_event_ms is None:
+                        self._first_event_ms = int((time.monotonic() - self._started) * 1000)
+                    self._tracker.feed(event)
+                terminal = self._tracker.finalize()
+                return ObservationResult("terminal", terminal, terminal.reason,
+                                         self._first_event_ms)
+            except Exception as exc:
+                if isinstance(exc, TranslationError) and exc.reason in {
+                        "empty_stream", "unexpected_eof"}:
+                    kind = ("no_business_event" if exc.reason == "empty_stream"
+                            else "missing_terminal")
+                    return ObservationResult(kind, None, exc.reason, self._first_event_ms)
+                self._error = exc
+        return ObservationResult("observer_error", None, "observer_error", self._first_event_ms)
+
+
 class PassthroughTerminalTracker:
     """PASSTHROUGH 协议终态与 usage 旁路跟踪器。"""
 
