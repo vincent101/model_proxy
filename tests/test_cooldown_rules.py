@@ -28,6 +28,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from core import translate as pt  # noqa: E402
 from core.server import (  # noqa: E402
     ModelProxyHandler,
+    StreamHealthStore,
     resolve_cooldown_seconds,
     _record_unconfigured,
     _snapshot_unconfigured_hits,
@@ -204,6 +205,21 @@ def _run(h, upstream_queue):
                side_effect=list(upstream_queue)) as m:
         h._forward("POST")
     return m
+
+
+class TestStreamHealthObservation(unittest.TestCase):
+    def test_counts_invalid_without_enforcement_and_valid_resets(self):
+        store = StreamHealthStore()
+        for _ in range(3):
+            store.record("s1", "invalid")
+        snapshot = store.snapshot()
+        self.assertFalse(snapshot["enforcement"])
+        self.assertEqual(snapshot["supplies"]["s1"]["consecutive"], 3)
+        store.record("s1", "client_disconnect")
+        store.record("s1", "observer_error")
+        self.assertEqual(store.snapshot()["supplies"]["s1"]["consecutive"], 3)
+        store.record("s1", "valid")
+        self.assertNotIn("s1", store.snapshot()["supplies"])
 
 
 # ---------------------------------------------------------------------------

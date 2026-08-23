@@ -331,7 +331,7 @@ def _format_protocol_conversion_traffic(items: list[dict]) -> list[str]:
 
 def load_stream_integrity(log_path: str, *, now: datetime | None = None,
                           window_days: int = PROTOCOL_HINT_WINDOW_DAYS) -> list[dict]:
-    """聚合新格式 ACCESS 中的 invalid/client_disconnect；旧日志不猜测。"""
+    """聚合新格式 ACCESS 中的 invalid/client_disconnect/observer_error；旧日志不猜测。"""
     if not log_path or not os.path.isfile(log_path):
         return []
     start = (now or datetime.now()) - timedelta(days=window_days)
@@ -341,7 +341,7 @@ def load_stream_integrity(log_path: str, *, now: datetime | None = None,
             for line in f:
                 p = parse_access_line(line)
                 if not p or p["ts"] < start or p["stream_integrity"] not in {
-                        "invalid", "client_disconnect"}:
+                        "invalid", "client_disconnect", "observer_error"}:
                     continue
                 key = tuple(p.get(k, "") for k in (
                     "token", "source", "route", "tier", "supply", "terminal_reason"))

@@ -112,7 +112,9 @@ session override 的唯一来源是独立 sidecar 文件 `config/session_overrid
 - ② 识别入站协议（path 尾缀 → body 特征兜底）
 - ③ token → strategy → route 候选列表 → tier → supply（含跨 route 兜底）
 - ④ decode → remap → encode → syntax_adapt（相对排名映射）
-- ⑤ (source,target) 组合决定 PASSTHROUGH 或转换；失败且 failover=on 则冷却+换 supply
+- ⑤ (source,target) 组合决定 PASSTHROUGH 或转换；仅 HTTP 429/5xx/网络失败且 failover=on 时冷却并换 supply
+
+HTTP 200 后不再切换 supply：PASSTHROUGH 立即提交并逐块原样转发，旁路观察终态、usage 与首事件时间；正常 EOF 若为空流或缺终态，追加客户端协议 error。`first_event_ms` 仅为旁路指标，不影响首字节提交。
 
 关键点：入站阶段代理不关心客户端把 base_url 后面拼了什么 path，出站只用配置的 `supply.url`。
 

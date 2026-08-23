@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+- 流式响应改为 HTTP 2xx 后立即提交；仅 HTTP 状态/网络错误参与 failover
+- PASSTHROUGH 原始字节即时转发，旁路观察终态、usage 与首事件时间
+- 正常 EOF 的空流/缺终态追加协议 error；observer 故障与客户端断连独立记账
+- 删除首事件 probe、预读缓冲、流级 failover 与超时切换子系统
+
 ## 0.10 (2026-08-20)
 - CLI status cooldown 列表展示每个 supply 的触发 errorcode（http_429/net_error:...）
 - codex 接入全链路：ModelProxyHandler 升 HTTP/1.1（修 HTTP/1.0+chunked 非标组合致

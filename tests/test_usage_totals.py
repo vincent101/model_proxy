@@ -104,6 +104,15 @@ class TestUsageTotalsStoreRecord(unittest.TestCase):
         self.assertEqual((combo["ok"], combo["fail"], combo["client_disconnect"]),
                          (0, 0, 1))
 
+    def test_observer_error_is_neither_ok_nor_upstream_failure(self):
+        store = UsageTotalsStore(self.path)
+        acc = _acc()
+        acc["stream_integrity"] = "observer_error"
+        store.record(acc, 50)
+        bucket = store._data["total"]
+        self.assertEqual((bucket["ok"], bucket["fail"], bucket["client_disconnect"]),
+                         (0, 0, 0))
+
     def test_none_dims_use_placeholder(self):
         store = UsageTotalsStore(self.path)
         store.record(_acc(supply="", route="", strategy=""), 50)
