@@ -1,6 +1,10 @@
 # Changelog
 
 ## Unreleased
+- session 身份展示：新增 core/session_identity.py 只读解析 ~/.claude/sessions 注册表
+  （按次扫描不缓存，坏 JSON/缺字段跳过，同 UUID 多进程取 procStart 最新）；
+  CLI status 活跃 session 行首附 `name · uuid8`（段标题注明 name 为当前注册快照），
+  $route 回执尾部由 server 层统一附 `session 身份: name · uuid8`（未命中仅 uuid8）
 - 流式响应改为 HTTP 2xx 后立即提交；仅 HTTP 状态/网络错误参与 failover
 - PASSTHROUGH 原始字节即时转发，旁路观察终态、usage 与首事件时间
 - 正常 EOF 的空流/缺终态追加协议 error；observer 故障与客户端断连独立记账

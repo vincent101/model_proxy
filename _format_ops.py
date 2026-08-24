@@ -18,6 +18,11 @@ from pathlib import Path
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from core.protocol_hints import PROTOCOL_HINT_WINDOW_DAYS
+from core.session_identity import (
+    load_session_names,
+    match_session_name,
+    session_display_id,
+)
 
 TIER_NAMES = ("opus", "sonnet", "haiku")
 
@@ -438,10 +443,13 @@ def load_active_sessions(log_path: str, *, now: datetime | None = None,
     return {"sessions": sessions, "truncated": truncated, "log_missing": False}
 
 
-def _format_active_sessions(result: dict, cfg: dict | None = None) -> list[str]:
+def _format_active_sessions(result: dict, cfg: dict | None = None,
+                            session_names: dict[str, str] | None = None) -> list[str]:
     """渲染活跃 session 段（header + 每 session 一行 + FAIL err 续行）。
 
-    行格式：`sid8  state n=N fail=F [fo=K]  HH:MM status  route(tokens) tier/supply(pct%) ...`
+    行格式：`[name · ]sid8  state n=N fail=F [fo=K]  HH:MM status  route(tokens) tier/supply(pct%) ...`
+    session_names 为 ~/.claude/sessions 注册快照（{sessionId: name}），命中时
+    行首附 name；id 列宽随内容动态放宽（≥8），命名行与未命名行各自对齐。
     链路为窗口内 (tier, supply) 分布按次数降序；route 取窗口内主 route，括注引用它的 strategy。
     排序：FAIL → warn → ok，同档按最近请求时间倒序。
     """
@@ -495,14 +503,22 @@ def _format_active_sessions(result: dict, cfg: dict | None = None) -> list[str]:
     if truncated:
         header += "  （窗口数据可能被截断）"
 
-    lines = [header]
-
     # 上限 20 行
     max_rows = 20
     shown = entries[:max_rows]
 
-    for sid, agg, state in shown:
-        id_str = "(none)" if sid == "(none)" else sid[:8]
+    # 行首 id：注册快照命中时附 name（name · uuid8）；id 列宽随内容动态放宽（≥8）。
+    names = session_names or {}
+    id_strs = [session_display_id(names, sid) for sid, _, _ in shown]
+    id_w = max([8] + [display_width(s) for s in id_strs])
+    # name 标注存在的语义提示只在段标题说一次（name 取自当前注册快照，可能滞后
+    # 于 30min 窗口内的历史请求），不逐行重复。
+    if any(match_session_name(names, sid) for sid, _, _ in shown):
+        header += "  （name 为当前注册快照）"
+
+    lines = [header]
+
+    for (sid, agg, state), id_str in zip(shown, id_strs):
         fo_part = f" fo={agg['fo']}" if agg["fo"] > 0 else ""
         ts_str = agg["last_ts"].strftime("%H:%M") if agg["last_ts"] else "--:--"
 
@@ -516,7 +532,7 @@ def _format_active_sessions(result: dict, cfg: dict | None = None) -> list[str]:
         route_part = f"{main_route}({','.join(toks)})" if toks else main_route
 
         if agg["builtin_only"]:
-            line = (f"  {_pad(id_str, 8)}  {_pad(state, 4)} n=0 fail=0"
+            line = (f"  {_pad(id_str, id_w)}  {_pad(state, 4)} n=0 fail=0"
                     f"  {ts_str} 200"
                     f"  {route_part}（仅 $route)")
         else:
@@ -526,7 +542,7 @@ def _format_active_sessions(result: dict, cfg: dict | None = None) -> list[str]:
             for (tier, supply), cnt in chains:
                 pct = round(cnt / agg["n"] * 100) if agg["n"] else 0
                 chain_parts.append(f"{tier}/{_short_supply(supply)}({pct}%)")
-            line = (f"  {_pad(id_str, 8)}  {_pad(state, 4)}"
+            line = (f"  {_pad(id_str, id_w)}  {_pad(state, 4)}"
                     f" n={agg['n']} fail={agg['fail']}{fo_part}"
                     f"  {ts_str} {agg['last_status']}"
                     f"  {route_part} {' '.join(chain_parts)}")
@@ -685,7 +701,8 @@ def _compute_degraded(health: dict[str, dict]) -> list[dict]:
 
 def _format_status_from_json(data: dict, config_path: str, totals_path: str,
                              log_path: str | None = None,
-                             cooldown_unknown: bool = False) -> list[str]:
+                             cooldown_unknown: bool = False,
+                             sessions_dir=None) -> list[str]:
     """从 server status JSON + config + 账本 格式化 status 输出。
 
     布局：health 行 → degraded supplies 段 → active sessions 段（在线时恒展示）
@@ -694,6 +711,9 @@ def _format_status_from_json(data: dict, config_path: str, totals_path: str,
     cooldown_unknown=True（离线统一展示路径）：cooldown 是 server 内存态离线拿不到，
     health 行显 "cooldown (未知)/N"，明细段跳过；degraded（账本）/active sessions（日志）
     /overrides（sidecar）均不依赖代理进程，离线照常展示。
+
+    sessions_dir：session 身份注册表目录（默认 ~/.claude/sessions）。显式参数
+    供测试注入临时目录（不读真实 HOME）；仅在有 log_path 时扫描一次。
     """
     cooldown = data.get("cooldown", {})
     n_supplies = len(data.get("supplies", []))
@@ -741,10 +761,12 @@ def _format_status_from_json(data: dict, config_path: str, totals_path: str,
             ref = ",".join(refs.get(d["id"], [])) or "未被引用"
             lines.append(f"  {_pad(d['id'], 24)} fail {d['fail_pct']:.1f}% ({d['fail']}/{d['requests']})  ← {ref}")
 
-    # active sessions 段（在线时恒展示）
+    # active sessions 段（在线时恒展示；行首 name 标注取自 session 注册快照）
     if log_path:
         lines.append("")
-        lines.extend(_format_active_sessions(load_active_sessions(log_path), cfg))
+        session_names = load_session_names(sessions_dir)
+        lines.extend(_format_active_sessions(load_active_sessions(log_path), cfg,
+                                             session_names))
 
     hints = data.get("protocol_conversion_hints")
     if log_path and hints is not None:

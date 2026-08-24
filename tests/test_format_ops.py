@@ -1062,6 +1062,15 @@ class TestFormatActiveSessions(unittest.TestCase):
 
 class TestStatusFormatWithSessions(unittest.TestCase):
 
+    def setUp(self):
+        # 隔离真实 HOME：默认注册表指向不存在路径（未命中 → 纯 uuid8，
+        # 输出确定性）；需要 name 标注的用例显式传 sessions_dir 注入临时注册表。
+        self._patcher = patch(
+            "core.session_identity.DEFAULT_SESSIONS_DIR",
+            Path("/nonexistent/sessions-registry"))
+        self._patcher.start()
+        self.addCleanup(self._patcher.stop)
+
     def _make_config(self, td, cfg_dict=None):
         path = os.path.join(td, "config.json")
         cfg = cfg_dict or {
@@ -1180,6 +1189,98 @@ class TestStatusFormatWithSessions(unittest.TestCase):
                 data, cfg_path, totals_path, log_path)
         joined = "\n".join(lines)
         self.assertIn("无活跃请求", joined)
+
+    # -----------------------------------------------------------------
+    # session name 标注（~/.claude/sessions 注册快照 join，注入测试路径）
+    # -----------------------------------------------------------------
+
+    def _make_registry(self, td, entries):
+        """写临时 session 注册表目录，返回路径。"""
+        d = os.path.join(td, "sessions")
+        os.makedirs(d, exist_ok=True)
+        for i, e in enumerate(entries):
+            with open(os.path.join(d, f"{2000 + i}.json"), "w",
+                      encoding="utf-8") as f:
+                json.dump(e, f)
+        return d
+
+    def _status_data(self):
+        return {
+            "supplies": [{"id": "s1"}], "routes": [], "strategies": [],
+            "cooldown": {}, "default_cooldown_seconds": 60,
+        }
+
+    def test_named_session_annotated(self):
+        """注册表命中 → 行首 `name · uuid8`，段标题注明 name 为当前注册快照。"""
+        now = datetime.now()
+        sid = "b6ceb46d-1a05-4604-b6a5-ce6fb1a99e8a"
+        with tempfile.TemporaryDirectory() as td:
+            cfg_path = self._make_config(td)
+            totals_path = self._make_totals(td)
+            log_path = self._make_log(td, [
+                self._make_access_line(ts=now - timedelta(minutes=5),
+                                       session=sid),
+            ])
+            sessions_dir = self._make_registry(td, [{
+                "pid": 1, "sessionId": sid, "name": "notevault-42",
+                "procStart": "Mon Aug 24 03:42:10 2026",
+            }])
+            lines = _format_status_from_json(
+                self._status_data(), cfg_path, totals_path, log_path,
+                sessions_dir=sessions_dir)
+        joined = "\n".join(lines)
+        self.assertIn("notevault-42 · b6ceb46d", joined)
+        header = next(ln for ln in lines if ln.startswith("active sessions"))
+        self.assertIn("name 为当前注册快照", header)  # 段标题一次性注明
+
+    def test_unnamed_session_plain_uuid8_no_note(self):
+        """注册表未命中 → 仅 uuid8、无 name 标注，段标题不加注册快照说明。"""
+        now = datetime.now()
+        sid = "b6ceb46d-1a05-4604-b6a5-ce6fb1a99e8a"
+        with tempfile.TemporaryDirectory() as td:
+            cfg_path = self._make_config(td)
+            totals_path = self._make_totals(td)
+            log_path = self._make_log(td, [
+                self._make_access_line(ts=now - timedelta(minutes=5),
+                                       session=sid),
+            ])
+            sessions_dir = self._make_registry(td, [])  # 空注册表
+            lines = _format_status_from_json(
+                self._status_data(), cfg_path, totals_path, log_path,
+                sessions_dir=sessions_dir)
+        joined = "\n".join(lines)
+        self.assertIn("\n  b6ceb46d ", joined)  # 行首 id 仍为纯 uuid8
+        self.assertNotIn("notevault-42", joined)
+        self.assertNotIn("name 为当前注册快照", joined)
+
+    def test_mixed_named_and_unnamed_rows(self):
+        """命中与未命中混排：命中行带 name 标注，未命中行保持纯 uuid8。"""
+        now = datetime.now()
+        sid_hit = "aaaabbbb-1111-2222-3333-444444444444"
+        sid_miss = "ccccdddd-1111-2222-3333-444444444444"
+        with tempfile.TemporaryDirectory() as td:
+            cfg_path = self._make_config(td)
+            totals_path = self._make_totals(td)
+            log_path = self._make_log(td, [
+                self._make_access_line(ts=now - timedelta(minutes=5),
+                                       session=sid_hit, req_id="r1"),
+                self._make_access_line(ts=now - timedelta(minutes=6),
+                                       session=sid_miss, req_id="r2"),
+            ])
+            sessions_dir = self._make_registry(td, [{
+                "pid": 1, "sessionId": sid_hit, "name": "notevault-7",
+                "procStart": "Mon Aug 24 03:42:10 2026",
+            }])
+            lines = _format_status_from_json(
+                self._status_data(), cfg_path, totals_path, log_path,
+                sessions_dir=sessions_dir)
+        joined = "\n".join(lines)
+        self.assertIn("notevault-7 · aaaabbbb", joined)
+        self.assertNotIn("notevault-7 · ccccdddd", joined)
+        # 未命中行仍是纯 uuid8（不带 name 前缀）
+        for line in lines:
+            if "ccccdddd" in line:
+                self.assertTrue(line.lstrip().startswith("ccccdddd"))
 
 
 if __name__ == "__main__":

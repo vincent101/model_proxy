@@ -30,6 +30,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 # 合并后的双向协议转换器（core 包内相对导入）
+from . import session_identity
 from . import translate as pt
 from .commands import (
     CMD_PREFIX,
@@ -2340,6 +2341,14 @@ class ModelProxyHandler(BaseHTTPRequestHandler):
         handler = COMMAND_HANDLERS[CMD_PREFIX]
         result = handler(ctx)
 
+        # 回执尾部附当前请求 session 的身份（name · uuid8；注册表未命中仅
+        # uuid8；无 session 不附）。身份解析限定在 server 层完成，commands.py
+        # 维持"只操作代理自身路由/观测状态"的命令层边界，不读外部注册表。
+        identity = session_identity.format_session_identity(session_key)
+        receipt_text = result.receipt_text
+        if identity:
+            receipt_text += f"\nsession 身份: {identity}"
+
         # ACCESS route= 记「本次命令操作/查询后的生效 route」以便核对（§3.3）：
         # 切换成功后就是目标 route；reset 成功后重新算一次候选（写操作已完成，
         # sidecar 已更新）；查询/切换失败（如 route 不存在）则用查询时算好的候选。
@@ -2358,9 +2367,9 @@ class ModelProxyHandler(BaseHTTPRequestHandler):
 
         is_stream = isinstance(body_json, dict) and body_json.get("stream") is True
         if is_stream:
-            self._write_builtin_stream_response(result.receipt_text, request_model)
+            self._write_builtin_stream_response(receipt_text, request_model)
         else:
-            self._write_builtin_buffered_response(result.receipt_text, request_model)
+            self._write_builtin_buffered_response(receipt_text, request_model)
 
     def _write_builtin_stream_response(self, receipt_text: str, request_model) -> None:
         """自造 anthropic 流式回执（§3.2 事件序列），复用 translate.py 既有事件构造
