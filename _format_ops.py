@@ -329,46 +329,6 @@ def _format_protocol_conversion_traffic(items: list[dict]) -> list[str]:
     return lines
 
 
-def load_stream_integrity(log_path: str, *, now: datetime | None = None,
-                          window_days: int = PROTOCOL_HINT_WINDOW_DAYS) -> list[dict]:
-    """聚合新格式 ACCESS 中的 invalid/client_disconnect/observer_error；旧日志不猜测。"""
-    if not log_path or not os.path.isfile(log_path):
-        return []
-    start = (now or datetime.now()) - timedelta(days=window_days)
-    aggs = {}
-    try:
-        with open(log_path, "r", encoding="utf-8", errors="replace") as f:
-            for line in f:
-                p = parse_access_line(line)
-                if not p or p["ts"] < start or p["stream_integrity"] not in {
-                        "invalid", "client_disconnect", "observer_error"}:
-                    continue
-                key = tuple(p.get(k, "") for k in (
-                    "token", "source", "route", "tier", "supply", "terminal_reason"))
-                a = aggs.setdefault(key, {"n": 0, "committed": 0, "failover": 0,
-                                          "integrity": p["stream_integrity"]})
-                a["n"] += 1
-                a["committed"] += int(p["response_committed"] == "1")
-                a["failover"] += int(p["failover"] == "1")
-    except OSError:
-        return []
-    names = ("token", "source", "route", "tier", "supply", "terminal_reason")
-    return [{**dict(zip(names, key)), **value} for key, value in sorted(aggs.items())]
-
-
-def _format_stream_integrity(items: list[dict]) -> list[str]:
-    if not items:
-        return []
-    lines = ["stream integrity (last 7d):"]
-    for x in items:
-        reason = x["terminal_reason"] or x["integrity"]
-        lines.append(f"  ⚠ {x['token']}[{x['source']}] → {x['route']}.{x['tier']} → "
-                     f"{x['supply']}: {reason} {x['n']} "
-                     f"(committed {x['committed']}, failover {x['failover']})")
-    lines.append("  hint: upstream stream ended without a valid protocol terminal")
-    return lines
-
-
 def _short_supply(sid: str) -> str:
     """supply id 缩写：去掉 vendor 段（-sankuai / -openai）。
 
@@ -785,12 +745,6 @@ def _format_status_from_json(data: dict, config_path: str, totals_path: str,
     if log_path:
         lines.append("")
         lines.extend(_format_active_sessions(load_active_sessions(log_path), cfg))
-
-    if log_path:
-        integrity_lines = _format_stream_integrity(load_stream_integrity(log_path))
-        if integrity_lines:
-            lines.append("")
-            lines.extend(integrity_lines)
 
     hints = data.get("protocol_conversion_hints")
     if log_path and hints is not None:
