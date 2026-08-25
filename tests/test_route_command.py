@@ -677,10 +677,10 @@ class TestForwardInterceptEndToEnd(unittest.TestCase):
 
 
 class TestRouteReceiptSessionIdentity(unittest.TestCase):
-    """$route 回执尾部身份行（server 层统一追加，commands.py 不读注册表）。
+    """$route 回执首行身份内嵌（server 层统一替换，commands.py 不读注册表）。
 
-    形态：命中 → `session 身份: name · uuid8`；未命中 → `session 身份: uuid8`；
-    无 session → 不附身份行。
+    形态：注册表命中 → 各行 `session <uuid8>` 升级为 `session <name · uuid8>`；
+    未命中 → 保持 uuid8 原样；无 session → 不替换。
     """
 
     def setUp(self):
@@ -720,7 +720,7 @@ class TestRouteReceiptSessionIdentity(unittest.TestCase):
         return resp["content"][0]["text"]
 
     def test_receipt_identity_hit(self):
-        """注册表命中 → 回执尾部附 `session 身份: name · uuid8`。"""
+        """注册表命中 → 首行 `当前 session name · uuid8 生效 route:`。"""
         with tempfile.TemporaryDirectory() as d:
             cfg_path = self._write_cfg(d)
             sidecar_path = Path(d) / "session_overrides.json"
@@ -729,10 +729,11 @@ class TestRouteReceiptSessionIdentity(unittest.TestCase):
             self._write_session_registry(sid, "notevault-9")
             _, raw = _send(h, "$route", sid)
         text = self._receipt_text(raw)
-        self.assertIn("session 身份: notevault-9 · b6ceb46d", text)
+        self.assertIn("当前 session notevault-9 · b6ceb46d 生效 route:", text)
+        self.assertNotIn("session 身份:", text)
 
     def test_receipt_identity_hit_on_switch(self):
-        """写命令（切换）回执同样附身份行。"""
+        """写命令（切换）回执同样首行内嵌身份。"""
         with tempfile.TemporaryDirectory() as d:
             cfg_path = self._write_cfg(d)
             sidecar_path = Path(d) / "session_overrides.json"
@@ -741,20 +742,19 @@ class TestRouteReceiptSessionIdentity(unittest.TestCase):
             self._write_session_registry(sid, "notevault-9")
             _, raw = _send(h, "$route nation", sid)
         text = self._receipt_text(raw)
-        self.assertIn("session 身份: notevault-9 · b6ceb46d", text)
+        self.assertIn("session notevault-9 · b6ceb46d", text)
+        self.assertNotIn("session 身份:", text)
 
     def test_receipt_identity_miss_shows_uuid8_only(self):
-        """注册表未命中 → 身份行仅 uuid8，不带 name 与 ·。"""
+        """注册表未命中 → 回执保持 uuid8，不带 name 与 ·。"""
         with tempfile.TemporaryDirectory() as d:
             cfg_path = self._write_cfg(d)
             sidecar_path = Path(d) / "session_overrides.json"
             h = _make_forward_handler(cfg_path, sidecar_path)
             _, raw = _send(h, "$route", "sess-e2e-miss")
         text = self._receipt_text(raw)
-        self.assertIn("session 身份: sess-e2e", text)
-        identity_line = next(ln for ln in text.splitlines()
-                             if ln.startswith("session 身份:"))
-        self.assertNotIn("·", identity_line)
+        self.assertIn("当前 session sess-e2e", text)
+        self.assertNotIn("·", text)
 
     def test_receipt_no_session_no_identity_line(self):
         """无 session（session_key 为空）→ 不附身份行。"""

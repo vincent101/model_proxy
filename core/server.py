@@ -2341,13 +2341,15 @@ class ModelProxyHandler(BaseHTTPRequestHandler):
         handler = COMMAND_HANDLERS[CMD_PREFIX]
         result = handler(ctx)
 
-        # 回执尾部附当前请求 session 的身份（name · uuid8；注册表未命中仅
-        # uuid8；无 session 不附）。身份解析限定在 server 层完成，commands.py
-        # 维持"只操作代理自身路由/观测状态"的命令层边界，不读外部注册表。
-        identity = session_identity.format_session_identity(session_key)
+        # 回执内嵌当前请求 session 的身份：把各行 "session <uuid8>" 升级为
+        # "session <name · uuid8>"（注册表命中 name 时）。身份解析限定在 server
+        # 层完成，commands.py 维持"只操作代理自身路由/观测状态"的命令层边界。
         receipt_text = result.receipt_text
-        if identity:
-            receipt_text += f"\nsession 身份: {identity}"
+        if session_key:
+            identity = session_identity.format_session_identity(session_key)
+            short = session_key[:8]
+            if identity and identity != short:
+                receipt_text = receipt_text.replace(f"session {short}", f"session {identity}")
 
         # ACCESS route= 记「本次命令操作/查询后的生效 route」以便核对（§3.3）：
         # 切换成功后就是目标 route；reset 成功后重新算一次候选（写操作已完成，
