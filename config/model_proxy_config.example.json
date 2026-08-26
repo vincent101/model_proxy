@@ -1,5 +1,7 @@
 {
   "admin_token": "<ADMIN_TOKEN_PLACEHOLDER>",
+  "listen": { "host": "127.0.0.1", "port": 18889 },
+  "allow_hosts": [],
   "cooldown_rules": [
     {"errorcode": [429, 500, 502, 503, 504], "cooldown_seconds": 60},
     {"errorcode": [401, 402, 403], "cooldown_seconds": 21600},
