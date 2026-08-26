@@ -14,7 +14,6 @@ Host 白名单见 core/listen_config.py）、配置 tools/model_proxy/config/mod
 
 import hashlib
 import hmac
-import ipaddress
 import json
 import logging
 import os
@@ -35,7 +34,7 @@ from typing import Any, Callable
 # 合并后的双向协议转换器（core 包内相对导入）
 from . import session_identity
 from . import translate as pt
-from .listen_config import ListenConfigError, resolve_listen
+from .listen_config import ListenConfigError, parse_host_authority, resolve_listen
 from .commands import (
     CMD_PREFIX,
     COMMAND_HANDLERS,
@@ -1360,65 +1359,6 @@ def _responses_failed_event(adapter: "pt.AnthropicToResponsesStreamAdapter", mes
 _LOOPBACK_HOST_NAMES = frozenset({"localhost", "127.0.0.1", "::1"})
 
 
-def _parse_port_literal(s: str) -> int:
-    """端口字面量校验：纯数字且 1-65535，否则 ValueError。"""
-    if not (s.isascii() and s.isdigit()):
-        raise ValueError(f"端口非数字: {s!r}")
-    port = int(s)
-    if not (1 <= port <= 65535):
-        raise ValueError(f"端口越界: {s!r}")
-    return port
-
-
-def parse_host_authority(authority: str) -> tuple[str, int | None]:
-    """结构化解析 Host 头/白名单条目的 authority → (hostname 小写, port|None)。
-
-    契约（见 docs/designs/2026-08-26-本地三服务开放家庭局域网-v2.md §2.1）：
-    - 拒绝 userinfo（@）、路径字符（/?#）、空 hostname、非法/越界端口、尾随点；
-    - 括号 IPv6（[::1]:18889）走独立分支结构化解析，未加括号的多冒号串拒绝
-      ——禁止简单 split(":")；
-    - hostname 按 ASCII 统一小写后返回（大小写不敏感比较由调用方对小写值进行）。
-    畸形输入一律 ValueError，不抛其他异常。
-    """
-    if not isinstance(authority, str) or not authority:
-        raise ValueError("authority 为空")
-    if any(c in authority for c in "@/?#"):
-        raise ValueError(f"含 userinfo/路径字符: {authority!r}")
-    if authority.startswith("["):
-        close = authority.find("]")
-        if close == -1:
-            raise ValueError(f"IPv6 括号未闭合: {authority!r}")
-        host = authority[1:close]
-        rest = authority[close + 1:]
-        if not host:
-            raise ValueError("IPv6 字面量为空")
-        try:
-            ipaddress.IPv6Address(host)
-        except ValueError as e:
-            raise ValueError(f"非法 IPv6 字面量: {authority!r}") from e
-        port = None
-        if rest:
-            if not rest.startswith(":") or len(rest) == 1:
-                raise ValueError(f"非法端口后缀: {authority!r}")
-            port = _parse_port_literal(rest[1:])
-    else:
-        if "[" in authority or "]" in authority:
-            raise ValueError(f"括号错位: {authority!r}")
-        if authority.count(":") > 1:
-            raise ValueError(f"未加括号的多冒号（IPv6 须用 [] 括起）: {authority!r}")
-        if ":" in authority:
-            host, _, port_s = authority.partition(":")
-            port = _parse_port_literal(port_s)
-        else:
-            host, port = authority, None
-        if not host:
-            raise ValueError("hostname 为空")
-    host = host.lower()
-    if host.endswith("."):
-        raise ValueError(f"不接受尾随点: {authority!r}")
-    return host, port
-
-
 def is_host_allowed(host_value: str, *, listen_port: int,
                     allow_hosts: list[str]) -> bool:
     """单个 Host 头值是否放行：loopback 恒放行；其余端口必须存在且与监听端口一致，
@@ -1436,7 +1376,7 @@ def is_host_allowed(host_value: str, *, listen_port: int,
         try:
             e_host, e_port = parse_host_authority(entry)
         except ValueError:
-            continue  # 畸形条目不匹配（类型合法性已在启动时由 listen_config 校验）
+            continue  # 畸形条目不匹配（类型/结构/端口合法性已在启动时由 listen_config 校验）
         if host == e_host and (e_port is None or e_port == listen_port):
             return True
     return False

@@ -8,7 +8,9 @@ server.py（启动绑定与 Host 校验装配）与 model_proxy_cli.sh、hooker/
 - 有 listen 段：host 与 port 必须齐全且合法，缺任一或非法值 → ListenConfigError
   （fail-fast，不静默回退）；此时配置为唯一权威，MODEL_PROXY_PORT 不再生效。
 - MODEL_PROXY_PORT 本身非法（非数字/越界 1-65535）时，无论哪条路径都失败。
-- allow_hosts：非字符串数组或含空串 → 失败；listen.host 非 loopback 而 allow_hosts
+- allow_hosts：非字符串数组或含空串 → 失败；条目结构必须可被 parse_host_authority
+  解析、带端口时端口必须等于监听端口（请求 Host 端口恒等于监听端口，不符 = 永不
+  匹配 = 必为配错），任一违规启动失败；listen.host 非 loopback 而 allow_hosts
   为空 → 失败（开放监听必须声明放行目标）；绑 loopback 时不启用 Host 校验。
 - listen 仅启动时读取，修改后需重启生效，不做热重载。
 
@@ -20,6 +22,7 @@ server.py（启动绑定与 Host 校验装配）与 model_proxy_cli.sh、hooker/
 
 from __future__ import annotations
 
+import ipaddress
 import json
 import os
 import sys
@@ -34,6 +37,68 @@ LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "::1"})
 
 class ListenConfigError(Exception):
     """listen/allow_hosts 配置非法。fail-fast：调用方（server 启动 / CLI）应终止。"""
+
+
+def _parse_port_literal(s: str) -> int:
+    """端口字面量校验：纯数字且 1-65535，否则 ValueError。"""
+    if not (s.isascii() and s.isdigit()):
+        raise ValueError(f"端口非数字: {s!r}")
+    port = int(s)
+    if not (1 <= port <= 65535):
+        raise ValueError(f"端口越界: {s!r}")
+    return port
+
+
+def parse_host_authority(authority: str) -> tuple[str, int | None]:
+    """结构化解析 Host 头/白名单条目的 authority → (hostname 小写, port|None)。
+
+    自 core/server.py 下沉至此（listen_config 是仅依赖标准库的单一真相源模块，
+    server/cli/脚本模式共用一份实现）。
+
+    契约（见 docs/designs/2026-08-26-本地三服务开放家庭局域网-v2.md §2.1）：
+    - 拒绝 userinfo（@）、路径字符（/?#）、空 hostname、非法/越界端口、尾随点；
+    - 括号 IPv6（[::1]:18889）走独立分支结构化解析，未加括号的多冒号串拒绝
+      ——禁止简单 split(":")；
+    - hostname 按 ASCII 统一小写后返回（大小写不敏感比较由调用方对小写值进行）。
+    畸形输入一律 ValueError，不抛其他异常。
+    """
+    if not isinstance(authority, str) or not authority:
+        raise ValueError("authority 为空")
+    if any(c in authority for c in "@/?#"):
+        raise ValueError(f"含 userinfo/路径字符: {authority!r}")
+    if authority.startswith("["):
+        close = authority.find("]")
+        if close == -1:
+            raise ValueError(f"IPv6 括号未闭合: {authority!r}")
+        host = authority[1:close]
+        rest = authority[close + 1:]
+        if not host:
+            raise ValueError("IPv6 字面量为空")
+        try:
+            ipaddress.IPv6Address(host)
+        except ValueError as e:
+            raise ValueError(f"非法 IPv6 字面量: {authority!r}") from e
+        port = None
+        if rest:
+            if not rest.startswith(":") or len(rest) == 1:
+                raise ValueError(f"非法端口后缀: {authority!r}")
+            port = _parse_port_literal(rest[1:])
+    else:
+        if "[" in authority or "]" in authority:
+            raise ValueError(f"括号错位: {authority!r}")
+        if authority.count(":") > 1:
+            raise ValueError(f"未加括号的多冒号（IPv6 须用 [] 括起）: {authority!r}")
+        if ":" in authority:
+            host, _, port_s = authority.partition(":")
+            port = _parse_port_literal(port_s)
+        else:
+            host, port = authority, None
+        if not host:
+            raise ValueError("hostname 为空")
+    host = host.lower()
+    if host.endswith("."):
+        raise ValueError(f"不接受尾随点: {authority!r}")
+    return host, port
 
 
 def _valid_port_value(value) -> bool:
@@ -79,6 +144,29 @@ def _load_config(config_path: str | os.PathLike) -> dict:
     return config
 
 
+def _validate_allow_hosts(allow_hosts: list[str], listen_port: int) -> None:
+    """allow_hosts 条目结构/端口校验（fail-fast，不静默全拒）。
+
+    运行时匹配语义（core/server.py is_host_allowed）：请求 Host 的端口恒等于
+    监听端口，条目端口与监听端口不符 → 永不匹配，必为配错；结构无法解析的条目
+    同样永不匹配。启动即拦截并报条目原文与原因。无端口条目合法（缺省匹配，
+    现有语义保留）。loopback 监听同样校验（与类型校验一致，不因无暴露面豁免），
+    避免日后切开放监听时才暴露配错。
+    """
+    for entry in allow_hosts:
+        try:
+            _, entry_port = parse_host_authority(entry)
+        except ValueError as e:
+            raise ListenConfigError(
+                f"allow_hosts 条目结构非法: {entry!r}（{e}）") from e
+        if entry_port is not None and entry_port != listen_port:
+            raise ListenConfigError(
+                f"allow_hosts 条目端口与监听端口不符: {entry!r}"
+                f"（条目端口 {entry_port} ≠ 监听端口 {listen_port}；"
+                "请求 Host 端口恒等于监听端口，端口不符的条目永不匹配，必为配错；"
+                "不带端口的条目合法）")
+
+
 def resolve_listen(config_path: str | os.PathLike,
                    env_port: str | None = None) -> dict:
     """解析 listen 段 + allow_hosts。
@@ -119,6 +207,8 @@ def resolve_listen(config_path: str | os.PathLike,
         raise ListenConfigError(
             "allow_hosts 必须为非空字符串数组（类型不符或含空串均启动失败，"
             "不静默忽略）")
+
+    _validate_allow_hosts(allow_hosts, port)
 
     host_check_enabled = host.lower() not in LOOPBACK_HOSTS
     if host_check_enabled and not allow_hosts:
