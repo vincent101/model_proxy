@@ -3,8 +3,10 @@ tools/model_proxy/core/server.py — 本地多协议路由代理主体
 
 多协议 AI 模型代理主程序：HTTP server、路由决策、转发编排、协议转换、控制 API。
 入口为 tools/model_proxy/model_proxy.py（thin wrapper 调用本模块 main()）。
-端口 18889、配置 tools/model_proxy/config/model_proxy_config.json（可用 MODEL_PROXY_CONFIG
-环境变量覆盖）、进程锁 /tmp/model_proxy.lock、日志 tools/model_proxy/.model_proxy.log。
+监听地址默认 127.0.0.1:18889，可经 config listen 段配置（回退矩阵与 allow_hosts
+Host 白名单见 core/listen_config.py）、配置 tools/model_proxy/config/model_proxy_config.json
+（可用 MODEL_PROXY_CONFIG 环境变量覆盖）、进程锁 /tmp/model_proxy.lock、
+日志 tools/model_proxy/.model_proxy.log。
 （v1 proxy.py 于 2026-07-24 下线删除，本模块为唯一代理实现。）
 
 仅使用 Python 标准库，不引入第三方依赖。
@@ -32,6 +34,7 @@ from typing import Any, Callable
 # 合并后的双向协议转换器（core 包内相对导入）
 from . import session_identity
 from . import translate as pt
+from .listen_config import ListenConfigError, parse_host_authority, resolve_listen
 from .commands import (
     CMD_PREFIX,
     COMMAND_HANDLERS,
@@ -1343,6 +1346,70 @@ def _responses_failed_event(adapter: "pt.AnthropicToResponsesStreamAdapter", mes
 
 
 # ---------------------------------------------------------------------------
+# Host 头校验（listen.host 非 loopback 时启用）
+#
+# 安全定位（必须如实认知）：Host 头是客户端可控的 HTTP 头，allow_hosts 仅缓解浏览器
+# DNS rebinding 攻击，不是客户端鉴权，也不能限制局域网设备访问——任意可达设备都可
+# 伪造 Host 通过。真正的边界是"可信 LAN + 无公网映射 + client_token"，不得把本白名单
+# 描述为网络边界。loopback Host（localhost/127.0.0.1/[::1]，含带端口）代码内置恒放行，
+# 不进配置——本机 cli.sh / ensure 脚本 / Claude Code（MODEL_PROXY_BASE 固定 127.0.0.1）
+# 永不因白名单漏配而断。
+# ---------------------------------------------------------------------------
+
+_LOOPBACK_HOST_NAMES = frozenset({"localhost", "127.0.0.1", "::1"})
+
+
+def is_host_allowed(host_value: str, *, listen_port: int,
+                    allow_hosts: list[str]) -> bool:
+    """单个 Host 头值是否放行：loopback 恒放行；其余端口必须存在且与监听端口一致，
+    且命中 allow_hosts 条目（hostname 小写比较，条目端口缺省匹配任意端口）。
+    畸形 authority 一律不放行。"""
+    try:
+        host, port = parse_host_authority(host_value)
+    except ValueError:
+        return False
+    if host in _LOOPBACK_HOST_NAMES:
+        return True  # loopback 恒放行（含带端口形式；端口值不参与判定）
+    if port is None or port != listen_port:
+        return False  # 端口必须存在且与监听端口一致（host:* 形式不支持）
+    for entry in allow_hosts:
+        try:
+            e_host, e_port = parse_host_authority(entry)
+        except ValueError:
+            continue  # 畸形条目不匹配（类型/结构/端口合法性已在启动时由 listen_config 校验）
+        if host == e_host and (e_port is None or e_port == listen_port):
+            return True
+    return False
+
+
+def check_request_host(host_values: list[str], *, listen_port: int,
+                       allow_hosts: list[str]) -> bool:
+    """Host 头集合校验：缺失（空列表）或重复（多于一个）拒绝，不取第一个；
+    单值走 is_host_allowed。"""
+    if len(host_values) != 1:
+        return False
+    return is_host_allowed(host_values[0], listen_port=listen_port,
+                           allow_hosts=allow_hosts)
+
+
+class HostHeaderValidator:
+    """Host 头白名单校验器（仅 DNS rebinding 防护，非访问控制）。
+
+    main() 在 listen.host 非 loopback 时装配到 server.host_validator；
+    handler 层所有路由之前调用（含 /model_proxy 控制接口），与 client_token/
+    admin_token 认证正交。
+    """
+
+    def __init__(self, listen_port: int, allow_hosts: list[str]):
+        self.listen_port = listen_port
+        self.allow_hosts = list(allow_hosts)
+
+    def check(self, host_values: list[str]) -> bool:
+        return check_request_host(host_values, listen_port=self.listen_port,
+                                  allow_hosts=self.allow_hosts)
+
+
+# ---------------------------------------------------------------------------
 # ModelProxyHandler（控制 API + 转发编排）
 # ---------------------------------------------------------------------------
 
@@ -1364,9 +1431,29 @@ class ModelProxyHandler(BaseHTTPRequestHandler):
     # dispatch
     # ------------------------------------------------------------------
 
+    def _host_check(self) -> bool:
+        """Host 头校验守卫：通过返回 True；不通过已回 403 并返回 False。
+
+        仅 listen.host 非 loopback 时启用（server.host_validator 由 main() 装配，
+        None 即未启用，行为与旧版完全一致）。置于所有路由之前（含控制接口），
+        缺失/重复 Host、畸形 authority、白名单外一律拒绝。
+        """
+        validator = getattr(self.server, "host_validator", None)
+        if validator is None:
+            return True
+        values = self.headers.get_all("Host") or []
+        if validator.check(values):
+            return True
+        log.warning("host_check.reject req_id=%s host=%r path=%s",
+                    _req_local.req_id, values, self.path)
+        self._send_json(403, {"error": "host not allowed"})
+        return False
+
     def do_GET(self):
         _req_local.req_id = uuid.uuid4().hex[:8]
         try:
+            if not self._host_check():
+                return
             if self.path.startswith(_CONTROL_PATH_PREFIX):
                 self._dispatch_control("GET")
             else:
@@ -1377,6 +1464,8 @@ class ModelProxyHandler(BaseHTTPRequestHandler):
     def do_POST(self):
         _req_local.req_id = uuid.uuid4().hex[:8]
         try:
+            if not self._host_check():
+                return
             if self.path.startswith(_CONTROL_PATH_PREFIX):
                 self._dispatch_control("POST")
             else:
@@ -1387,6 +1476,8 @@ class ModelProxyHandler(BaseHTTPRequestHandler):
     def do_PUT(self):
         _req_local.req_id = uuid.uuid4().hex[:8]
         try:
+            if not self._host_check():
+                return
             self._forward_logged("PUT")
         finally:
             _req_local.req_id = None
@@ -1394,6 +1485,8 @@ class ModelProxyHandler(BaseHTTPRequestHandler):
     def do_DELETE(self):
         _req_local.req_id = uuid.uuid4().hex[:8]
         try:
+            if not self._host_check():
+                return
             self._forward_logged("DELETE")
         finally:
             _req_local.req_id = None
@@ -1401,6 +1494,8 @@ class ModelProxyHandler(BaseHTTPRequestHandler):
     def do_PATCH(self):
         _req_local.req_id = uuid.uuid4().hex[:8]
         try:
+            if not self._host_check():
+                return
             self._forward_logged("PATCH")
         finally:
             _req_local.req_id = None
@@ -2873,7 +2968,17 @@ class ModelProxyHandler(BaseHTTPRequestHandler):
 
 def main():
     config_path = _DEFAULT_CONFIG_PATH
-    port = int(os.environ.get("MODEL_PROXY_PORT", "18889"))
+
+    # 0. 解析 listen/allow_hosts（回退矩阵见 core/listen_config.py；与 cli.sh/
+    #    ensure_model_proxy.sh 共用同一实现）。fail-fast：非法配置在任何副作用
+    #    （锁/账本/日志截断）之前退出，stderr 信息随 nohup 落入日志文件。
+    try:
+        listen_cfg = resolve_listen(config_path,
+                                    os.environ.get("MODEL_PROXY_PORT"))
+    except ListenConfigError as e:
+        print(f"model_proxy: listen/allow_hosts 配置非法，启动失败：{e}",
+              file=sys.stderr)
+        raise SystemExit(1)
 
     # 0. 解析运行时路径（bootstrap，不依赖 ConfigStore；文件缺失/corrupt 回退默认值）
     global _runtime_paths
@@ -2923,16 +3028,25 @@ def main():
     # 与主 config 同目录，代理独占写，见 docs/designs/2026-08-04-in-band-route-command-design.md §4.5）
     sidecar_store = SessionOverridesSidecar(config_path.parent / "session_overrides.json")
 
-    # 3. 启动 ThreadingHTTPServer
-    server = ThreadingHTTPServer(("127.0.0.1", port), ModelProxyHandler)
+    # 3. 启动 ThreadingHTTPServer（监听地址来自 listen 段/回退矩阵，见 listen_config）
+    server = ThreadingHTTPServer(
+        (listen_cfg["host"], listen_cfg["port"]), ModelProxyHandler)
     server.config_store = config_store    # type: ignore[attr-defined]
     server.cooldown_store = cooldown_store  # type: ignore[attr-defined]
     server.stream_health_store = stream_health_store  # type: ignore[attr-defined]
     server.pref_store = pref_store        # type: ignore[attr-defined]
     server.sidecar_store = sidecar_store  # type: ignore[attr-defined]
+    # Host 头校验仅 listen.host 非 loopback 时装配（None = 未启用，loopback 无暴露面）
+    server.host_validator = (  # type: ignore[attr-defined]
+        HostHeaderValidator(listen_cfg["port"], listen_cfg["allow_hosts"])
+        if listen_cfg["host_check_enabled"] else None)
 
-    log.info("startup.listening port=%d pid=%d config_path=%s",
-             port, os.getpid(), str(config_path))
+    log.info("startup.listening host=%s port=%d pid=%d config_path=%s "
+             "host_check=%s allow_hosts=%d",
+             listen_cfg["host"], listen_cfg["port"], os.getpid(),
+             str(config_path),
+             "on" if listen_cfg["host_check_enabled"] else "off",
+             len(listen_cfg["allow_hosts"]))
     try:
         server.serve_forever()
     except KeyboardInterrupt:

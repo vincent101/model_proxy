@@ -3,12 +3,26 @@
 # 手动控制 model_proxy.py（http://127.0.0.1:18889/model_proxy/*）。
 # 用法：model_proxy_cli.sh <子命令> [参数]
 
-MODEL_PROXY_PORT="${MODEL_PROXY_PORT:-18889}"
-MODEL_PROXY_BASE="http://127.0.0.1:${MODEL_PROXY_PORT}"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CONFIG_FILE="${MODEL_PROXY_CONFIG:-$SCRIPT_DIR/config/model_proxy_config.json}"
 PATHS_FILE="$SCRIPT_DIR/config/runtime_paths.json"
 CONFIG_OPS="$SCRIPT_DIR/_config_ops.py"
+
+# ---- 监听端口解析（与 server.py 共用 core/listen_config.py，单一实现）----
+# 有 listen 段以配置为准；无段回退 MODEL_PROXY_PORT/18889。配置非法（含
+# MODEL_PROXY_PORT 本身非法）直接退出，与 server 启动行为一致（fail-fast）。
+# MODEL_PROXY_BASE 固定 127.0.0.1：本机控制命令不经外部地址绕行。
+resolve_listen_config() {
+  local out
+  if ! out=$(python3 "$SCRIPT_DIR/core/listen_config.py" --shell "$CONFIG_FILE" "${MODEL_PROXY_PORT:-}" 2>&1); then
+    echo "Error: listen/allow_hosts 配置非法: $out" >&2
+    exit 1
+  fi
+  eval "$out"
+  MODEL_PROXY_PORT="$LISTEN_PORT"
+  MODEL_PROXY_BASE="http://127.0.0.1:${MODEL_PROXY_PORT}"
+}
+resolve_listen_config
 
 # ---- 从 runtime_paths.json 加载运行时路径（启动时执行一次）----
 # 注意：eval 注入的 shell 变量名必须与后续代码使用的变量名完全一致。

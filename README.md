@@ -102,6 +102,42 @@ session override 的唯一来源是独立 sidecar 文件 `config/session_overrid
 
 字段明细、protocol 推断、route_pool 分配算法、session override sidecar 见 [CONFIG.md](docs/CONFIG.md)。
 
+### 监听配置：`listen` 与 `allow_hosts`
+
+默认监听 `127.0.0.1:18889`。config 顶层新增两个键（`example.json` 已含安全默认值；JSON 不支持注释，语义以本节为准）：
+
+```json
+"listen": { "host": "127.0.0.1", "port": 18889 },
+"allow_hosts": []
+```
+
+**回退矩阵**（server 启动、`model_proxy_cli.sh`、`hooker/ensure_model_proxy.sh` 三处共用 `core/listen_config.py` 同一实现，行为一致）：
+
+| 场景 | host | port |
+|---|---|---|
+| 无 `listen` 段 | 固定 `127.0.0.1` | 取 `MODEL_PROXY_PORT`（合法时），否则 `18889` |
+| 有 `listen` 段 | 段内 `host`（必须非空） | 段内 `port`（必须 1-65535），`MODEL_PROXY_PORT` 不再生效 |
+
+**fail-fast 规则**（以下任一命中即启动失败，报错明确、不静默回退）：
+
+- 写了 `listen` 段但缺 `host` 或缺 `port`、`host` 为空、`port` 非数字或越界；
+- `MODEL_PROXY_PORT` 本身非法（非数字/越界），无论哪条路径；
+- `allow_hosts` 不是非空字符串数组（含空串）；
+- `listen.host` 非 loopback 而 `allow_hosts` 为空——开放监听必须声明放行目标。
+
+**`allow_hosts` 语义**（Host 头白名单，条目带端口，如 `"mba-xxx.local:18889"`；DNS 名一律写小写；条目不带端口则匹配该主机任意端口）：
+
+- 仅在 `listen.host` 为非 loopback（如 `0.0.0.0`）时启用校验；绑 loopback 时无暴露面、不校验，行为与旧版完全一致。
+- loopback Host（`localhost`/`127.0.0.1`/`[::1]`，含带端口形式）代码内置恒放行，**不进配置**——本机 `cli.sh`/ensure 脚本/Claude Code 永不因白名单漏配而断。
+- 校验置于所有路由之前（含 `/model_proxy` 控制接口）：缺失 Host、重复 Host、畸形 authority（userinfo/非法端口/尾随点/未加括号的 IPv6）、端口与监听端口不一致、白名单外 Host 一律 403。
+- **安全定位（必须如实认知）**：Host 头是客户端可控的 HTTP 头。`allow_hosts` **仅缓解浏览器 DNS rebinding 攻击，不是客户端鉴权，也不能限制局域网设备访问**——任意可达设备都可伪造 `Host: 127.0.0.1` 或白名单值通过。真正的边界是"可信 LAN + 路由器无公网映射 + client_token"；禁止端口转发/UPnP/DMZ 等公网暴露。
+
+**开放家庭局域网部署步骤**：
+
+1. `config/model_proxy_config.json` 中把 `listen.host` 改为 `0.0.0.0`（或具体 LAN IP），`allow_hosts` 填入小写 `.local` 名与 DHCP 保留 IP 条目（均带端口，两种都要）；
+2. 重启生效：`model_proxy_cli.sh off && model_proxy_cli.sh on`——`listen`/`allow_hosts` 仅启动时读取，**不参与热重载**；
+3. 客户端 base_url 填 `http://<主机名或IP>:18889/` 并配 client_token。离开家庭网络（接入热点/公共 Wi-Fi）时建议 `off` 停服务。
+
 ## 4. 请求处理流程
 
 ```
@@ -224,7 +260,7 @@ token 里选定）过滤候选 client_token；无匹配协议的 token 时提示
 | hermes | `http://localhost:18889/` | 打印片段供手动粘贴（标准库无 yaml writer） |
 | openclaw | `http://localhost:18889/` | 写入 `providers.<name>.baseUrl`；json5 专属语法则降级打印 |
 
-（端口随 `MODEL_PROXY_PORT` 变化，上表以默认 18889 为例。）
+（端口默认 18889，可经 `MODEL_PROXY_PORT` 或 config `listen` 段配置，见「监听配置」；上表以默认为例。）
 
 ## 8. 已知限制
 
@@ -291,7 +327,8 @@ tools/model_proxy/
 ├── _config_ops.py                     # supply/route/strategy 的增删改实现（被 cli 调用）
 ├── _install_ops.py                    # install 子命令实现（四个 SDK 接入）
 ├── core/                              # 核心实现包
-│   ├── server.py                      # 主体：HTTP server、路由决策、转发编排、控制 API
+│   ├── server.py                      # 主体：HTTP server、路由决策、转发编排、控制 API、Host 头校验
+│   ├── listen_config.py               # listen/allow_hosts 配置解析（server 与 cli/ensure 共用的单一实现）
 │   ├── translate.py                   # 多协议结构转换器（Anthropic⇄Chat / Responses⇄Anthropic / Anthropic⇄Responses）
 │   └── reasoning/                     # effort/thinking 强度处理领域层
 │       ├── ladder.py                  # canonical 强度全序 + budget↔canonical 换算
