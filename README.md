@@ -262,6 +262,48 @@ token 里选定）过滤候选 client_token；无匹配协议的 token 时提示
 
 （端口默认 18889，可经 `MODEL_PROXY_PORT` 或 config `listen` 段配置，见「监听配置」；上表以默认为例。）
 
+### 局域网远程接入（另一台电脑）
+
+服务端按「监听配置」开放（`listen.host=0.0.0.0` + `allow_hosts` 白名单）后，同一家庭局域网内的另一台电脑可以直连使用。完整设计见 NoteVault vault 的 `docs/designs/2026-08-26-本地三服务开放家庭局域网-v2.md`（含寻址取舍、防火墙、验证清单）。
+
+**寻址**：服务端跑 `scutil --get LocalHostName` 取主机名，客户端用其**小写形式**的 mDNS 名（如 `mba-xxx.local`）；路由器 DHCP 保留 IP 作为回退地址。两种地址都须已列入服务端 `allow_hosts` 白名单（带端口），否则该形式直连会被 403。
+
+**Claude Code 接入**（另一台电脑的 `~/.claude/settings.json`，`env` 段合并写入）：
+
+```json
+{
+  "env": {
+    "ANTHROPIC_BASE_URL": "http://<主机名>.local:18889/",
+    "ANTHROPIC_AUTH_TOKEN": "<client_token>",
+    "ANTHROPIC_DEFAULT_OPUS_MODEL": "claude-opus",
+    "ANTHROPIC_DEFAULT_SONNET_MODEL": "claude-sonnet",
+    "ANTHROPIC_DEFAULT_HAIKU_MODEL": "claude-haiku"
+  }
+}
+```
+
+与本地 `install` 的唯一区别是 base_url 从 `localhost` 换成 `<主机名>.local`；也可先在本机跑 `install` 生成配置，再到远程机器上改 base_url 一行。token 只用 client_token，绝不把上游 appkey 复制到客户端。配置后完全退出并重启 Claude Code 生效。
+
+**同机一并开放的两个 MCP 服务**（与本代理同一套开放方案，客户端 `.mcp.json` 示例）：
+
+```json
+{
+  "mcpServers": {
+    "open-websearch": { "type": "http", "url": "http://<主机名>.local:3000/mcp" },
+    "friday-websearch": { "type": "http", "url": "http://<主机名>.local:3001/mcp" }
+  }
+}
+```
+
+**连通验证**（远程机器上）：
+
+```bash
+nc -vz <主机名>.local 18889   # 三端口各测一次；通则 TCP 可达
+# model_proxy 冒烟：用 Claude Code 发一条最小消息，服务端 .model_proxy.log 出现 ACCESS 行即接入成功
+```
+
+**可用性边界**：服务端 Mac 关机/睡眠/离开家庭网络时三服务不可达，且远端请求无法触发本机的懒启动 hook——恢复方式是在 Mac 上开一次 Claude Code 会话或手动跑两个 ensure 脚本（详见上述设计文档第 3 节）。
+
 ## 8. 已知限制
 
 - model_proxy 已独立为 git repo（远端 `https://github.com/vincent101/model_proxy.git`），可独立 clone 使用。
