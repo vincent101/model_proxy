@@ -1024,6 +1024,7 @@ _MODEL_TIER_MAP = {
     "claude-opus": "opus",
     "claude-sonnet": "sonnet",
     "claude-haiku": "haiku",
+    "claude-fable": "fable",
 }
 
 
