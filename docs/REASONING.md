@@ -64,7 +64,7 @@ budget 分档断点（Anthropic `thinking.budget_tokens` 语义）是全局固�
 ## 5. source 能力为何挂 strategy
 
 **为什么 source 能力挂在 strategy（按 client_token）下、而不是按表面模型名声明**：表面模型名
-（`claude-opus`/`claude-sonnet`/`claude-haiku`）只是客户端请求体里的 tier 选择器字符串，会被
+（`claude-fable`/`claude-opus`/`claude-sonnet`/`claude-haiku`）只是客户端请求体里的 tier 选择器字符串，会被
 多个 SDK 共享——codex-cli 也固定发 `model="claude-sonnet"`（见 README「SDK 接入」的
 install 逻辑），跟 Claude Code 发的 `claude-sonnet` 同名，但两者是不同的客户端接入、理应能配
 不同档位声明。真正代表"哪个客户端接入"的身份是 `client_token`（一个 token 一条 strategy，

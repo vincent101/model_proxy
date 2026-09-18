@@ -32,6 +32,16 @@
       "target_model": "claude-haiku-3.5"
     },
     {
+      "id": "claude-fable-k0",
+      "url": "https://aigc.sankuai.com/v1/anthropic/v1/messages",
+      "protocol": "anthropic",
+      "appkey": "<APPKEY_PLACEHOLDER>",
+      "target_model": "claude-fable-1",
+      "reasoning_capability": {
+        "effort_enum": ["low", "medium", "high", "xhigh", "max"]
+      }
+    },
+    {
       "id": "glm-sonnet-k0",
       "url": "https://aigc.sankuai.com/v1/anthropic/v1/messages",
       "protocol": "anthropic",
@@ -46,6 +56,7 @@
     {
       "id": "claude",
       "tiers": {
+        "fable": ["claude-fable-k0"],
         "opus": ["claude-opus-k0"],
         "sonnet": ["claude-sonnet-k0"],
         "haiku": ["claude-haiku-k0"]
@@ -55,6 +66,7 @@
     {
       "id": "glm",
       "tiers": {
+        "fable": ["glm-sonnet-k0"],
         "opus": ["glm-sonnet-k0"],
         "sonnet": ["glm-sonnet-k0"],
         "haiku": ["glm-sonnet-k0"]
@@ -67,6 +79,7 @@
       "client_token": "cc",
       "route_id": "claude",
       "tiers_source_capability": {
+        "fable":  {"effort_enum": ["low", "medium", "high", "xhigh", "max"]},
         "opus":   {"effort_enum": ["off", "low", "medium", "high", "xhigh"]},
         "sonnet": {"effort_enum": ["off", "low", "medium", "high", "xhigh"]},
         "haiku":  {"effort_enum": ["off", "low", "medium", "high"]}
@@ -77,6 +90,7 @@
       "client_token": "cc-glm",
       "route_id": "glm",
       "tiers_source_capability": {
+        "fable":  {"effort_enum": ["low", "medium", "high", "xhigh", "max"]},
         "opus":   {"effort_enum": ["off", "low", "medium", "high", "xhigh"]},
         "sonnet": {"effort_enum": ["off", "low", "medium", "high", "xhigh"]},
         "haiku":  {"effort_enum": ["off", "low", "medium", "high"]}

@@ -1,6 +1,7 @@
 # Changelog
 
 ## Unreleased
+- fable 档支持：_MODEL_TIER_MAP 新增 `claude-fable`→fable 映射（config 示例与文档同步补齐）
 - session 身份展示：新增 core/session_identity.py 只读解析 ~/.claude/sessions 注册表
   （按次扫描不缓存，坏 JSON/缺字段跳过，同 UUID 多进程取 procStart 最新）；
   CLI status 活跃 session 行首附 `name · uuid8`（段标题注明 name 为当前注册快照），

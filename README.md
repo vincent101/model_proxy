@@ -47,6 +47,7 @@ tools/model_proxy/model_proxy_cli.sh install
 ```
 ANTHROPIC_BASE_URL=http://localhost:18889/
 ANTHROPIC_AUTH_TOKEN=<你选的 client_token>
+ANTHROPIC_DEFAULT_FABLE_MODEL=claude-fable
 ANTHROPIC_DEFAULT_OPUS_MODEL=claude-opus
 ANTHROPIC_DEFAULT_SONNET_MODEL=claude-sonnet
 ANTHROPIC_DEFAULT_HAIKU_MODEL=claude-haiku
@@ -229,9 +230,9 @@ token→route 绑定。
 支持四个 SDK：
 
 - **claude**（Claude Code，Anthropic 协议）：写 `~/.claude/settings.json` 的
-  `env.ANTHROPIC_BASE_URL`/`ANTHROPIC_AUTH_TOKEN`，并补齐三个档位环境变量
-  （`ANTHROPIC_DEFAULT_OPUS_MODEL`/`_SONNET_MODEL`/`_HAIKU_MODEL` 固定填
-  `claude-opus`/`claude-sonnet`/`claude-haiku`）；同时确保 `~/.claude.json` 含
+  `env.ANTHROPIC_BASE_URL`/`ANTHROPIC_AUTH_TOKEN`，并补齐四个档位环境变量
+  （`ANTHROPIC_DEFAULT_FABLE_MODEL`/`_OPUS_MODEL`/`_SONNET_MODEL`/`_HAIKU_MODEL` 固定填
+  `claude-fable`/`claude-opus`/`claude-sonnet`/`claude-haiku`）；同时确保 `~/.claude.json` 含
   `hasCompletedOnboarding=true`（新机器跳过官方登录引导）。
 - **codex**（codex-cli，Responses 协议）：写 `~/.codex/config.toml` 的
   `[model_providers.model_proxy]` 段（`base_url`/`wire_api="responses"`/`experimental_bearer_token`
@@ -275,6 +276,7 @@ token 里选定）过滤候选 client_token；无匹配协议的 token 时提示
   "env": {
     "ANTHROPIC_BASE_URL": "http://<主机名>.local:18889/",
     "ANTHROPIC_AUTH_TOKEN": "<client_token>",
+    "ANTHROPIC_DEFAULT_FABLE_MODEL": "claude-fable",
     "ANTHROPIC_DEFAULT_OPUS_MODEL": "claude-opus",
     "ANTHROPIC_DEFAULT_SONNET_MODEL": "claude-sonnet",
     "ANTHROPIC_DEFAULT_HAIKU_MODEL": "claude-haiku"

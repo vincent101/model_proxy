@@ -14,9 +14,9 @@
     {"id": "ds-flash-sankuai-xxxx","url": "https://aigc.sankuai.com/v1/anthropic/v1/messages","protocol": "anthropic","appkey": "xxx","target_model": "deepseek-v4-flash","reasoning_capability": {"effort_enum": ["high"]}}
   ],
   "routes": [
-    {"id": "nation1","tiers": {"opus": ["glm-53-sankuai-xxxx"],"sonnet": ["ds-pro-sankuai-xxxx"],"haiku": ["ds-flash-sankuai-xxxx"]},"failover": "on"}
+    {"id": "nation1","tiers": {"fable": ["glm-53-sankuai-xxxx"],"opus": ["glm-53-sankuai-xxxx"],"sonnet": ["ds-pro-sankuai-xxxx"],"haiku": ["ds-flash-sankuai-xxxx"]},"failover": "on"}
   ],
   "strategies": [
-    {"client_token": "cc","route_pool": [{"route_id":"openai1","weight":1}],"tiers_source_capability": {"opus": {"effort_enum": ["low","medium","high","xhigh","max"]},"sonnet": {"effort_enum": ["low","medium","high","xhigh","max"]},"haiku": {"effort_enum": ["low","medium","high","max"]}},"note": "Claude Code SDK"}
+    {"client_token": "cc","route_pool": [{"route_id":"openai1","weight":1}],"tiers_source_capability": {"fable": {"effort_enum": ["low","medium","high","xhigh","max"]},"opus": {"effort_enum": ["low","medium","high","xhigh","max"]},"sonnet": {"effort_enum": ["low","medium","high","xhigh","max"]},"haiku": {"effort_enum": ["low","medium","high","max"]}},"note": "Claude Code SDK"}
   ]
 }

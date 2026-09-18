@@ -40,16 +40,17 @@
      session_key 一致性哈希，排出一个有序候选列表（详见 [CONFIG.md](CONFIG.md)「route_pool
      哈希分配」）。
    - 候选列表为空 → 401（no strategy/route matched）。
-2. 把请求体 `model` 字段精确查表映射成 tier 名（`claude-opus`→opus / `claude-sonnet`→
-   sonnet / `claude-haiku`→haiku，仅这三个精确值，非子串猜测）。tier 解析只与 `model` 有关，
+2. 把请求体 `model` 字段精确查表映射成 tier 名（`claude-fable`→fable / `claude-opus`→
+   opus / `claude-sonnet`→sonnet / `claude-haiku`→haiku，仅这四个精确值，非子串猜测）。
+   tier 解析只与 `model` 有关，
    与候选哪个 route 无关。
 3. 按候选列表顺序逐个尝试 route：取该 route 的 `tiers[tier]` supplies 列表，交给同 route 内
    failover 逐个选未冷却的 supply；若该候选 route 缺 tier 配置或该 tier 下所有 supply 都不可用，
    换下一个候选 route 重试（记 `route_failover=1`），直到某候选可用或候选耗尽。
 
-`model` 字段不是上述三个预设值之一时，选路直接 400 失败，不兜底。`settings.json` 里的
-`ANTHROPIC_DEFAULT_OPUS_MODEL`/`_SONNET_MODEL`/`_HAIKU_MODEL` 固定填
-`claude-opus`/`claude-sonnet`/`claude-haiku`；切换单值写法的家族用 `switch`，不动 model 标签。
+`model` 字段不是上述四个预设值之一时，选路直接 400 失败，不兜底。`settings.json` 里的
+`ANTHROPIC_DEFAULT_FABLE_MODEL`/`_OPUS_MODEL`/`_SONNET_MODEL`/`_HAIKU_MODEL` 固定填
+`claude-fable`/`claude-opus`/`claude-sonnet`/`claude-haiku`；切换单值写法的家族用 `switch`，不动 model 标签。
 
 ## 4. effort 映射链路
 
