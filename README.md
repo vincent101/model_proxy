@@ -24,7 +24,7 @@ cp tools/model_proxy/config/model_proxy_config.example.json \
 chmod 600 tools/model_proxy/config/model_proxy_config.json
 ```
 
-编辑 `config/model_proxy_config.json`，把所有 `<APPKEY_PLACEHOLDER>` 替换为真实 appkey（每个 supply 一条），`<ADMIN_TOKEN_PLACEHOLDER>` 替换为自定义控制 API 鉴权 token（Quick Start 不涉及控制 API，可暂时填任意值）。example.json 已含一条可用 strategy（`client_token: "cc"`,绑 `claude` 家族），配好 appkey 即可直接启动。配置字段完整说明见 [CONFIG.md](docs/CONFIG.md)。
+编辑 `config/model_proxy_config.json`，把所有 `"appkey": "xxx"` 替换为真实 appkey（每个 supply 一条），`admin_token` 替换为自定义控制 API 鉴权 token（Quick Start 不涉及控制 API，可暂时填任意值）。example.json 已含一条可用 strategy（`client_token: "cc"` 绑 `nation1` route）与四条示例 supply——其中三条为 aigc 系（配 appkey 即用），`glm-53-mcli-example` 展示自定义网关接入（`appkey_file` 从本地登录态读 token + `extra_headers`/`system_inject` 注入网关要求的客户端特征，无需 appkey）。配置字段完整说明见 [CONFIG.md](docs/CONFIG.md)。
 
 **② 启动代理**
 ```bash
