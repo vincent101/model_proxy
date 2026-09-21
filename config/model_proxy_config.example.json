@@ -1,7 +1,11 @@
 {
   "admin_token": "xaxaxaaxaxaxaxax",
+  "listen": {"host": "0.0.0.0", "port": 18889},
+  "allow_hosts": [],
   "cooldown_rules": [
     {"errorcode": [429,500,502,503,504],"cooldown_seconds": 60},
+    {"errorcode": [],"cooldown_seconds": 3600},
+    {"errorcode": [400],"cooldown_seconds": 5},
     {"errorcode": [401,402,403],"cooldown_seconds": 21600},
     {"errorcode": ["URLError"],"cooldown_seconds": 60}
   ],
@@ -11,7 +15,7 @@
     {"id": "glm-53-sankuai-xxxx","url": "https://aigc.sankuai.com/v1/anthropic/v1/messages","protocol": "anthropic","appkey": "xxx","target_model": "glm-5.3","reasoning_capability": {"effort_enum": ["high","max"]}},
     {"id": "ds-pro-sankuai-xxxx","url": "https://aigc.sankuai.com/v1/anthropic/v1/messages","protocol": "anthropic","appkey": "xxx","target_model": "deepseek-v4-pro","reasoning_capability": {"effort_enum": ["low","high","max"]}},
     {"id": "ds-flash-sankuai-xxxx","url": "https://aigc.sankuai.com/v1/anthropic/v1/messages","protocol": "anthropic","appkey": "xxx","target_model": "deepseek-v4-flash","reasoning_capability": {"effort_enum": ["high"]}},
-    {"id": "glm-53-mcli-example","url": "https://mcli.sankuai.com/v1/messages","protocol": "anthropic","appkey_file": "~/.config/mcopilot-cli/.config.yaml","target_model": "glm-5.3","extra_headers": {"X-Working-Dir": "/"},"system_inject": "x-anthropic-billing-header: cc_version=2.1.196; cc_entrypoint=sdk-cli; cch=00000;","reasoning_capability": {"effort_enum": ["off","low","medium","high"]}}
+    {"id": "glm-53-mcli-example","url": "https://mcli.sankuai.com/v1/messages","protocol": "anthropic","appkey_file": "~/.config/mcopilot-cli/.config.yaml","target_model": "glm-5.3","reasoning_capability": {"effort_enum": ["off","low","medium","high"]},"extra_headers": {"X-Working-Dir": "/"},"system_inject": "x-anthropic-billing-header: cc_version=2.1.196; cc_entrypoint=sdk-cli; cch=00000;"}
   ],
   "routes": [
     {"id": "nation1","tiers": {"fable": ["glm-53-sankuai-xxxx"],"opus": ["glm-53-sankuai-xxxx"],"sonnet": ["ds-pro-sankuai-xxxx","glm-53-mcli-example"],"haiku": ["ds-flash-sankuai-xxxx"]},"failover": "on"}
