@@ -77,10 +77,10 @@ tools/model_proxy/model_proxy_cli.sh logs
 
 client_token: "cc"            id: "claude"                   id: "claude-sonnet-k0"
 route_id: "claude"  --------> tiers:                          url / protocol
-tiers_source_                   opus:   [id, ...]  --------->  appkey / target_model
+tiers_source_                   opus:   [id, ...]  --------->  appkey(_file) / target_model
   capability (optional)         sonnet: [id, ...]   (by id)    reasoning_capability
-                                 haiku:  [id, ...]              (optional)
-                               failover: on / off
+                                 haiku:  [id, ...]              extra_headers / system_inject
+                               failover: on / off                (optional, 2026-09-20)
 
 一个 client_token               家族模板，不含 token，              一个 id = 一个上游端点，
 对应一条 strategy               可被多条 strategy 复用               多个 route 可共享同一个 supply
@@ -92,7 +92,11 @@ tiers_source_                   opus:   [id, ...]  --------->  appkey / target_m
 session override 的唯一来源是独立 sidecar 文件 `config/session_overrides.json`，通过 `$route` 命令
 或直接编辑该文件维护，不再是 strategy 的字段。
 
-- **supplies**：每条 = 一个上游端点（url + 协议 + appkey + target_model + 可选能力）。
+- **supplies**：每条 = 一个上游端点（url + 协议 + appkey 或 appkey_file + target_model + 可选能力
+  + 可选 extra_headers / system_inject）。后三个可选字段用于接入带客户端校验的自定义网关
+  （如 mcli/CatPaw：注入 `X-Working-Dir` 头与计费 system 块、鉴权值从本地登录态文件读取），
+  完整语义与配置样例见 [docs/CONFIG.md](docs/CONFIG.md) 速查表与
+  [docs/designs/2026-09-20-model_proxy接入mcli的supply层扩展.md](../docs/designs/2026-09-20-model_proxy接入mcli的supply层扩展.md)。
 - **routes**：家族模板，固定 opus/sonnet/haiku 三档，每档一个按优先级排列的 supply id 列表，
   取第一个未冷却的；route 本身不含 token，可被多条 strategy 复用。
 - **strategies**：把某个 client_token 绑定到某个 route——可以绑单个 route（`route_id`），也可以

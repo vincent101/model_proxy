@@ -297,7 +297,12 @@ class PassthroughTerminalTracker:
         self.saw_business_event = True
         if event.is_done:
             if self.source != "chat":
-                raise TranslationError("unexpected [DONE]", reason="malformed_stream")
+                # mcli 等网关会在语义完整的非 chat 流（如 anthropic message_stop）之后
+                # 追加 OpenAI 风格冗余 [DONE] 尾巴：终态已确认则忽略；
+                # 未确认（真 malformed，[DONE] 早于终态事件）仍报错。
+                if not self.confirmed:
+                    raise TranslationError("unexpected [DONE]", reason="malformed_stream")
+                return
             if self._anthropic_candidate is None:
                 raise TranslationError("[DONE] before finish_reason", reason="missing_stop_reason")
             self.terminal = self._anthropic_candidate

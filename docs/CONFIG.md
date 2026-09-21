@@ -56,11 +56,18 @@ session override 存放在独立 sidecar 文件 `config/session_overrides.json`�
 | `id` | string | 必填 | 唯一标识，routes 里按 id 引用 | — |
 | `url` | string | 必填 | 完整终态请求端点，代理不做拼接，只在其后拼接净化后的原始 query | — |
 | `protocol` | string | 可选 | `anthropic`/`chat`/`responses`，缺省从 url 尾缀推断，推断不出报 500 | 从 url 推断 |
-| `appkey` | string | 必填 | 鉴权用 Bearer token，注入转发请求 | — |
+| `appkey` | string | 与 appkey_file 二选一 | 鉴权用 Bearer token（静态），注入转发请求 | — |
+| `appkey_file` | string | 与 appkey 二选一 | 鉴权值的文件来源：每请求读取（~ 展开），逐行匹配 `AUTHORIZATION:` 前缀取值（mcopilot-cli 登录态）。读取失败该请求 500 且不冷却 | — |
 | `target_model` | string | 必填 | 实际下发给上游的模型名 | — |
 | `cooldown_seconds` | number | 可选 | 触发失败后的冷却时长 | 顶层 `default_cooldown_seconds` |
+| `extra_headers` | object | 可选 | 出站 header 注入，优先级最高（覆盖客户端透传值与内置注入）；禁止 `authorization`/`x-api-key`/`content-length` 键 | `{}` |
+| `system_inject` | string | 可选 | 注入计费标识等 system 块（前置合并进客户端 system，幂等）；仅 `protocol: anthropic` 的 supply 可配 | — |
 | `reasoning_capability.effort_enum` | string[] | 可选 | target 侧真实支持的 effort 档位有序列表 | 默认 5 档 `off/low/medium/high/xhigh` |
 | `reasoning_capability.off_alias` | string | 可选 | 关闭动作具体落到哪个档位 | 含 off 则落 off，否则不设（走 STRIP） |
+
+三个扩展字段的完整语义（合并矩阵/校验规则/失败语义）见
+[docs/designs/2026-09-20-model_proxy接入mcli的supply层扩展.md](../../docs/designs/2026-09-20-model_proxy接入mcli的supply层扩展.md)；
+mcli（CatPaw）supply 配置样例见该文档头部。
 
 ## 3. routes 字段
 

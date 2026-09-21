@@ -1,101 +1,167 @@
 {
-  "admin_token": "<ADMIN_TOKEN_PLACEHOLDER>",
-  "listen": { "host": "127.0.0.1", "port": 18889 },
-  "allow_hosts": [],
+  "admin_token": "xaxaxaaxaxaxaxax",
   "cooldown_rules": [
-    {"errorcode": [429, 500, 502, 503, 504], "cooldown_seconds": 60},
-    {"errorcode": [401, 402, 403], "cooldown_seconds": 21600},
-    {"errorcode": ["URLError"], "cooldown_seconds": 60}
+    {
+      "errorcode": [
+        429,
+        500,
+        502,
+        503,
+        504
+      ],
+      "cooldown_seconds": 60
+    },
+    {
+      "errorcode": [],
+      "cooldown_seconds": 3600
+    },
+    {
+      "errorcode": [
+        401,
+        402,
+        403
+      ],
+      "cooldown_seconds": 21600
+    },
+    {
+      "errorcode": [
+        "URLError"
+      ],
+      "cooldown_seconds": 60
+    }
   ],
-  "upstream_timeout_seconds": 1800,
-  "budget_retry": {"enabled": true, "max_retries": 5},
+  "upstream_timeout_seconds": 3600,
+  "budget_retry": {
+    "enabled": true,
+    "max_retries": 5
+  },
   "supplies": [
     {
-      "id": "claude-opus-k0",
+      "id": "glm-53-sankuai-xxxx",
       "url": "https://aigc.sankuai.com/v1/anthropic/v1/messages",
       "protocol": "anthropic",
-      "appkey": "<APPKEY_PLACEHOLDER>",
-      "target_model": "claude-opus-4"
-    },
-    {
-      "id": "claude-sonnet-k0",
-      "url": "https://aigc.sankuai.com/v1/anthropic/v1/messages",
-      "protocol": "anthropic",
-      "appkey": "<APPKEY_PLACEHOLDER>",
-      "target_model": "claude-sonnet-4"
-    },
-    {
-      "id": "claude-haiku-k0",
-      "url": "https://aigc.sankuai.com/v1/anthropic/v1/messages",
-      "protocol": "anthropic",
-      "appkey": "<APPKEY_PLACEHOLDER>",
-      "target_model": "claude-haiku-3.5"
-    },
-    {
-      "id": "claude-fable-k0",
-      "url": "https://aigc.sankuai.com/v1/anthropic/v1/messages",
-      "protocol": "anthropic",
-      "appkey": "<APPKEY_PLACEHOLDER>",
-      "target_model": "claude-fable-1",
+      "appkey": "xxx",
+      "target_model": "glm-5.3",
       "reasoning_capability": {
-        "effort_enum": ["low", "medium", "high", "xhigh", "max"]
+        "effort_enum": [
+          "high",
+          "max"
+        ]
       }
     },
     {
-      "id": "glm-sonnet-k0",
+      "id": "ds-pro-sankuai-xxxx",
       "url": "https://aigc.sankuai.com/v1/anthropic/v1/messages",
       "protocol": "anthropic",
-      "appkey": "<APPKEY_PLACEHOLDER>",
-      "target_model": "glm-5.2",
+      "appkey": "xxx",
+      "target_model": "deepseek-v4-pro",
       "reasoning_capability": {
-        "effort_enum": ["none", "minimal", "low", "medium", "high"]
+        "effort_enum": [
+          "low",
+          "high",
+          "max"
+        ]
+      }
+    },
+    {
+      "id": "ds-flash-sankuai-xxxx",
+      "url": "https://aigc.sankuai.com/v1/anthropic/v1/messages",
+      "protocol": "anthropic",
+      "appkey": "xxx",
+      "target_model": "deepseek-v4-flash",
+      "reasoning_capability": {
+        "effort_enum": [
+          "high"
+        ]
+      }
+    },
+    {
+      "id": "glm-53-mcli-example",
+      "url": "https://mcli.sankuai.com/v1/messages",
+      "protocol": "anthropic",
+      "appkey_file": "~/.config/mcopilot-cli/.config.yaml",
+      "target_model": "glm-5.3",
+      "extra_headers": {
+        "X-Working-Dir": "/"
+      },
+      "system_inject": "x-anthropic-billing-header: cc_version=2.1.196; cc_entrypoint=sdk-cli; cch=00000;",
+      "reasoning_capability": {
+        "effort_enum": [
+          "off",
+          "low",
+          "medium",
+          "high"
+        ]
       }
     }
   ],
   "routes": [
     {
-      "id": "claude",
+      "id": "nation1",
       "tiers": {
-        "fable": ["claude-fable-k0"],
-        "opus": ["claude-opus-k0"],
-        "sonnet": ["claude-sonnet-k0"],
-        "haiku": ["claude-haiku-k0"]
+        "fable": [
+          "glm-53-sankuai-xxxx"
+        ],
+        "opus": [
+          "glm-53-sankuai-xxxx"
+        ],
+        "sonnet": [
+          "ds-pro-sankuai-xxxx"
+        ],
+        "haiku": [
+          "ds-flash-sankuai-xxxx"
+        ]
       },
       "failover": "on"
-    },
-    {
-      "id": "glm",
-      "tiers": {
-        "fable": ["glm-sonnet-k0"],
-        "opus": ["glm-sonnet-k0"],
-        "sonnet": ["glm-sonnet-k0"],
-        "haiku": ["glm-sonnet-k0"]
-      },
-      "failover": "off"
     }
   ],
   "strategies": [
     {
       "client_token": "cc",
-      "route_id": "claude",
+      "route_pool": [
+        {
+          "route_id": "openai1",
+          "weight": 1
+        }
+      ],
       "tiers_source_capability": {
-        "fable":  {"effort_enum": ["low", "medium", "high", "xhigh", "max"]},
-        "opus":   {"effort_enum": ["off", "low", "medium", "high", "xhigh"]},
-        "sonnet": {"effort_enum": ["off", "low", "medium", "high", "xhigh"]},
-        "haiku":  {"effort_enum": ["off", "low", "medium", "high"]}
+        "fable": {
+          "effort_enum": [
+            "low",
+            "medium",
+            "high",
+            "xhigh",
+            "max"
+          ]
+        },
+        "opus": {
+          "effort_enum": [
+            "low",
+            "medium",
+            "high",
+            "xhigh",
+            "max"
+          ]
+        },
+        "sonnet": {
+          "effort_enum": [
+            "low",
+            "medium",
+            "high",
+            "xhigh",
+            "max"
+          ]
+        },
+        "haiku": {
+          "effort_enum": [
+            "low",
+            "medium",
+            "high",
+            "max"
+          ]
+        }
       },
-      "note": "默认 Claude 家族"
-    },
-    {
-      "client_token": "cc-glm",
-      "route_id": "glm",
-      "tiers_source_capability": {
-        "fable":  {"effort_enum": ["low", "medium", "high", "xhigh", "max"]},
-        "opus":   {"effort_enum": ["off", "low", "medium", "high", "xhigh"]},
-        "sonnet": {"effort_enum": ["off", "low", "medium", "high", "xhigh"]},
-        "haiku":  {"effort_enum": ["off", "low", "medium", "high"]}
-      },
-      "note": "切到 GLM 家族"
+      "note": "Claude Code SDK"
     }
   ]
 }

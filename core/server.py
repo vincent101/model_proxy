@@ -646,6 +646,12 @@ class ConfigStore:
                 log.warning("config.validate: strategy=%s route_pool has invalid route_ids=%s",
                             ct, invalid)
         self._validate_cooldown_rules(self._config.get("cooldown_rules", []), "top")
+        # supply 层扩展字段校验（extra_headers / system_inject / appkey_file）：
+        # 不同于上方容错校验，此处 raise——启动路径 fail-fast，热重载路径被
+        # _reload_locked 吞为 warning（已知降级，见 validate_supply_ext docstring）。
+        for s in self._config.get("supplies", []):
+            if isinstance(s, dict):
+                validate_supply_ext(s)
 
     def _validate_cooldown_rules(self, rules: list, ctx: str) -> None:
         """校验 cooldown_rules 策略组格式（容错：非法策略组跳过 + log warning，不阻断加载）。
@@ -1188,6 +1194,115 @@ def detect_target(supply: dict) -> str:
     return resolve_protocol(supply)
 
 
+# ---------------------------------------------------------------------------
+# supply 层扩展字段（extra_headers / system_inject / appkey_file）
+# 设计记录：docs/designs/2026-09-20-model_proxy接入mcli的supply层扩展.md
+# ---------------------------------------------------------------------------
+
+# extra_headers 禁键（小写比较）：鉴权归 appkey/appkey_file 管，避免双来源
+# 冲突；content-length 由 body 长度决定，不可覆盖。
+_EXTRA_HEADER_FORBIDDEN_KEYS = {"authorization", "x-api-key", "content-length"}
+
+
+def validate_supply_ext(supply: dict) -> None:
+    """supply 层扩展字段校验（extra_headers / system_inject / appkey_file）。
+
+    与 _validate_config 既有容错校验（log.warning 不阻断加载）不同，本组
+    校验 raise ValueError：启动路径 fail-fast 阻断加载；热重载路径由
+    _reload_locked 吞异常降级为 warning（已知接受）。_config_ops.py 的
+    supply_add/supply_edit 写盘前调用同款校验拒写盘（单一真相源）。
+    """
+    sid = supply.get("id", "")
+    eh = supply.get("extra_headers")
+    if eh is not None:
+        if not isinstance(eh, dict):
+            raise ValueError(f"supply {sid}: extra_headers 必须为 dict")
+        for k, v in eh.items():
+            if not isinstance(v, str) or not v:
+                raise ValueError(f"supply {sid}: extra_headers[{k!r}] 值必须为非空 string")
+            if k.lower() in _EXTRA_HEADER_FORBIDDEN_KEYS:
+                raise ValueError(
+                    f"supply {sid}: extra_headers 禁止键 {k!r}（authorization/x-api-key "
+                    "鉴权归 appkey/appkey_file 管；content-length 由 body 长度决定）")
+    if supply.get("system_inject"):
+        # 终态协议以 resolve_protocol 为准（显式 protocol 优先，缺省从 url 推断）
+        protocol = resolve_protocol(supply)
+        if protocol != "anthropic":
+            raise ValueError(
+                f"supply {sid}: system_inject 仅支持 anthropic 协议 supply"
+                f"（当前 {protocol}）")
+    has_appkey = bool(supply.get("appkey"))
+    has_appkey_file = bool(supply.get("appkey_file"))
+    if has_appkey and has_appkey_file:
+        raise ValueError(f"supply {sid}: appkey 与 appkey_file 互斥，只能配其一")
+    if not has_appkey and not has_appkey_file:
+        raise ValueError(f"supply {sid}: 须配置 appkey 或 appkey_file 之一")
+
+
+def inject_system_block(body_json: dict, text: str) -> bool:
+    """system_inject：向 body["system"] 前置合并注入块（幂等，原地修改）。
+
+    合并矩阵（设计记录 §2）：
+    - system 缺省 / 空数组 → [inject_block]
+    - 字符串 → [inject_block, {"type":"text","text":原值}]
+    - 非空数组 → 首块 text == 注入文本 → 跳过（幂等硬约束：budget_retry /
+      failover 重试复用同一 body_json，重复注入会叠加计费标识块）；
+      否则前置插入
+    - 首块畸形（非 dict）→ 视为不匹配 → 前置插入
+    返回是否发生修改（False = 幂等跳过；未知形态不动）。
+    """
+    inject_block = {"type": "text", "text": text}
+    system = body_json.get("system")
+    if system is None or (isinstance(system, list) and not system):
+        body_json["system"] = [inject_block]
+        return True
+    if isinstance(system, str):
+        body_json["system"] = [inject_block, {"type": "text", "text": system}]
+        return True
+    if isinstance(system, list):
+        first = system[0]
+        if isinstance(first, dict) and first.get("text") == text:
+            return False
+        body_json["system"] = [inject_block] + system
+        return True
+    return False
+
+
+def resolve_appkey(supply: dict) -> str:
+    """出站鉴权值：appkey 直取，或 appkey_file 每请求读取解析。
+
+    - appkey_file 支持 ~ 展开（os.path.expanduser）；逐行 strip 后精确匹配
+      "AUTHORIZATION:" 前缀取值（目标文件非标准 YAML，勿用 yaml 库；
+      与 CatpawCLI token store 同款策略，无缓存）。
+    - 失败（文件不存在 / 无 AUTHORIZATION 行 / 值为空）抛 ValueError（消息含
+      supply id 与原因），调用方出站前 500 返回、不进 cooldown（配置问题
+      非上游问题，冷却会误伤 failover）。
+    - appkey 与 appkey_file 均缺 → 返回 ""（维持历史空串照发行为；必填由
+      validate_supply_ext 在加载/写盘层把关，热重载降级路径不额外拦截）。
+    """
+    appkey = supply.get("appkey")
+    if appkey:
+        return appkey
+    appkey_file = supply.get("appkey_file")
+    if not appkey_file:
+        return ""
+    sid = supply.get("id", "")
+    path = os.path.expanduser(appkey_file)
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            lines = f.readlines()
+    except OSError as e:
+        raise ValueError(f"supply {sid} appkey_file 读取失败: {e}") from e
+    for line in lines:
+        line = line.strip()
+        if line.startswith("AUTHORIZATION:"):
+            token = line[len("AUTHORIZATION:"):].strip()
+            if token:
+                return token
+            raise ValueError(f"supply {sid} appkey_file 读取失败: AUTHORIZATION 值为空")
+    raise ValueError(f"supply {sid} appkey_file 读取失败: 无 AUTHORIZATION 行")
+
+
 def pick_translator(source: str, target: str) -> str:
     """组合分发决策表。
 
@@ -1633,12 +1748,27 @@ class ModelProxyHandler(BaseHTTPRequestHandler):
             if supply.get("target_model") and "model" in outgoing:
                 outgoing["model"] = supply["target_model"]
             outgoing.pop("stream", None)
+            # system_inject（count_tokens 同样注入，取与主转发一致性；见设计记录 §2）
+            if target == "anthropic" and supply.get("system_inject"):
+                inject_system_block(outgoing, supply["system_inject"])
             send_body = json.dumps(outgoing, ensure_ascii=False).encode("utf-8")
-            appkey = supply.get("appkey", "")
+            # appkey 直取 / appkey_file 每请求读取；失败出站前 500，不进 cooldown
+            try:
+                appkey = resolve_appkey(supply)
+            except ValueError as e:
+                self._acc["final_error"] = str(e)
+                self._write_buffered_response(
+                    500, [], error_body_for_source("anthropic", 500, str(e)))
+                return
             headers = {k: v for k, v in self.headers.items()
                        if k.lower() not in {"host", "content-length", "authorization", "x-api-key"}}
             headers.update({"Authorization": f"Bearer {appkey}", "x-api-key": appkey,
                             "Content-Type": "application/json", "Content-Length": str(len(send_body))})
+            # extra_headers：supply 声明的出站 header，最高优先（跳过 content-length）
+            for k, v in (supply.get("extra_headers") or {}).items():
+                if k.lower() == "content-length":
+                    continue
+                headers[k] = v
             req = urllib.request.Request(target_url, data=send_body, headers=headers, method=method)
             try:
                 resp = urllib.request.urlopen(req, timeout=cs.get_upstream_timeout())
@@ -2042,6 +2172,12 @@ class ModelProxyHandler(BaseHTTPRequestHandler):
                         _stamp_budget(body_json, target)
                         if _bf and body_json.get(_bf) != _pre_budget:
                             send_body = json.dumps(body_json, ensure_ascii=False).encode("utf-8")
+                    # system_inject：anthropic 出站 body 前置合并计费 system 块
+                    # （幂等，重试复用 body_json 不重复注入；见 inject_system_block）
+                    if target == "anthropic" and isinstance(body_json, dict) \
+                            and supply.get("system_inject"):
+                        if inject_system_block(body_json, supply["system_inject"]):
+                            send_body = json.dumps(body_json, ensure_ascii=False).encode("utf-8")
 
                 elif mode == ANTHROPIC_TO_CHAT:
                     # 组合3：anthropic 请求 → chat 上游。转成 OpenAI body，打 native chat 端点。
@@ -2105,11 +2241,22 @@ class ModelProxyHandler(BaseHTTPRequestHandler):
                     if target_model:
                         anthropic_body["model"] = target_model
                     _stamp_budget(anthropic_body, target)   # ④b（anthropic 字段 max_tokens）
+                    # system_inject：转换后 anthropic body 同样前置注入（幂等）
+                    if target == "anthropic" and supply.get("system_inject"):
+                        inject_system_block(anthropic_body, supply["system_inject"])
                     send_body = json.dumps(anthropic_body, ensure_ascii=False).encode("utf-8")
                     # target_url 已在分支前统一算好（supply.url 现在已是完整 /v1/messages 端点）
 
                 # ---- 注入出站 appkey（Authorization Bearer + x-api-key）----
-                appkey = supply.get("appkey", "")
+                # appkey 直取 / appkey_file 每请求读取；失败出站前 500、不进
+                # cooldown（配置问题非上游问题，同 detect_target 失败先例）
+                try:
+                    appkey = resolve_appkey(supply)
+                except ValueError as e:
+                    log.error("resolve_appkey failed: supply=%s err=%s", supply_id, e)
+                    self._write_buffered_response(
+                        500, [], error_body_for_source(source, 500, str(e)))
+                    return
                 _skip_req_headers = {"host", "content-length", "authorization", "x-api-key"}
                 fwd_headers: dict[str, str] = {}
                 for key, val in self.headers.items():
@@ -2122,6 +2269,13 @@ class ModelProxyHandler(BaseHTTPRequestHandler):
                 if mode != PASSTHROUGH:
                     # 转换后 body 一律 JSON
                     fwd_headers["Content-Type"] = "application/json"
+                # extra_headers：supply 声明的出站 header，最高优先——覆盖透传值
+                # 与内置注入（含转换路径的 Content-Type）；content-length 由 body
+                # 长度决定，跳过不覆盖
+                for k, v in (supply.get("extra_headers") or {}).items():
+                    if k.lower() == "content-length":
+                        continue
+                    fwd_headers[k] = v
 
                 req = urllib.request.Request(
                     url=target_url,

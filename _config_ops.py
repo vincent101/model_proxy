@@ -23,6 +23,7 @@ import urllib.request
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from core.reasoning.registry import resolve_protocol
+from core.server import validate_supply_ext, inject_system_block, resolve_appkey
 from _format_ops import (
     mask_appkey as _mask_appkey,
     strategy_route_desc as _strategy_route_desc,
@@ -370,7 +371,12 @@ def probe_effort(supply: dict) -> "tuple[int | None, str, list[str] | None, bool
     （供 classify_supply_reachability 按异常类型细分原因，而不是只能用文本猜）。
     """
     url = (supply.get("url") or "").rstrip("/")
-    appkey = supply.get("appkey", "")
+    # appkey 直取 / appkey_file 每请求读取（与主链路 server.py resolve_appkey 同源）；
+    # 解析失败走既有五元组契约（status=None、exc=ValueError），不发网络请求
+    try:
+        appkey = resolve_appkey(supply)
+    except ValueError as e:
+        return None, str(e), None, False, e
     model = supply.get("target_model", "")
 
     try:
@@ -394,9 +400,20 @@ def probe_effort(supply: dict) -> "tuple[int | None, str, list[str] | None, bool
                 "reasoning": {"effort": PROBE_VALUE},
                 "input": "probe"}
 
+    # system_inject：仅 anthropic 协议注入（与主链路同款守卫）；
+    # inject_system_block 原地修改 body dict，必须在 json.dumps 之前调用
+    if proto == "anthropic" and supply.get("system_inject"):
+        inject_system_block(body, supply["system_inject"])
+
     data = json.dumps(body).encode("utf-8")
     headers = {"Content-Type": "application/json",
                "Authorization": f"Bearer {appkey}", "x-api-key": appkey}
+    # extra_headers：supply 声明的出站 header，base headers 之后应用 = 最高优先；
+    # 跳过 content-length（body 长度决定）——与主链路 count_tokens 路径同语义
+    for k, v in (supply.get("extra_headers") or {}).items():
+        if k.lower() == "content-length":
+            continue
+        headers[k] = v
     req = urllib.request.Request(target, data=data, headers=headers, method="POST")
 
     status = None
@@ -424,6 +441,7 @@ class ReachabilityCategory:
     TIMEOUT = "timeout"
     CONN_REFUSED = "conn_refused"
     NETWORK_OTHER = "network_other"
+    CONFIG_ERROR = "config_error"
     AUTH_ERROR = "auth_error"
     MODEL_ERROR = "model_error"
     REACHABLE = "reachable"
@@ -441,6 +459,12 @@ def classify_supply_reachability(status: "int | None", text_fixed: str,
     description 是给用户看的中文人类可读描述。
     """
     if status is None:
+        # probe 路径产生 ValueError 的来源恰好且仅有两处——resolve_protocol（非法协议）
+        # 与 resolve_appkey（appkey_file 解析失败），均为本地配置问题、请求未发出；
+        # urlopen 网络异常家族（URLError/gaierror/timeout/OSError）与 ValueError 类型
+        # 不相交，isinstance 判别可靠
+        if isinstance(exc, ValueError):
+            return ReachabilityCategory.CONFIG_ERROR, f"本地配置错误（探测请求未发出）: {exc}"
         # urllib.request.urlopen 真实抛出的网络层异常几乎总是 urllib.error.URLError，
         # 底层原因（DNS/超时/拒绝连接）包在 exc.reason 里，不是裸的 socket.gaierror/
         # ConnectionRefusedError 本身——所以 gaierror/ConnectionRefusedError 的 isinstance
@@ -664,6 +688,15 @@ def supply_add(path: str) -> None:
         err(str(e))
         done(False); sys.exit(1)
 
+    # 保存前 supply 扩展字段校验（extra_headers/system_inject/appkey_file；与
+    # ConfigStore._validate_config 同一真相源 core.server.validate_supply_ext），
+    # 违者拒绝写盘。
+    try:
+        validate_supply_ext(entry)
+    except ValueError as e:
+        err(str(e))
+        done(False); sys.exit(1)
+
     # 连通性测试 + 同步探测（add 时无条件跑，用户在场即时决定接受/跳过）。
     # REACHABLE 时复用同一次响应做档位解析，不再发第二次请求。
     category, desc, rcap = connectivity_test_then_probe(entry)
@@ -733,6 +766,13 @@ def supply_edit(path: str, sid: str) -> None:
     # 保存前用唯一权威解析校验：protocol 留空时须能从 url 尾缀推断出来，否则拒绝保存。
     try:
         resolve_protocol(target)
+    except ValueError as e:
+        err(str(e))
+        done(False); sys.exit(1)
+
+    # 保存前 supply 扩展字段校验（同 supply_add；编辑含手改配置文件后经 edit 收敛的场景）。
+    try:
+        validate_supply_ext(target)
     except ValueError as e:
         err(str(e))
         done(False); sys.exit(1)

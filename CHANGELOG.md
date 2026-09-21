@@ -1,6 +1,28 @@
 # Changelog
 
-## Unreleased
+## 0.11 (2026-09-21)
+
+### 修复：passthrough 观察器对 mcli 流的 [DONE] 尾巴误报（2026-09-21）
+
+- mcli 网关在语义完整的 Anthropic 流（message_stop 后）追加 OpenAI 风格 `data: [DONE]`
+  冗余尾巴，观察器对非 chat 源无条件报 malformed_stream → catpaw 系流式请求
+  observer_error 100%（09-20 达 943 条），stream_integrity/stream_health 全盲
+- 修复：终态已确认（confirmed）则忽略冗余 [DONE]，未确认维持报错；
+  真实 34KB mcli 流样本事件全集核对无第二不兼容点
+
+### supply 层扩展：接入 mcli（CatPaw）等自定义网关（2026-09-20）
+
+- supply 新增三可选字段（设计：docs/designs/2026-09-20-model_proxy接入mcli的supply层扩展.md）：
+  - `extra_headers`：出站 header 注入（最高优先，禁 authorization/x-api-key/content-length）
+  - `system_inject`：计费标识 system 块前置合并（幂等，仅 anthropic supply）
+  - `appkey_file`：鉴权值文件来源（每请求读，与 appkey 互斥）
+- 配置校验：`ConfigStore._validate_config` 新增三字段校验（启动 fail-fast，热重载
+  降级为 warning——现有吞异常行为不变）；CLI supply_add/supply_edit 写盘前同款校验
+- CLI 探测感知新字段（设计：docs/designs/2026-09-20-model_proxy-CLI探测感知supply扩展字段.md）：
+  probe_effort 补三字段；`classify_supply_reachability` 新增 `CONFIG_ERROR` 分类
+  （附带：非法 protocol 从 NETWORK_OTHER 迁入 CONFIG_ERROR）
+- 测试：tests/test_supply_ext.py（44 用例）+ test_config_ops.py 扩展（6 用例）
+
 - fable 档支持：_MODEL_TIER_MAP 新增 `claude-fable`→fable 映射（config 示例与文档同步补齐）
 - session 身份展示：新增 core/session_identity.py 只读解析 ~/.claude/sessions 注册表
   （按次扫描不缓存，坏 JSON/缺字段跳过，同 UUID 多进程取 procStart 最新）；

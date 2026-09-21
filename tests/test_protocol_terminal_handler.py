@@ -296,6 +296,45 @@ class TestSSEFramerAndPassthroughTracker(unittest.TestCase):
             tracker.finalize()
         self.assertEqual(ctx.exception.reason, "empty_stream")
 
+    def test_anthropic_confirmed_then_redundant_done_tail_is_ignored(self):
+        # mcli 实测样本：语义完整的 anthropic 流之后追加 OpenAI 风格 data: [DONE] 尾巴。
+        # 终态已确认（message_stop）→ 该事件被忽略，观察结果仍为 valid 终态。
+        acc = {}
+        observer = pt.PassthroughStreamObserver("anthropic", acc)
+        observer.feed(b''.join([
+            b'event: message_start\n'
+            b'data: {"type":"message_start","message":{"usage":{"input_tokens":15}}}\n\n',
+            b'event: content_block_start\n'
+            b'data: {"type":"content_block_start","index":0,'
+            b'"content_block":{"type":"text","text":""}}\n\n',
+            b'event: content_block_delta\n'
+            b'data: {"type":"content_block_delta","index":0,'
+            b'"delta":{"type":"text_delta","text":"hi"}}\n\n',
+            b'event: message_delta\n'
+            b'data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},'
+            b'"usage":{"output_tokens":265}}\n\n',
+            b'event: message_stop\ndata: {"type":"message_stop"}\n\n',
+            b'data: [DONE]\n\n',
+        ]))
+        result = observer.finish()
+        self.assertEqual(result.kind, "terminal")
+        self.assertTrue(observer._tracker.confirmed)
+        self.assertEqual(result.terminal_state.status, pt.TerminalStatus.COMPLETED)
+        self.assertEqual(acc["stop_reason"], "end_turn")
+        self.assertEqual((acc["usage_in"], acc["usage_out"]), (15, 265))
+
+    def test_anthropic_done_before_terminal_still_malformed(self):
+        # [DONE] 出现在 message_stop 之前（终态未确认）→ 仍是 observer_error/malformed。
+        observer = pt.PassthroughStreamObserver("anthropic", {})
+        observer.feed(b''.join([
+            b'event: message_start\n'
+            b'data: {"type":"message_start","message":{"usage":{}}}\n\n',
+            b'data: [DONE]\n\n',
+        ]))
+        result = observer.finish()
+        self.assertEqual(result.kind, "observer_error")
+        self.assertEqual(result.reason, "observer_error")
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

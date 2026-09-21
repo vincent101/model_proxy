@@ -7,9 +7,13 @@ fixture 来源：本次会话中真实拿到的样本（claude类 expected one o
 运行：cd tools/model_proxy && python3 -m unittest tests.test_config_ops -v
 """
 
+import email.message
+import io
+import json
 import os
 import socket
 import sys
+import tempfile
 import unittest
 import urllib.error
 from unittest.mock import patch
@@ -17,6 +21,7 @@ from unittest.mock import patch
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from _config_ops import (
+    PROBE_VALUE,
     ReachabilityCategory,
     _extract_enum_candidates,
     _fix_mojibake,
@@ -501,6 +506,113 @@ class TestValidateStrategyRouteFields(unittest.TestCase):
             result = _validate_strategy_route_fields(entry)
         self.assertIsNone(result)
         mock_err.assert_not_called()
+
+
+class TestProbeEffortExtFields(unittest.TestCase):
+    """supply 扩展字段（extra_headers / system_inject / appkey_file）在 probe_effort
+    请求构造层的生效验证。mock urlopen（side_effect 记录 req 后抛可读 HTTPError 400），
+    不发真实网络请求。
+    """
+
+    def _probe_with_captured_request(self, supply):
+        """mock urlopen：记录传入的 Request 后抛 HTTPError(400)（e.read() 可读），
+        返回 (captured_req, probe_effort 五元组)。"""
+        captured = {}
+
+        def fake_urlopen(req, timeout=None):
+            captured["req"] = req
+            raise urllib.error.HTTPError(
+                req.full_url, 400, "Bad Request",
+                email.message.Message(), io.BytesIO(b'{"error":{"message":"bad"}}'))
+
+        with patch("_config_ops.urllib.request.urlopen", side_effect=fake_urlopen):
+            result = probe_effort(supply)
+        return captured["req"], result
+
+    def test_extra_headers_injected_and_content_length_skipped(self):
+        # 用例1：extra_headers 后置覆盖生效；content-length 被跳过。
+        # 注意 urllib Request 将 header key 存为 .capitalize() 形态
+        # （X-Working-Dir → X-working-dir），断言须用该形态。
+        supply = {"id": "s1", "protocol": "anthropic", "url": "http://x",
+                  "target_model": "m", "appkey": "k",
+                  "extra_headers": {"X-Working-Dir": "/", "Content-Length": "999"}}
+        req, (status, _, _, _, _) = self._probe_with_captured_request(supply)
+        self.assertEqual(status, 400)
+        self.assertEqual(req.headers.get("X-working-dir"), "/")
+        # 订正①：mock urlopen 后自动 Content-Length 注入不执行，mock 的 headers
+        # 里没有该键——断言的是 999 未被透传（content-length 由 body 长度决定）。
+        self.assertNotIn("Content-length", req.headers)
+
+    def test_system_inject_injected_into_anthropic_body(self):
+        # 用例2：system_inject 注入 anthropic body，effort 探测字段仍在。
+        supply = {"id": "s2", "protocol": "anthropic", "url": "http://x",
+                  "target_model": "m", "appkey": "k",
+                  "system_inject": "You are working in /vault"}
+        req, _ = self._probe_with_captured_request(supply)
+        body = json.loads(req.data)
+        self.assertEqual(body["system"][0]["text"], "You are working in /vault")
+        self.assertEqual(body["output_config"]["effort"], PROBE_VALUE)
+
+    def test_system_inject_not_injected_for_non_anthropic(self):
+        # 用例3：非 anthropic 协议即使带 system_inject 也不注入（probe 层守卫，
+        # 与主链路同款；配置层校验由 validate_supply_ext 在加载/写盘时把关）。
+        supply = {"id": "s3", "protocol": "chat", "url": "http://x",
+                  "target_model": "m", "appkey": "k",
+                  "system_inject": "should be ignored"}
+        req, _ = self._probe_with_captured_request(supply)
+        body = json.loads(req.data)
+        self.assertNotIn("system", body)
+
+    def test_appkey_file_resolved_into_auth_headers(self):
+        # 用例4：appkey_file 解析成功 → Authorization / x-api-key 均取到 token。
+        with tempfile.NamedTemporaryFile("w", suffix=".txt", delete=False) as f:
+            f.write("# comment\nAUTHORIZATION: tok123\n")
+            path = f.name
+        try:
+            supply = {"id": "s4", "protocol": "anthropic", "url": "http://x",
+                      "target_model": "m", "appkey_file": path}
+            req, (status, _, _, _, _) = self._probe_with_captured_request(supply)
+            self.assertEqual(status, 400)
+            self.assertEqual(req.headers.get("Authorization"), "Bearer tok123")
+            self.assertEqual(req.headers.get("X-api-key"), "tok123")
+        finally:
+            os.unlink(path)
+
+    def test_appkey_file_failure_returns_config_error(self):
+        # 用例5：appkey_file 解析失败 → 五元组 status=None、exc=ValueError、不发请求，
+        # classify_supply_reachability 归 CONFIG_ERROR。
+        with tempfile.NamedTemporaryFile("w", suffix=".txt", delete=False) as f:
+            f.write("no AUTHORIZATION line here\n")
+            path = f.name
+        try:
+            supply = {"id": "s5", "protocol": "anthropic", "url": "http://x",
+                      "target_model": "m", "appkey_file": path}
+            with patch("_config_ops.urllib.request.urlopen") as mock_urlopen:
+                status, text, cands, is_complete, exc = probe_effort(supply)
+            mock_urlopen.assert_not_called()
+            self.assertIsNone(status)
+            self.assertIsInstance(exc, ValueError)
+            category, desc = classify_supply_reachability(status, text, exc)
+            self.assertEqual(category, ReachabilityCategory.CONFIG_ERROR)
+        finally:
+            os.unlink(path)
+        # 订正②：非法 protocol（ValueError）从 NETWORK_OTHER 迁移到 CONFIG_ERROR 的
+        # 行为变化，纯函数断言。
+        ve = ValueError("非法 protocol")
+        category, _ = classify_supply_reachability(None, str(ve), ve)
+        self.assertEqual(category, ReachabilityCategory.CONFIG_ERROR)
+
+    def test_supply_without_ext_fields_unchanged(self):
+        # 用例6（回归）：不带新字段的存量 supply，请求构造与改造前逐字段一致——
+        # mock 模式下自动 Content-Length 注入不执行，headers 恰为三个基础键。
+        supply = {"id": "s6", "protocol": "anthropic", "url": "http://x",
+                  "target_model": "m", "appkey": "k"}
+        req, (status, _, _, _, _) = self._probe_with_captured_request(supply)
+        self.assertEqual(status, 400)
+        self.assertEqual(set(req.headers.keys()),
+                         {"Content-type", "Authorization", "X-api-key"})
+        body = json.loads(req.data)
+        self.assertNotIn("system", body)
 
 
 if __name__ == "__main__":
