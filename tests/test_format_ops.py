@@ -357,7 +357,7 @@ class TestStatusFormatFromJson(unittest.TestCase):
             self.assertIn("http_429", joined)
 
     def test_config_count_row(self):
-        """config 计数行含 supplies/routes/strategies 数。"""
+        """config 合并行：计数 + mtime 一行，位于 health 行之前（原尾部单行上移）。"""
         with tempfile.TemporaryDirectory() as td:
             cfg_path = self._make_config(td)
             totals_path = self._make_totals(td)
@@ -369,8 +369,24 @@ class TestStatusFormatFromJson(unittest.TestCase):
             }
             lines = _format_status_from_json(data, cfg_path, totals_path)
             joined = "\n".join(lines)
-            self.assertIn("config: 2 supplies / 1 routes / 1 strategies", joined)
+            self.assertIn("config 2 supplies / 1 routes / 1 strategies", joined)
+            self.assertRegex(joined, r"（mtime \d{2}-\d{2} \d{2}:\d{2}）")
             self.assertNotIn("default_cooldown", joined)
+            # 尾部不再有独立的 config 行：全文只出现一次 "config"
+            self.assertEqual(joined.count("config "), 1)
+
+    def test_config_row_first_before_health(self):
+        """config 行在 health 行之前（头部区，紧贴进程态首行）。"""
+        with tempfile.TemporaryDirectory() as td:
+            cfg_path = self._make_config(td)
+            totals_path = self._make_totals(td)
+            data = {
+                "supplies": [{"id": "s1"}], "routes": [{"id": "r1"}],
+                "strategies": [], "cooldown": {}, "default_cooldown_seconds": 60,
+            }
+            lines = _format_status_from_json(data, cfg_path, totals_path)
+            joined = "\n".join(lines)
+            self.assertLess(joined.index("config "), joined.index("health:"))
 
     def test_all_zero_no_anomaly_sections(self):
         """全 0（无 cooldown/degraded/overrides/缺档）时无异常段。"""
@@ -1139,10 +1155,9 @@ class TestStatusFormatWithSessions(unittest.TestCase):
             lines = _format_status_from_json(
                 data, cfg_path, totals_path, log_path)
         joined = "\n".join(lines)
-        # health 行在 session 段之前
+        # config 行（头部）→ health 行 → session 段
+        self.assertLess(joined.index("config "), joined.index("health:"))
         self.assertLess(joined.index("health:"), joined.index("active sessions"))
-        # session 段在 config 计数行之前
-        self.assertLess(joined.index("active sessions"), joined.index("config:"))
 
     def test_no_log_path_no_session_section(self):
         """不传 log_path 时不展示 session 段（兼容已有调用）。"""

@@ -182,7 +182,7 @@ cmd_status() {
   fi
 
   # 进程态信息（ps 失败则省略，不报错）
-  local etime="" started="" config_mtime=""
+  local etime="" started=""
   local ps_etime ps_lstart
   ps_etime=$(ps -o etime= -p "$pid" 2>/dev/null | xargs)
   ps_lstart=$(ps -o lstart= -p "$pid" 2>/dev/null)
@@ -196,16 +196,13 @@ cmd_status() {
     hm=$(echo "$ps_lstart" | awk '{print $4}' | cut -c1-5)
     started="  (started $md $hm"
   fi
-  config_mtime=$(stat -f "%Sm" -t "%m-%d %H:%M" "$CONFIG_FILE" 2>/dev/null)
-
-  # 首行（bash 侧打印，信息全在 bash 侧）；config mtime 另起一行
+  # 首行（bash 侧打印，信息全在 bash 侧）；config 计数+mtime 合并行由
+  # _format_ops.py 的 status-format 在 health 行之前输出（单一来源），
+  # bash 侧不再单独打 mtime 行。
   if [[ -n "$started" ]]; then
     echo "service running on port $MODEL_PROXY_PORT  pid $pid$etime$started)"
   else
     echo "service running on port $MODEL_PROXY_PORT  pid $pid$etime"
-  fi
-  if [[ -n "$config_mtime" ]]; then
-    echo "  config mtime $config_mtime"
   fi
 
   local out

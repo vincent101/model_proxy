@@ -720,6 +720,15 @@ def _format_status_from_json(data: dict, config_path: str, totals_path: str,
     n_routes = len(data.get("routes", []))
     n_strategies = len(data.get("strategies", []))
 
+    # config 计数 + mtime 合并行（head 区，紧贴进程态首行之后 bash 打印）。
+    # mtime 由 formatter 从 config_path 自行 stat（单一来源，无需 CLI 传参）；
+    # stat 失败（权限/竞态删除）时省略括号段而非报错。
+    try:
+        config_mtime = datetime.fromtimestamp(
+            os.path.getmtime(config_path)).strftime("%m-%d %H:%M")
+    except OSError:
+        config_mtime = ""
+
     # overrides 求和
     overrides_count = sum(
         st.get("sidecar_overrides_count", 0) or 0
@@ -737,6 +746,15 @@ def _format_status_from_json(data: dict, config_path: str, totals_path: str,
     n_cooldown = len(cooldown)
 
     lines = []
+
+    # config 合并行：计数 + mtime 一行（原尾部单行计数上移；config 损坏时
+    # server 仍按最近一次成功加载的配置运行，计数照打、提示入行）
+    if cfg_err:
+        config_text = f"config: （{cfg_err}，server 按最近成功加载的配置运行）"
+    else:
+        mtime_part = f"（mtime {config_mtime}）" if config_mtime else ""
+        config_text = f"config {n_supplies} supplies / {n_routes} routes / {n_strategies} strategies{mtime_part}"
+    lines.append(config_text)
 
     # health 行
     if cooldown_unknown:
@@ -789,13 +807,6 @@ def _format_status_from_json(data: dict, config_path: str, totals_path: str,
             ref = ",".join(refs.get(sid, [])) or "未被引用"
             suffix = f" ({reason})" if reason else ""
             lines.append(f"  {_pad(sid, 24)} {int(remain)}s  ← {ref}{suffix}")
-
-    # config 计数行（config 损坏时显式提示而非崩溃）
-    lines.append("")
-    if cfg_err:
-        lines.append(f"config: （{cfg_err}，server 仍按最近一次成功加载的配置运行）")
-    else:
-        lines.append(f"config: {n_supplies} supplies / {n_routes} routes / {n_strategies} strategies")
 
     return lines
 
