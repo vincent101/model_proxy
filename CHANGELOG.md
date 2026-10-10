@@ -1,5 +1,21 @@
 # Changelog
 
+## 0.12 (2026-10-10)
+
+### 新功能：正文错误识别——mcli 200+错误文本转 failover/冷却（2026-10-10）
+
+- mcli 系 supply 上游 HTTP 200 但正文携带错误文本（限频「当前小时请求过于频繁」/
+  路由未命中「未命中任何路由策略」），对既有 HTTP-code 驱动的 failover/cooldown 不可见
+- 顶层 `body_error_rules` 配置文案→`body_*` 错误码映射（contains/exact/prefix 三档，
+  不做 regex）；冷却时长仍在 `cooldown_rules` 单一来源配（合并式与 int code 同行）
+- 非流式：读响应后判定，命中即换 supply 同请求重发（客户端零感知）；未配 code 原样透传
+- 流式：B+ 边界内旁路累计收口判定（finally 覆盖断开/读错路径），命中冷却 + ACCESS 记
+  `body_error=`；当前请求透传错误文本，下一条请求自动换 supply
+- 误伤防护：无 tool_use/thinking 块 + text ≤200 字（rule 级可覆盖）+ 模式命中
+- 已知限制：流式仅 anthropic SSE text 形态；转换路径/count_tokens 插点为 Phase 2 暂缓
+- 设计：docs/designs/2026-10-10-正文错误识别与failover衔接方案.md（两轮复核修订）；
+  测试 +39（全量 925 绿）
+
 ## 0.11 (2026-09-21)
 
 ### 修复：passthrough 观察器对 mcli 流的 [DONE] 尾巴误报（2026-09-21）

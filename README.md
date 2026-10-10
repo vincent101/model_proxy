@@ -346,6 +346,18 @@ nc -vz <主机名>.local 18889   # 三端口各测一次；通则 TCP 可达
   - **已知限制：仅非流式生效**。流式响应字节即时下发客户端、发出后无法回追，流式只在收口
     处检测记 `budget_truncated` 日志不重试——流式场景仍需调用侧给足起步预算（流式检测覆盖
     anthropic 透传与 chat 方向；responses 协议流式 adapter 未持有 incomplete 状态，不检测）。
+- 正文错误识别（2026-10-10 起）：mcli 系 supply 上游报错时 HTTP 层 200 但正文携带错误文本
+  （实测「当前小时请求过于频繁，请下个整点重试」「本次请求未命中任何路由策略」），对 HTTP-code
+  驱动的 failover/cooldown 不可见。顶层 `body_error_rules` 把文案映射为 `body_*` 错误码
+  （`pattern` + `match: contains/exact/prefix`），冷却时长仍在 `cooldown_rules` 单一来源配
+  （合并式：`[429, "body_rate_limited"]` 同行）。**非流式**：`resp.read()` 后判定，命中即
+  走 HTTPError 同款四连换 supply 重发，客户端只看到重发后的正常响应；未配 code 的文案
+  原样透传。**流式**：B+ 边界内不预读不缓冲，旁路累计 text 收口判定（挂 finally，覆盖
+  客户端断开/上游读错），命中即冷却该 supply 并在 ACCESS 行记 `body_error=`——**当前请求
+  如实透传错误文本，下一条请求自动换 supply**。误伤防护三条结构条件：响应无 tool_use/thinking
+  块 + text ≤200 字符（rule 级 `max_text_len` 可覆盖）+ 模式命中。已知限制：流式仅覆盖
+  anthropic SSE text 形态（纯文本流/responses 协议流不识别）。详见
+  [设计记录](docs/designs/2026-10-10-正文错误识别与failover衔接方案.md)。
 - codex install 写入的 base_url 层级已对 codex 0.145.0 官方 config-reference 逐字核对确认：
   `base_url` 含 `/v1` 不含 `/responses`，由 `wire_api="responses"` 让 codex 自拼 `/responses`
   后缀（详见「SDK 接入」）。
