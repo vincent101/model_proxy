@@ -279,6 +279,15 @@ class PassthroughStreamObserver:
                 self._error = exc
         return ObservationResult("observer_error", None, "observer_error", self._first_event_ms)
 
+    def body_text_state(self) -> tuple[str, int, bool]:
+        """正文错误识别输入（透传 tracker 的旁路累计状态）。"""
+        return self._tracker.body_text_state()
+
+
+# 流式旁路 text 累计上限（防长流内存）：超出后只计数不存文本；任何合理配置的
+# max_text_len（缺省 200）远小于该上限，长度条件判定不受影响。
+_BODY_TEXT_ACCUM_CAP = 10000
+
 
 class PassthroughTerminalTracker:
     """PASSTHROUGH 协议终态与 usage 旁路跟踪器。"""
@@ -290,6 +299,12 @@ class PassthroughTerminalTracker:
         self.confirmed = False
         self.saw_business_event = False
         self._anthropic_candidate: TerminalState | None = None
+        # 正文错误识别旁路累计（设计 2026-10-10 §2.4）：text 全文 + tool/thinking
+        # 结构标记。与 stream_content 标记并列，只记不说。
+        self._body_text_parts: list[str] = []
+        self._body_stored_len = 0
+        self._body_text_len = 0
+        self._body_saw_tool_or_thinking = False
 
     def feed(self, event: SSEEvent) -> None:
         if event.is_comment:
@@ -331,8 +346,21 @@ class PassthroughTerminalTracker:
                 self.terminal = TerminalState(TerminalStatus.FAILED, "upstream_error")
                 self.confirmed = True
             elif typ == "content_block_start":
-                if (data.get("content_block") or {}).get("type") in ("text", "tool_use"):
+                _cb_type = (data.get("content_block") or {}).get("type")
+                if _cb_type in ("text", "tool_use"):
                     self.acc["stream_content"] = 1
+                if _cb_type in ("tool_use", "thinking"):
+                    self._body_saw_tool_or_thinking = True
+            elif typ == "content_block_delta":
+                _delta = data.get("delta") or {}
+                if _delta.get("type") == "text_delta":
+                    _t = _delta.get("text")
+                    if isinstance(_t, str):
+                        self._body_text_len += len(_t)
+                        if self._body_stored_len < _BODY_TEXT_ACCUM_CAP:
+                            _take = _t[:_BODY_TEXT_ACCUM_CAP - self._body_stored_len]
+                            self._body_text_parts.append(_take)
+                            self._body_stored_len += len(_take)
             # 未知非终态事件原样容忍。
         elif self.source == "responses":
             if typ in ("response.completed", "response.incomplete"):
@@ -360,6 +388,15 @@ class PassthroughTerminalTracker:
         details = usage.get("output_tokens_details") or {}
         if details.get("reasoning_tokens") is not None:
             self.acc["usage_reasoning"] = details.get("reasoning_tokens") or 0
+
+    def body_text_state(self) -> tuple[str, int, bool]:
+        """正文错误识别输入：(累计 text 全文, 全文总长, 是否出现过 tool/thinking 块)。
+
+        全文总长在超出 _BODY_TEXT_ACCUM_CAP 后仍继续计数（长度条件判定用全长）；
+        累计文本本身截断在 cap 内。
+        """
+        return ("".join(self._body_text_parts), self._body_text_len,
+                self._body_saw_tool_or_thinking)
 
     def finalize(self) -> TerminalState:
         if self.confirmed:

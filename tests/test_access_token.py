@@ -37,6 +37,9 @@ class _FakeConfig:
     def get_budget_retry(self):
         return {"enabled": False, "max_retries": 0}
 
+    def get_body_error_rules(self):
+        return []
+
     def get_cooldown_rules(self):
         return []
 

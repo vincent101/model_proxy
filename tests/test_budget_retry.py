@@ -91,6 +91,9 @@ class _FakeConfig:
     def get_budget_retry(self):
         return self._budget_retry or {"enabled": True, "max_retries": 5}
 
+    def get_body_error_rules(self):
+        return []
+
     def get_cooldown_rules(self):
         return [
             {"errorcode": [401, 403, 429, 500, 502, 503, 504], "cooldown_seconds": 60},

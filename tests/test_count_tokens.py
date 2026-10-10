@@ -31,6 +31,7 @@ class Config:
     def get_routes_map(self): return {"r1": self.route}
     def get_supply_map(self): return self.supplies
     def get_upstream_timeout(self): return 10
+    def get_body_error_rules(self): return []
     def get_cooldown_rules(self): return getattr(self, "rules", [])
 
 

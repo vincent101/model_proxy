@@ -11,6 +11,10 @@
   ],
   "upstream_timeout_seconds": 3600,
   "budget_retry": {"enabled": true,"max_retries": 5},
+  "body_error_rules": [
+    {"pattern": "当前小时请求过于频繁", "match": "contains", "errorcode": "body_rate_limited"},
+    {"pattern": "未命中任何路由策略", "match": "contains", "errorcode": "body_route_miss"}
+  ],
   "supplies": [
     {"id": "glm-53-sankuai-xxxx","url": "https://aigc.sankuai.com/v1/anthropic/v1/messages","protocol": "anthropic","appkey": "xxx","target_model": "glm-5.3","reasoning_capability": {"effort_enum": ["high","max"]}},
     {"id": "ds-pro-sankuai-xxxx","url": "https://aigc.sankuai.com/v1/anthropic/v1/messages","protocol": "anthropic","appkey": "xxx","target_model": "deepseek-v4-pro","reasoning_capability": {"effort_enum": ["low","high","max"]}},

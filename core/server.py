@@ -552,6 +552,13 @@ class ConfigStore:
         with self._lock:
             return list(self._config.get("cooldown_rules", []))
 
+    def get_body_error_rules(self) -> list[dict]:
+        """顶层 body_error_rules（浅拷贝）。无键/空数组 = 功能整体关闭（fail-open，
+        对齐 budget_retry 缺省启停风格）。规则形状见 docs/designs/
+        2026-10-10-正文错误识别与failover衔接方案.md §2.1。"""
+        with self._lock:
+            return list(self._config.get("body_error_rules", []))
+
     # ------------------------------------------------------------------
     # 热重载（拷贝 proxy.py 原样）
     # ------------------------------------------------------------------
@@ -646,6 +653,7 @@ class ConfigStore:
                 log.warning("config.validate: strategy=%s route_pool has invalid route_ids=%s",
                             ct, invalid)
         self._validate_cooldown_rules(self._config.get("cooldown_rules", []), "top")
+        self._validate_body_error_rules(self._config.get("body_error_rules", []))
         # supply 层扩展字段校验（extra_headers / system_inject / appkey_file）：
         # 不同于上方容错校验，此处 raise——启动路径 fail-fast，热重载路径被
         # _reload_locked 吞为 warning（已知降级，见 validate_supply_ext docstring）。
@@ -656,7 +664,7 @@ class ConfigStore:
     def _validate_cooldown_rules(self, rules: list, ctx: str) -> None:
         """校验 cooldown_rules 策略组格式（容错：非法策略组跳过 + log warning，不阻断加载）。
 
-        每条 rule 必须有 errorcode（非空 list，元素为 int 或 "URLError" 字符串）
+        每条 rule 必须有 errorcode（非空 list，元素为 int 或任意非空字符串）
         和 cooldown_seconds（正 int）。非法 rule log warning + 跳过，不阻断加载。
         """
         if not isinstance(rules, list):
@@ -673,14 +681,51 @@ class ConfigStore:
                             ctx, i)
                 continue
             for c in ec:
-                if not isinstance(c, int) and c != "URLError":
+                # 元素校验放开为「int 或任意非空字符串」，不特判 "URLError"/body_* 前缀
+                # （设计 2026-10-10 复核修订中1）：特判前缀则每引入新虚拟 code 都要同步
+                # 改校验，违背「加规则一行成本」目标；errorcode 命名空间本就开放
+                # （_record_unconfigured/resolve_cooldown_seconds 均按任意值处理），
+                # 校验收紧无安全收益。
+                if not isinstance(c, int) and not (isinstance(c, str) and c):
                     log.warning("config.validate: %s cooldown_rules[%d] errorcode has invalid "
-                                "element %r (must be int or 'URLError'), skipped",
+                                "element %r (must be int or non-empty string), skipped",
                                 ctx, i, c)
             cs_val = rule.get("cooldown_seconds")
             if not isinstance(cs_val, int) or cs_val <= 0:
                 log.warning("config.validate: %s cooldown_rules[%d] cooldown_seconds missing/invalid, skipped",
                             ctx, i)
+
+    def _validate_body_error_rules(self, rules: list) -> None:
+        """校验 body_error_rules 格式（容错：非法 rule 跳过 + log warning，不阻断加载，
+        同 _validate_cooldown_rules 风格；运行期由 match_body_error 对非法 rule 容错跳过）。
+
+        每条 rule 必须有 pattern（非空 str）与 errorcode（非空 str）；
+        match 可选（contains 默认 | exact | prefix，不做 regex）；
+        max_text_len 可选（正 int，缺省 _BODY_ERROR_MAX_TEXT_LEN_DEFAULT）。
+        """
+        if not isinstance(rules, list):
+            log.warning("config.validate: top body_error_rules not a list, skipped")
+            return
+        for i, rule in enumerate(rules):
+            if not isinstance(rule, dict):
+                log.warning("config.validate: top body_error_rules[%d] not a dict, skipped", i)
+                continue
+            if not isinstance(rule.get("pattern"), str) or not rule.get("pattern"):
+                log.warning("config.validate: top body_error_rules[%d] pattern missing/empty, skipped", i)
+                continue
+            if not isinstance(rule.get("errorcode"), str) or not rule.get("errorcode"):
+                log.warning("config.validate: top body_error_rules[%d] errorcode missing/empty, skipped", i)
+                continue
+            match = rule.get("match") or "contains"
+            if match not in ("contains", "exact", "prefix"):
+                log.warning("config.validate: top body_error_rules[%d] match=%r invalid "
+                            "(must be contains/exact/prefix), skipped", i, match)
+                continue
+            mtl = rule.get("max_text_len")
+            if mtl is not None and (not isinstance(mtl, int) or isinstance(mtl, bool)
+                                    or mtl <= 0):
+                log.warning("config.validate: top body_error_rules[%d] max_text_len=%r invalid "
+                            "(must be positive int), skipped", i, mtl)
 
 
 # ---------------------------------------------------------------------------
@@ -804,6 +849,94 @@ def _snapshot_unconfigured_hits() -> dict[str, int]:
     """返回当前 unconfigured_hits 快照（浅拷贝）。"""
     with _unconfigured_lock:
         return dict(_unconfigured_hits)
+
+
+# ---------------------------------------------------------------------------
+# 正文错误识别（body error）：200 + 正文携带错误文本 → 虚拟 errorcode（body_*）
+# 走既有 resolve_cooldown_seconds → cd.cooldown 链路（设计 2026-10-10 §2.2）
+# ---------------------------------------------------------------------------
+
+_BODY_ERROR_MAX_TEXT_LEN_DEFAULT = 200   # text 全文长度上限（rule 级 max_text_len 可覆盖）
+
+
+def match_body_error(text: str, rules: list | None, *,
+                     saw_tool_or_thinking: bool, text_len: int) -> str | None:
+    """正文错误识别纯函数：返回命中的虚拟 errorcode，未命中/结构条件不满足返回 None。
+
+    误伤防护——三条结构条件全部满足才判错误（设计 §2.2）：
+    1. 响应无 tool_use、无 thinking 块（正常回复一旦开始思考/调工具即排除）；
+    2. text 全文长度 ≤ max_text_len（缺省 200，rule 级可覆盖）——条件 2 先行短路，
+       超限一次整数比较即出，短响应才做个位数模式匹配；
+    3. 模式按 match 档命中（contains 默认 | exact | prefix，不做 regex）。
+
+    非法 rule（非 dict / 缺 pattern / 缺 errorcode）容错跳过，不抛异常。
+    """
+    if not rules or saw_tool_or_thinking or not isinstance(text, str):
+        return None
+    for rule in rules:
+        if not isinstance(rule, dict):
+            continue
+        pattern = rule.get("pattern")
+        if not isinstance(pattern, str) or not pattern:
+            continue
+        code = rule.get("errorcode")
+        if not isinstance(code, str) or not code:
+            continue
+        max_len = rule.get("max_text_len", _BODY_ERROR_MAX_TEXT_LEN_DEFAULT)
+        if not isinstance(max_len, int) or isinstance(max_len, bool) or max_len <= 0:
+            max_len = _BODY_ERROR_MAX_TEXT_LEN_DEFAULT
+        if text_len > max_len:
+            continue
+        match = rule.get("match") or "contains"
+        if match == "exact":
+            hit = text == pattern
+        elif match == "prefix":
+            hit = text.startswith(pattern)
+        else:   # contains（默认，未知取值同按 contains 容错）
+            hit = pattern in text
+        if hit:
+            return code
+    return None
+
+
+def _extract_body_error_text(resp_body: bytes) -> tuple[str, bool]:
+    """非流式响应的正文错误 text 提取（设计 §2.3 + 复核轻5）。
+
+    返回 (text, saw_tool_or_thinking)：
+    - JSON 合法且有 content text 块 → 拼接块文本；content 含 tool_use/thinking 块
+      时置结构标记；
+    - 无 content text（content 空 / 错误文本在 error 等顶层字段 / JSON 解析失败）
+      → raw UTF-8 全文兜底（兜底条件是「无 content text」而非仅「解析失败」，
+      覆盖 JSON 合法的错误字段形态）。
+    """
+    saw = False
+    try:
+        pj = json.loads(resp_body)
+    except Exception:
+        return resp_body.decode("utf-8", "replace"), False
+    texts: list[str] = []
+    if isinstance(pj, dict):
+        content = pj.get("content")
+        if isinstance(content, list):
+            for blk in content:
+                if not isinstance(blk, dict):
+                    continue
+                btype = blk.get("type")
+                if btype in ("tool_use", "thinking"):
+                    saw = True
+                elif btype == "text" and isinstance(blk.get("text"), str):
+                    texts.append(blk["text"])
+    if texts:
+        return "".join(texts), saw
+    return resp_body.decode("utf-8", "replace"), saw
+
+
+def _match_body_error_from_response(resp_body: bytes, rules: list | None) -> str | None:
+    """非流式响应字节 → 命中的虚拟 errorcode（无规则/未命中返回 None）。"""
+    if not rules:
+        return None
+    text, saw = _extract_body_error_text(resp_body)
+    return match_body_error(text, rules, saw_tool_or_thinking=saw, text_len=len(text))
 
 
 # 组合分发模式（精确组合命名）
@@ -1639,6 +1772,9 @@ class ModelProxyHandler(BaseHTTPRequestHandler):
             # OPT-04: final_error 记错误出口的短 reason（截断 80 字符、空格转下划线）。
             # budget 截断终态（status=200 + budget_truncated=1）不写 final_error，两者正交。
             "final_error": "",
+            # 正文错误识别观测：命中 body_error_rules 时记虚拟 errorcode
+            # （body_rate_limited 等；最终成功的 failover 请求同样保留首命中 code）。
+            "body_error": "",
             # OPT-10: attempt_errors 记 failover 失败明细（supply_id, reason），
             # 仅 2 处 failover continue 前 append（不含 budget 重试的 4 处 continue）。
             "attempt_errors": [],
@@ -1683,7 +1819,8 @@ class ModelProxyHandler(BaseHTTPRequestHandler):
                 "target_protocol=%s conversion_kind=%s failover=%s attempts=%s "
                 "usage_in=%s usage_out=%s token=%s session=%s "
                 "route_failover=%s builtin=%s budget_retried=%s budget_truncated=%s "
-                "stop_reason=%s final_error=%s nudge_rewritten=%s response_committed=%s "
+                "stop_reason=%s final_error=%s body_error=%s nudge_rewritten=%s "
+                "response_committed=%s "
                 "stream_integrity=%s terminal_status=%s terminal_reason=%s first_event_ms=%s",
                 ms, a["status"], a["source"], a["operation"],
                 a["route"], a["tier"], a["supply"],
@@ -1692,6 +1829,7 @@ class ModelProxyHandler(BaseHTTPRequestHandler):
                 a["route_failover"], a["builtin"], a["budget_retried"],
                 a["budget_truncated"], a["stop_reason"],
                 re.sub(r"\s+", "_", a["final_error"][:80]),
+                a["body_error"],
                 a["nudge_rewritten"], a["response_committed"], a["stream_integrity"],
                 a["terminal_status"], a["terminal_reason"], a["first_event_ms"])
             if usage_totals is not None:
@@ -2367,6 +2505,38 @@ class ModelProxyHandler(BaseHTTPRequestHandler):
                 if mode == PASSTHROUGH:
                     # PASSTHROUGH 流式已在即时提交分支返回；此处仅处理非流式透传。
                     resp_body = resp.read()
+                    # 正文错误识别（Phase 1，设计 2026-10-10 §2.3）：200+语义错误
+                    # → 虚拟 errorcode 走既有 cooldown/failover 链路（④b 同款位置，
+                    # 判定在 _maybe_budget_retry 之前）。
+                    _be_code = _match_body_error_from_response(
+                        resp_body, cs.get_body_error_rules())
+                    if _be_code is not None:
+                        _be_secs = resolve_cooldown_seconds(_be_code, cs)
+                        if failover == "on" and _be_secs is not None:
+                            log.warning("cooldown+failover(body_error): supply=%s code=%s secs=%s",
+                                        supply_id, _be_code, _be_secs)
+                            self._acc["failover"] = 1
+                            self._acc["attempt_errors"].append(
+                                (supply_id, _be_code))
+                            self._acc["body_error"] = _be_code
+                            cd.cooldown(supply_id, _be_secs, _be_code)
+                            tried_set.add(supply_id)
+                            resp.close()   # 复核轻4：continue 前 close（对标 budget_retry）
+                            continue
+                        # 命中但 cooldown_rules 未配该 code → _record_unconfigured +
+                        # 原样写回 resp_body（复核中3：真 fail-open，不走
+                        # error_body_for_source——它需真实非 2xx status，传 200 会产出
+                        # 200+proxy error 体的畸形响应）。
+                        log.warning("unconfigured body error: supply=%s code=%s "
+                                    "(not in cooldown_rules, passing through)",
+                                    supply_id, _be_code)
+                        _record_unconfigured(_be_code)
+                        self._acc["body_error"] = _be_code
+                        self._acc["final_error"] = f"body_error {_be_code} passthrough"
+                        self._write_buffered_response(
+                            resp_status, list(resp.getheaders()), resp_body)
+                        resp.close()
+                        return
                     if _maybe_budget_retry(resp_body, target, supply_id):
                         resp.close()
                         continue
@@ -2824,6 +2994,51 @@ class ModelProxyHandler(BaseHTTPRequestHandler):
             log.info("passthrough client disconnected")
         finally:
             resp.close()
+            # 正文错误收口判定（设计 §2.4 + 复核中2）：挂 finally 覆盖客户端断开 /
+            # 上游读错提前退出（挂 finish() 后则这两类退出不判定不冷却）。
+            # 当前请求不救：已透传字节零改动（B+ 边界）。
+            self._maybe_body_error_cooldown(observer)
+
+    def _maybe_body_error_cooldown(self, observer) -> None:
+        """流式收口正文错误判定 + 跨请求冷却（_write_streaming_response 专用）。
+
+        命中 → cd.cooldown(supply_id, secs, code)（supply_id 取 _acc["supply"]，
+        复核轻7：本函数无 supply_id 参数，:2094 每轮 attempt 已写入）+ ACCESS
+        body_error 字段 + log.warning；未配 cooldown → _record_unconfigured 只记
+        不冷却（对齐 HTTPError 语义）。不补 error 事件、不改已透传字节、不重试。
+        直接构造的测试 handler 可能无 server/config_store（同 stream_health_store
+        的 getattr 容忍先例）；无规则时零行为。
+        """
+        if observer is None or not hasattr(self, "_acc"):
+            return
+        acc = self._acc
+        if acc.get("body_error"):
+            return   # 幂等护栏（修订中2）：判定单点挂 finally，护栏防任何重复进入
+        _server = getattr(self, "server", None)
+        cs = getattr(_server, "config_store", None)
+        _getter = getattr(cs, "get_body_error_rules", None)
+        rules = _getter() if callable(_getter) else []
+        if not rules:
+            return
+        text, text_len, saw = observer.body_text_state()
+        code = match_body_error(text, rules, saw_tool_or_thinking=saw,
+                                text_len=text_len)
+        if code is None:
+            return
+        supply_id = acc.get("supply", "")
+        acc["body_error"] = code
+        acc["final_error"] = f"body_error {code}"
+        secs = resolve_cooldown_seconds(code, cs)
+        if secs is None:
+            log.warning("unconfigured body error: supply=%s code=%s "
+                        "(not in cooldown_rules, no cooldown)", supply_id, code)
+            _record_unconfigured(code)
+            return
+        log.warning("body_error cooldown: supply=%s code=%s secs=%s",
+                    supply_id, code, secs)
+        cd = getattr(_server, "cooldown_store", None)
+        if cd is not None:
+            cd.cooldown(supply_id, secs, code)
 
     def _record_stream_terminal(self, terminal: "pt.TerminalState") -> None:
         if hasattr(self, "_acc"):
