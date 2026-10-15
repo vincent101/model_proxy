@@ -296,7 +296,11 @@ responses 走 `reasoning.effort`），从报错响应里用宽松正则尝试提
 解析结果不保证准确（供应商报错格式差异大），需人工核实后再接受；探测无结论时会提示用户自行
 查阅目标模型官方文档确认支持的分档，再进入人工输入环节手动填。`supply add`/`edit`（重新探测
 环节）内部同样先跑这次连通性测试：若判定 REACHABLE，直接复用该次响应做 effort 档位解析，
-不再发第二次探测请求；否则打印归因并跳过（`add` 时会二次确认是否仍要保存该 supply）。
+不再发第二次探测请求；否则打印归因并跳过（`add` 时会二次确认是否仍要保存该 supply）。此外，
+连通性判定为 REACHABLE（2xx 或 400 探测值被拒）后会叠加顶层 `body_error_rules` 正文识别（与
+failover 侧同一对识别函数）：正文命中规则即降级判失败（`body_error`，附"正文摘要"行，取提取后
+text 截 100 字符），并跳过 effort 探测与 `reasoning_capability` 写入；未配置规则或未命中则
+行为与不叠加时完全一致（fail-open）。
 
 ## 11. stats 账本 schema
 

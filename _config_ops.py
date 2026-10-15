@@ -23,7 +23,13 @@ import urllib.request
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from core.reasoning.registry import resolve_protocol
-from core.server import validate_supply_ext, inject_system_block, resolve_appkey
+from core.server import (
+    validate_supply_ext,
+    inject_system_block,
+    resolve_appkey,
+    _extract_body_error_text,
+    match_body_error,
+)
 from _format_ops import (
     mask_appkey as _mask_appkey,
     strategy_route_desc as _strategy_route_desc,
@@ -445,6 +451,7 @@ class ReachabilityCategory:
     AUTH_ERROR = "auth_error"
     MODEL_ERROR = "model_error"
     REACHABLE = "reachable"
+    BODY_ERROR = "body_error"   # 2xx/400-探测被拒 + 正文命中 body_error_rules（设计 2026-10-15）
     UNKNOWN = "unknown"
 
 
@@ -503,7 +510,39 @@ def classify_supply_reachability(status: "int | None", text_fixed: str,
     return ReachabilityCategory.UNKNOWN, f"HTTP {status}，未归入已知类别，请人工核查响应内容"
 
 
-def _print_connectivity_status(status: "int | None", text_fixed: str, category: str, desc: str) -> None:
+def _body_error_check(text_fixed: str, rules) -> "tuple[str | None, str]":
+    """纯函数（不发请求）：对探测响应文本跑 body_error 识别，返回 (errorcode | None, extracted_text)。
+
+    复用生产链路同一对函数（_extract_body_error_text + match_body_error），保证测试侧与
+    failover 侧识别面完全一致。text_fixed 源自 raw bytes，encode 回 UTF-8 走 json.loads
+    无损。rules 为空时 match_body_error 返回 None（fail-open）。
+    """
+    text, saw = _extract_body_error_text(text_fixed.encode("utf-8"))
+    code = match_body_error(text, rules, saw_tool_or_thinking=saw, text_len=len(text))
+    return code, text
+
+
+def _apply_body_error_rules(status: "int | None", category: str, desc: str,
+                            text_fixed: str, body_rules) -> "tuple[str, str, str | None]":
+    """REACHABLE 分类后叠加 body_error_rules 正文识别，命中降级 BODY_ERROR。
+
+    返回 (category, desc, body_error_text)：未命中 / 无 rules / 非 REACHABLE 分类时
+    原样返回 (category, desc, None)——零行为变化（fail-open）。run_connectivity_test
+    与 connectivity_test_then_probe 共用本函数，保证打印结论与探测 gating 同一真相源
+    （classify_supply_reachability 保持纯 status/exc 归因，不掺 rules，见设计）。
+    """
+    if not body_rules or category != ReachabilityCategory.REACHABLE:
+        return category, desc, None
+    code, text = _body_error_check(text_fixed, body_rules)
+    if code is None:
+        return category, desc, None
+    return (ReachabilityCategory.BODY_ERROR,
+            f"HTTP {status} 但正文命中 body_error 规则（{code}），supply 实际不可用或受限",
+            text)
+
+
+def _print_connectivity_status(status: "int | None", text_fixed: str, category: str, desc: str,
+                               body_error_text: "str | None" = None) -> None:
     """打印结构化输出的第①项：当前接口联通状态（成功/失败及原因 + HTTP status，
     失败时附上游原始响应/异常文本）。供 run_connectivity_test 和
     run_probe_and_maybe_accept（独立跑分支）共用，保证展示格式统一。"""
@@ -512,12 +551,19 @@ def _print_connectivity_status(status: "int | None", text_fixed: str, category: 
     else:
         print(f"- 当前接口联通状态：失败，{desc}")
     print(f"    HTTP status={status}")
+    if category == ReachabilityCategory.BODY_ERROR and body_error_text is not None:
+        # 仅异常展示：摘要取 _extract_body_error_text 提取后的 text（跳 JSON 噪声），
+        # 截 100 字符、换行折叠为空格；正常 REACHABLE 不附正文（探测节已打印全文）
+        print(f"    正文摘要：{body_error_text.replace(chr(10), ' ')[:100]}")
     if category != ReachabilityCategory.REACHABLE:
         print(f"    {text_fixed}")
 
 
-def run_connectivity_test(supply: dict) -> "tuple[int | None, str, list[str] | None, bool, Exception | None]":
+def run_connectivity_test(supply: dict, body_rules=None) -> "tuple[int | None, str, list[str] | None, bool, Exception | None]":
     """独立的联通性测试：调用 probe_effort 并按分类打印结构化的"联通状态"一项。
+
+    body_rules（顶层 body_error_rules）：REACHABLE 分类后叠加正文识别，命中降级
+    BODY_ERROR 并附正文摘要行；无 rules 零行为变化（fail-open）。
 
     返回 probe_effort 的原始五元组，供调用方在 REACHABLE 场景下直接复用
     （通过 run_probe_and_maybe_accept 的 prefetched 参数），避免重复发请求。
@@ -527,7 +573,10 @@ def run_connectivity_test(supply: dict) -> "tuple[int | None, str, list[str] | N
     result = probe_effort(supply)
     status, text_fixed, regex_candidates, is_complete, exc = result
     category, desc = classify_supply_reachability(status, text_fixed, exc)
-    _print_connectivity_status(status, text_fixed, category, desc)
+    category, desc, body_error_text = _apply_body_error_rules(
+        status, category, desc, text_fixed, body_rules)
+    _print_connectivity_status(status, text_fixed, category, desc,
+                               body_error_text=body_error_text)
     return result
 
 
@@ -615,18 +664,23 @@ def run_probe_and_maybe_accept(supply: dict, interactive_prompt: bool = True,
     return None
 
 
-def connectivity_test_then_probe(supply: dict) -> "tuple[str, str, dict | None]":
+def connectivity_test_then_probe(supply: dict, body_rules=None) -> "tuple[str, str, dict | None]":
     """连通性测试 + REACHABLE 时复用响应做 effort 探测确认。
+
+    body_rules（顶层 body_error_rules）透传给 run_connectivity_test；BODY_ERROR
+    != REACHABLE → 自动跳过 effort 探测与 rcap 写入（测试进程不写任何运行时状态）。
 
     只发一次上游请求（run_connectivity_test 内的 probe_effort 是唯一请求点）。
     返回 (category, desc, rcap)：
-      - category/desc 来自 classify_supply_reachability，供调用方决定后续分支；
+      - category/desc 为 classify + body_error 降级后的最终结论，供调用方决定后续分支；
       - rcap：REACHABLE 且用户接受写入时为 {"effort_enum":[...]}，否则 None。
     非 REACHABLE 时不进入探测/写入环节，rcap 恒为 None。
     """
-    result = run_connectivity_test(supply)
+    result = run_connectivity_test(supply, body_rules=body_rules)
     status, text_fixed, regex_candidates, is_complete, exc = result
     category, desc = classify_supply_reachability(status, text_fixed, exc)
+    category, desc, _ = _apply_body_error_rules(
+        status, category, desc, text_fixed, body_rules)
     if category == ReachabilityCategory.REACHABLE:
         rcap = run_probe_and_maybe_accept(supply, prefetched=result)
         return category, desc, rcap
@@ -699,7 +753,7 @@ def supply_add(path: str) -> None:
 
     # 连通性测试 + 同步探测（add 时无条件跑，用户在场即时决定接受/跳过）。
     # REACHABLE 时复用同一次响应做档位解析，不再发第二次请求。
-    category, desc, rcap = connectivity_test_then_probe(entry)
+    category, desc, rcap = connectivity_test_then_probe(entry, cfg.get("body_error_rules"))
     if category != ReachabilityCategory.REACHABLE:
         if not confirm(f"连通性测试未通过（{desc}），是否仍要保存该 supply？"):
             print("已取消新增。")
@@ -780,7 +834,7 @@ def supply_edit(path: str, sid: str) -> None:
     # reasoning_capability 重新探测（可选）：先跑连通性测试，REACHABLE 则复用响应做探测，
     # 否则提示归因后跳过 rcap 写入（edit 自身有保存流程，不阻断整体 edit）。
     if confirm("reasoning_capability 重新探测?"):
-        category, desc, rcap = connectivity_test_then_probe(target)
+        category, desc, rcap = connectivity_test_then_probe(target, cfg.get("body_error_rules"))
         if category != ReachabilityCategory.REACHABLE:
             print(f"连通性测试未通过（{desc}），跳过 reasoning_capability 探测。")
         if rcap:
@@ -801,7 +855,7 @@ def supply_check(path: str, sid: str) -> None:
     if target is None:
         err(f"supply id 不存在: {sid}")
         done(False); sys.exit(1)
-    category, desc, rcap = connectivity_test_then_probe(target)
+    category, desc, rcap = connectivity_test_then_probe(target, cfg.get("body_error_rules"))
     if category != ReachabilityCategory.REACHABLE:
         print("连通性测试未通过，跳过 effort 探测。")
         done(False)

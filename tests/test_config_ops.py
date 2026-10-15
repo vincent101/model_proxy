@@ -7,6 +7,7 @@ fixture 来源：本次会话中真实拿到的样本（claude类 expected one o
 运行：cd tools/model_proxy && python3 -m unittest tests.test_config_ops -v
 """
 
+import contextlib
 import email.message
 import io
 import json
@@ -23,6 +24,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from _config_ops import (
     PROBE_VALUE,
     ReachabilityCategory,
+    _body_error_check,
     _extract_enum_candidates,
     _fix_mojibake,
     _is_response_complete,
@@ -457,6 +459,131 @@ class TestSupplyCheck(unittest.TestCase):
         mock_run_probe.assert_not_called()
         mock_write.assert_not_called()
         self.assertNotIn("reasoning_capability", cfg["supplies"][0])
+
+
+class TestBodyErrorCheck(unittest.TestCase):
+    """_body_error_check 纯函数单测（不发请求）：包装 _extract_body_error_text +
+    match_body_error，测试侧与生产链路同一识别面（设计 2026-10-15）。
+    """
+
+    RULES = [{"pattern": "请求过于频繁", "errorcode": "body_rate_limited"}]
+
+    def test_hit_content_text_block(self):
+        # 正例（设计推演）：200 + content text 块携带限频文案 → 命中 body_rate_limited
+        text_fixed = '{"content":[{"type":"text","text":"当前小时请求过于频繁"}]}'
+        code, text = _body_error_check(text_fixed, self.RULES)
+        self.assertEqual(code, "body_rate_limited")
+        self.assertEqual(text, "当前小时请求过于频繁")
+
+    def test_no_hit_normal_400_error_body(self):
+        # 反例：正常 400（探测值被拒），错误文本在 error 顶层字段 → 兜底 raw 全文、
+        # pattern 不含 → 未命中
+        text_fixed = ('{"error":{"message":"Invalid parameter: '
+                      'reasoning_effort must be one of low, medium, high"}}')
+        code, text = _body_error_check(text_fixed, self.RULES)
+        self.assertIsNone(code)
+        self.assertEqual(text, text_fixed)
+
+    def test_no_rules_fail_open(self):
+        # 无 rules → 恒 None（fail-open，零行为变化）
+        code, text = _body_error_check('{"content":[{"type":"text","text":"请求过于频繁"}]}', None)
+        self.assertIsNone(code)
+        code, _ = _body_error_check('{"content":[{"type":"text","text":"请求过于频繁"}]}', [])
+        self.assertIsNone(code)
+
+    def test_long_text_short_circuit(self):
+        # 长文短路：提取后 text 全文 >200（默认 max_text_len）→ 规则跳过不判定
+        long_text = "前置噪声" * 60 + "请求过于频繁"   # 240+ 字符
+        text_fixed = json.dumps({"content": [{"type": "text", "text": long_text}]},
+                                ensure_ascii=False)
+        code, _ = _body_error_check(text_fixed, self.RULES)
+        self.assertIsNone(code)
+
+    def test_tool_use_block_marker_blocks_match(self):
+        # 误伤防护：content 含 tool_use 块（正常回复开始调工具）→ 结构标记置位 → 不判定
+        text_fixed = json.dumps(
+            {"content": [{"type": "text", "text": "请求过于频繁"},
+                         {"type": "tool_use", "id": "t1", "name": "x", "input": {}}]},
+            ensure_ascii=False)
+        code, _ = _body_error_check(text_fixed, self.RULES)
+        self.assertIsNone(code)
+
+
+class TestBodyErrorDowngrade(unittest.TestCase):
+    """run_connectivity_test / connectivity_test_then_probe 的 BODY_ERROR 降级与
+    摘要行展示（mock probe_effort，不发请求）；无 rules 零行为回归。
+    """
+
+    RULES = [{"pattern": "请求过于频繁", "errorcode": "body_rate_limited"}]
+
+    def _supply(self):
+        return {"id": "test-supply", "protocol": "anthropic",
+                "url": "http://x", "target_model": "m", "appkey": "k"}
+
+    def _body_error_result(self):
+        # 200 + content text 限频文案（REACHABLE 的 2xx 形态）
+        return (200, '{"content":[{"type":"text","text":"当前小时请求过于频繁"}]}',
+                None, True, None)
+
+    def test_run_connectivity_test_200_downgrades_and_prints_summary(self):
+        buf = io.StringIO()
+        with patch("_config_ops.probe_effort",
+                   return_value=self._body_error_result()), \
+             contextlib.redirect_stdout(buf):
+            result = run_connectivity_test(self._supply(), body_rules=self.RULES)
+        out = buf.getvalue()
+        self.assertIn("失败", out)
+        self.assertIn("body_rate_limited", out)
+        self.assertIn("正文摘要：当前小时请求过于频繁", out)
+        # 五元组原样返回（REACHABLE 复用契约不受降级影响）
+        self.assertEqual(result[0], 200)
+
+    def test_run_connectivity_test_400_probe_rejected_downgrades(self):
+        # REACHABLE 的 400 形态（探测非法值被拒）同样叠加正文识别
+        result_400 = (400, '{"error":{"message":"请求过于频繁，请稍后再试"}}', None, True, None)
+        buf = io.StringIO()
+        with patch("_config_ops.probe_effort", return_value=result_400), \
+             contextlib.redirect_stdout(buf):
+            run_connectivity_test(self._supply(), body_rules=self.RULES)
+        self.assertIn("body_error", buf.getvalue())
+        self.assertIn("body_rate_limited", buf.getvalue())
+
+    def test_then_probe_body_error_skips_effort_probe_and_rcap(self):
+        # 联动：BODY_ERROR != REACHABLE → 跳过 effort 探测与 rcap 写入
+        with patch("_config_ops.probe_effort",
+                   return_value=self._body_error_result()) as mock_probe, \
+             patch("_config_ops.run_probe_and_maybe_accept") as mock_run_probe:
+            category, desc, rcap = connectivity_test_then_probe(
+                self._supply(), body_rules=self.RULES)
+        mock_probe.assert_called_once()
+        mock_run_probe.assert_not_called()
+        self.assertEqual(category, ReachabilityCategory.BODY_ERROR)
+        self.assertIn("body_rate_limited", desc)
+        self.assertIsNone(rcap)
+
+    def test_then_probe_no_rules_reachable_flow_unchanged(self):
+        # 无 rules 零行为回归：REACHABLE 流程照旧进入探测并写入
+        reachable_result = (400, '{"error":{"message":"expected one of `low`, `high`"}}',
+                            ["low", "high"], True, None)
+        with patch("_config_ops.probe_effort", return_value=reachable_result) as mock_probe, \
+             patch("builtins.input", return_value=""), \
+             patch("_config_ops.confirm", return_value=True):
+            category, desc, rcap = connectivity_test_then_probe(self._supply())
+        mock_probe.assert_called_once()
+        self.assertEqual(category, ReachabilityCategory.REACHABLE)
+        self.assertEqual(rcap, {"effort_enum": ["low", "high"]})
+
+    def test_run_connectivity_test_no_rules_reachable_no_summary_line(self):
+        # 无 rules 时 REACHABLE 输出与现状一致：无"正文摘要"行
+        buf = io.StringIO()
+        with patch("_config_ops.probe_effort",
+                   return_value=(200, '{"ok":true}', None, True, None)), \
+             contextlib.redirect_stdout(buf):
+            run_connectivity_test(self._supply())
+        out = buf.getvalue()
+        self.assertIn("成功", out)
+        self.assertNotIn("正文摘要", out)
+        self.assertNotIn("失败", out)
 
 
 class TestValidateStrategyRouteFields(unittest.TestCase):
