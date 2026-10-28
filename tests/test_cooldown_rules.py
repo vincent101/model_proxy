@@ -33,7 +33,8 @@ from core.server import (  # noqa: E402
     _record_unconfigured,
     _snapshot_unconfigured_hits,
     _unconfigured_hits,
-)  # noqa: E402
+)
+from core.thinking_guard import ThinkingStripStore  # noqa: E402  # noqa: E402
 
 
 # ---------------------------------------------------------------------------
@@ -164,7 +165,8 @@ def _make_server(supplies, tier_supplies, rules=None, failover="on"):
     cd = _FakeCooldown()
     ns = SimpleNamespace(
         config_store=_FakeConfig(supply_map, routes_map, strategies, rules),
-        cooldown_store=cd, pref_store=_FakePref(), sidecar_store=_FakeSidecar())
+        cooldown_store=cd, pref_store=_FakePref(), sidecar_store=_FakeSidecar(),
+        thinking_strip_store=ThinkingStripStore())
     return ns, cd
 
 
@@ -185,6 +187,7 @@ def _make_handler(server_ns, body=None):
         "strategy": "", "session": "", "route_failover": 0,
         "builtin": "", "budget_retried": "", "budget_truncated": 0, "stop_reason": "",
         "final_error": "", "attempt_errors": [],
+        "thinking_strip": 0,
     }
     h._responses = []
 

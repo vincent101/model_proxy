@@ -11,6 +11,7 @@ import unittest
 from types import SimpleNamespace
 
 from core.server import ModelProxyHandler
+from core.thinking_guard import ThinkingStripStore
 
 
 class _FakeConfig:
@@ -57,7 +58,8 @@ def _make_handler(auth_header):
         headers.update(auth_header)
     h = ModelProxyHandler.__new__(ModelProxyHandler)
     h.server = SimpleNamespace(config_store=_FakeConfig(), cooldown_store=_FakeStore(),
-                               pref_store=_FakeStore(), sidecar_store=_FakeStore())
+                               pref_store=_FakeStore(), sidecar_store=_FakeStore(),
+                               thinking_strip_store=ThinkingStripStore())
     h.path = "/v1/messages"
     h.headers = headers
     h.rfile = io.BytesIO(raw)

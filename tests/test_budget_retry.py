@@ -32,7 +32,8 @@ from unittest.mock import patch
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from core.server import ModelProxyHandler  # noqa: E402  # noqa: E402
+from core.server import ModelProxyHandler  # noqa: E402
+from core.thinking_guard import ThinkingStripStore  # noqa: E402  # noqa: E402
 
 
 # ---------------------------------------------------------------------------
@@ -218,7 +219,8 @@ def _make_server(supplies, tier_supplies, budget_retry=None, failover="on"):
     pref = _FakePref()
     ns = SimpleNamespace(
         config_store=_FakeConfig(supply_map, routes_map, strategies, budget_retry),
-        cooldown_store=cd, pref_store=pref, sidecar_store=_FakeSidecar())
+        cooldown_store=cd, pref_store=pref, sidecar_store=_FakeSidecar(),
+        thinking_strip_store=ThinkingStripStore())
     return ns, cd, pref
 
 
@@ -237,6 +239,7 @@ def _make_handler(server_ns, body: dict, path="/v1/messages"):
         "strategy": "", "session": "", "route_failover": 0,
         "builtin": "", "budget_retried": "", "budget_truncated": 0, "stop_reason": "",
         "final_error": "", "attempt_errors": [],
+        "thinking_strip": 0,
     }
     h._responses = []
 

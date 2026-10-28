@@ -35,6 +35,11 @@ from typing import Any, Callable
 from . import claudian_titles
 from . import session_identity
 from . import translate as pt
+from .thinking_guard import (
+    ThinkingStripStore,
+    is_invalid_signature_rejection,
+    strip_empty_signature_thinking,
+)
 from .listen_config import ListenConfigError, parse_host_authority, resolve_listen
 from .commands import (
     CMD_PREFIX,
@@ -1782,6 +1787,9 @@ class ModelProxyHandler(BaseHTTPRequestHandler):
             # nudge 改写观测：入站 body 命中已知 SDK 注入文案改写时置 "1"
             # （含 $route 等未转发请求——命中即置位，属预期）。
             "nudge_rewritten": "",
+            # thinking 剥离重试观测：签名 400 触发 learn+剥离重试时置 1
+            # （低频高价值，对齐 body_error/nudge_rewritten 先例）。
+            "thinking_strip": 0,
             "response_committed": 0, "stream_integrity": "",
             "terminal_status": "", "terminal_reason": "", "first_event_ms": "",
         }
@@ -1821,6 +1829,7 @@ class ModelProxyHandler(BaseHTTPRequestHandler):
                 "usage_in=%s usage_out=%s token=%s session=%s "
                 "route_failover=%s builtin=%s budget_retried=%s budget_truncated=%s "
                 "stop_reason=%s final_error=%s body_error=%s nudge_rewritten=%s "
+                "thinking_strip=%s "
                 "response_committed=%s "
                 "stream_integrity=%s terminal_status=%s terminal_reason=%s first_event_ms=%s",
                 ms, a["status"], a["source"], a["operation"],
@@ -1831,7 +1840,8 @@ class ModelProxyHandler(BaseHTTPRequestHandler):
                 a["budget_truncated"], a["stop_reason"],
                 re.sub(r"\s+", "_", a["final_error"][:80]),
                 a["body_error"],
-                a["nudge_rewritten"], a["response_committed"], a["stream_integrity"],
+                a["nudge_rewritten"], a["thinking_strip"], a["response_committed"],
+                a["stream_integrity"],
                 a["terminal_status"], a["terminal_reason"], a["first_event_ms"])
             if usage_totals is not None:
                 try:
@@ -1987,6 +1997,7 @@ class ModelProxyHandler(BaseHTTPRequestHandler):
         cs: ConfigStore = self.server.config_store
         cd: CooldownStore = self.server.cooldown_store
         pref_store: SyntaxPreferenceStore = self.server.pref_store
+        thinking_strip_store: ThinkingStripStore = self.server.thinking_strip_store
         # 1. 热重载 + 读 body
         cs.maybe_reload()
         content_length = int(self.headers.get("Content-Length", 0) or 0)
@@ -2100,6 +2111,7 @@ class ModelProxyHandler(BaseHTTPRequestHandler):
             return
 
         _reasoning_retried = False   # reasoning 语法重试只做一次，作用域覆盖整个请求周期
+        _thinking_strip_retried = False   # thinking 签名 400 剥离重试只做一次（与语法重试独立互不消耗）
         # raw_intent 必须在循环外、基于客户端原始 body_json 只 decode 一次。
         # body_json 在循环体内会被原地改写（model 改写为 target_model、reasoning_wire
         # 通过 apply_fields 写回），若在循环内重新 decode，第二轮起会对"已被上一轮写入
@@ -2295,6 +2307,19 @@ class ModelProxyHandler(BaseHTTPRequestHandler):
                     if target_model and isinstance(body_json, dict) and "model" in body_json:
                         body_json["model"] = target_model
                         send_body = json.dumps(body_json, ensure_ascii=False).encode("utf-8")
+                    # thinking 剥离：aigc 验签 supply（learn 到的）出站前删空签名历史 thinking 块。
+                    # fail-open：未 learn 的 supply 首轮请求不剥离（mcli 不验签，零行为变化；
+                    # 剥离后 failover 到未 learn supply 的场景见设计风险 R7，后果良性）。
+                    # 注意 send_body 强制 re-dump：raw_body 逃逸坑的核心修复——若 supply 无
+                    # target_model/reasoning_wire/system_inject 且预算无变化，send_body 停留在
+                    # 原始字节，只改 body_json 不 re-dump 会静默丢弃剥离结果（推演·具象3）。
+                    if (target == "anthropic" and isinstance(body_json, dict)
+                            and thinking_strip_store.snapshot(supply_id)):
+                        _n = strip_empty_signature_thinking(body_json)
+                        if _n:
+                            log.warning("thinking_strip: supply=%s removed %d empty-signature thinking blocks",
+                                        supply_id, _n)
+                            send_body = json.dumps(body_json, ensure_ascii=False).encode("utf-8")
                     # reasoning 字段按目标 capability 相对映射后原地 merge（含 anthropic→anthropic 与
                     # responses→responses：source==target 时 syntax_adapt 的 variant 就是该协议唯一/
                     # 学到的语法，PASSTHROUGH 不代表"不处理 reasoning"，只代表 body 结构本身不用转换）
@@ -2429,6 +2454,19 @@ class ModelProxyHandler(BaseHTTPRequestHandler):
                     resp_headers = list(e.headers.items())
                     resp_body = e.read()
 
+
+                    # thinking 签名 400 自适应剥离重试（仅一次，不 rotate/cooldown/tried_set，
+                    # 与 reasoning 语法重试同模式；分类器文本与 interpret_rejection 各 pattern 互斥，
+                    # 单个 400 至多命中其一。置于语法重试之前：签名错误更特定且不依赖 reasoning_wire）。
+                    if (resp_status == 400 and not _thinking_strip_retried
+                            and mode == PASSTHROUGH and target == "anthropic"
+                            and is_invalid_signature_rejection(resp_body)):
+                        thinking_strip_store.learn(supply_id)
+                        _thinking_strip_retried = True
+                        self._acc["thinking_strip"] = 1
+                        log.warning("thinking_strip_retry: supply=%s learned, stripping and retrying once",
+                                    supply_id)
+                        continue  # 重进 while：select_supply 复选同 supply，D 点命中刚 learn 的偏好自动剥离重发
 
                     # reasoning 语法自适应重试（仅一次，不 rotate/cooldown supply，
                     # 与 failover 重试的关键区别：不加入 tried_set、不调用 cd.cooldown）。
@@ -3401,6 +3439,10 @@ def main():
     # 见 core/thinking_guard.py 与 docs/designs/2026-10-28-thinking空签名剥离与supply级自适应.md）
     thinking_strip_store = ThinkingStripStore()
 
+    # 2.5b 实例化 ThinkingStripStore（thinking 空签名剥离的 supply 级学习，
+    # 见 core/thinking_guard.py 与 docs/designs/2026-10-28-thinking空签名剥离与supply级自适应.md）
+    thinking_strip_store = ThinkingStripStore()
+
     # 2.6 实例化 SessionOverridesSidecar（$route in-band 指令的 override 落盘，
     # 与主 config 同目录，代理独占写，见 docs/designs/2026-08-04-in-band-route-command-design.md §4.5）
     sidecar_store = SessionOverridesSidecar(config_path.parent / "session_overrides.json")
@@ -3412,6 +3454,7 @@ def main():
     server.cooldown_store = cooldown_store  # type: ignore[attr-defined]
     server.stream_health_store = stream_health_store  # type: ignore[attr-defined]
     server.pref_store = pref_store        # type: ignore[attr-defined]
+    server.thinking_strip_store = thinking_strip_store  # type: ignore[attr-defined]
     server.thinking_strip_store = thinking_strip_store  # type: ignore[attr-defined]
     server.sidecar_store = sidecar_store  # type: ignore[attr-defined]
     # Host 头校验仅 listen.host 非 loopback 时装配（None = 未启用，loopback 无暴露面）

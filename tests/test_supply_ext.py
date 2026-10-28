@@ -35,7 +35,8 @@ from core.server import (  # noqa: E402
     inject_system_block,
     resolve_appkey,
     validate_supply_ext,
-)  # noqa: E402
+)
+from core.thinking_guard import ThinkingStripStore  # noqa: E402  # noqa: E402
 
 INJECT = "x-anthropic-billing-header: cc_version=2.1.196; cc_entrypoint=sdk-cli; cch=00000;"
 
@@ -172,7 +173,8 @@ def _make_server(supplies, tier_supplies=None, failover="on"):
     cd = _FakeCooldown()
     ns = SimpleNamespace(
         config_store=_FakeConfig(supply_map, routes_map, strategies),
-        cooldown_store=cd, pref_store=_FakePref(), sidecar_store=_FakeSidecar())
+        cooldown_store=cd, pref_store=_FakePref(), sidecar_store=_FakeSidecar(),
+        thinking_strip_store=ThinkingStripStore())
     return ns, cd
 
 
@@ -192,6 +194,7 @@ def _make_handler(server_ns, body: dict, path="/v1/messages", extra_req_headers=
         "strategy": "", "session": "", "route_failover": 0,
         "builtin": "", "budget_retried": "", "budget_truncated": 0, "stop_reason": "",
         "final_error": "", "attempt_errors": [],
+        "thinking_strip": 0,
     }
     h._responses = []
 

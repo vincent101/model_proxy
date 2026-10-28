@@ -11,6 +11,7 @@ from unittest.mock import patch
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from core.server import ModelProxyHandler, build_target_url, detect_operation, detect_source
+from core.thinking_guard import ThinkingStripStore
 
 
 class FakeResponse:
@@ -63,7 +64,8 @@ class TestCountTokens(unittest.TestCase):
         cd = Cooldown()
         h = ModelProxyHandler.__new__(ModelProxyHandler)
         h.server = SimpleNamespace(config_store=Config(supplies, failover), cooldown_store=cd,
-                                   pref_store=SimpleNamespace(), sidecar_store=Sidecar())
+                                   pref_store=SimpleNamespace(), sidecar_store=Sidecar(),
+                                   thinking_strip_store=ThinkingStripStore())
         h.path = "/v1/messages/count_tokens"
         h.headers = {"Authorization": "Bearer tok", "Content-Length": str(len(raw))}
         h.rfile = io.BytesIO(raw)

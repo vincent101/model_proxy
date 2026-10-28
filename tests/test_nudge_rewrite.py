@@ -26,7 +26,8 @@ from core.server import (  # noqa: E402
     _NUDGE_TEXT_ORIG,
     _NUDGE_TEXT_REWRITTEN,
     _rewrite_known_injected_texts,
-)  # noqa: E402
+)
+from core.thinking_guard import ThinkingStripStore  # noqa: E402  # noqa: E402
 
 
 # ---------------------------------------------------------------------------
@@ -194,7 +195,7 @@ def _make_server(supplies, tier_supplies):
     ns = SimpleNamespace(
         config_store=_FakeConfig(supply_map, routes_map, strategies),
         cooldown_store=_FakeCooldown(), pref_store=_FakePref(),
-        sidecar_store=_FakeSidecar())
+        sidecar_store=_FakeSidecar(), thinking_strip_store=ThinkingStripStore())
     return ns
 
 
@@ -214,6 +215,7 @@ def _make_handler(server_ns, body: dict, path="/v1/messages"):
         "builtin": "", "budget_retried": "", "budget_truncated": 0, "stop_reason": "",
         "final_error": "", "attempt_errors": [],
         "nudge_rewritten": "",
+        "thinking_strip": 0,
     }
     h._responses = []
 

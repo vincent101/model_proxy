@@ -39,7 +39,8 @@ from core.server import (  # noqa: E402
     CooldownStore,
     ModelProxyHandler,
     SyntaxPreferenceStore,
-)  # noqa: E402
+)
+from core.thinking_guard import ThinkingStripStore  # noqa: E402  # noqa: E402
 
 
 def _routes_map():
@@ -561,6 +562,7 @@ def _make_forward_handler(cfg_path, sidecar_path):
     fs.config_store = ConfigStore(cfg_path)
     fs.cooldown_store = CooldownStore()
     fs.pref_store = SyntaxPreferenceStore()
+    fs.thinking_strip_store = ThinkingStripStore()
     fs.sidecar_store = SessionOverridesSidecar(sidecar_path)
     h.server = fs
     return h
@@ -582,6 +584,7 @@ def _send(h, text, session_id, stream=False):
         "failover": 0, "attempts": 0, "token": "", "usage_in": 0, "usage_out": 0,
         "strategy": "", "session": "", "route_failover": 0, "builtin": "",
         "final_error": "", "attempt_errors": [],
+        "thinking_strip": 0,
     }
     h._forward("POST")
     return h._acc, h.wfile.getvalue()
