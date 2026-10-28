@@ -32,6 +32,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 # 合并后的双向协议转换器（core 包内相对导入）
+from . import claudian_titles
 from . import session_identity
 from . import translate as pt
 from .listen_config import ListenConfigError, parse_host_authority, resolve_listen
@@ -1986,7 +1987,6 @@ class ModelProxyHandler(BaseHTTPRequestHandler):
         cs: ConfigStore = self.server.config_store
         cd: CooldownStore = self.server.cooldown_store
         pref_store: SyntaxPreferenceStore = self.server.pref_store
-
         # 1. 热重载 + 读 body
         cs.maybe_reload()
         content_length = int(self.headers.get("Content-Length", 0) or 0)
@@ -2100,7 +2100,6 @@ class ModelProxyHandler(BaseHTTPRequestHandler):
             return
 
         _reasoning_retried = False   # reasoning 语法重试只做一次，作用域覆盖整个请求周期
-
         # raw_intent 必须在循环外、基于客户端原始 body_json 只 decode 一次。
         # body_json 在循环体内会被原地改写（model 改写为 target_model、reasoning_wire
         # 通过 apply_fields 写回），若在循环内重新 decode，第二轮起会对"已被上一轮写入
@@ -2429,6 +2428,7 @@ class ModelProxyHandler(BaseHTTPRequestHandler):
                     resp_status = e.code
                     resp_headers = list(e.headers.items())
                     resp_body = e.read()
+
 
                     # reasoning 语法自适应重试（仅一次，不 rotate/cooldown supply，
                     # 与 failover 重试的关键区别：不加入 tried_set、不调用 cd.cooldown）。
@@ -2762,14 +2762,17 @@ class ModelProxyHandler(BaseHTTPRequestHandler):
         result = handler(ctx)
 
         # 回执内嵌当前请求 session 的身份：把各行 "session <uuid8>" 升级为
-        # "session <name · uuid8>"（注册表命中 name 时）。身份解析限定在 server
-        # 层完成，commands.py 维持"只操作代理自身路由/观测状态"的命令层边界。
+        # "session <name · uuid8>"（注册表命中 name 时），再补 claudian 会话标题
+        # 成 "session <name · uuid8>（<标题>）"（meta 命中标题时）。身份解析限定
+        # 在 server 层完成，commands.py 维持"只操作代理自身路由/观测状态"的命令层边界。
         receipt_text = result.receipt_text
         if session_key:
             identity = session_identity.format_session_identity(session_key)
+            title = claudian_titles.lookup_session_title(session_key)
+            display = f"{identity}（{title}）" if title else identity
             short = session_key[:8]
-            if identity and identity != short:
-                receipt_text = receipt_text.replace(f"session {short}", f"session {identity}")
+            if display != short:
+                receipt_text = receipt_text.replace(f"session {short}", f"session {display}")
 
         # ACCESS route= 记「本次命令操作/查询后的生效 route」以便核对（§3.3）：
         # 切换成功后就是目标 route；reset 成功后重新算一次候选（写操作已完成，
@@ -3394,6 +3397,10 @@ def main():
     # 2.5 实例化 SyntaxPreferenceStore（reasoning 语法偏好，取代旧 _THINKING_FMT_CACHE）
     pref_store = SyntaxPreferenceStore()
 
+    # 2.5b 实例化 ThinkingStripStore（thinking 空签名剥离的 supply 级学习，
+    # 见 core/thinking_guard.py 与 docs/designs/2026-10-28-thinking空签名剥离与supply级自适应.md）
+    thinking_strip_store = ThinkingStripStore()
+
     # 2.6 实例化 SessionOverridesSidecar（$route in-band 指令的 override 落盘，
     # 与主 config 同目录，代理独占写，见 docs/designs/2026-08-04-in-band-route-command-design.md §4.5）
     sidecar_store = SessionOverridesSidecar(config_path.parent / "session_overrides.json")
@@ -3405,6 +3412,7 @@ def main():
     server.cooldown_store = cooldown_store  # type: ignore[attr-defined]
     server.stream_health_store = stream_health_store  # type: ignore[attr-defined]
     server.pref_store = pref_store        # type: ignore[attr-defined]
+    server.thinking_strip_store = thinking_strip_store  # type: ignore[attr-defined]
     server.sidecar_store = sidecar_store  # type: ignore[attr-defined]
     # Host 头校验仅 listen.host 非 loopback 时装配（None = 未启用，loopback 无暴露面）
     server.host_validator = (  # type: ignore[attr-defined]

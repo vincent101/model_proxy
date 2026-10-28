@@ -37,7 +37,7 @@ from core.server import (  # noqa: E402
     match_body_error,
     _snapshot_unconfigured_hits,
     _unconfigured_hits,
-)
+)  # noqa: E402
 
 
 # ---------------------------------------------------------------------------

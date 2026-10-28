@@ -39,7 +39,7 @@ from core.server import (  # noqa: E402
     CooldownStore,
     ModelProxyHandler,
     SyntaxPreferenceStore,
-)
+)  # noqa: E402
 
 
 def _routes_map():
@@ -590,16 +590,21 @@ def _send(h, text, session_id, stream=False):
 class TestForwardInterceptEndToEnd(unittest.TestCase):
 
     def setUp(self):
-        # 隔离真实 HOME：$route 回执现在会读 ~/.claude/sessions 注册表，
-        # 统一 patch 到临时空目录（未命中 → 回执仅附 uuid8，输出确定性）。
+        # 隔离真实 HOME 与 vault：$route 回执会读 ~/.claude/sessions 注册表和
+        # .claudian/sessions 会话标题，统一 patch 到临时空目录（未命中 → 回执
+        # 仅附 uuid8，输出确定性；真实 vault 恰有同 UUID conv 会污染断言）。
         self._sessions_td = tempfile.TemporaryDirectory()
         sessions_dir = Path(self._sessions_td.name) / "sessions"
         sessions_dir.mkdir()
         self._sessions_dir = sessions_dir
-        self._patcher = patch(
+        self._identity_patcher = patch(
             "core.session_identity.DEFAULT_SESSIONS_DIR", sessions_dir)
-        self._patcher.start()
-        self.addCleanup(self._patcher.stop)
+        self._identity_patcher.start()
+        self._claudian_patcher = patch(
+            "core.claudian_titles.DEFAULT_CLAUDIAN_SESSIONS_DIR", sessions_dir)
+        self._claudian_patcher.start()
+        self.addCleanup(self._identity_patcher.stop)
+        self.addCleanup(self._claudian_patcher.stop)
         self.addCleanup(self._sessions_td.cleanup)
 
     def _write_session_registry(self, sid, name):
@@ -684,14 +689,20 @@ class TestRouteReceiptSessionIdentity(unittest.TestCase):
     """
 
     def setUp(self):
+        # 同 TestForwardInterceptEndToEnd：隔离真实 HOME 与 vault 的两个外部
+        # 状态源，回执输出确定性（真实 vault 恰有同 UUID conv 会污染断言）。
         self._sessions_td = tempfile.TemporaryDirectory()
         sessions_dir = Path(self._sessions_td.name) / "sessions"
         sessions_dir.mkdir()
         self._sessions_dir = sessions_dir
-        self._patcher = patch(
+        self._identity_patcher = patch(
             "core.session_identity.DEFAULT_SESSIONS_DIR", sessions_dir)
-        self._patcher.start()
-        self.addCleanup(self._patcher.stop)
+        self._identity_patcher.start()
+        self._claudian_patcher = patch(
+            "core.claudian_titles.DEFAULT_CLAUDIAN_SESSIONS_DIR", sessions_dir)
+        self._claudian_patcher.start()
+        self.addCleanup(self._identity_patcher.stop)
+        self.addCleanup(self._claudian_patcher.stop)
         self.addCleanup(self._sessions_td.cleanup)
 
     def _write_cfg(self, d):
@@ -771,6 +782,108 @@ class TestRouteReceiptSessionIdentity(unittest.TestCase):
                 h.server.sidecar_store, "claude-sonnet", {})
         text = self._receipt_text(h.wfile.getvalue())
         self.assertNotIn("session 身份", text)
+
+
+class TestRouteReceiptClaudianTitle(unittest.TestCase):
+    """$route 回执首行身份再补 claudian 会话标题（server 层统一替换）。
+
+    形态：注册表+标题双命中 → `session <name · uuid8>（<标题>）`；
+    仅标题命中 → `session <uuid8>（<标题>）`；双未命中 → uuid8 原样、无（。
+    """
+
+    def setUp(self):
+        self._sessions_td = tempfile.TemporaryDirectory()
+        sessions_dir = Path(self._sessions_td.name) / "sessions"
+        sessions_dir.mkdir()
+        self._sessions_dir = sessions_dir
+        self._identity_patcher = patch(
+            "core.session_identity.DEFAULT_SESSIONS_DIR", sessions_dir)
+        self._identity_patcher.start()
+        self._claudian_patcher = patch(
+            "core.claudian_titles.DEFAULT_CLAUDIAN_SESSIONS_DIR", sessions_dir)
+        self._claudian_patcher.start()
+        self.addCleanup(self._identity_patcher.stop)
+        self.addCleanup(self._claudian_patcher.stop)
+        self.addCleanup(self._sessions_td.cleanup)
+
+    def _write_cfg(self, d):
+        cfg_path = Path(d) / "model_proxy_config.json"
+        cfg = {
+            "admin_token": "x",
+            "supplies": [],
+            "routes": [{"id": "claude", "tiers": {}}, {"id": "nation", "tiers": {}}],
+            "strategies": [{
+                "client_token": "cc",
+                "route_pool": [{"route_id": "claude", "weight": 1}],
+            }],
+        }
+        cfg_path.write_text(json.dumps(cfg), encoding="utf-8")
+        return cfg_path
+
+    def _write_session_registry(self, sid, name):
+        (self._sessions_dir / "777.json").write_text(json.dumps({
+            "pid": 777, "sessionId": sid, "name": name,
+            "procStart": "Mon Aug 24 10:00:00 2026",
+            "startedAt": 1787500000000,
+        }), encoding="utf-8")
+
+    def _write_claudian_meta(self, sid, title):
+        """写 conv-*.meta.json（键序/缩进仿 claudian toSessionMetadata 序列化）。"""
+        meta = {
+            "id": "conv-1776259022755-oiaafac3i",
+            "providerId": "claude",
+            "title": title,
+            "titleGenerationStatus": "success",
+            "createdAt": 1776259022756,
+            "updatedAt": 1776649791897,
+            "sessionId": sid,
+        }
+        (self._sessions_dir / "conv-e2e.meta.json").write_text(
+            json.dumps(meta, indent=2, ensure_ascii=False), encoding="utf-8")
+
+    def _receipt_text(self, raw: bytes) -> str:
+        resp = json.loads(raw.decode("utf-8"))
+        return resp["content"][0]["text"]
+
+    def test_receipt_registry_and_title_both_hit(self):
+        """① 注册表+标题双命中 → `当前 session name · uuid8（标题） 生效 route:`。"""
+        with tempfile.TemporaryDirectory() as d:
+            cfg_path = self._write_cfg(d)
+            sidecar_path = Path(d) / "session_overrides.json"
+            h = _make_forward_handler(cfg_path, sidecar_path)
+            sid = "b6ceb46d-1a05-4604-b6a5-ce6fb1a99e8a"
+            self._write_session_registry(sid, "notevault-9")
+            self._write_claudian_meta(sid, "quant策略架构Agent")
+            _, raw = _send(h, "$route", sid)
+        text = self._receipt_text(raw)
+        self.assertIn("当前 session notevault-9 · b6ceb46d（quant策略架构Agent） 生效 route:", text)
+        self.assertNotIn("session 身份:", text)
+
+    def test_receipt_title_only_hit(self):
+        """② 仅标题命中 → `session uuid8（标题）`，无 `·`。"""
+        with tempfile.TemporaryDirectory() as d:
+            cfg_path = self._write_cfg(d)
+            sidecar_path = Path(d) / "session_overrides.json"
+            h = _make_forward_handler(cfg_path, sidecar_path)
+            sid = "b6ceb46d-1a05-4604-b6a5-ce6fb1a99e8a"
+            self._write_claudian_meta(sid, "quant策略架构Agent")
+            _, raw = _send(h, "$route", sid)
+        text = self._receipt_text(raw)
+        self.assertIn("当前 session b6ceb46d（quant策略架构Agent） 生效 route:", text)
+        self.assertNotIn("·", text)
+
+    def test_receipt_both_miss_shows_uuid8_only(self):
+        """③ 双未命中 → uuid8 原样，session id 后不接身份分隔/标题括号。"""
+        with tempfile.TemporaryDirectory() as d:
+            cfg_path = self._write_cfg(d)
+            sidecar_path = Path(d) / "session_overrides.json"
+            h = _make_forward_handler(cfg_path, sidecar_path)
+            _, raw = _send(h, "$route", "sess-e2e-miss")
+        text = self._receipt_text(raw)
+        self.assertIn("当前 session sess-e2e 生效 route:", text)
+        self.assertNotIn("·", text)
+        # 回固定有 route 来源等全角括号，此处只断言 session id 后不接标题括号。
+        self.assertNotIn("session sess-e2e（", text)
 
 
 if __name__ == "__main__":

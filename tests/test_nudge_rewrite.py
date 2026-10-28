@@ -26,7 +26,7 @@ from core.server import (  # noqa: E402
     _NUDGE_TEXT_ORIG,
     _NUDGE_TEXT_REWRITTEN,
     _rewrite_known_injected_texts,
-)
+)  # noqa: E402
 
 
 # ---------------------------------------------------------------------------

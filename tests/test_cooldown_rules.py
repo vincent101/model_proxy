@@ -33,7 +33,7 @@ from core.server import (  # noqa: E402
     _record_unconfigured,
     _snapshot_unconfigured_hits,
     _unconfigured_hits,
-)
+)  # noqa: E402
 
 
 # ---------------------------------------------------------------------------

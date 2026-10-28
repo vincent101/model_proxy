@@ -32,7 +32,7 @@ from unittest.mock import patch
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from core.server import ModelProxyHandler  # noqa: E402
+from core.server import ModelProxyHandler  # noqa: E402  # noqa: E402
 
 
 # ---------------------------------------------------------------------------

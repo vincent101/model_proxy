@@ -508,7 +508,7 @@ def _handle_query(ctx: CommandContext) -> CommandResult:
 
     override_rid = sidecar_map.get(session_key)
     if override_rid and override_rid in routes_map:
-        source = "sidecar（本次会话最近一次 $route 指令）"
+        source = "sidecar"
         current_route = override_rid
     else:
         # 未命中 override：自动哈希分配。具体候选顺序由 server.py 调用

@@ -35,7 +35,7 @@ from core.server import (  # noqa: E402
     inject_system_block,
     resolve_appkey,
     validate_supply_ext,
-)
+)  # noqa: E402
 
 INJECT = "x-anthropic-billing-header: cc_version=2.1.196; cc_entrypoint=sdk-cli; cch=00000;"
 
