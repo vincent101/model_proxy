@@ -72,6 +72,9 @@ print_help() {
 进程控制:
   on                                启动 model_proxy.py
   off                               停止 model_proxy.py
+  restart                           停止后重启进程（代码更新后用；reload 只换配置不换代码）
+                                    内存学习态清零：pref/thinking_strip 48h 记忆、
+                                    cooldown、流健康计数；在途请求会被切断
   reload                            触发配置热重载（无条件清空所有 cooldown）
 
 查询观察:
@@ -420,6 +423,36 @@ cmd_off() {
   done
 }
 
+# ---- restart ----
+# 语义：off（SIGTERM，幂等）→ 等"端口释放且进程退出"→ on。用途：代码更新（reload 只换配置不换代码）。
+# 无条件先 off：进程可能活着但没监听（启动中卡住），此时只看端口会漏掉它，
+# 它仍持有 flock，新进程会 lock_conflict 退出。
+# 内存态丢失清单（48h 学习记忆清零，重启后上游会重吃一轮 400 学习）见 README §5。
+cmd_restart() {
+  local target="$SCRIPT_DIR/model_proxy.py"
+  cmd_off
+  # 等端口空 且 无 model_proxy.py 进程：SIGTERM 异步，进程退出才释放 flock；
+  # 锁在绑定端口之前获取，只看端口会在"卡住未监听"时放行并撞锁。
+  local waited=0 holder
+  while lsof -i :"$MODEL_PROXY_PORT" -sTCP:LISTEN -t &>/dev/null \
+        || pgrep -f "$target" &>/dev/null; do
+    if (( waited >= 10 )); then
+      holder=$( { lsof -i :"$MODEL_PROXY_PORT" -sTCP:LISTEN 2>/dev/null | tail -n +2; \
+                  pgrep -fl "$target" 2>/dev/null; } )
+      echo "ERROR: 5s 内旧进程未退出/端口未释放，中止 restart（未启动新进程）。残留："
+      echo "$holder"
+      echo "可手动 kill -9 上述 pid 后执行 on。"
+      return 1
+    fi
+    sleep 0.5; waited=$((waited+1))
+  done
+  if cmd_on; then
+    return 0
+  fi
+  echo "ERROR: restart 中间态：旧进程已停止、新进程未启动，服务离线（启动日志见上）。"
+  return 1
+}
+
 # ---- logs：最近 N 条日志（OPT-11：支持按字段过滤） ----
 # 用法：
 #   logs              最近 30 条 ACCESS 记录（默认行为，向后兼容）
@@ -663,6 +696,9 @@ case "${1:-}" in
     ;;
   off)
     cmd_off
+    ;;
+  restart)
+    cmd_restart
     ;;
   logs)
     cmd_logs "${@:2}"

@@ -176,6 +176,7 @@ HTTP 200 后不再切换 supply：PASSTHROUGH 立即提交并逐块原样转发�
 | `install` | 交互式列出四个 SDK + 本机检测状态，选择安装 |
 | `on` | 启动 model_proxy.py（已在监听则跳过） |
 | `off` | 停止 model_proxy.py（严格按脚本绝对路径匹配进程） |
+| `restart` | 停止后重启进程（代码更新后用；reload 只换配置不换代码） |
 | `logs [N]` | 显示最近 N 条 ACCESS 访问日志（默认 30 条）；支持 `req=<id>` / `level=ERROR` / `event=cooldown` 过滤 |
 | `stats [时间]` | 读独立累计账本，按 supply/route/strategy 三维度各投影一段；支持 today/month/YYYY-MM-DD/YYYY-MM/全历史 |
 | `--help` / `-h` | 显示帮助 |
@@ -191,6 +192,8 @@ HTTP 200 后不再切换 supply：PASSTHROUGH 立即提交并逐块原样转发�
 - **strategy 录入**：`tiers_source_capability` 逐 tier 人工问答录入（source 侧无可探测真实上游，详见 [CONFIG.md](docs/CONFIG.md)「strategy 录入流程」）。
 - **热重载**：`ConfigStore` 按 mtime 比对，每次转发请求都 `maybe_reload()`，改配置落盘即在下一个
   请求生效；也可用 `reload` 主动强制重载（无条件清空所有冷却）。配置文件解析失败时保留旧配置并记 warning 日志，不崩溃。
+- **reload 与 restart 边界**：`reload`=换配置不断流（cooldown 也清）；`restart`=换代码全量重启
+  （pref/thinking_strip 48h 学习记忆、cooldown、流健康计数全清，在途请求切断，停机窗口约 1-2s）。
 - supply test 归因+探测、stats 账本 schema 见 [CONFIG.md](docs/CONFIG.md)。
 - 日志写 `.model_proxy.log`（启动时截断保留末 5000 行），累计用量账本写 `.model_proxy_totals.json`（路径配置见 `config/runtime_paths.json`）。日志级别、ACCESS 字段、translate 限流、token 统计等运维内容见
   `docs/designs/2026-07-22-access-log-and-latency.md`、
