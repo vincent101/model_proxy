@@ -104,6 +104,37 @@ def parse_route_command(content):
     return True, (tokens[1] if len(tokens) == 2 else None)
 
 
+def extract_last_user_input_content(body_json: dict):
+    """从 Responses input 数组取最后一条 user message 的 content。
+
+    只支持 type=="message" 且 role=="user" 的 item；content 兼容三种形态：
+    - 字符串：原样返回（官方 Responses API 允许）；
+    - 数组：与 commands.last_text_block 同语义，取最后一个 input_text 块；
+    - 其他：返回 None（fail-open，调用方照常转发）。
+
+    同样只看最后一条 user message（与 Anthropic 版 extract_last_user_message_content
+    对齐），避免历史指令被反复命中；末尾若先是 assistant/function_call item，则跳过
+    它们继续向前找最近的 user message。
+    """
+    inputs = body_json.get("input") if isinstance(body_json, dict) else None
+    if not isinstance(inputs, list):
+        return None
+    for item in reversed(inputs):
+        if not (isinstance(item, dict) and item.get("type") == "message"
+                and item.get("role") == "user"):
+            continue
+        content = item.get("content")
+        if isinstance(content, str):
+            return content
+        if isinstance(content, list):
+            texts = [b.get("text", "") for b in content
+                     if isinstance(b, dict) and b.get("type") == "input_text"]
+            if texts:
+                return texts[-1]
+        return None
+    return None
+
+
 def extract_last_user_message_content(body_json: dict):
     """从请求体 messages 数组取最后一条 role=="user" 元素的 content。
 

@@ -13,10 +13,11 @@
 
 import os
 import sys
+import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from core.commands import parse_route_command  # noqa: E402
+from core.commands import extract_last_user_input_content, parse_route_command  # noqa: E402
 
 
 # ---------------------------------------------------------------------------
@@ -131,3 +132,45 @@ if __name__ == "__main__":
     if not failed and not unexpected:
         print(f"全部通过（合成 {len(CASES)}/{len(CASES)}）")
     sys.exit(1 if (failed or unexpected) else 0)
+
+
+class TestExtractLastUserInputContent(unittest.TestCase):
+    """Responses input 中最后一条用户输入提取（$route Responses 门控前置）。"""
+
+    def test_string_content(self):
+        body = {"input": [
+            {"type": "message", "role": "user", "content": "old"},
+            {"type": "function_call", "id": "fc_1", "call_id": "call_1"},
+            {"type": "message", "role": "user", "content": "$route openai1"},
+        ]}
+        self.assertEqual(extract_last_user_input_content(body), "$route openai1")
+
+    def test_array_input_text(self):
+        body = {"input": [{
+            "type": "message", "role": "user", "content": [
+                {"type": "input_text", "text": "context"},
+                {"type": "input_text", "text": "$route reset"},
+            ]}]
+        }
+        self.assertEqual(extract_last_user_input_content(body), "$route reset")
+
+    def test_assistant_tail_still_finds_previous_user(self):
+        body = {"input": [
+            {"type": "message", "role": "user", "content": "old"},
+            {"type": "message", "role": "assistant", "content": "reply"},
+        ]}
+        self.assertEqual(extract_last_user_input_content(body), "old")
+
+    def test_only_non_user_items(self):
+        body = {"input": [
+            {"type": "function_call", "call_id": "call_1"},
+            {"type": "function_call_output", "call_id": "call_1", "output": "ok"},
+        ]}
+        self.assertIsNone(extract_last_user_input_content(body))
+
+    def test_non_list_or_malformed(self):
+        self.assertIsNone(extract_last_user_input_content({}))
+        self.assertIsNone(extract_last_user_input_content({"input": "probe"}))
+        self.assertIsNone(extract_last_user_input_content(None))
+        self.assertIsNone(extract_last_user_input_content(
+            {"input": [{"type": "message", "role": "user", "content": [{"type": "other"}]}]}))

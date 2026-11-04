@@ -19,6 +19,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from core.server import (  # noqa: E402
     extract_session_key,
+    extract_responses_session_key,
     extract_route_candidates,
 )
 
@@ -233,3 +234,37 @@ class TestExtractRouteCandidatesMutuallyExclusiveField(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+
+
+class TestExtractResponsesSessionKey(unittest.TestCase):
+    """Responses 协议 session key：prompt_cache_key → previous_response_id → conversation.id。"""
+
+    def test_prompt_cache_key_first(self):
+        body = {
+            "prompt_cache_key": "cache-123",
+            "previous_response_id": "resp_old",
+            "conversation": {"id": "conv_1"},
+        }
+        self.assertEqual(extract_responses_session_key(body), "cache-123")
+
+    def test_previous_response_id_fallback(self):
+        body = {"previous_response_id": "resp_old", "conversation": {"id": "conv_1"}}
+        self.assertEqual(extract_responses_session_key(body), "resp_old")
+
+    def test_conversation_id_fallback(self):
+        self.assertEqual(extract_responses_session_key({"conversation": {"id": "conv_1"}}), "conv_1")
+
+    def test_empty_values_rejected(self):
+        body = {"prompt_cache_key": "", "previous_response_id": None,
+                "conversation": {"id": ""}}
+        self.assertIsNone(extract_responses_session_key(body))
+
+    def test_non_dict_inputs_rejected(self):
+        self.assertIsNone(extract_responses_session_key(None))
+        self.assertIsNone(extract_responses_session_key("x"))
+        self.assertIsNone(extract_responses_session_key([1]))
+        self.assertIsNone(extract_responses_session_key({"conversation": "conv_1"}))
+
+    def test_anthropic_metadata_not_used_for_responses(self):
+        # Responses 提取函数不读 Anthropic metadata，保持职责分离。
+        self.assertIsNone(extract_responses_session_key({"metadata": {"user_id": "x"}}))

@@ -1418,6 +1418,21 @@ class OpenAIToAnthropicStreamAdapter:
         """
         return (self.input_tokens, self.output_tokens, self.reasoning_tokens)
 
+    def terminal_state(self) -> TerminalState:
+        """统一终态读取接口（server.py 流式成功路径调用）。
+
+        Chat adapter 的失败态只置 _failed；成功态以 final_stop_reason 映射
+        为准。未终态保持 OPEN，由调用方记录 unexpected_eof。
+        """
+        if self._failed:
+            return TerminalState(TerminalStatus.FAILED, "upstream_error")
+        if self.final_stop_reason is not None:
+            try:
+                return map_chat_terminal(self.final_stop_reason)
+            except TranslationError:
+                return TerminalState(TerminalStatus.FAILED, "upstream_error")
+        return TerminalState(TerminalStatus.OPEN, "")
+
 
 # ############################################################################
 # §2 Responses ⇄ Anthropic（反向）
@@ -2015,6 +2030,22 @@ class AnthropicToResponsesStreamAdapter:
         供 server.py access 日志统一调用，避免按 adapter 类型分别取不同命名的属性。
         """
         return (self.usage_in, self.usage_out, self.usage_reasoning)
+
+    def terminal_state(self) -> TerminalState:
+        """统一终态读取接口（server.py 流式成功路径调用）。
+
+        failed 对应 response.failed；completed 覆盖 completed/incomplete，终态
+        reason 依 final_stop_reason 映射，缺省 end_turn。未终态保持 OPEN。
+        """
+        if self.failed:
+            return TerminalState(TerminalStatus.FAILED, "upstream_error")
+        if self.completed:
+            reason = self.final_stop_reason or "end_turn"
+            try:
+                return map_anthropic_terminal(reason)
+            except TranslationError:
+                return TerminalState(TerminalStatus.FAILED, "upstream_error")
+        return TerminalState(TerminalStatus.OPEN, "")
 
     # ---- message item ----
 
@@ -2818,3 +2849,19 @@ class ResponsesToAnthropicStreamAdapter:
         供 server.py access 日志统一调用，避免按 adapter 类型分别取不同命名的属性。
         """
         return (self.input_tokens, self.output_tokens, self.usage_reasoning)
+
+    def terminal_state(self) -> TerminalState:
+        """统一终态读取接口（server.py 流式成功路径调用）。
+
+        _failed 表示已发出 error；_completed 表示已发出 message_stop，终态
+        reason 依 final_stop_reason 映射，缺省 end_turn。未终态保持 OPEN。
+        """
+        if self._failed:
+            return TerminalState(TerminalStatus.FAILED, "upstream_error")
+        if self._completed:
+            reason = self.final_stop_reason or "end_turn"
+            try:
+                return map_anthropic_terminal(reason)
+            except TranslationError:
+                return TerminalState(TerminalStatus.FAILED, "upstream_error")
+        return TerminalState(TerminalStatus.OPEN, "")

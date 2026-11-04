@@ -11,6 +11,7 @@
   ],
   "upstream_timeout_seconds": 3600,
   "budget_retry": {"enabled": true,"max_retries": 5},
+  "log_upstream_error_body": {"enabled": false, "max_bytes": 4096, "redact_patterns": []},
   "body_error_rules": [
     {"pattern": "当前小时请求过于频繁", "match": "contains", "errorcode": "body_rate_limited"},
     {"pattern": "未命中任何路由策略", "match": "contains", "errorcode": "body_route_miss"}

@@ -35,6 +35,10 @@ from typing import Any, Callable
 from . import claudian_titles
 from . import session_identity
 from . import translate as pt
+from .responses_id_guard import (
+    parse_invalid_item_id_rejection,
+    rewrite_invalid_item_id,
+)
 from .thinking_guard import (
     ThinkingStripStore,
     is_invalid_signature_rejection,
@@ -46,6 +50,7 @@ from .commands import (
     COMMAND_HANDLERS,
     CommandContext,
     SessionOverridesSidecar,
+    extract_last_user_input_content,
     extract_last_user_message_content,
     parse_route_command,
 )
@@ -565,6 +570,31 @@ class ConfigStore:
         with self._lock:
             return list(self._config.get("body_error_rules", []))
 
+    def get_log_upstream_error_body(self) -> dict:
+        """可选顶层块 log_upstream_error_body。缺省关闭（不记错误体）。
+
+        - enabled：是否记录非 2xx 上游错误体；
+        - max_bytes：截断长度，正 int，缺省 4096，上限 65536；
+        - redact_patterns：额外子串脱敏列表，缺省仅内置 token/appkey/key。
+        """
+        with self._lock:
+            cfg = self._config.get("log_upstream_error_body") or {}
+        if not isinstance(cfg, dict):
+            return {"enabled": False, "max_bytes": 4096, "redact_patterns": []}
+        try:
+            max_bytes = int(cfg.get("max_bytes", 4096))
+        except (TypeError, ValueError):
+            max_bytes = 4096
+        max_bytes = max(1, min(max_bytes, 65536))
+        patterns = cfg.get("redact_patterns") or []
+        if not isinstance(patterns, list):
+            patterns = []
+        return {
+            "enabled": bool(cfg.get("enabled", False)),
+            "max_bytes": max_bytes,
+            "redact_patterns": [str(x) for x in patterns if isinstance(x, str) and x],
+        }
+
     # ------------------------------------------------------------------
     # 热重载（拷贝 proxy.py 原样）
     # ------------------------------------------------------------------
@@ -1032,6 +1062,33 @@ def extract_session_key(body_json):
     return session_id if isinstance(session_id, str) and session_id else None
 
 
+def extract_responses_session_key(body_json):
+    """从 Responses 请求体提取稳定 session 标识，取不到返回 None。
+
+    候选顺序（宁缺勿错，全部要求非空字符串）：
+    1. prompt_cache_key —— codex-cli 实测会带（docs/designs/
+       2026-08-22-跨协议静默丢弃审计与修复方案.md），且按会话稳定；
+    2. previous_response_id —— 服务端有状态续接时的响应链根；
+    3. conversation.id —— 部分网关/SDK 会显式带，同一会话稳定。
+
+    注意：conversation.id 在请求侧并非 OpenAI Responses 官方必填字段，
+    只作为最后兜底；三者都缺时保持 None，不制造伪 session（否则会破坏
+    route_pool 一致性哈希语义）。
+    """
+    if not isinstance(body_json, dict):
+        return None
+    for key in ("prompt_cache_key", "previous_response_id"):
+        value = body_json.get(key)
+        if isinstance(value, str) and value:
+            return value
+    conversation = body_json.get("conversation")
+    if isinstance(conversation, dict):
+        value = conversation.get("id")
+        if isinstance(value, str) and value:
+            return value
+    return None
+
+
 # 已知 SDK 注入文案改写表（docs/designs/2026-08-09-cli-thinking-only-nudge文案proxy改写.md）。
 # 键：claude CLI thinking_only_retry 注入的 nudge 原文（2.1.197 硬编码孤立字符串，
 # CLI 升级若改文案则静默失配——fail-open 原样透传，无崩溃风险；失配主动核对方式见
@@ -1115,6 +1172,38 @@ def detect_source(path: str, body: dict | None) -> str:
                 return "anthropic"
             return "chat"
     return "unknown"
+
+
+_UPSTREAM_ERROR_REDACT_BUILTINS = ("appkey", "token", "api-key", "authorization", "secret")
+
+
+def _redact_upstream_error_text(text: str, patterns: list[str]) -> str:
+    """对错误体文本做保守脱敏：内置敏感键 + 配置额外子串。
+
+    只做子串替换，不解析 JSON——错误体结构不可控，解析反而可能失效。
+    """
+    out = text
+    for pattern in [*_UPSTREAM_ERROR_REDACT_BUILTINS, *(patterns or [])]:
+        if pattern:
+            out = out.replace(pattern, "***")
+    return out
+
+
+def _log_upstream_error_body(resp_body: bytes, status: int, supply_id: str,
+                             target: str, cfg: dict) -> None:
+    """按配置记录上游非 2xx 错误体（截断 + 脱敏）。fail-open：异常只跳过。"""
+    if not (cfg and cfg.get("enabled")):
+        return
+    try:
+        max_bytes = int(cfg.get("max_bytes", 4096))
+        raw = resp_body[:max_bytes].decode("utf-8", "replace")
+        text = re.sub(r"\s+", " ", raw).strip()
+        text = _redact_upstream_error_text(text, cfg.get("redact_patterns") or [])
+        log.warning(
+            "UPSTREAM_ERROR status=%s supply=%s target=%s body=%r",
+            status, supply_id, target, text[:max_bytes])
+    except Exception:
+        pass
 
 
 def build_target_url(supply_url: str, request_path: str, operation: str) -> str:
@@ -1790,6 +1879,8 @@ class ModelProxyHandler(BaseHTTPRequestHandler):
             # thinking 剥离重试观测：签名 400 触发 learn+剥离重试时置 1
             # （低频高价值，对齐 body_error/nudge_rewritten 先例）。
             "thinking_strip": 0,
+            # Responses item id 400 触发重写重试时置 1（终态成功后保留，便于观测）。
+            "responses_id_rewrite": 0,
             "response_committed": 0, "stream_integrity": "",
             "terminal_status": "", "terminal_reason": "", "first_event_ms": "",
         }
@@ -1829,7 +1920,7 @@ class ModelProxyHandler(BaseHTTPRequestHandler):
                 "usage_in=%s usage_out=%s token=%s session=%s "
                 "route_failover=%s builtin=%s budget_retried=%s budget_truncated=%s "
                 "stop_reason=%s final_error=%s body_error=%s nudge_rewritten=%s "
-                "thinking_strip=%s "
+                "thinking_strip=%s responses_id_rewrite=%s "
                 "response_committed=%s "
                 "stream_integrity=%s terminal_status=%s terminal_reason=%s first_event_ms=%s",
                 ms, a["status"], a["source"], a["operation"],
@@ -1840,7 +1931,8 @@ class ModelProxyHandler(BaseHTTPRequestHandler):
                 a["budget_truncated"], a["stop_reason"],
                 re.sub(r"\s+", "_", a["final_error"][:80]),
                 a["body_error"],
-                a["nudge_rewritten"], a["thinking_strip"], a["response_committed"],
+                a["nudge_rewritten"], a["thinking_strip"],
+                a["responses_id_rewrite"], a["response_committed"],
                 a["stream_integrity"],
                 a["terminal_status"], a["terminal_reason"], a["first_event_ms"])
             if usage_totals is not None:
@@ -2018,13 +2110,22 @@ class ModelProxyHandler(BaseHTTPRequestHandler):
         except (json.JSONDecodeError, ValueError):
             body_json = None
         request_model = body_json.get("model") if isinstance(body_json, dict) else None
-        self._acc["session"] = extract_session_key(body_json) or ""
 
-        # 4. source 协议识别
+        # 4. source 协议识别（须先于 session 提取：Responses/Anthropic 用不同字段）
         source = detect_source(self.path, body_json)
         self._acc["source"] = source
         operation = detect_operation(self.path)
         self._acc["operation"] = operation
+
+        # 3b. session 提取：Responses 优先 prompt_cache_key / previous_response_id /
+        # conversation.id；Anthropic 维持 metadata.user_id。取不到则 None（不制造伪
+        # session，避免 route_pool 一致性哈希被空串串扰）。
+        session_key = None
+        if source == "responses" or operation == OP_RESPONSES:
+            session_key = extract_responses_session_key(body_json)
+        if session_key is None:
+            session_key = extract_session_key(body_json)
+        self._acc["session"] = session_key or ""
 
         # 5. 三阶段匹配：strategy → route候选列表（session_hash分配 + B选项跨route兜底）
         #    → tier → supplies 列表
@@ -2052,14 +2153,26 @@ class ModelProxyHandler(BaseHTTPRequestHandler):
         # 命令，回退原逻辑，最终按现状 401，行为不变）。
         sidecar: SessionOverridesSidecar = self.server.sidecar_store
         sidecar.maybe_reload()
-        if (operation == OP_MESSAGES and source == "anthropic" and session_key and strategy is not None
-                and isinstance(body_json, dict) and isinstance(body_json.get("messages"), list)):
+        _builtin_command_source = None
+        if (operation == OP_MESSAGES and source == "anthropic" and session_key
+                and strategy is not None and isinstance(body_json, dict)
+                and isinstance(body_json.get("messages"), list)):
             last_user_content = extract_last_user_message_content(body_json)
-            is_cmd, cmd_arg = ((False, None) if last_user_content is None
-                                else parse_route_command(last_user_content))
+            _builtin_command_source = "anthropic"
+        elif (operation == OP_RESPONSES and source == "responses" and session_key
+                and strategy is not None and isinstance(body_json, dict)
+                and isinstance(body_json.get("input"), list)):
+            last_user_content = extract_last_user_input_content(body_json)
+            _builtin_command_source = "responses"
+        else:
+            last_user_content = None
+
+        if last_user_content is not None:
+            is_cmd, cmd_arg = parse_route_command(last_user_content)
             if is_cmd:
                 self._handle_builtin_command(cmd_arg, token, session_key, strategy,
-                                              routes_map, sidecar, request_model, body_json)
+                                              routes_map, sidecar, request_model, body_json,
+                                              protocol=_builtin_command_source)
                 return
 
         # 命中 override 的普通请求：读 sidecar 后构造浅拷贝视图再选 route，
@@ -2112,6 +2225,7 @@ class ModelProxyHandler(BaseHTTPRequestHandler):
 
         _reasoning_retried = False   # reasoning 语法重试只做一次，作用域覆盖整个请求周期
         _thinking_strip_retried = False   # thinking 签名 400 剥离重试只做一次（与语法重试独立互不消耗）
+        _responses_id_retried = False    # Responses input item id 400 重写重试只做一次（见 responses_id_guard）
         # raw_intent 必须在循环外、基于客户端原始 body_json 只 decode 一次。
         # body_json 在循环体内会被原地改写（model 改写为 target_model、reasoning_wire
         # 通过 apply_fields 写回），若在循环内重新 decode，第二轮起会对"已被上一轮写入
@@ -2455,6 +2569,26 @@ class ModelProxyHandler(BaseHTTPRequestHandler):
                     resp_body = e.read()
 
 
+                    # Responses input item id 兼容重试（仅一次）：上游拒绝 Codex 的
+                    # item_... 历史 function_call id、要求 fc_... 时，只改该 item 的 id
+                    # 并同 supply 重试。不进 tried_set、不 cooldown；失败走既有 failover。
+                    _log_cfg_getter = getattr(cs, "get_log_upstream_error_body", None)
+                    _log_upstream_error_body(
+                        resp_body, resp_status, supply_id, target,
+                        _log_cfg_getter() if _log_cfg_getter else None)
+
+                    if (resp_status == 400 and not _responses_id_retried
+                            and mode == PASSTHROUGH and target == "responses"):
+                        _item_rejection = parse_invalid_item_id_rejection(resp_body)
+                        if (_item_rejection is not None
+                                and rewrite_invalid_item_id(body_json or {}, _item_rejection)):
+                            _responses_id_retried = True
+                            self._acc["responses_id_rewrite"] = 1
+                            log.warning(
+                                "responses_id_retry: supply=%s index=%s expected_prefix=%s",
+                                supply_id, _item_rejection.index, _item_rejection.expected_prefix)
+                            continue
+
                     # thinking 签名 400 自适应剥离重试（仅一次，不 rotate/cooldown/tried_set，
                     # 与 reasoning 语法重试同模式；分类器文本与 interpret_rejection 各 pattern 互斥，
                     # 单个 400 至多命中其一。置于语法重试之前：签名错误更特定且不依赖 reasoning_wire）。
@@ -2767,7 +2901,8 @@ class ModelProxyHandler(BaseHTTPRequestHandler):
     # ------------------------------------------------------------------
 
     def _handle_builtin_command(self, cmd_arg, client_token, session_key, strategy,
-                                 routes_map, sidecar, request_model, body_json) -> None:
+                                 routes_map, sidecar, request_model, body_json,
+                                 protocol: str = "anthropic") -> None:
         """命令层统一入口：分发 → 统一响应合成 → 统一 ACCESS 记录。
 
         目前唯一命令 $route 的匹配已在调用方 `_forward` 完成（parse_route_command
@@ -2829,10 +2964,119 @@ class ModelProxyHandler(BaseHTTPRequestHandler):
             self._acc["route"] = resolved_route_id or ""
 
         is_stream = isinstance(body_json, dict) and body_json.get("stream") is True
-        if is_stream:
-            self._write_builtin_stream_response(receipt_text, request_model)
+        if protocol == "responses":
+            if is_stream:
+                self._write_builtin_responses_stream_response(receipt_text, request_model)
+            else:
+                self._write_builtin_responses_buffered_response(receipt_text, request_model)
         else:
-            self._write_builtin_buffered_response(receipt_text, request_model)
+            if is_stream:
+                self._write_builtin_stream_response(receipt_text, request_model)
+            else:
+                self._write_builtin_buffered_response(receipt_text, request_model)
+
+    def _write_builtin_responses_stream_response(self, receipt_text: str,
+                                                    request_model) -> None:
+        """自造 Responses 流式回执：事件序列对齐 OpenAI Responses SSE。
+
+        语义与 Anthropic 版一致：零上游消耗，usage 全 0；终态用
+        response.completed（不是 response.failed）。
+        """
+        now = int(time.time())
+        response_id = pt.gen_response_id()
+        conversation_id = pt.gen_conversation_id()
+        message_id = pt.gen_message_id()
+
+        def _response(status: str, completed_at=None, usage=None):
+            return {
+                "id": response_id,
+                "object": "response",
+                "created_at": now,
+                "status": status,
+                "background": False,
+                "completed_at": completed_at,
+                "model": request_model or "",
+                "output": [] if usage is None else [{
+                    "id": message_id,
+                    "type": "message",
+                    "status": "completed",
+                    "content": [{"type": "output_text", "text": receipt_text}],
+                    "role": "assistant",
+                }],
+                "parallel_tool_calls": True,
+                "conversation": {"id": conversation_id},
+                "reasoning": {"effort": None, "summary": None},
+                "service_tier": "default" if usage is not None else "auto",
+                "store": False,
+                "usage": usage,
+                "metadata": {},
+            }
+
+        events = [
+            {"type": "response.created", "response": _response("in_progress")},
+            {"type": "response.in_progress", "response": _response("in_progress")},
+            {"type": "response.output_item.added", "output_index": 0, "item": {
+                "id": message_id, "type": "message", "status": "in_progress",
+                "content": [], "role": "assistant"}},
+            {"type": "response.content_part.added", "item_id": message_id,
+             "output_index": 0, "content_index": 0,
+             "part": {"type": "output_text", "text": ""}},
+            {"type": "response.output_text.delta", "item_id": message_id,
+             "output_index": 0, "content_index": 0, "delta": receipt_text},
+            {"type": "response.output_text.done", "item_id": message_id,
+             "output_index": 0, "content_index": 0, "text": receipt_text},
+            {"type": "response.content_part.done", "item_id": message_id,
+             "output_index": 0, "content_index": 0,
+             "part": {"type": "output_text", "text": receipt_text}},
+            {"type": "response.output_item.done", "output_index": 0, "item": {
+                "id": message_id, "type": "message", "status": "completed",
+                "content": [{"type": "output_text", "text": receipt_text}],
+                "role": "assistant"}},
+            {"type": "response.completed", "response": _response(
+                "completed", completed_at=now,
+                usage={"input_tokens": 0, "output_tokens": 0, "total_tokens": 0})},
+        ]
+
+        self._begin_sse_chunked()
+        try:
+            for i, ev in enumerate(events):
+                ev["sequence_number"] = i
+                self._write_sse_chunk(pt.responses_sse_bytes(ev))
+            self.wfile.write(b"0\r\n\r\n")
+            self.wfile.flush()
+        except (BrokenPipeError, ConnectionResetError):
+            pass
+
+    def _write_builtin_responses_buffered_response(self, receipt_text: str,
+                                                     request_model) -> None:
+        """自造 Responses 非流式回执。"""
+        now = int(time.time())
+        resp = {
+            "id": pt.gen_response_id(),
+            "object": "response",
+            "created_at": now,
+            "status": "completed",
+            "background": False,
+            "completed_at": now,
+            "model": request_model or "",
+            "output": [{
+                "id": pt.gen_message_id(),
+                "type": "message",
+                "status": "completed",
+                "content": [{"type": "output_text", "text": receipt_text}],
+                "role": "assistant",
+            }],
+            "parallel_tool_calls": True,
+            "conversation": {"id": pt.gen_conversation_id()},
+            "reasoning": {"effort": None, "summary": None},
+            "service_tier": "default",
+            "store": False,
+            "usage": {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0},
+            "metadata": {},
+        }
+        self._write_buffered_response(
+            200, [("Content-Type", "application/json")],
+            json.dumps(resp, ensure_ascii=False).encode("utf-8"))
 
     def _write_builtin_stream_response(self, receipt_text: str, request_model) -> None:
         """自造 anthropic 流式回执（§3.2 事件序列），复用 translate.py 既有事件构造
@@ -3083,6 +3327,14 @@ class ModelProxyHandler(BaseHTTPRequestHandler):
 
     def _record_stream_terminal(self, terminal: "pt.TerminalState") -> None:
         if hasattr(self, "_acc"):
+            if terminal.status is pt.TerminalStatus.OPEN:
+                # 成功写回路径结束但 adapter 无终态：不允许伪装成 valid。
+                # 归为 unexpected_eof，保留观测证据，便于后续修复。
+                self._acc["stream_integrity"] = "invalid"
+                self._acc["terminal_status"] = "open"
+                self._acc["terminal_reason"] = "unexpected_eof"
+                self._acc["final_error"] = "unexpected_eof"
+                return
             self._acc["stream_integrity"] = "valid"
             self._acc["terminal_status"] = terminal.status.value
             self._acc["terminal_reason"] = terminal.reason
@@ -3180,7 +3432,7 @@ class ModelProxyHandler(BaseHTTPRequestHandler):
             # 流结束：收尾（[DONE] 或上游断流都走 finalize，幂等）
             for ev in adapter.finalize():
                 self._write_sse_chunk(pt.anthropic_sse_bytes(ev))
-            self._record_stream_terminal(self._adapter_terminal_state(adapter))
+            self._record_stream_terminal(adapter.terminal_state())
             self.wfile.write(b"0\r\n\r\n")
             self.wfile.flush()
         except (BrokenPipeError, ConnectionResetError):
@@ -3228,6 +3480,12 @@ class ModelProxyHandler(BaseHTTPRequestHandler):
                     ev_type, ev_data = self._parse_anthropic_sse_block(block)
                     if ev_type is None and ev_data is None:
                         continue  # SSE 注释/keep-alive 帧
+                    if ev_type == "__DONE__":
+                        # mcli 等网关会在语义完整的 Responses 流之后追加 OpenAI 风格
+                        # data: [DONE] 尾巴：终态已确认则忽略；未确认仍按 malformed。
+                        if getattr(adapter, "completed", False) or getattr(adapter, "failed", False):
+                            continue
+                        raise pt.TranslationError("unexpected [DONE]", reason="malformed_stream")
                     if ev_type is None:
                         raise pt.TranslationError("malformed SSE frame", reason="malformed_stream")
                     for ev in adapter.feed(ev_type, ev_data):
@@ -3237,6 +3495,10 @@ class ModelProxyHandler(BaseHTTPRequestHandler):
                 ev_type, ev_data = self._parse_anthropic_sse_block(buf)
                 if ev_type is None and ev_data is None:
                     pass  # SSE 注释/keep-alive 帧
+                elif ev_type == "__DONE__":
+                    # 同上：终态已确认的冗余 [DONE] 尾巴忽略；终态前出现仍报错。
+                    if not (getattr(adapter, "completed", False) or getattr(adapter, "failed", False)):
+                        raise pt.TranslationError("unexpected [DONE]", reason="malformed_stream")
                 elif ev_type is None:
                     raise pt.TranslationError("malformed SSE frame", reason="malformed_stream")
                 else:
@@ -3245,7 +3507,7 @@ class ModelProxyHandler(BaseHTTPRequestHandler):
             # 流意外结束（无 message_stop）时补收尾，幂等
             for ev in adapter.finalize():
                 self._write_sse_chunk(pt.responses_sse_bytes(ev))
-            self._record_stream_terminal(self._adapter_terminal_state(adapter))
+            self._record_stream_terminal(adapter.terminal_state())
             self.wfile.write(b"0\r\n\r\n")
             self.wfile.flush()
         except (BrokenPipeError, ConnectionResetError):
@@ -3293,6 +3555,12 @@ class ModelProxyHandler(BaseHTTPRequestHandler):
                     ev_type, ev_data = self._parse_anthropic_sse_block(block)
                     if ev_type is None and ev_data is None:
                         continue  # SSE 注释/keep-alive 帧
+                    if ev_type == "__DONE__":
+                        # 同 passthrough 规则：终态已确认的冗余 [DONE] 尾巴忽略；
+                        # 终态前出现仍报错（真 malformed）。
+                        if getattr(adapter, "_completed", False) or getattr(adapter, "_failed", False):
+                            continue
+                        raise pt.TranslationError("unexpected [DONE]", reason="malformed_stream")
                     if ev_type is None:
                         raise pt.TranslationError("malformed SSE frame", reason="malformed_stream")
                     for ev in adapter.feed(ev_type, ev_data):
@@ -3302,6 +3570,9 @@ class ModelProxyHandler(BaseHTTPRequestHandler):
                 ev_type, ev_data = self._parse_anthropic_sse_block(buf)
                 if ev_type is None and ev_data is None:
                     pass  # SSE 注释/keep-alive 帧
+                elif ev_type == "__DONE__":
+                    if not (getattr(adapter, "_completed", False) or getattr(adapter, "_failed", False)):
+                        raise pt.TranslationError("unexpected [DONE]", reason="malformed_stream")
                 elif ev_type is None:
                     raise pt.TranslationError("malformed SSE frame", reason="malformed_stream")
                 else:
@@ -3310,7 +3581,7 @@ class ModelProxyHandler(BaseHTTPRequestHandler):
             # 流意外结束（无 response.completed）时补收尾，幂等
             for ev in adapter.finalize():
                 self._write_sse_chunk(pt.anthropic_sse_bytes(ev))
-            self._record_stream_terminal(self._adapter_terminal_state(adapter))
+            self._record_stream_terminal(adapter.terminal_state())
             self.wfile.write(b"0\r\n\r\n")
             self.wfile.flush()
         except (BrokenPipeError, ConnectionResetError):
@@ -3352,6 +3623,8 @@ class ModelProxyHandler(BaseHTTPRequestHandler):
                 payload = raw[len(b"data:"):].lstrip()
         if payload is None:
             return None, None
+        if payload == b"[DONE]":
+            return "__DONE__", None
         try:
             data = json.loads(payload)
         except (json.JSONDecodeError, ValueError):

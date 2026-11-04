@@ -338,3 +338,100 @@ class TestSSEFramerAndPassthroughTracker(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+
+
+class TestAdapterTerminalState(unittest.TestCase):
+    """统一 adapter.terminal_state() 契约：修复原 _adapter_terminal_state 缺失。"""
+
+    def test_chat_adapter_terminal_states(self):
+        a = pt.OpenAIToAnthropicStreamAdapter({}, "m")
+        self.assertEqual(a.terminal_state().status, pt.TerminalStatus.OPEN)
+        a.final_stop_reason = "tool_calls"
+        self.assertEqual(a.terminal_state().status, pt.TerminalStatus.COMPLETED)
+        self.assertEqual(a.terminal_state().reason, "tool_use")
+        a._failed = True
+        self.assertEqual(a.terminal_state().status, pt.TerminalStatus.FAILED)
+
+    def test_anthropic_to_responses_terminal_states(self):
+        a = pt.AnthropicToResponsesStreamAdapter("m")
+        self.assertEqual(a.terminal_state().status, pt.TerminalStatus.OPEN)
+        a.final_stop_reason = "end_turn"
+        a.completed = True
+        self.assertEqual(a.terminal_state().status, pt.TerminalStatus.COMPLETED)
+        self.assertEqual(a.terminal_state().reason, "end_turn")
+        a.failed = True
+        self.assertEqual(a.terminal_state().status, pt.TerminalStatus.FAILED)
+
+    def test_responses_to_anthropic_terminal_states(self):
+        a = pt.ResponsesToAnthropicStreamAdapter({}, "m")
+        self.assertEqual(a.terminal_state().status, pt.TerminalStatus.OPEN)
+        a.final_stop_reason = "tool_use"
+        a._completed = True
+        self.assertEqual(a.terminal_state().status, pt.TerminalStatus.COMPLETED)
+        self.assertEqual(a.terminal_state().reason, "tool_use")
+        a._failed = True
+        self.assertEqual(a.terminal_state().status, pt.TerminalStatus.FAILED)
+
+    def test_handler_records_open_terminal_as_invalid(self):
+        h = _Handler()
+        h._record_stream_terminal(pt.TerminalState(pt.TerminalStatus.OPEN, ""))
+        self.assertEqual(h._acc["stream_integrity"], "invalid")
+        self.assertEqual(h._acc["terminal_reason"], "unexpected_eof")
+
+
+class TestTranslatedStreamRedundantDoneTail(unittest.TestCase):
+    """mcli 实测兼容：转换流终态后追加 data: [DONE] 应被忽略，不判 malformed。"""
+
+    def test_responses_to_anthropic_done_tail_after_completed(self):
+        payload = b"".join([
+            b'data: {"type":"response.created","response":{"status":"in_progress"}}\n\n',
+            b'data: {"type":"response.output_item.added","item":{"type":"message","status":"in_progress","content":[]},"output_index":0}\n\n',
+            b'data: {"type":"response.output_text.delta","delta":"OK","output_index":0}\n\n',
+            b'data: {"type":"response.completed","response":{"status":"completed","usage":{"input_tokens":1,"output_tokens":1}}}\n\n',
+            b'data: [DONE]\n\n',
+        ])
+        h = _Handler()
+        adapter = pt.ResponsesToAnthropicStreamAdapter({}, "m")
+        h._write_translated_stream_from_responses(_Upstream(payload), adapter)
+        wire = _decode_chunked(h.wfile.getvalue()).decode()
+        self.assertIn("message_stop", wire)
+        self.assertNotIn("event: error", wire)
+        self.assertEqual(h._acc["stream_integrity"], "valid")
+        self.assertEqual(h._acc["terminal_status"], "completed")
+
+    def test_responses_to_anthropic_done_before_terminal_is_malformed(self):
+        payload = b"".join([
+            b'data: {"type":"response.created","response":{"status":"in_progress"}}\n\n',
+            b'data: [DONE]\n\n',
+        ])
+        h = _Handler()
+        adapter = pt.ResponsesToAnthropicStreamAdapter({}, "m")
+        h._write_translated_stream_from_responses(_Upstream(payload), adapter)
+        self.assertEqual(h._acc["stream_integrity"], "invalid")
+        self.assertEqual(h._acc["terminal_reason"], "malformed_stream")
+
+    def test_anthropic_to_responses_done_tail_after_completed(self):
+        payload = b"".join([
+            b'event: message_start\ndata: {"type":"message_start","message":{"usage":{}}}\n\n',
+            b'event: message_delta\ndata: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{}}\n\n',
+            b'event: message_stop\ndata: {"type":"message_stop"}\n\n',
+            b'data: [DONE]\n\n',
+        ])
+        h = _Handler()
+        adapter = pt.AnthropicToResponsesStreamAdapter("m")
+        h._write_responses_stream(_Upstream(payload), adapter)
+        wire = _decode_chunked(h.wfile.getvalue()).decode()
+        self.assertIn("response.completed", wire)
+        self.assertNotIn("response.failed", wire)
+        self.assertEqual(h._acc["stream_integrity"], "valid")
+
+    def test_anthropic_to_responses_done_before_terminal_is_malformed(self):
+        payload = b"".join([
+            b'event: message_start\ndata: {"type":"message_start","message":{"usage":{}}}\n\n',
+            b'data: [DONE]\n\n',
+        ])
+        h = _Handler()
+        adapter = pt.AnthropicToResponsesStreamAdapter("m")
+        h._write_responses_stream(_Upstream(payload), adapter)
+        self.assertEqual(h._acc["stream_integrity"], "invalid")
+        self.assertEqual(h._acc["terminal_reason"], "malformed_stream")
