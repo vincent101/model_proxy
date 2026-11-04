@@ -37,7 +37,7 @@ from . import session_identity
 from . import translate as pt
 from .responses_id_guard import (
     parse_invalid_item_id_rejection,
-    rewrite_invalid_item_id,
+    rewrite_invalid_item_ids,
 )
 from .thinking_guard import (
     ThinkingStripStore,
@@ -2580,13 +2580,21 @@ class ModelProxyHandler(BaseHTTPRequestHandler):
                     if (resp_status == 400 and not _responses_id_retried
                             and mode == PASSTHROUGH and target == "responses"):
                         _item_rejection = parse_invalid_item_id_rejection(resp_body)
-                        if (_item_rejection is not None
-                                and rewrite_invalid_item_id(body_json or {}, _item_rejection)):
+                        _rewrite_result = None
+                        if _item_rejection is not None:
+                            _rewrite_result = rewrite_invalid_item_ids(
+                                body_json or {}, _item_rejection)
+                        if _rewrite_result is not None and _rewrite_result.fields > 0:
                             _responses_id_retried = True
                             self._acc["responses_id_rewrite"] = 1
                             log.warning(
-                                "responses_id_retry: supply=%s index=%s expected_prefix=%s",
-                                supply_id, _item_rejection.index, _item_rejection.expected_prefix)
+                                "responses_id_retry: supply=%s index=%s expected_prefix=%s "
+                                "rewritten=%d ids=%d call_ids=%d",
+                                supply_id, _item_rejection.index,
+                                _item_rejection.expected_prefix,
+                                _rewrite_result.fields,
+                                _rewrite_result.id_count,
+                                _rewrite_result.call_id_count)
                             continue
 
                     # thinking 签名 400 自适应剥离重试（仅一次，不 rotate/cooldown/tried_set，
