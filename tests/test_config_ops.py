@@ -8,11 +8,13 @@ fixture 来源：本次会话中真实拿到的样本（claude类 expected one o
 """
 
 import contextlib
+import copy
 import email.message
 import io
 import json
 import os
 import socket
+import stat
 import sys
 import tempfile
 import unittest
@@ -23,6 +25,12 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from _config_ops import (
     PROBE_VALUE,
+    _split_supply_ids,
+    atomic_write,
+    compact_config_json,
+    load_config,
+    prompt_source_capability,
+    route_edit,
     ReachabilityCategory,
     _body_error_check,
     _extract_enum_candidates,
@@ -740,6 +748,83 @@ class TestProbeEffortExtFields(unittest.TestCase):
                          {"Content-type", "Authorization", "X-api-key"})
         body = json.loads(req.data)
         self.assertNotIn("system", body)
+
+
+class TestConfigAtomicAndCsvContracts(unittest.TestCase):
+    def test_atomic_write_current_object_roundtrip_and_permissions(self):
+        previous = {"old": "synthetic previous value"}
+        current = {"unknown": {"message": "中文  with,comma"},
+                   "supplies": [{"id": "s,1", "target_model": "model  variant"}],
+                   "routes": [{"tiers": {"opus": ["s,1"]}, "id": "r,1"}]}
+        before = copy.deepcopy(current)
+        with tempfile.TemporaryDirectory() as directory:
+            path = os.path.join(directory, 'synthetic.json')
+            with open(path, 'w', encoding='utf-8') as f:
+                json.dump(previous, f)
+            os.chmod(path, 0o644)
+            real_replace = os.replace
+            seen = []
+            def inspect_replace(source, destination):
+                self.assertEqual(os.path.dirname(source), directory)
+                self.assertEqual(destination, path)
+                self.assertTrue(source.endswith('.tmp'))
+                self.assertEqual(load_config(source), current)
+                seen.append(source)
+                real_replace(source, destination)
+            with patch('_config_ops.os.replace', side_effect=inspect_replace) as replace:
+                atomic_write(path, current)
+            replace.assert_called_once()
+            self.assertEqual(load_config(path), current)
+            self.assertEqual(current, before)
+            self.assertEqual(stat.S_IMODE(os.stat(path).st_mode), 0o600)
+            with open(path, encoding='utf-8') as f:
+                text = f.read()
+            self.assertEqual(text, compact_config_json(current) + '\n')
+            self.assertFalse(text.endswith('\n\n'))
+            self.assertFalse(os.path.exists(seen[0]))
+            self.assertEqual(os.listdir(directory), ['synthetic.json'])
+
+    def test_atomic_write_failure_cleans_temp_and_preserves_previous(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = os.path.join(directory, 'synthetic.json')
+            previous = {"old": "synthetic"}
+            with open(path, 'w', encoding='utf-8') as f:
+                json.dump(previous, f)
+            with patch('_config_ops.os.replace', side_effect=OSError('synthetic failure')):
+                with self.assertRaises(OSError):
+                    atomic_write(path, {"new": "current"})
+            self.assertEqual(load_config(path), previous)
+            self.assertEqual(os.listdir(directory), ['synthetic.json'])
+
+    def test_supply_id_csv_contract_unchanged(self):
+        for raw, expected in [('s1, s2', ['s1', 's2']),
+                              (' s1 ,, s2 , ', ['s1', 's2']),
+                              ('s,1', ['s', '1']), (' , ', [])]:
+            with self.subTest(raw=raw):
+                self.assertEqual(_split_supply_ids(raw), expected)
+
+    def test_effort_csv_contract_and_empty_edit_preserves_existing_list(self):
+        existing = {"sonnet": {"effort_enum": ["low,high", "  exact  "]}}
+        with patch('builtins.input', side_effect=[' low, high ,, max ', '', '-']):
+            result = prompt_source_capability(existing)
+        self.assertEqual(result, {"opus": {"effort_enum": ['low', 'high', 'max']},
+                                  "sonnet": existing['sonnet'],
+                                  "haiku": {"effort_enum": []}})
+        self.assertEqual(existing['sonnet']['effort_enum'], ['low,high', '  exact  '])
+
+    def test_route_edit_empty_input_retains_comma_ids_on_disk(self):
+        cfg = {"supplies": [{"id": "s,1"}, {"id": "s2"}],
+               "routes": [{"id": "r,1", "tiers": {"opus": ["s,1", "s2"],
+                          "sonnet": ["s,1"], "haiku": []}, "failover": "on"}]}
+        with tempfile.TemporaryDirectory() as directory:
+            path = os.path.join(directory, 'synthetic.json')
+            atomic_write(path, cfg)
+            with patch('builtins.input', side_effect=['', '', '', '']), \
+                 patch('_config_ops.done') as done, \
+                 contextlib.redirect_stdout(io.StringIO()):
+                route_edit(path, 'r,1')
+            done.assert_called_once_with(True)
+            self.assertEqual(load_config(path), cfg)
 
 
 if __name__ == "__main__":

@@ -45,176 +45,28 @@ TIER_NAMES = ("opus", "sonnet", "haiku")
 
 
 # ---------------------------------------------------------------------------
-# 配置文件紧凑格式：effort_enum 数组 + tier 对象 + routes.tiers 数组 + supply 对象 + route_pool 对象单行化
+# 配置文件紧凑格式：根字段逐行，根数组元素逐行，内部值紧凑
 # ---------------------------------------------------------------------------
 
-# 正则1：把 "effort_enum": [ 多行 ] 压成 "effort_enum": ["a","b","c"]
-# 匹配 effort_enum 键后、跨行的数组，捕获数组内容
-_EFFORT_ENUM_ARRAY = re.compile(
-    r'("effort_enum":\s*)\[\s*\n([^\]]*?)\n\s*\]',
-    re.DOTALL,
-)
+def compact_config_json(obj):
+    """序列化配置对象，不修改值或输入对象；不用于请求体。"""
+    if not isinstance(obj, dict):
+        return json.dumps(obj, indent=2, ensure_ascii=False)
+    if not obj:
+        return "{}"
 
-# 正则2：把 tiers_source_capability 下的 "tier": {\n ... \n} 压成 "tier": {...}
-# 仅匹配紧邻 effort_enum 的单键 dict（tier 对象只有 effort_enum 一个键）
-_TIER_OBJECT = re.compile(
-    r'("(?:opus|sonnet|haiku)":\s*)\{\s*\n\s*("effort_enum":\s*\[[^\]]*\])\s*\n\s*\}',
-    re.DOTALL,
-)
+    def compact(value):
+        return json.dumps(value, ensure_ascii=False, separators=(",", ": "))
 
-# 正则3：把 routes.tiers 下的 "tier": [ 多行 ] 压成 "tier": ["id1","id2",...]
-# 匹配 tier 键后、跨行的 supply id 数组（多元素也压单行）
-_ROUTES_TIERS_ARRAY = re.compile(
-    r'("(?:opus|sonnet|haiku)":\s*)\[\s*\n([^\]]*?)\n\s*\]',
-    re.DOTALL,
-)
-
-# 正则4：把 supplies 数组里的每条 supply 对象压成单行（含嵌套 reasoning_capability）
-# 匹配完整的 supply 对象结构（id/url/protocol/appkey/target_model/reasoning_capability）。
-# 注意：必须在正则1 之后执行——先压 effort_enum 数组，才能匹配到完整 supply 对象单行。
-# 脆性：supply 结构扩展（加 priority 等字段）会失配、回退多行（不报错不丢数据）。
-_SUPPLY_OBJECT = re.compile(
-    r'\{\s*\n\s*"id":\s*"[^"]+",\s*\n\s*"url":\s*"[^"]+",\s*\n\s*"protocol":\s*"[^"]+",'
-    r'\s*\n\s*"appkey":\s*"[^"]+",\s*\n\s*"target_model":\s*"[^"]+",'
-    r'\s*\n\s*"reasoning_capability":\s*\{[^}]*\}\s*\n\s*\}',
-    re.DOTALL,
-)
-
-# 正则5：压 strategies.route_pool 下的 {route_id, weight} 对象
-# 匹配 route_pool 数组里的每个 {route_id, weight} 两字段对象，压成单行 {"route_id":"x","weight":1}。
-# 不锚定 "route_pool": [ 前缀（该前缀只出现在数组第一个对象前，后续对象前是逗号+空白），
-# 改为匹配对象本身——config 里 {route_id, weight} 两字段对象只出现在 route_pool 下，不会误伤其他结构。
-# 脆性：route_pool 对象加字段（如 fallback）会失配、回退多行（不报错不丢数据）。
-_ROUTE_POOL_OBJECT = re.compile(
-    r'\{\s*\n\s*"route_id":\s*"([^"]+)",\s*\n\s*"weight":\s*(\d+)\s*\n\s*\}',
-    re.DOTALL,
-)
-
-# 正则6：压 routes 数组里的每条 route 对象成单行（含嵌套 tiers）
-# 匹配完整 route 对象结构（id/tiers/failover）。必须在正则3 之后执行——
-# 先把 tiers 下各 tier 数组压成单行，本正则对整块 replace \n 才能得到全单行结果。
-# tiers 内部无 "},"（tier 行以 "]," 结尾），非贪婪 .*? 停在 tiers 对象闭合处。
-# 脆性：route 对象加字段或 failover 缺失会失配、回退多行（不报错不丢数据）。
-_ROUTE_OBJECT = re.compile(
-    r'\{\s*\n\s*"id":\s*"[^"]+",\s*\n\s*"tiers":\s*\{.*?\},\s*\n\s*"failover":\s*"[^"]+"\s*\n\s*\}',
-    re.DOTALL,
-)
-
-# 正则7：压 strategies 数组里的每条 strategy 对象成单行（含嵌套 route_pool/tiers_source_capability）
-# 匹配完整 strategy 对象结构（client_token/route_pool 或 route_id 单值两种写法/
-# tiers_source_capability/note，note 可选）。
-# 键序锚定（与正则4 supply 同风格）：client_token → route_pool|route_id →
-# tiers_source_capability → note；键序漂移（如 dict 追加把 route_pool 排到尾部）会失配、
-# 回退多行（不报错不丢数据）。
-# 必须在正则2/正则5 之后执行——tier 对象与 route_pool 对象先压单行，本正则才能整块匹配。
-# tiers_source_capability 的 \{.*?\}, 依赖回溯跨过 tier 行尾的 "},"，停在其对象闭合处
-# （haiku 为末键无逗号，其后的 "}," 即 tiers_source_capability 闭合）。
-# 脆性：strategy 对象加字段（note 外）或键序漂移会失配、回退多行（不报错不丢数据）。
-_STRATEGY_OBJECT = re.compile(
-    r'\{\s*\n\s*"client_token":\s*"[^"]+",\s*\n\s*'
-    r'(?:"route_pool":\s*\[.*?\]|"route_id":\s*"[^"]+"),'
-    r'\s*\n\s*"tiers_source_capability":\s*\{.*?\},(?:\s*\n\s*"note":\s*"[^"]*")?\s*\n\s*\}',
-    re.DOTALL,
-)
-
-# 正则8：压 cooldown_rules 数组里的每条规则对象成单行（含嵌套 errorcode 数字数组）
-# 键序锚定：errorcode → cooldown_seconds。
-# 脆性：规则对象加字段或键序漂移会失配、回退多行（不报错不丢数据）。
-_COOLDOWN_RULE_OBJECT = re.compile(
-    r'\{\s*\n\s*"errorcode":\s*\[[^\]]*\],\s*\n\s*"cooldown_seconds":\s*\d+\s*\n\s*\}',
-    re.DOTALL,
-)
-
-# 正则9：压 budget_retry 顶层对象成单行（保留 "budget_retry": 键前缀）
-# 键序锚定：enabled → max_retries。
-# 脆性：加字段或键序漂移会失配、回退多行（不报错不丢数据）。
-_BUDGET_RETRY_OBJECT = re.compile(
-    r'("budget_retry":\s*)\{\s*\n\s*"enabled":\s*(?:true|false),'
-    r'\s*\n\s*"max_retries":\s*\d+\s*\n\s*\}',
-    re.DOTALL,
-)
-
-
-def compact_config_json(obj) -> str:
-    """生成 config 文本：indent=2 多行，但以下结构压成单行（与用户手改格式一致）：
-    1. effort_enum 数组（正则1）
-    2. tiers_source_capability 下的 tier 对象（正则2）
-    3. routes.tiers 下的 supply id 数组，含多元素（正则3）
-    4. supplies 数组里的每条 supply 对象，含嵌套 reasoning_capability（正则4）
-    5. strategies.route_pool 下的 {route_id, weight} 对象（正则5）
-    6. routes 数组里的每条 route 对象，含嵌套 tiers（正则6）
-    7. strategies 数组里的每条 strategy 对象，含嵌套 route_pool 或 route_id 单值、
-       tiers_source_capability（正则7）
-    8. cooldown_rules 数组里的每条规则对象，含嵌套 errorcode 数字数组（正则8）
-    9. budget_retry 顶层对象（正则9）
-
-    顺序敏感：正则1 → 正则2 → 正则3 → 正则4 → 正则5 → 正则6 → 正则7 →
-    正则8 → 正则9。
-    正则4 必须在正则1 后执行（effort_enum 先单行才能匹配到完整 supply 对象）。
-    正则5 独立，不依赖前面正则的结果。
-    正则6 必须在正则3 后执行（tier 数组先单行，route 对象整块压行才完整）。
-    正则7 必须在正则2/正则5 后执行（tier 对象与 route_pool 对象先单行）。
-    正则8/正则9 独立，不依赖其他正则的结果。
-
-    读取侧用 json.load 无感知，本函数只影响文本外观。
-
-    约束：
-    - 请求体序列化（转发上游）不得用本函数。
-    - 新增 tier 名需更新正则2/正则3 的 tier 名白名单（opus|sonnet|haiku）。
-    - supply 对象结构扩展（加字段）会导致正则4 失配、回退多行（不报错不丢数据）。
-    - route_pool 对象结构扩展（加 fallback 等字段）会导致正则5 失配、回退多行（不报错不丢数据）。
-    """
-    text = json.dumps(obj, indent=2, ensure_ascii=False)
-
-    # 正则1：压 effort_enum 数组
-    def _compact_array(m):
-        vals = [s.strip().strip('"') for s in m.group(2).split(',') if s.strip()]
-        return m.group(1) + '[' + ','.join('"' + v + '"' for v in vals) + ']'
-
-    text = _EFFORT_ENUM_ARRAY.sub(_compact_array, text)
-
-    # 正则2：压 tier 对象（此时其内 effort_enum 已是单行）
-    text = _TIER_OBJECT.sub(lambda m: m.group(1) + '{' + m.group(2) + '}', text)
-
-    # 正则3：压 routes.tiers 下的 supply id 数组（多元素也压单行）
-    def _compact_tiers_array(m):
-        vals = [s.strip().strip('"') for s in m.group(2).split(',') if s.strip()]
-        return m.group(1) + '[' + ','.join('"' + v + '"' for v in vals) + ']'
-
-    text = _ROUTES_TIERS_ARRAY.sub(_compact_tiers_array, text)
-
-    # 正则4：压 supplies 数组里的每条 supply 对象（含嵌套 reasoning_capability）
-    # effort_enum 已在正则1 压成单行，reasoning_capability 内部已是单行，
-    # 正则4 可匹配到完整对象并压成单行
-    text = _SUPPLY_OBJECT.sub(lambda m: m.group(0)
-                              .replace('\n', '').replace('  ', ''), text)
-
-    # 正则5：压 route_pool 下的 {route_id, weight} 对象
-    # 匹配每个对象（不锚定 route_pool 数组前缀，靠 {route_id, weight} 两字段结构识别）
-    text = _ROUTE_POOL_OBJECT.sub(
-        lambda m: '{"route_id":"' + m.group(1) + '","weight":' + m.group(2) + '}',
-        text
-    )
-
-    # 正则6：压 routes 数组里的每条 route 对象成单行（此时 tiers 内部已单行）
-    text = _ROUTE_OBJECT.sub(lambda m: m.group(0)
-                             .replace('\n', '').replace('  ', ''), text)
-
-    # 正则7：压 strategies 数组里的每条 strategy 对象成单行
-    # （此时 route_pool 对象与 tier 对象已单行）
-    text = _STRATEGY_OBJECT.sub(lambda m: m.group(0)
-                                .replace('\n', '').replace('  ', ''), text)
-
-    # 正则8：压 cooldown_rules 数组里的每条规则对象成单行
-    text = _COOLDOWN_RULE_OBJECT.sub(lambda m: m.group(0)
-                                     .replace('\n', '').replace('  ', ''), text)
-
-    # 正则9：压 budget_retry 顶层对象成单行（保留键前缀）
-    text = _BUDGET_RETRY_OBJECT.sub(
-        lambda m: m.group(1) + m.group(0)[len(m.group(1)):]
-        .replace('\n', '').replace('  ', ''), text)
-
-    return text
+    fields = []
+    for key, value in obj.items():
+        prefix = "  " + json.dumps(key, ensure_ascii=False) + ": "
+        if isinstance(value, list) and value:
+            elements = ",\n".join("    " + compact(element) for element in value)
+            fields.append(prefix + "[\n" + elements + "\n  ]")
+        else:
+            fields.append(prefix + compact(value))
+    return "{\n" + ",\n".join(fields) + "\n}"
 
 
 # ---------------------------------------------------------------------------
@@ -722,8 +574,6 @@ def supply_add(path: str) -> None:
     smodel = input("目标模型 target_model: ").strip()
     scooldown = input("冷却时长 cooldown_seconds (回车用全局默认): ").strip()
 
-    # 键序对齐紧凑正则 _SUPPLY_OBJECT（id/url/protocol/appkey/target_model/reasoning_capability），
-    # 使 CLI 新增的 supply 写盘后也能被压成单行，与既有单行风格一致（O8）。
     entry: dict = {"id": sid, "url": surl}
     if sproto:
         entry["protocol"] = sproto

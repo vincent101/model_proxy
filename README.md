@@ -199,6 +199,8 @@ HTTP 200 后不再切换 supply：PASSTHROUGH 立即提交并逐块原样转发�
   `docs/designs/2026-07-22-access-log-and-latency.md`、
   `docs/designs/2026-07-23-usage-totals-ledger.md`、
   `docs/designs/2026-08-08-log-optimization-plan.md`。
+- 本次局部修订：[工具参数关联、配置序列化保真与新增 guard 撤除](docs/designs/2026-11-04-tool-config-fix-and-guard-revert.md)，见配套回归
+  [工具参数关联](tests/test_tool_stream_association.py)与[guard 撤除](tests/test_responses_guard_removal.py)。
 
 ## 6. 会话内命令：`$route`
 
