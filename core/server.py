@@ -39,6 +39,10 @@ from .responses_id_guard import (
     parse_invalid_item_id_rejection,
     rewrite_invalid_item_ids,
 )
+from .responses_store_guard import (
+    enable_store_for_retry,
+    parse_store_disabled_rejection,
+)
 from .thinking_guard import (
     ThinkingStripStore,
     is_invalid_signature_rejection,
@@ -1881,6 +1885,8 @@ class ModelProxyHandler(BaseHTTPRequestHandler):
             "thinking_strip": 0,
             # Responses item id 400 触发重写重试时置 1（终态成功后保留，便于观测）。
             "responses_id_rewrite": 0,
+            # Responses store=false 引用持久化 item 触发 store=true 重试时置 1。
+            "responses_store_retry": 0,
             "response_committed": 0, "stream_integrity": "",
             "terminal_status": "", "terminal_reason": "", "first_event_ms": "",
         }
@@ -1920,7 +1926,7 @@ class ModelProxyHandler(BaseHTTPRequestHandler):
                 "usage_in=%s usage_out=%s token=%s session=%s "
                 "route_failover=%s builtin=%s budget_retried=%s budget_truncated=%s "
                 "stop_reason=%s final_error=%s body_error=%s nudge_rewritten=%s "
-                "thinking_strip=%s responses_id_rewrite=%s "
+                "thinking_strip=%s responses_id_rewrite=%s responses_store_retry=%s "
                 "response_committed=%s "
                 "stream_integrity=%s terminal_status=%s terminal_reason=%s first_event_ms=%s",
                 ms, a["status"], a["source"], a["operation"],
@@ -1932,7 +1938,8 @@ class ModelProxyHandler(BaseHTTPRequestHandler):
                 re.sub(r"\s+", "_", a["final_error"][:80]),
                 a["body_error"],
                 a["nudge_rewritten"], a["thinking_strip"],
-                a["responses_id_rewrite"], a["response_committed"],
+                a["responses_id_rewrite"], a["responses_store_retry"],
+                a["response_committed"],
                 a["stream_integrity"],
                 a["terminal_status"], a["terminal_reason"], a["first_event_ms"])
             if usage_totals is not None:
@@ -2226,6 +2233,7 @@ class ModelProxyHandler(BaseHTTPRequestHandler):
         _reasoning_retried = False   # reasoning 语法重试只做一次，作用域覆盖整个请求周期
         _thinking_strip_retried = False   # thinking 签名 400 剥离重试只做一次（与语法重试独立互不消耗）
         _responses_id_retried = False    # Responses input item id 400 重写重试只做一次（见 responses_id_guard）
+        _responses_store_retried = False # Responses store=false 引用持久化 item 的 400 重试只做一次（见 responses_store_guard）
         # raw_intent 必须在循环外、基于客户端原始 body_json 只 decode 一次。
         # body_json 在循环体内会被原地改写（model 改写为 target_model、reasoning_wire
         # 通过 apply_fields 写回），若在循环内重新 decode，第二轮起会对"已被上一轮写入
@@ -2596,6 +2604,21 @@ class ModelProxyHandler(BaseHTTPRequestHandler):
                                 _rewrite_result.id_count,
                                 _rewrite_result.call_id_count)
                             continue
+
+                    # Responses store=false 兼容重试（仅一次）：历史 input 引用服务端
+                    # 持久化 item（如 rs_...）而本次请求 store=false 时，上游要求
+                    # store=true 或删除 item。按上游建议选择保留 reasoning 上下文：
+                    # 只把本次出站 store 改为 true，同 supply 重试一次。
+                    if (resp_status == 400 and not _responses_store_retried
+                            and mode == PASSTHROUGH and target == "responses"
+                            and parse_store_disabled_rejection(resp_body)
+                            and enable_store_for_retry(body_json or {})):
+                        _responses_store_retried = True
+                        self._acc["responses_store_retry"] = 1
+                        log.warning(
+                            "responses_store_retry: supply=%s store=false→true, retrying once",
+                            supply_id)
+                        continue
 
                     # thinking 签名 400 自适应剥离重试（仅一次，不 rotate/cooldown/tried_set，
                     # 与 reasoning 语法重试同模式；分类器文本与 interpret_rejection 各 pattern 互斥，
