@@ -1,13 +1,11 @@
 """compact_config_json 紧凑格式单测。
 
-验证 effort_enum 数组、tiers_source_capability 下的 tier 对象、
-routes.tiers 下的 supply id 数组、supplies 里的 supply 对象、
-strategies.route_pool 下的 {route_id, weight} 对象被压成单行，
-其余结构保持 indent=2 多行，且数据无损。
+验证根字段和数组元素的稳定格式，以及任意 JSON 配置值的保真。
 
 运行：cd tools/model_proxy && python3 -m unittest tests.test_config_compact_format -v
 """
 
+import copy
 import json
 import os
 import sys
@@ -22,7 +20,7 @@ def _make_full_cfg():
     """构造一个含 effort_enum / tiers_source_capability / supplies / routes 的完整 config 样本。
 
     supplies 里的对象含完整字段（id/url/protocol/appkey/target_model/reasoning_capability），
-    routes.tiers 含多元素和单元素数组。含 cooldown_rules 与 budget_retry（正则8/9 用）。
+    routes.tiers 含多元素和单元素数组，也含 cooldown_rules 与 budget_retry。
     """
     return {
         "cooldown_rules": [
@@ -61,8 +59,7 @@ def _make_full_cfg_with_route_pool():
     """构造一个含 route_pool（多 route）的完整 config 样本，用于 route_pool 紧凑格式测试。
 
     在 _make_full_cfg 基础上加一个 route r2，strategy tok1 改用 route_pool（含 r1 + r2 两条）。
-    strategy 键序按 _STRATEGY_OBJECT 锚定序重建：client_token/route_pool/
-    tiers_source_capability/note（dict 追加会把 route_pool 排到尾部，破坏键序锚定）。
+    strategy 包含 client_token、route_pool、tiers_source_capability 和 note。
     """
     cfg = _make_full_cfg()
     cfg["routes"].append(
@@ -120,7 +117,7 @@ class TestCompactFormat(unittest.TestCase):
         self.assertIn('"opus": ["s1","s2"]', text)
 
     def test_routes_tiers_single_element_single_line(self):
-        """routes.tiers.<tier> 单元素数组也应是单行（json.dumps 默认单行，正则3 不崩）。"""
+        """routes.tiers.<tier> 单元素数组也应是单行。"""
         text = compact_config_json(_make_full_cfg())
         self.assertIn('"sonnet": ["s2"]', text)
 
@@ -130,13 +127,13 @@ class TestCompactFormat(unittest.TestCase):
         self.assertIn('"haiku": []', text)
 
     def test_routes_array_remains_multiline(self):
-        """routes 数组本身仍应多行展开（数组框架多行，每条 route 对象单行，见正则6）。"""
+        """routes 数组本身仍应多行展开（数组框架多行，每条 route 对象单行）。"""
         text = compact_config_json(_make_full_cfg())
         # routes 数组应跨行（含换行后的 "id"）
         self.assertRegex(text, r'"routes":\s*\[\s*\n\s*\{')
 
     def test_route_object_single_line(self):
-        """routes 数组里每条 route 对象应被压成单行（含嵌套 tiers，正则6）。"""
+        """routes 数组里每条 route 对象应被压成单行（含嵌套 tiers）。"""
         text = compact_config_json(_make_full_cfg_with_route_pool())
         self.assertIn(
             '{"id": "r1","tiers": {"opus": ["s1","s2"],"sonnet": ["s2"],"haiku": []},'
@@ -148,17 +145,17 @@ class TestCompactFormat(unittest.TestCase):
             text)
 
     def test_strategy_object_single_line_route_pool_form(self):
-        """route_pool 形式的 strategy 对象应被压成单行（正则7）。"""
+        """route_pool 形式的 strategy 对象应被压成单行。"""
         text = compact_config_json(_make_full_cfg_with_route_pool())
         self.assertIn(
-            '{"client_token": "tok1","route_pool": [{"route_id":"r1","weight":1},'
-            '{"route_id":"r2","weight":2}],"tiers_source_capability": '
+            '{"client_token": "tok1","route_pool": [{"route_id": "r1","weight": 1},'
+            '{"route_id": "r2","weight": 2}],"tiers_source_capability": '
             '{"opus": {"effort_enum": ["low","medium","high","xhigh","max"]},'
             '"sonnet": {"effort_enum": ["low","medium","high","xhigh","max"]},',
             text)
 
     def test_strategy_object_single_line_route_id_form(self):
-        """route_id 单值形式（旧写法）的 strategy 对象也应被压成单行（正则7 二选一分支）。"""
+        """route_id 单值形式（旧写法）的 strategy 对象也应被压成单行。"""
         text = compact_config_json(_make_full_cfg())
         self.assertIn(
             '{"client_token": "tok1","route_id": "r1","tiers_source_capability": '
@@ -168,7 +165,7 @@ class TestCompactFormat(unittest.TestCase):
             text)
 
     def test_cooldown_rule_object_single_line(self):
-        """cooldown_rules 数组里每条规则对象应被压成单行（含嵌套 errorcode 数字数组，正则8）。"""
+        """cooldown_rules 数组里每条规则对象应被压成单行（含嵌套 errorcode 数字数组）。"""
         text = compact_config_json(_make_full_cfg())
         self.assertIn(
             '{"errorcode": [429,500,502,503,504],"cooldown_seconds": 60}',
@@ -178,7 +175,7 @@ class TestCompactFormat(unittest.TestCase):
             text)
 
     def test_budget_retry_object_single_line(self):
-        """budget_retry 顶层对象应被压成单行（保留键前缀，正则9）。"""
+        """budget_retry 顶层对象应被压成单行（保留键前缀）。"""
         text = compact_config_json(_make_full_cfg())
         self.assertIn(
             '"budget_retry": {"enabled": true,"max_retries": 5}',
@@ -191,16 +188,16 @@ class TestCompactFormat(unittest.TestCase):
         text = compact_config_json(cfg)
         self.assertEqual(json.loads(text), cfg)
 
-    # 3. 无 effort_enum 时正常多行
-    def test_no_effort_enum_fallback(self):
-        """不含 effort_enum 的 config，输出应与 json.dumps(indent=2) 完全一致。"""
+    # 3. 不依赖 effort_enum 的稳定格式
+    def test_no_effort_enum_stable_format(self):
         cfg = {"a": 1, "b": [1, 2, 3], "c": {"x": "y"}}
-        expected = json.dumps(cfg, indent=2, ensure_ascii=False)
+        expected = '{\n  "a": 1,\n  "b": [\n    1,\n    2,\n    3\n  ],\n  "c": {"x": "y"}\n}'
         self.assertEqual(compact_config_json(cfg), expected)
+        self.assertEqual(json.loads(expected), cfg)
 
     # 4. note 字段含 "effort_enum" 文字不误伤
     def test_note_containing_effort_enum_text(self):
-        """note 值里包含 "effort_enum" 文字不应被正则误伤。"""
+        """note 值里包含 "effort_enum" 文字应原样保留。"""
         cfg = {
             "strategies": [
                 {
@@ -250,9 +247,9 @@ class TestCompactFormat(unittest.TestCase):
         # 数据无损
         self.assertEqual(json.loads(text), cfg)
 
-    # 7. 混合场景：supplies 多行/单行 + routes.tiers 多元素/单元素 + effort_enum 全部正确压行
+    # 7. 混合场景：supplies、routes.tiers 与 effort_enum 均保持紧凑
     def test_mixed_scenario(self):
-        """一个 config 同时含 supplies（多行对象）、routes.tiers（多元素/单元素）、
+        """一个 config 同时含 supplies、routes.tiers（多元素/单元素）、
         effort_enum，全部正确压行。
         """
         cfg = {
@@ -297,11 +294,9 @@ class TestCompactFormat(unittest.TestCase):
         # 数据无损
         self.assertEqual(json.loads(text), cfg)
 
-    # 8. supply 结构扩展（加 priority 字段）时正则4 失配回退多行，不报错不丢数据
-    def test_supply_with_extra_field_falls_back_to_multiline(self):
-        """supply 对象加了正则4 不识别的字段（如 priority）时，正则4 失配，
-        该 supply 回退多行展开（不报错不丢数据）。
-        """
+    # 8. supply 结构扩展后仍保真、单行
+    def test_supply_with_extra_field_stays_single_line(self):
+        """未知字段不能导致扩展对象展开或丢失。"""
         cfg = {
             "supplies": [
                 {"id": "s1", "url": "http://x", "protocol": "anthropic", "appkey": "k1",
@@ -310,13 +305,11 @@ class TestCompactFormat(unittest.TestCase):
             ],
         }
         text = compact_config_json(cfg)
-        # 数据无损（回退多行不影响 json.load）
         self.assertEqual(json.loads(text), cfg)
-        # supply 对象应未被压成单行（含 priority 字段，正则4 不匹配）
-        # 检查 "priority" 仍在（没丢数据）
-        self.assertIn('"priority": 1', text)
-        # effort_enum 仍被正则1 压成单行
-        self.assertIn('"effort_enum": ["low","high"]', text)
+        self.assertIn(
+            '    {"id": "s1","url": "http://x","protocol": "anthropic",'
+            '"appkey": "k1","target_model": "m1","priority": 1,'
+            '"reasoning_capability": {"effort_enum": ["low","high"]}}', text)
 
     # 9. route_pool 多行对象压单行（2 个 route 的场景，如 cc 的 [nation1, nation2]）
     def test_route_pool_multi_element_single_line(self):
@@ -336,8 +329,8 @@ class TestCompactFormat(unittest.TestCase):
         }
         text = compact_config_json(cfg)
         # 两个对象都应单行出现
-        self.assertIn('{"route_id":"nation1","weight":1}', text)
-        self.assertIn('{"route_id":"nation2","weight":1}', text)
+        self.assertIn('{"route_id": "nation1","weight": 1}', text)
+        self.assertIn('{"route_id": "nation2","weight": 1}', text)
         # 不应出现跨行的 route_id/weight 对象（多行对象里 route_id 后会换行接 weight）
         self.assertNotRegex(text, r'"route_id":\s*"[^"]+",\s*\n\s*"weight"')
         # 数据无损
@@ -357,7 +350,7 @@ class TestCompactFormat(unittest.TestCase):
             ],
         }
         text = compact_config_json(cfg)
-        self.assertIn('{"route_id":"openai","weight":1}', text)
+        self.assertIn('{"route_id": "openai","weight": 1}', text)
         # 数据无损
         self.assertEqual(json.loads(text), cfg)
 
@@ -370,11 +363,9 @@ class TestCompactFormat(unittest.TestCase):
         text = compact_config_json(cfg)
         self.assertEqual(json.loads(text), cfg)
 
-    # 12. route_pool 加字段（如 fallback）时正则5 失配回退多行，不报错不丢数据
-    def test_route_pool_with_extra_field_falls_back_to_multiline(self):
-        """route_pool 对象加了正则5 不识别的字段（如 fallback）时，正则5 失配，
-        该对象回退多行展开（不报错不丢数据）。
-        """
+    # 12. route_pool 扩展字段仍保真、紧凑
+    def test_route_pool_with_extra_field_stays_single_line(self):
+        """route_pool 扩展字段不导致展开或丢失。"""
         cfg = {
             "strategies": [
                 {
@@ -386,12 +377,92 @@ class TestCompactFormat(unittest.TestCase):
             ],
         }
         text = compact_config_json(cfg)
-        # 数据无损（回退多行不影响 json.load）
         self.assertEqual(json.loads(text), cfg)
-        # fallback 字段仍在（没丢数据）
-        self.assertIn('"fallback": "r2"', text)
-        # 对象应未被压成单行（含 fallback 字段，正则5 不匹配）
-        self.assertNotIn('{"route_id":"r1","weight":1}', text)
+        self.assertIn('{"route_id": "r1","weight": 1,"fallback": "r2"}', text)
+        self.assertIn('    {"client_token": "x","route_pool": [', text)
+
+
+class TestConfigSerializationRegression(unittest.TestCase):
+    def test_double_spaces_in_supply_value_roundtrip(self):
+        cfg = {"supplies": [{
+            "id": "s1", "url": "http://example.invalid", "protocol": "chat",
+            "appkey": "synthetic", "target_model": "model  variant",
+            "reasoning_capability": {"effort_enum": ["low", "high"]},
+        }]}
+        self.assertEqual(json.loads(compact_config_json(cfg)), cfg)
+
+    def test_comma_in_tier_supply_id_roundtrip(self):
+        cfg = {"routes": [{
+            "id": "r1", "tiers": {"opus": ["s,1", "s2"], "sonnet": [], "haiku": []},
+            "failover": "on",
+        }]}
+        self.assertEqual(json.loads(compact_config_json(cfg)), cfg)
+
+
+class TestGeneralJsonPreservation(unittest.TestCase):
+    def assert_same_tree(self, actual, expected):
+        self.assertIs(type(actual), type(expected))
+        if isinstance(expected, dict):
+            self.assertEqual(list(actual), list(expected))
+            for key in expected:
+                self.assert_same_tree(actual[key], expected[key])
+        elif isinstance(expected, list):
+            self.assertEqual(len(actual), len(expected))
+            for a, b in zip(actual, expected):
+                self.assert_same_tree(a, b)
+        else:
+            self.assertEqual(actual, expected)
+
+    def test_escaping_unicode_unknown_fields_order_and_stability(self):
+        special_key = '键"\\\n\t,  '
+        special_value = '模型"\\\n\t,  保留'
+        cfg = {
+            special_key: special_value,
+            "strategies": [{"extra": {special_key: [[], {}, special_value]},
+                            "route_id": "r,1", "client_token": "synthetic"}],
+            "routes": [{"unknown": [[], {}], "failover": "on", "id": "r,1",
+                        "tiers": {"sonnet": "s,1", "opus": ["s,1", "s 2"]}}],
+            "supplies": [{"extension": {"nested": [[], {}, [special_value]]},
+                          "target_model": "model  variant", "id": "s,1",
+                          "reasoning_capability": {"effort_enum": ["low,high", "  x  "]}}],
+            "unknown": {"array": [[], {}, ["a,b  中文"]]},
+        }
+        before = copy.deepcopy(cfg)
+        text = compact_config_json(cfg)
+        self.assert_same_tree(cfg, before)
+        loaded = json.loads(text)
+        self.assert_same_tree(loaded, before)
+        self.assertEqual(compact_config_json(cfg), text)
+        self.assertEqual(compact_config_json(loaded), text)
+        self.assertIn(json.dumps(special_key, ensure_ascii=False), text)
+        self.assertIn(json.dumps(special_value, ensure_ascii=False), text)
+        self.assertNotIn('\\u6a21', text)
+        self.assertNotIn('\n\n', text)
+        self.assertFalse(text.endswith('\n'))
+        self.assertEqual(loaded['routes'][0]['tiers']['sonnet'], 's,1')
+
+    def test_root_arrays_mixed_values_and_nested_compact_format(self):
+        cfg = {"empty": [], "mixed": [None, True, 3, 1.5, "汉,  字", [], {},
+                                     {"z": [[], {}], "a": {}}],
+               "nested": {"items": [[], {}], "empty": {}}, "last": False}
+        expected = (
+            '{\n  "empty": [],\n  "mixed": [\n'
+            '    null,\n    true,\n    3,\n    1.5,\n    "汉,  字",\n'
+            '    [],\n    {},\n    {"z": [[],{}],"a": {}}\n  ],\n'
+            '  "nested": {"items": [[],{}],"empty": {}},\n  "last": false\n}'
+        )
+        text = compact_config_json(cfg)
+        self.assertEqual(text, expected)
+        self.assert_same_tree(json.loads(text), cfg)
+
+    def test_empty_dict_and_non_dict_roots_keep_json_dumps_behavior(self):
+        self.assertEqual(compact_config_json({}), '{}')
+        for value in ([], [1, {"中": [1, 2]}], "文本  ,", 0, False, None):
+            with self.subTest(value=value):
+                text = compact_config_json(value)
+                self.assertEqual(text, json.dumps(value, indent=2, ensure_ascii=False))
+                self.assert_same_tree(json.loads(text), value)
+                self.assertFalse(text.endswith('\n'))
 
 
 if __name__ == "__main__":

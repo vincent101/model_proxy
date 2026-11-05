@@ -145,8 +145,12 @@ class SSEEvent:
 class SSEFramer:
     """增量 SSE framing；保留原始字节并严格解析业务事件。"""
 
-    def __init__(self):
+    def __init__(self, *, allow_event_only: bool = False):
+        self._allow_event_only = allow_event_only
         self._buffer = bytearray()
+        self._scan_pos = 0
+        self._line_start = 0
+        self._after_cr = False
         self.saw_business_event = False
 
     @property
@@ -156,19 +160,37 @@ class SSEFramer:
     def feed(self, chunk: bytes, *, max_events: int | None = None) -> list[SSEEvent]:
         self._buffer.extend(chunk)
         events = []
-        while max_events is None or len(events) < max_events:
-            raw = bytes(self._buffer)
-            lf = raw.find(b"\n\n")
-            crlf = raw.find(b"\r\n\r\n")
-            candidates = [(lf, 2), (crlf, 4)]
-            candidates = [(p, n) for p, n in candidates if p >= 0]
-            if not candidates:
-                break
-            pos, sep_len = min(candidates)
+        while (self._scan_pos < len(self._buffer)
+               and (max_events is None or len(events) < max_events)):
+            pos = self._scan_pos
+            byte = self._buffer[pos]
+            if self._after_cr:
+                self._after_cr = False
+                if byte == 10:
+                    # CR 已终止该行；跨 chunk 后到的 LF 只配对，不再终止一行。
+                    self._scan_pos += 1
+                    self._line_start = self._scan_pos
+                    continue
+            if byte not in (10, 13):
+                self._scan_pos += 1
+                continue
+            blank_line = pos == self._line_start
+            self._scan_pos += 1
+            self._line_start = self._scan_pos
+            self._after_cr = byte == 13
+            if not blank_line:
+                continue
+            # 空行的 CR 本身即可发布帧，不等待下一 chunk 来判定 CRLF。
             block = bytes(self._buffer[:pos])
-            framed = bytes(self._buffer[:pos + sep_len])
-            del self._buffer[:pos + sep_len]
-            event = self._parse(block, framed)
+            if (self._after_cr and self._scan_pos < len(self._buffer)
+                    and self._buffer[self._scan_pos] == 10):
+                # LF 已在 buffer 时仍保留在当前 raw；尚未到达时绝不等它。
+                self._scan_pos += 1
+                self._after_cr = False
+            framed = bytes(self._buffer[:self._scan_pos])
+            del self._buffer[:self._scan_pos]
+            self._scan_pos = self._line_start = 0
+            event = self._parse(block, framed, allow_event_only=self._allow_event_only)
             if event is not None:
                 if not event.is_comment:
                     self.saw_business_event = True
@@ -176,22 +198,39 @@ class SSEFramer:
         return events
 
     def finish(self) -> list[SSEEvent]:
+        events = self.feed(b"")
         if not self._buffer or not bytes(self._buffer).strip():
             self._buffer.clear()
-            return []
+            self._scan_pos = self._line_start = 0
+            self._after_cr = False
+            return self._finish_events(events)
         block = bytes(self._buffer)
         self._buffer.clear()
+        self._scan_pos = self._line_start = 0
+        self._after_cr = False
         # 完整末尾事件可无空行；只有 event/data 字段才视为完整。
         if not any(line.lstrip().startswith((b"event:", b"data:"))
                    for line in block.splitlines()):
-            if all(not line.strip() or line.lstrip().startswith(b":")
+            if all(not line.strip() or line.lstrip().startswith((b":", b"id:", b"retry:"))
                    for line in block.splitlines()):
-                return [SSEEvent(block, None, None, is_comment=True)]
+                return self._finish_events(events + [SSEEvent(block, None, None, is_comment=True)])
             raise TranslationError("malformed trailing SSE frame", reason="malformed_stream")
-        return [self._parse(block, block)]
+        event = self._parse(block, block, allow_event_only=self._allow_event_only)
+        if event is not None:
+            if not event.is_comment:
+                self.saw_business_event = True
+            events.append(event)
+        return self._finish_events(events)
+
+    def _finish_events(self, events: list[SSEEvent]) -> list[SSEEvent]:
+        # Individual event-only frames are ignored. At normal EOF an entirely
+        # non-business stream must not make a conversion adapter report success.
+        if self._allow_event_only and not self.saw_business_event:
+            raise TranslationError("empty SSE stream", reason="empty_stream")
+        return events
 
     @staticmethod
-    def _parse(block: bytes, raw: bytes) -> SSEEvent | None:
+    def _parse(block: bytes, raw: bytes, *, allow_event_only: bool = False) -> SSEEvent | None:
         event_type = None
         data_lines = []
         has_field = False
@@ -205,7 +244,17 @@ class SSEFramer:
             only_comments = False
             if line.startswith(b"event:"):
                 has_field = True
-                event_type = line[6:].lstrip().decode("utf-8", "replace")
+                value = line[6:]
+                if value.startswith(b" "):
+                    value = value[1:]
+                try:
+                    event_type = value.decode("utf-8")
+                except UnicodeDecodeError as exc:
+                    raise TranslationError("malformed SSE UTF-8", reason="malformed_stream") from exc
+            elif line == b"data" and allow_event_only:
+                # A bare data field is present but empty; it is not event-only.
+                has_field = True
+                data_lines.append(b"")
             elif line.startswith(b"data:"):
                 has_field = True
                 value = line[5:]
@@ -215,12 +264,14 @@ class SSEFramer:
         if only_comments or not has_field:
             return SSEEvent(raw, None, None, is_comment=True)
         if not data_lines:
+            if allow_event_only and event_type is not None:
+                return None
             raise TranslationError("SSE event has no data", reason="malformed_stream")
         payload = b"\n".join(data_lines)
         if payload == b"[DONE]":
             return SSEEvent(raw, event_type, None, is_done=True)
         try:
-            data = json.loads(payload)
+            data = json.loads(payload.decode("utf-8"))
         except (json.JSONDecodeError, ValueError) as exc:
             raise TranslationError("malformed SSE JSON", reason="malformed_stream") from exc
         data_type = data.get("type") if isinstance(data, dict) else None
@@ -1102,6 +1153,95 @@ def openai_to_anthropic_response(resp: dict, ctx: dict = None) -> dict:
 # 模块 C+D：流式状态机（正向规格 §3 + §4）
 # ============================================================
 
+class _AnthropicStreamBlocks:
+    """Local output queue for the two Anthropic-output adapters, not an identity map."""
+
+    def __init__(self, adapter):
+        self.adapter = adapter
+        self.queue = []
+        self.last = None
+
+    def add(self, kind, **metadata):
+        # A new logical block ends preceding text/thinking, never a preceding tool.
+        if self.last is not None and self.last["type"] not in ("tool_use", "pending"):
+            self.last["done"] = True
+        block = {"type": kind, "fragments": [], "done": False,
+                 "index": None, "stopped": False, **metadata}
+        self.queue.append(block)
+        if kind != "pending":
+            self.last = block
+        return block
+
+    def content(self, kind, fragment):
+        block = self.last
+        if block is None or block["type"] != kind or block["done"]:
+            block = self.add(kind)
+        if fragment:
+            block["fragments"].append(fragment)
+        return block
+
+    def bind_gate(self, gate, tool):
+        # An identified pre-added event reserves its first logical output position.
+        # No output can cross the gate before added supplies ID/name.
+        position = next(i for i, block in enumerate(self.queue) if block is gate)
+        if tool["index"] is None:
+            tool_position = next(i for i, block in enumerate(self.queue) if block is tool)
+            if tool_position > position:
+                self.queue.pop(tool_position)
+                self.queue.insert(position, tool)
+        gate_position = next(i for i, block in enumerate(self.queue) if block is gate)
+        self.queue.pop(gate_position)
+
+    def drain(self, events):
+        owner = self.adapter
+        while self.queue:
+            block = self.queue[0]
+            kind = block["type"]
+            if kind == "pending":
+                break
+            if block["index"] is None:
+                owner.cur_index += 1
+                block["index"] = owner.cur_index
+                owner.cur_type = kind
+                owner.block_open = True
+                if kind == "tool_use":
+                    start = owner._content_block_start_tool(
+                        owner.cur_index, block["id"], block["name"])
+                elif kind == "thinking":
+                    start = owner._content_block_start_thinking(owner.cur_index)
+                else:
+                    start = owner._content_block_start_text(owner.cur_index)
+                events.append(start)
+            index = block["index"]
+            for fragment in block["fragments"]:
+                if kind == "tool_use":
+                    event = owner._content_block_delta_input_json(index, fragment)
+                elif kind == "thinking":
+                    event = owner._content_block_delta_thinking(index, fragment)
+                else:
+                    event = owner._content_block_delta_text(index, fragment)
+                events.append(event)
+            block["fragments"].clear()
+            if not block["done"]:
+                break
+            events.append(owner._content_block_stop(index))
+            block["stopped"] = True
+            owner.block_open = False
+            self.queue.pop(0)
+
+    def finish(self, events):
+        for block in self.queue:
+            block["done"] = True
+        self.drain(events)
+
+    def clear(self):
+        for block in self.queue:
+            block["fragments"].clear()
+        self.queue.clear()
+        self.last = None
+        self.adapter.block_open = False
+
+
 class OpenAIToAnthropicStreamAdapter:
     """把 OpenAI SSE chunk 序列转换为 Anthropic 流式事件序列。
 
@@ -1115,8 +1255,8 @@ class OpenAIToAnthropicStreamAdapter:
 
     块索引管理（§3.5）：cur_index 从 -1 起，首块 open 时 +1 → 0；单调递增；
     切块先对旧块 content_block_stop（用旧 index），再 +1，再 content_block_start（新 index）。
-    工具分片重组（§4）：openai_index → anthropic_index 映射；id/name 只在首片出现；
-    arguments/partial_json 分片原样透传不拼接、不校验 JSON。
+    工具分片重组（§4）：按 openai_index 登记调用，实际发布后派生 anthropic_index；
+    首工具保持打开直到成功 finalize，后续块串行排空；参数原样透传不校验 JSON。
     """
 
     def __init__(self, ctx: dict = None, model: str = ""):
@@ -1133,6 +1273,8 @@ class OpenAIToAnthropicStreamAdapter:
         self.input_tokens = 0
         self.message_id = gen_msg_id()
         self.openai_index_to_anthropic_index = {}
+        self._tools = {}
+        self._blocks = _AnthropicStreamBlocks(self)
         self._finalized = False
         self._failed = False
         self.reasoning_buf = ""              # 累积 delta.reasoning_content
@@ -1262,6 +1404,7 @@ class OpenAIToAnthropicStreamAdapter:
                                    reason="malformed_stream")
         if isinstance(openai_chunk.get("error"), dict):
             self._failed = True
+            self._blocks.clear()
             err = classify_upstream_error(openai_chunk["error"])
             return [{"type": "error", "error": {
                 "type": "invalid_request_error" if err.http_status < 500 else "api_error",
@@ -1291,20 +1434,21 @@ class OpenAIToAnthropicStreamAdapter:
         if delta.get("content"):
             self.produced_content_block = True
             self._flush_thinking_block(events)   # ①b-chat：thinking 置前于 text
-            if self.cur_type != "text":
-                if self.block_open:
-                    events.append(self._content_block_stop(self.cur_index))
-                self.cur_index += 1
-                self.cur_type = "text"
-                self.block_open = True
-                events.append(self._content_block_start_text(self.cur_index))
-            events.append(self._content_block_delta_text(self.cur_index, delta["content"]))
+            self._blocks.content("text", delta["content"])
 
         # (C) 工具增量（§4）
         if delta.get("tool_calls"):
             self.produced_content_block = True
             self._flush_thinking_block(events)   # ①b-chat：thinking 置前于 tool_use
-            events.extend(self._handle_tool_calls_delta(delta["tool_calls"]))
+            try:
+                events.extend(self._handle_tool_calls_delta(delta["tool_calls"]))
+            except TranslationError as error:
+                self._failed = True
+                self._blocks.clear()
+                events.append({"type": "error", "error": {
+                    "type": "invalid_request_error" if error.http_status < 500 else "api_error",
+                    "message": str(error)}})
+                return events
 
         # (C.5) 思考增量：仅累积，不实时透传（finalize 时若从未产出内容才补块）
         if delta.get("reasoning_content"):
@@ -1316,7 +1460,7 @@ class OpenAIToAnthropicStreamAdapter:
 
         # (E) 本 chunk 内带 usage
         self._absorb_usage(openai_chunk.get("usage"))
-
+        self._drain_output(events)
         return events
 
     def _flush_thinking_block(self, events: list) -> None:
@@ -1330,17 +1474,9 @@ class OpenAIToAnthropicStreamAdapter:
         """
         if self.thinking_emitted or not self.reasoning_buf.strip():
             return
-        if self.block_open:
-            events.append(self._content_block_stop(self.cur_index))
-            self.block_open = False
-        self.cur_index += 1
-        self.cur_type = "thinking"
-        self.block_open = True
-        events.append(self._content_block_start_thinking(self.cur_index))
-        events.append(self._content_block_delta_thinking(self.cur_index, self.reasoning_buf))
-        events.append(self._content_block_stop(self.cur_index))
-        self.block_open = False
-        self.cur_type = None
+        block = self._blocks.add("thinking")
+        block["fragments"].append(self.reasoning_buf)
+        block["done"] = True
         self.thinking_emitted = True
         self.reasoning_buf = ""   # 已镜像为 thinking，清空避免 finalize 兜底重复
 
@@ -1350,31 +1486,55 @@ class OpenAIToAnthropicStreamAdapter:
         events = []
         for tc in tool_calls or []:
             oai_idx = tc.get("index")
-
-            # (1) 新工具：该 oai_idx 首次出现
-            if oai_idx not in self.openai_index_to_anthropic_index:
-                if self.block_open:
-                    events.append(self._content_block_stop(self.cur_index))
-                self.cur_index += 1
-                self.cur_type = "tool_use"
-                self.block_open = True
-                self.openai_index_to_anthropic_index[oai_idx] = self.cur_index
-                fn = tc.get("function") or {}
+            if type(oai_idx) is not int or oai_idx < 0:
+                raise TranslationError("Chat tool delta requires a nonnegative index",
+                                       source_type="chat", reason="tool_association_error")
+            fn = tc.get("function") or {}
+            block = self._tools.get(oai_idx)
+            if block is None:
                 original_name = self.tool_name_mapping.get(
                     fn.get("name", ""), fn.get("name", "")
                 )
-                tool_id = tc.get("id") or gen_toolu_id()
-                events.append(
-                    self._content_block_start_tool(self.cur_index, tool_id, original_name)
-                )
-
-            # (2) arguments 片段 → input_json_delta（原样透传，不拼接不校验）
-            fn = tc.get("function") or {}
+                block = self._blocks.add(
+                    "tool_use", id=tc.get("id") or gen_toolu_id(), name=original_name,
+                    source_id=tc.get("id"), source_name=fn.get("name"))
+                self._tools[oai_idx] = block
+            else:
+                self._accept_late_tool_metadata(block, tc.get("id"), fn.get("name"))
             frag = fn.get("arguments")
             if frag:  # 空字符串不发
-                a_idx = self.openai_index_to_anthropic_index[oai_idx]
-                events.append(self._content_block_delta_input_json(a_idx, frag))
+                block["fragments"].append(frag)
         return events
+
+    def _accept_late_tool_metadata(self, block, provided_id, provided_name):
+        """Accept metadata supplied late, but never rewrite an already-published block.
+
+        A missing -> provided transition is not a conflict. Two different values
+        actually supplied by upstream remain a conflict. Before start, supplied
+        metadata may replace the fallback; after start, the fallback stays stable.
+        """
+        if provided_id:
+            if not block["source_id"]:
+                block["source_id"] = provided_id
+                if block["index"] is None:
+                    block["id"] = provided_id
+            elif provided_id != block["source_id"]:
+                raise TranslationError("Chat tool call has conflicting IDs",
+                                       source_type="chat", reason="tool_association_error")
+        if provided_name:
+            if not block["source_name"]:
+                block["source_name"] = provided_name
+                if block["index"] is None:
+                    block["name"] = self.tool_name_mapping.get(provided_name, provided_name)
+            elif provided_name != block["source_name"]:
+                raise TranslationError("Chat tool call has conflicting names",
+                                      source_type="chat", reason="tool_association_error")
+
+    def _drain_output(self, events):
+        self._blocks.drain(events)
+        for index, block in self._tools.items():
+            if block["index"] is not None:
+                self.openai_index_to_anthropic_index[index] = block["index"]
 
     # ---- 收尾：finalize（§3.4 F） ----
 
@@ -1387,6 +1547,7 @@ class OpenAIToAnthropicStreamAdapter:
             return []
         if self.final_stop_reason is None:
             self._failed = True
+            self._blocks.clear()
             return [{"type": "error", "error": {"type": "api_error",
                     "message": "Chat stream ended before finish_reason"}}]
         events = []
@@ -1395,9 +1556,8 @@ class OpenAIToAnthropicStreamAdapter:
             events.append(self._message_start_event())
             self.sent_message_start = True
             events.append(self._ping_event())
-        if self.block_open:
-            events.append(self._content_block_stop(self.cur_index))
-            self.block_open = False
+        self._blocks.finish(events)
+        self._drain_output(events)
         # 空回答兜底：从未产出任何 text/tool block，但累积了 reasoning_content
         if (not self.produced_content_block
                 and _ENABLE_REASONING_FALLBACK
@@ -1421,14 +1581,14 @@ class OpenAIToAnthropicStreamAdapter:
     def terminal_state(self) -> TerminalState:
         """统一终态读取接口（server.py 流式成功路径调用）。
 
-        Chat adapter 的失败态只置 _failed；成功态以 final_stop_reason 映射
-        为准。未终态保持 OPEN，由调用方记录 unexpected_eof。
+        Chat adapter 的失败态只置 _failed；final_stop_reason 已转换为
+        Anthropic 域。未终态保持 OPEN，由调用方记录 unexpected_eof。
         """
         if self._failed:
             return TerminalState(TerminalStatus.FAILED, "upstream_error")
         if self.final_stop_reason is not None:
             try:
-                return map_chat_terminal(self.final_stop_reason)
+                return map_anthropic_terminal(self.final_stop_reason)
             except TranslationError:
                 return TerminalState(TerminalStatus.FAILED, "upstream_error")
         return TerminalState(TerminalStatus.OPEN, "")
@@ -2581,6 +2741,12 @@ class ResponsesToAnthropicStreamAdapter:
         self._completed = False
         self._failed = False
         self.usage_reasoning = 0
+        self._blocks = _AnthropicStreamBlocks(self)
+        self._tools = []
+        self._tool_items = {}
+        self._tool_indexes = {}
+        self._pending_arguments = []
+        self._anonymous_tool = None
 
     # ---- 事件构造 helper（复用 Anthropic 事件形态） ----
 
@@ -2682,7 +2848,176 @@ class ResponsesToAnthropicStreamAdapter:
 
     # ---- 核心：feed ----
 
+    @staticmethod
+    def _association_error(message):
+        return TranslationError(message, source_type="responses", reason="tool_association_error")
+
+    def _tool_keys(self, data):
+        item = data.get("item") or {}
+        item_id = data.get("item_id")
+        nested_id = item.get("id")
+        if item_id and nested_id and item_id != nested_id:
+            raise self._association_error("Conflicting Responses item_id and item.id")
+        item_id = item_id or nested_id
+        index = data.get("output_index")
+        if item_id is not None and (not isinstance(item_id, str) or not item_id):
+            raise self._association_error("Invalid Responses tool item_id")
+        if index is not None and (type(index) is not int or index < 0):
+            raise self._association_error("Invalid Responses tool output_index")
+        return item_id, index
+
+    def _lookup_tool(self, item_id, index):
+        by_item = self._tool_items.get(item_id) if item_id is not None else None
+        by_index = self._tool_indexes.get(index) if index is not None else None
+        if by_item is not None and by_index is not None and by_item is not by_index:
+            raise self._association_error("Responses item_id/output_index identify different tools")
+        if ((item_id is not None and by_item is None)
+                or (index is not None and by_index is None)):
+            return None
+        return by_item if by_item is not None else by_index
+
+    def _add_tool(self, data):
+        item = data.get("item") or {}
+        item_id, index = self._tool_keys(data)
+        by_item = self._tool_items.get(item_id) if item_id is not None else None
+        by_index = self._tool_indexes.get(index) if index is not None else None
+        if by_item is not None and by_index is not None and by_item is not by_index:
+            raise self._association_error("Conflicting Responses added tool binding")
+        tool = by_item if by_item is not None else by_index
+        if tool is not None:
+            if ((item_id is not None and tool["item_id"] not in (None, item_id))
+                    or (index is not None and tool["output_index"] not in (None, index))):
+                raise self._association_error("Responses tool binding has conflicting item/index")
+            self._accept_late_tool_metadata(
+                tool, item.get("call_id"), item.get("name"))
+        else:
+            if self._anonymous_tool is not None or (
+                    item_id is None and index is None and self._tools):
+                raise self._association_error("Unidentified Responses events cannot bind multiple tools")
+            name = item.get("name", "")
+            tool = self._blocks.add(
+                "tool_use", id=item.get("call_id") or gen_toolu_id(),
+                name=self.tool_name_mapping.get(name, name),
+                source_id=item.get("call_id"), source_name=item.get("name"),
+                item_id=None, output_index=None, arguments_done=False)
+            self._tools.append(tool)
+        if item_id is not None:
+            tool["item_id"] = item_id
+            self._tool_items[item_id] = tool
+        if index is not None:
+            tool["output_index"] = index
+            self._tool_indexes[index] = tool
+        self._resolve_arguments()
+
+    def _accept_late_tool_metadata(self, tool, provided_id, provided_name):
+        """Accept late call_id/name without rewriting an already-published block."""
+        if provided_id:
+            if not tool["source_id"]:
+                tool["source_id"] = provided_id
+                if tool["index"] is None:
+                    tool["id"] = provided_id
+            elif provided_id != tool["source_id"]:
+                raise self._association_error("Responses tool has conflicting call IDs")
+        if provided_name:
+            if not tool["source_name"]:
+                tool["source_name"] = provided_name
+                if tool["index"] is None:
+                    tool["name"] = self.tool_name_mapping.get(provided_name, provided_name)
+            elif provided_name != tool["source_name"]:
+                raise self._association_error("Responses tool has conflicting names")
+
+    def _queue_arguments(self, data, kind):
+        item_id, index = self._tool_keys(data)
+        anonymous = item_id is None and index is None
+        candidate = None
+        if anonymous:
+            if len(self._tools) != 1:
+                raise self._association_error("Unidentified Responses arguments require one registered tool")
+            candidate = self._tools[0]
+            self._anonymous_tool = candidate
+        else:
+            candidate = self._lookup_tool(item_id, index)
+        fragment = data.get("delta", "") if kind == "delta" else ""
+        # Seal violations must fail even if an earlier unidentified event is waiting.
+        if fragment and candidate is not None:
+            sealed = candidate["arguments_done"] or candidate["done"]
+            sealed = sealed or any(
+                entry["kind"] != "delta"
+                and (entry["candidate"] is candidate or
+                     (entry["item_id"] is not None and entry["item_id"] == candidate["item_id"]) or
+                     (entry["output_index"] is not None
+                      and entry["output_index"] == candidate["output_index"]))
+                for entry in self._pending_arguments)
+            if sealed:
+                raise self._association_error("Responses arguments delta arrived after tool/arguments done")
+        gate = self._blocks.add("pending") if not anonymous and candidate is None else None
+        item = (data.get("item") or {}) if kind == "item_done" else {}
+        self._pending_arguments.append({
+            "item_id": item_id, "output_index": index, "anonymous": anonymous,
+            "candidate": candidate, "kind": kind, "fragment": fragment, "gate": gate,
+            "call_id": item.get("call_id"), "name": item.get("name")})
+        self._resolve_arguments()
+
+    def _resolve_arguments(self, terminal=False):
+        # An uncertain fragment is a barrier only for calls it could identify.
+        # A fully identified first tool must still stream while another tool
+        # waits for added. The output gates separately preserve block order.
+        waiting = []
+        for entry in self._pending_arguments:
+            if entry["anonymous"]:
+                if not terminal:
+                    waiting.append(entry)
+                    continue
+                if len(self._tools) != 1:
+                    raise self._association_error("Unidentified Responses arguments became ambiguous")
+                tool = entry["candidate"]
+            else:
+                tool = self._lookup_tool(entry["item_id"], entry["output_index"])
+                if tool is None:
+                    if terminal:
+                        raise self._association_error("Unbound Responses tool event at terminal")
+                    waiting.append(entry)
+                    continue
+            if any(self._pending_could_identify(earlier, tool) for earlier in waiting):
+                waiting.append(entry)
+                continue
+            kind, fragment = entry["kind"], entry["fragment"]
+            if kind == "delta":
+                if fragment:
+                    if tool["arguments_done"] or tool["done"]:
+                        raise self._association_error("Responses arguments delta arrived after tool/arguments done")
+                    tool["fragments"].append(fragment)
+            elif kind == "arguments_done":
+                tool["arguments_done"] = True
+            else:
+                self._accept_late_tool_metadata(tool, entry["call_id"], entry["name"])
+                tool["arguments_done"] = True
+                tool["done"] = True
+            if entry["gate"] is not None:
+                self._blocks.bind_gate(entry["gate"], tool)
+        self._pending_arguments = waiting
+
+    @staticmethod
+    def _pending_could_identify(entry, tool):
+        if entry["anonymous"]:
+            return entry["candidate"] is tool
+        if (entry["item_id"] is not None and tool["item_id"] is not None
+                and entry["item_id"] != tool["item_id"]):
+            return False
+        if (entry["output_index"] is not None and tool["output_index"] is not None
+                and entry["output_index"] != tool["output_index"]):
+            return False
+        return True
+
     def feed(self, event_type: str, data: dict) -> list:
+        try:
+            return self._feed(event_type, data)
+        except TranslationError as error:
+            if error.reason != "tool_association_error":
+                raise
+            return self._emit_error(error)
+
+    def _feed(self, event_type: str, data: dict) -> list:
         events: list = []
         if self._completed or self._failed:
             return events
@@ -2700,74 +3035,43 @@ class ResponsesToAnthropicStreamAdapter:
             it = item.get("type")
             if it == "message":
                 # 开一个 text block（时机对齐正向：text 首个 delta 前开亦可，这里 added 时开）
-                if self.block_open:
-                    events.append(self._content_block_stop(self.cur_index))
-                self.cur_index += 1
-                self.cur_type = "text"
-                self.block_open = True
-                events.append(self._content_block_start_text(self.cur_index))
+                self._blocks.add("text")
             elif it == "function_call":
-                if self.block_open:
-                    events.append(self._content_block_stop(self.cur_index))
-                self.cur_index += 1
-                self.cur_type = "tool_use"
-                self.block_open = True
-                original = self.tool_name_mapping.get(item.get("name", ""), item.get("name", ""))
-                tool_id = item.get("call_id") or gen_toolu_id()
-                events.append(self._content_block_start_tool(self.cur_index, tool_id, original))
+                self._add_tool(data)
             elif it == "reasoning":
                 # ①b：开 thinking block（reasoning item 在 output 中位于 message 之前，
                 # 对齐 anthropic 原生"thinking 在前"约定）
-                if self.block_open:
-                    events.append(self._content_block_stop(self.cur_index))
-                self.cur_index += 1
-                self.cur_type = "thinking"
-                self.block_open = True
-                events.append(self._content_block_start_thinking(self.cur_index))
+                self._blocks.add("thinking")
 
         elif event_type in ("response.reasoning_text.delta",           # glm 通道（实测词表）
                             "response.reasoning_summary_text.delta"):  # openai 官方通道
             self._ensure_message_start(events)
-            if self.cur_type != "thinking" or not self.block_open:
-                if self.block_open:
-                    events.append(self._content_block_stop(self.cur_index))
-                self.cur_index += 1
-                self.cur_type = "thinking"
-                self.block_open = True
-                events.append(self._content_block_start_thinking(self.cur_index))
             txt = data.get("delta", "")
-            if txt:
-                # obfuscation 字段（glm 特有混淆标记）忽略，不写入 thinking block
-                events.append(self._content_block_delta_thinking(self.cur_index, txt))
+            self._blocks.content("thinking", txt)
 
         elif event_type in ("response.reasoning_text.done",
                             "response.reasoning_summary_text.done"):
-            if self.cur_type == "thinking" and self.block_open:
-                events.append(self._content_block_stop(self.cur_index))
-                self.block_open = False
+            block = self._blocks.last
+            if block is not None and block["type"] == "thinking":
+                block["done"] = True
 
         elif event_type == "response.output_text.delta":
             self._ensure_message_start(events)
-            if self.cur_type != "text" or not self.block_open:
-                if self.block_open:
-                    events.append(self._content_block_stop(self.cur_index))
-                self.cur_index += 1
-                self.cur_type = "text"
-                self.block_open = True
-                events.append(self._content_block_start_text(self.cur_index))
             txt = data.get("delta", "")
-            if txt:
-                events.append(self._content_block_delta_text(self.cur_index, txt))
+            self._blocks.content("text", txt)
 
         elif event_type == "response.function_call_arguments.delta":
-            frag = data.get("delta", "")
-            if frag and self.cur_type == "tool_use" and self.block_open:
-                events.append(self._content_block_delta_input_json(self.cur_index, frag))
+            self._queue_arguments(data, "delta")
+
+        elif event_type == "response.function_call_arguments.done":
+            self._queue_arguments(data, "arguments_done")
+
+        elif event_type == "response.output_item.done":
+            if (data.get("item") or {}).get("type") == "function_call":
+                self._queue_arguments(data, "item_done")
 
         elif event_type in ("response.output_text.done",
                              "response.content_part.done",
-                             "response.output_item.done",
-                             "response.function_call_arguments.done",
                              "response.content_part.added"):
             pass                                      # delta 已累积内容，忽略
 
@@ -2789,7 +3093,7 @@ class ResponsesToAnthropicStreamAdapter:
             if state.status == TerminalStatus.INCOMPLETE:
                 self.final_stop_reason = "max_tokens"
             elif self.final_stop_reason is None:
-                self.final_stop_reason = "tool_use" if self.cur_type == "tool_use" else "end_turn"
+                self.final_stop_reason = "tool_use" if self._tools else "end_turn"
             events.extend(self._emit_finish())
 
         elif event_type in ("response.failed", "error"):
@@ -2805,12 +3109,15 @@ class ResponsesToAnthropicStreamAdapter:
             raise TranslationError(f"unknown Responses stream event: {event_type!r}",
                                    source_type="responses", reason=f"unknown:{event_type}")
 
+        self._blocks.drain(events)
         return events
 
     def _emit_error(self, error: TranslationError) -> list:
         if self._completed or self._failed:
             return []
         self._failed = True
+        self._blocks.clear()
+        self._pending_arguments.clear()
         return [{
             "type": "error",
             "error": {
@@ -2823,10 +3130,9 @@ class ResponsesToAnthropicStreamAdapter:
         events: list = []
         if self._completed or self._failed:
             return events
+        self._resolve_arguments(terminal=True)
         self._ensure_message_start(events)
-        if self.block_open:
-            events.append(self._content_block_stop(self.cur_index))
-            self.block_open = False
+        self._blocks.finish(events)
         events.append(self._message_delta_event())
         events.append(self._message_stop_event())
         self._completed = True

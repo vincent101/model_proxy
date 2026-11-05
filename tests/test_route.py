@@ -10,10 +10,13 @@ select_supply（列表签名 + cooling/tried 跳过）、tier 内 failover、以
 
 import os
 import sys
+import tempfile
 import unittest
 
 # tests/ 与 core/ 同级，sys.path 指向 tools/model_proxy/ 以便 from core.server import
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+from _config_ops import atomic_write, load_config  # noqa: E402
 
 from core.server import (  # noqa: E402
     resolve_strategy,
@@ -94,6 +97,20 @@ class TestSelectSupply(unittest.TestCase):
         cd = _FakeCooldown()
         supply = select_supply(["k0", "k1"], supply_map, cd, set())
         self.assertEqual(supply["id"], "k0")
+
+    def test_roundtrip_comma_supply_id_matches_exactly(self):
+        cfg = {"supplies": [{"id": "s,1"}, {"id": "s"}, {"id": "1"}],
+               "routes": [{"id": "r,1", "tiers": {"opus": ["s,1", "s"]},
+                           "failover": "on"}]}
+        with tempfile.TemporaryDirectory() as directory:
+            path = os.path.join(directory, 'synthetic.json')
+            atomic_write(path, cfg)
+            loaded = load_config(path)
+        ids = select_supply_list(loaded['routes'][0], 'opus')
+        self.assertEqual(ids, ['s,1', 's'])
+        supply_map = {s['id']: s for s in loaded['supplies']}
+        self.assertEqual(select_supply(ids, supply_map, _FakeCooldown(), set())['id'], 's,1')
+        self.assertEqual(select_supply(ids, supply_map, _FakeCooldown(), {'s,1'})['id'], 's')
 
     def test_skip_tried(self):
         supply_map = {"k0": {"id": "k0"}, "k1": {"id": "k1"}}

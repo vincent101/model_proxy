@@ -7,6 +7,7 @@ import sys
 import time
 import unittest
 from types import SimpleNamespace
+from unittest.mock import patch
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -64,6 +65,17 @@ def _decode_chunked(raw: bytes) -> bytes:
     return bytes(out)
 
 
+def _chat_chunks(finish):
+    delta = ({"tool_calls": [{"index": 0, "id": "call_synthetic", "type": "function",
+                              "function": {"name": "lookup", "arguments": '{"x":1}'}}]}
+             if finish == "tool_calls" else {"content": "synthetic"})
+    return [
+        {"choices": [{"delta": delta, "finish_reason": None}]},
+        {"choices": [{"delta": {}, "finish_reason": finish}]},
+        {"choices": [], "usage": {"prompt_tokens": 11, "completion_tokens": 7}},
+    ]
+
+
 class TestTerminalMappings(unittest.TestCase):
     def test_all_terminal_mappings_and_unknowns(self):
         self.assertEqual(pt.map_anthropic_terminal("max_tokens").status, pt.TerminalStatus.INCOMPLETE)
@@ -97,6 +109,27 @@ class TestResponsesToAnthropicHandler(unittest.TestCase):
         adapter = pt.ResponsesToAnthropicStreamAdapter({}, "m")
         h._write_translated_stream_from_responses(_Upstream(payload), adapter)
         return _decode_chunked(h.wfile.getvalue()).decode(), adapter
+
+    def test_completed_tool_then_text_handoff(self):
+        wire, adapter = self._run([
+            {"type": "response.output_item.added", "output_index": 0,
+             "item": {"type": "function_call", "id": "item_synthetic",
+                      "call_id": "call_synthetic", "name": "lookup", "arguments": ""}},
+            {"type": "response.function_call_arguments.delta", "item_id": "item_synthetic",
+             "output_index": 0, "delta": '{"x":1}'},
+            {"type": "response.output_text.delta", "delta": "tail"},
+            {"type": "response.completed", "response": {"status": "completed"}},
+        ])
+        events = [json.loads(line[6:]) for line in wire.splitlines() if line.startswith("data: ")]
+        blocks = [event["content_block"]["type"] for event in events
+                  if event["type"] == "content_block_start"]
+        self.assertEqual(blocks, ["tool_use", "text"])
+        self.assertEqual([event["delta"]["stop_reason"] for event in events
+                          if event["type"] == "message_delta"], ["tool_use"])
+        self.assertEqual(wire.count("event: message_stop"), 1)
+        self.assertEqual(adapter.terminal_state(),
+                         pt.TerminalState(pt.TerminalStatus.COMPLETED, "tool_use"))
+        self.assertEqual(adapter.finalize(), [])
 
     def test_failed_becomes_error_without_message_stop(self):
         wire, adapter = self._run([
@@ -344,13 +377,117 @@ class TestAdapterTerminalState(unittest.TestCase):
     """统一 adapter.terminal_state() 契约：修复原 _adapter_terminal_state 缺失。"""
 
     def test_chat_adapter_terminal_states(self):
-        a = pt.OpenAIToAnthropicStreamAdapter({}, "m")
-        self.assertEqual(a.terminal_state().status, pt.TerminalStatus.OPEN)
-        a.final_stop_reason = "tool_calls"
-        self.assertEqual(a.terminal_state().status, pt.TerminalStatus.COMPLETED)
-        self.assertEqual(a.terminal_state().reason, "tool_use")
-        a._failed = True
-        self.assertEqual(a.terminal_state().status, pt.TerminalStatus.FAILED)
+        cases = [("stop", pt.TerminalStatus.COMPLETED, "end_turn"),
+                 ("tool_calls", pt.TerminalStatus.COMPLETED, "tool_use"),
+                 ("length", pt.TerminalStatus.INCOMPLETE, "max_tokens"),
+                 ("content_filter", pt.TerminalStatus.REFUSED, "refusal")]
+        for finish, status, reason in cases:
+            with self.subTest(finish=finish):
+                a = pt.OpenAIToAnthropicStreamAdapter({}, "m")
+                self.assertEqual(a.terminal_state().status, pt.TerminalStatus.OPEN)
+                events = []
+                for chunk in _chat_chunks(finish):
+                    events.extend(a.feed(chunk))
+                events.extend(a.finalize())
+                self.assertEqual(a.finalize(), [])
+                self.assertEqual(a.usage_tuple(), (11, 7, 0))
+                self.assertEqual(events[-2]["delta"]["stop_reason"], reason)
+                self.assertEqual(events[-1]["type"], "message_stop")
+                self.assertEqual(a.terminal_state(), pt.TerminalState(status, reason))
+
+    def test_chat_adapter_error_and_missing_finish_paths(self):
+        adapter = pt.OpenAIToAnthropicStreamAdapter({}, "m")
+        with self.assertRaises(pt.TranslationError):
+            adapter.feed({"choices": [{"delta": {}, "finish_reason": "future"}]})
+        self.assertEqual(adapter.finalize()[0]["type"], "error")
+        self.assertEqual(adapter.terminal_state().status, pt.TerminalStatus.FAILED)
+
+        for chunks in (
+            [{"choices": [{"delta": {"content": "unfinished"}, "finish_reason": None}]}],
+            [{"error": {"type": "server_error", "message": "synthetic"}}],
+            [{"choices": [{"delta": {}, "finish_reason": "stop"}]},
+             {"error": {"type": "server_error", "message": "late synthetic"}}],
+            [{"choices": [{"delta": {"tool_calls": [
+                {"index": 0, "id": "one", "function": {"name": "f", "arguments": "{}"}}]},
+                "finish_reason": None}]},
+             {"choices": [{"delta": {"tool_calls": [
+                {"index": 0, "id": "different", "function": {"arguments": ""}}]},
+                "finish_reason": None}]}],
+        ):
+            with self.subTest(chunks=chunks):
+                adapter = pt.OpenAIToAnthropicStreamAdapter({}, "m")
+                events = []
+                for chunk in chunks:
+                    events.extend(adapter.feed(chunk))
+                events.extend(adapter.finalize())
+                self.assertEqual(sum(e["type"] == "error" for e in events), 1)
+                self.assertNotIn("message_stop", [e["type"] for e in events])
+                self.assertEqual(adapter.terminal_state().status, pt.TerminalStatus.FAILED)
+                self.assertEqual(adapter.finalize(), [])
+
+    def test_chat_handler_wire_and_terminal_accounting(self):
+        cases = [("stop", "completed", "end_turn"),
+                 ("tool_calls", "completed", "tool_use"),
+                 ("length", "incomplete", "max_tokens"),
+                 ("content_filter", "refused", "refusal")]
+        for finish, status, reason in cases:
+            with self.subTest(finish=finish), patch.object(pt, "gen_msg_id", return_value="msg_synthetic"):
+                chunks = _chat_chunks(finish)
+                # 独立固定 wire oracle：不调用当前 adapter 或生产 serializer 生成期望。
+                expected_start = (
+                    b'event: message_start\ndata: {"type":"message_start","message":'
+                    b'{"id":"msg_synthetic","type":"message","role":"assistant",'
+                    b'"content":[],"model":"m","stop_reason":null,"stop_sequence":null,'
+                    b'"usage":{"input_tokens":0,"output_tokens":0,'
+                    b'"cache_creation_input_tokens":0,"cache_read_input_tokens":0}}}\n\n'
+                    b'event: ping\ndata: {"type":"ping"}\n\n')
+                if finish == "tool_calls":
+                    expected_content = (
+                        b'event: content_block_start\ndata: {"type":"content_block_start",'
+                        b'"index":0,"content_block":{"type":"tool_use","id":"call_synthetic",'
+                        b'"name":"lookup","input":{}}}\n\n'
+                        b'event: content_block_delta\ndata: {"type":"content_block_delta",'
+                        b'"index":0,"delta":{"type":"input_json_delta",'
+                        b'"partial_json":"{\\"x\\":1}"}}\n\n')
+                else:
+                    expected_content = (
+                        b'event: content_block_start\ndata: {"type":"content_block_start",'
+                        b'"index":0,"content_block":{"type":"text","text":""}}\n\n'
+                        b'event: content_block_delta\ndata: {"type":"content_block_delta",'
+                        b'"index":0,"delta":{"type":"text_delta","text":"synthetic"}}\n\n')
+                expected_end = (
+                    b'event: content_block_stop\ndata: {"type":"content_block_stop","index":0}\n\n'
+                    b'event: message_delta\ndata: {"type":"message_delta","delta":{"stop_reason":"'
+                    + reason.encode("ascii") +
+                    b'","stop_sequence":null},"usage":{"output_tokens":7,"input_tokens":11}}\n\n'
+                    b'event: message_stop\ndata: {"type":"message_stop"}\n\n')
+                expected_wire = expected_start + expected_content + expected_end
+                payload = b"".join(b"data: " + json.dumps(c).encode() + b"\n\n" for c in chunks)
+                payload += b"data: [DONE]\n\n"
+                h = _Handler()
+                adapter = pt.OpenAIToAnthropicStreamAdapter({}, "m")
+                upstream = _Upstream(payload)
+                h._write_translated_stream(upstream, adapter)
+                wire = _decode_chunked(h.wfile.getvalue())
+                self.assertEqual(wire, expected_wire)
+                actual_events = [json.loads(line[6:]) for line in wire.splitlines()
+                                 if line.startswith(b"data: ")]
+                self.assertEqual(actual_events[0]["message"]["id"], "msg_synthetic")
+                self.assertEqual(actual_events[3]["delta"],
+                                 {"type": "input_json_delta", "partial_json": '{"x":1}'}
+                                 if finish == "tool_calls" else
+                                 {"type": "text_delta", "text": "synthetic"})
+                self.assertEqual(actual_events[-2], {
+                    "type": "message_delta",
+                    "delta": {"stop_reason": reason, "stop_sequence": None},
+                    "usage": {"input_tokens": 11, "output_tokens": 7}})
+                self.assertEqual(actual_events[-1], {"type": "message_stop"})
+                self.assertIn(("status", 200), h.headers_sent)
+                self.assertEqual(h._acc["status"], 200)
+                self.assertEqual(h._acc["stream_integrity"], "valid")
+                self.assertEqual(h._acc["terminal_status"], status)
+                self.assertEqual(h._acc["terminal_reason"], reason)
+                self.assertTrue(upstream.closed)
 
     def test_anthropic_to_responses_terminal_states(self):
         a = pt.AnthropicToResponsesStreamAdapter("m")
@@ -435,3 +572,494 @@ class TestTranslatedStreamRedundantDoneTail(unittest.TestCase):
         h._write_responses_stream(_Upstream(payload), adapter)
         self.assertEqual(h._acc["stream_integrity"], "invalid")
         self.assertEqual(h._acc["terminal_reason"], "malformed_stream")
+
+
+class _FramingUpstream:
+    """只交付合成 read chunks；下一次 read 是首帧已写出的 happens-before 检查点。"""
+
+    def __init__(self, chunks, on_second_read=None):
+        self.chunks = list(chunks)
+        self.on_second_read = on_second_read
+        self.read_sizes = []
+        self.checked = False
+        self.closed = False
+
+    def read(self, size):
+        self.read_sizes.append(size)
+        if len(self.read_sizes) == 2 and self.on_second_read is not None:
+            self.on_second_read()
+            self.checked = True
+        if not self.chunks:
+            return b""
+        chunk = self.chunks.pop(0)
+        if isinstance(chunk, BaseException):
+            raise chunk
+        return chunk
+
+    def close(self):
+        self.closed = True
+
+
+class TestConvertedSSEFraming(unittest.TestCase):
+    PROTOCOLS = ("chat", "anthropic", "responses")
+    ENDINGS = (b"\n", b"\r\n", b"\r", None)
+
+    @staticmethod
+    def _events(source):
+        if source == "chat":
+            return [
+                {"choices": [{"delta": {"content": "合成🙂"}, "finish_reason": None}]},
+                {"choices": [{"delta": {}, "finish_reason": "stop"}]},
+                {"choices": [], "usage": {"prompt_tokens": 11, "completion_tokens": 7}},
+            ]
+        if source == "anthropic":
+            return [
+                {"type": "message_start", "message": {"usage": {}}},
+                {"type": "content_block_start", "index": 0,
+                 "content_block": {"type": "text", "text": ""}},
+                {"type": "content_block_delta", "index": 0,
+                 "delta": {"type": "text_delta", "text": "合成🙂"}},
+                {"type": "content_block_stop", "index": 0},
+                {"type": "message_delta", "delta": {"stop_reason": "end_turn"},
+                 "usage": {"input_tokens": 11, "output_tokens": 7}},
+                {"type": "message_stop"},
+            ]
+        return [
+            {"type": "response.created", "response": {"status": "in_progress"}},
+            {"type": "response.output_text.delta", "delta": "合成🙂"},
+            {"type": "response.completed", "response": {"status": "completed",
+             "usage": {"input_tokens": 11, "output_tokens": 7}}},
+        ]
+
+    @staticmethod
+    def _frame(event, ending=b"\n", *, explicit_type=False, multidata=False):
+        data = json.dumps(event, ensure_ascii=False, separators=(",", ":")).encode()
+        lines = []
+        if explicit_type:
+            lines.append(b"event: " + event["type"].encode())
+        if multidata and b"," in data:
+            head, tail = data.split(b",", 1)
+            lines.extend([b"data: " + head + b",", b"data:" + tail])
+        else:
+            lines.append(b"data: " + data)
+        lines.append(b"")
+        # 最后完整空行使用 CR，即使 chunk 结束在 CR 也必须即时 dispatch。
+        mixed = (b"\n", b"\r\n", b"\n")
+        return b"".join(line + (ending if ending is not None else
+                               (b"\r" if i == len(lines) - 1 else mixed[i % 3]))
+                        for i, line in enumerate(lines))
+
+    @classmethod
+    def _payload(cls, source, ending=b"\n", *, multidata=False, explicit_type=None):
+        if explicit_type is None:
+            explicit_type = source == "anthropic"
+        wire = b"".join(cls._frame(e, ending, explicit_type=explicit_type,
+                                  multidata=multidata) for e in cls._events(source))
+        if source == "chat":
+            wire += b"data: [DONE]" + (ending or b"\r") * 2
+        return wire
+
+    @staticmethod
+    def _wire_events(h):
+        return [json.loads(line[6:]) for line in _decode_chunked(h.wfile.getvalue()).splitlines()
+                if line.startswith(b"data: ")]
+
+    def _run(self, source, chunks, *, check_first=False, disconnect=False):
+        h = _Handler()
+        if disconnect:
+            h.wfile = SimpleNamespace(
+                write=lambda _data: (_ for _ in ()).throw(BrokenPipeError()),
+                flush=lambda: None)
+        first_type = b"response.created" if source == "anthropic" else b"message_start"
+
+        def check():
+            self.assertIn(first_type, _decode_chunked(h.wfile.getvalue()))
+
+        resp = _FramingUpstream([c for c in chunks if c != b""],
+                                check if check_first else None)
+        framer = pt.SSEFramer()
+        with patch.object(pt, "gen_msg_id", return_value="msg_synthetic"), \
+                patch.object(pt, "gen_response_id", return_value="resp_synthetic"), \
+                patch.object(pt, "gen_conversation_id", return_value="conv_synthetic"), \
+                patch.object(pt, "gen_message_id", return_value="item_synthetic"), \
+                patch.object(pt.time, "time", return_value=1700000000):
+            if source == "chat":
+                adapter = pt.OpenAIToAnthropicStreamAdapter({}, "m")
+                writer = h._write_translated_stream
+            elif source == "anthropic":
+                adapter = pt.AnthropicToResponsesStreamAdapter("m")
+                writer = h._write_responses_stream
+            else:
+                adapter = pt.ResponsesToAnthropicStreamAdapter({}, "m")
+                writer = h._write_translated_stream_from_responses
+            with patch("core.server.pt.SSEFramer", return_value=framer), \
+                    patch.object(framer, "feed", wraps=framer.feed) as feed, \
+                    patch.object(framer, "finish", wraps=framer.finish) as finish, \
+                    patch.object(adapter, "finalize", wraps=adapter.finalize) as finalize:
+                writer(resp, adapter)
+        self.assertTrue(resp.closed)
+        self.assertTrue(all(n == 4096 for n in resp.read_sizes))
+        return SimpleNamespace(h=h, adapter=adapter, resp=resp, feed=feed,
+                               finish=finish, finalize=finalize)
+
+    def _assert_success(self, result):
+        self.assertEqual(result.h._acc["stream_integrity"], "valid")
+        self.assertEqual(result.h._acc["terminal_status"], "completed")
+        self.assertEqual(result.h._acc["terminal_reason"], "end_turn")
+        self.assertEqual(result.adapter.usage_tuple(), (11, 7, 0))
+        self.assertIn(("status", 200), result.h.headers_sent)
+
+    def test_three_handlers_all_endings_every_cut_and_bytewise(self):
+        for source in self.PROTOCOLS:
+            baseline = self._run(source, [self._payload(source)])
+            self._assert_success(baseline)
+            expected = _decode_chunked(baseline.h.wfile.getvalue())
+            for ending in self.ENDINGS:
+                payload = self._payload(source, ending)
+                for cut in range(len(payload) + 1):
+                    with self.subTest(source=source, ending=ending, cut=cut):
+                        result = self._run(source, [payload[:cut], payload[cut:]])
+                        self._assert_success(result)
+                        self.assertEqual(_decode_chunked(result.h.wfile.getvalue()), expected)
+                with self.subTest(source=source, ending=ending, bytewise=True):
+                    result = self._run(source, [payload[i:i + 1]
+                                               for i in range(len(payload))])
+                    self._assert_success(result)
+                    self.assertEqual(_decode_chunked(result.h.wfile.getvalue()), expected)
+
+    def test_multidata_and_type_fallback_match_single_data_wire(self):
+        for source in self.PROTOCOLS:
+            expected = _decode_chunked(self._run(
+                source, [self._payload(source)]).h.wfile.getvalue())
+            for ending in self.ENDINGS:
+                with self.subTest(source=source, ending=ending):
+                    result = self._run(source, [self._payload(
+                        source, ending, multidata=True, explicit_type=False)])
+                    self._assert_success(result)
+                    self.assertEqual(_decode_chunked(result.h.wfile.getvalue()), expected)
+
+    def test_first_frame_written_before_next_read_even_cr_lf_split(self):
+        for source in self.PROTOCOLS:
+            for ending in self.ENDINGS:
+                with self.subTest(source=source, ending=ending):
+                    first = self._frame(self._events(source)[0], ending)
+                    continuation = b""
+                    if ending == b"\r\n":
+                        first, continuation = first[:-1], b"\n"
+                    rest = b"".join(self._frame(e, ending)
+                                    for e in self._events(source)[1:])
+                    if source == "chat":
+                        rest += b"data: [DONE]" + (ending or b"\r") * 2
+                    result = self._run(source, [first, continuation + rest], check_first=True)
+                    self.assertTrue(result.resp.checked)
+                    self._assert_success(result)
+
+    def test_comment_id_only_and_blank_frames_do_not_reach_adapter(self):
+        for source in self.PROTOCOLS:
+            with self.subTest(source=source):
+                plain = self._payload(source, b"\r")
+                result = self._run(source, [b": ping\r\rid: x\r\r" + plain])
+                expected = self._run(source, [plain])
+                self._assert_success(result)
+                self.assertEqual(_decode_chunked(result.h.wfile.getvalue()),
+                                 _decode_chunked(expected.h.wfile.getvalue()))
+
+    def test_bad_multidata_and_type_conflict_remain_framing_errors(self):
+        for source in self.PROTOCOLS:
+            for bad in (b'data: {"n":1}\rdata: {"n":2}\r\r',
+                        b'event: a\rdata: {"type":"b"}\r\r'):
+                with self.subTest(source=source, bad=bad):
+                    result = self._run(source, [bad])
+                    self.assertEqual(result.h._acc["terminal_reason"], "malformed_stream")
+                    self.assertNotIn("message_stop", [e["type"] for e in self._wire_events(result.h)])
+                    self.assertNotIn("response.completed", [e["type"] for e in self._wire_events(result.h)])
+                    self.assertEqual(result.finish.call_count, 0)
+                    self.assertEqual(result.finalize.call_count, 0)
+
+    def test_nonchat_missing_type_still_malformed(self):
+        for source in ("anthropic", "responses"):
+            with self.subTest(source=source):
+                result = self._run(source, [b'data: {"delta":"synthetic"}\r\r'])
+                self.assertEqual(result.h._acc["terminal_reason"], "malformed_stream")
+
+    def test_unknown_event_and_chat_finish_stay_adapter_errors(self):
+        for source in self.PROTOCOLS:
+            with self.subTest(source=source):
+                event = ({"choices": [{"delta": {}, "finish_reason": "future"}]}
+                         if source == "chat" else {"type": "future_ping"})
+                result = self._run(source, [self._frame(event, b"\r")])
+                self.assertIn("unknown", result.h._acc["terminal_reason"])
+                self.assertEqual(result.finish.call_count, 0)
+                self.assertEqual(result.finalize.call_count, 0)
+
+    def test_eof_complete_tail_is_accepted_only_at_normal_eof(self):
+        for source in self.PROTOCOLS:
+            with self.subTest(source=source):
+                payload = self._payload(source)
+                if source == "chat":
+                    payload = payload[:-len(b"data: [DONE]\n\n")]
+                payload = payload.rstrip(b"\n")
+                result = self._run(source, [payload])
+                self._assert_success(result)
+                self.assertEqual(result.finish.call_count, 1)
+                self.assertEqual(result.finalize.call_count, 1)
+
+    def test_missing_terminal_normal_eof_keeps_original_finalize_failure(self):
+        for source in self.PROTOCOLS:
+            with self.subTest(source=source):
+                result = self._run(source, [self._frame(self._events(source)[0], b"\r")])
+                events = self._wire_events(result.h)
+                expected = "response.failed" if source == "anthropic" else "error"
+                self.assertEqual([e["type"] for e in events].count(expected), 1)
+                self.assertNotIn("message_stop", [e["type"] for e in events])
+                self.assertNotIn("response.completed", [e["type"] for e in events])
+                self.assertEqual(result.finish.call_count, 1)
+                self.assertEqual(result.finalize.call_count, 1)
+
+    def test_read_exception_never_finishes_or_finalizes_buffered_tail(self):
+        for source in self.PROTOCOLS:
+            with self.subTest(source=source):
+                payload = self._payload(source)
+                if source == "chat":
+                    payload = payload[:-len(b"data: [DONE]\n\n")]
+                payload = payload.rstrip(b"\n")
+                result = self._run(source, [payload, OSError("synthetic read failure")])
+                self.assertEqual(result.finish.call_count, 0)
+                self.assertEqual(result.finalize.call_count, 0)
+                self.assertEqual(result.h._acc["terminal_reason"], "internal_translation_error")
+                events = self._wire_events(result.h)
+                self.assertNotIn("message_stop", [e["type"] for e in events])
+                self.assertNotIn("response.completed", [e["type"] for e in events])
+
+    def test_client_disconnect_does_not_finish_or_finalize(self):
+        for source in self.PROTOCOLS:
+            with self.subTest(source=source):
+                result = self._run(source, [self._payload(source)], disconnect=True)
+                self.assertEqual(result.h._acc["stream_integrity"], "client_disconnect")
+                self.assertEqual(result.finish.call_count, 0)
+                self.assertEqual(result.finalize.call_count, 0)
+
+    def test_chat_done_breaks_without_consuming_bad_tail_or_reading_again(self):
+        for ending in self.ENDINGS:
+            with self.subTest(ending=ending):
+                bad = b"data: {bad}" + (ending or b"\r") * 2
+                result = self._run("chat", [self._payload("chat", ending) + bad,
+                                          AssertionError("must not read after DONE")])
+                self._assert_success(result)
+                self.assertEqual(len(result.resp.read_sizes), 1)
+                self.assertEqual(result.finish.call_count, 0)
+                self.assertEqual(result.finalize.call_count, 1)
+                self.assertNotIn("error", [e["type"] for e in self._wire_events(result.h)])
+
+    def test_nonchat_done_requires_confirmed_terminal_including_eof_tail(self):
+        for source in ("anthropic", "responses"):
+            for ending in self.ENDINGS:
+                for suffix in (b"", (ending or b"\r") * 2):
+                    with self.subTest(source=source, ending=ending, suffix=suffix):
+                        done = b"data: [DONE]" + suffix
+                        before = self._run(source, [done])
+                        self.assertEqual(before.h._acc["terminal_reason"], "malformed_stream")
+                        after = self._run(source, [self._payload(source, ending) + done])
+                        self._assert_success(after)
+
+    def test_confirmed_terminal_survives_same_chunk_bad_tail(self):
+        for source in ("anthropic", "responses"):
+            for ending in self.ENDINGS:
+                with self.subTest(source=source, ending=ending):
+                    result = self._run(source, [self._payload(source, ending) +
+                                               b"data: {bad}" + (ending or b"\r") * 2])
+                    types = [e["type"] for e in self._wire_events(result.h)]
+                    terminal = "response.completed" if source == "anthropic" else "message_stop"
+                    self.assertEqual(types.count(terminal), 1)
+                    self.assertNotIn("error", types)
+                    self.assertNotIn("response.failed", types)
+                    self.assertEqual(result.h._acc["terminal_reason"], "malformed_stream")
+                    self.assertEqual(result.finish.call_count, 0)
+                    self.assertEqual(result.finalize.call_count, 0)
+                    self.assertTrue(result.feed.call_args_list)
+                    self.assertTrue(all(c.kwargs == {"max_events": 1}
+                                        for c in result.feed.call_args_list))
+                    self.assertTrue(any(c.args == (b"",) for c in result.feed.call_args_list))
+
+    def test_post_terminal_unknown_keeps_existing_adapter_redundancy_policy(self):
+        for source in ("anthropic", "responses"):
+            with self.subTest(source=source):
+                result = self._run(source, [self._payload(source, b"\r") +
+                                           self._frame({"type": "future_ping"}, b"\r")])
+                self._assert_success(result)
+
+    def test_nonchat_done_after_failed_or_incomplete_is_redundant(self):
+        for source in ("anthropic", "responses"):
+            for status in ("failed", "incomplete"):
+                for ending in self.ENDINGS:
+                    with self.subTest(source=source, status=status, ending=ending):
+                        if status == "failed":
+                            event = {"type": "error", "error": {
+                                "type": "server_error", "message": "synthetic failure"}}
+                            events = [event] if source == "anthropic" else [
+                                {"type": "response.failed", "response": {
+                                    "status": "failed", "error": event["error"]}}]
+                        elif source == "anthropic":
+                            events = [{"type": "message_delta", "delta": {
+                                "stop_reason": "max_tokens"}, "usage": {}},
+                                {"type": "message_stop"}]
+                        else:
+                            events = [{"type": "response.incomplete", "response": {
+                                "status": "incomplete", "incomplete_details": {
+                                    "reason": "max_output_tokens"}}}]
+                        payload = b"".join(self._frame(e, ending) for e in events)
+                        result = self._run(source, [payload + b"data: [DONE]"])
+                        self.assertEqual(result.h._acc["stream_integrity"], "valid")
+                        self.assertEqual(result.h._acc["terminal_status"], status)
+                        types = [e["type"] for e in self._wire_events(result.h)]
+                        terminal = (("response.failed" if status == "failed" else
+                                     "response.incomplete") if source == "anthropic" else
+                                    ("error" if status == "failed" else "message_stop"))
+                        self.assertEqual(types.count(terminal), 1)
+
+    def test_nonchat_done_after_candidate_but_before_confirmation_is_malformed(self):
+        for source in ("anthropic", "responses"):
+            with self.subTest(source=source):
+                candidate = ({"type": "message_delta", "delta": {
+                    "stop_reason": "end_turn"}, "usage": {}} if source == "anthropic" else
+                    {"type": "response.created", "response": {"status": "in_progress"}})
+                result = self._run(source, [self._frame(candidate, b"\r") + b"data: [DONE]\r\r"])
+                self.assertEqual(result.h._acc["terminal_reason"], "malformed_stream")
+
+    def test_confirmed_terminal_survives_malformed_unframed_eof_tail(self):
+        for source in ("anthropic", "responses"):
+            with self.subTest(source=source):
+                result = self._run(source, [self._payload(source, b"\r") + b"data: {bad}"])
+                types = [e["type"] for e in self._wire_events(result.h)]
+                terminal = "response.completed" if source == "anthropic" else "message_stop"
+                self.assertEqual(types.count(terminal), 1)
+                self.assertNotIn("error", types)
+                self.assertNotIn("response.failed", types)
+                self.assertEqual(result.h._acc["terminal_reason"], "malformed_stream")
+                self.assertEqual(result.finish.call_count, 1)
+                self.assertEqual(result.finalize.call_count, 0)
+
+    def test_unknown_terminal_keeps_original_adapter_failure_policy(self):
+        for source in ("anthropic", "responses"):
+            with self.subTest(source=source):
+                events = ([{"type": "message_delta", "delta": {
+                    "stop_reason": "future"}, "usage": {}}, {"type": "message_stop"}]
+                    if source == "anthropic" else [{"type": "response.completed",
+                    "response": {"status": "future"}}])
+                result = self._run(source, [b"".join(self._frame(e, b"\r") for e in events)])
+                types = [e["type"] for e in self._wire_events(result.h)]
+                self.assertNotIn("message_stop", types)
+                self.assertNotIn("response.completed", types)
+                self.assertEqual(types.count("response.failed" if source == "anthropic" else "error"), 1)
+                self.assertEqual(result.h._acc["terminal_status"],
+                                 "failed" if source == "anthropic" else "open")
+
+    def _run_event_only_actual(self, source, chunks):
+        h = _Handler()
+        resp = _FramingUpstream(chunks)
+        if source == "chat":
+            adapter, writer = pt.OpenAIToAnthropicStreamAdapter({}, "m"), h._write_translated_stream
+        elif source == "anthropic":
+            adapter, writer = pt.AnthropicToResponsesStreamAdapter("m"), h._write_responses_stream
+        else:
+            adapter, writer = pt.ResponsesToAnthropicStreamAdapter({}, "m"), h._write_translated_stream_from_responses
+        writer(resp, adapter)
+        self.assertTrue(resp.closed)
+        return h, adapter
+
+    def test_event_only_real_three_writers_and_immediate_same_chunk(self):
+        for source in self.PROTOCOLS:
+            for ending in self.ENDINGS:
+                with self.subTest(source=source, ending=ending):
+                    sep = ending or b"\r"
+                    prefix = b"event: ping" + sep + b": comment" + sep + b"id: x" + sep + sep
+                    h, adapter = self._run_event_only_actual(source, [prefix + self._payload(source, ending)])
+                    self.assertEqual(h._acc["stream_integrity"], "valid")
+                    self.assertEqual(h._acc["terminal_status"], "completed")
+                    self.assertEqual(adapter.usage_tuple(), (11, 7, 0))
+
+    def test_event_only_real_three_writers_eof_never_success(self):
+        for source in self.PROTOCOLS:
+            for wire in (b"event: ping\n\n", b"event: ping", b"event: ping\r\n"):
+                with self.subTest(source=source, wire=wire):
+                    h, _ = self._run_event_only_actual(source, [wire])
+                    self.assertNotEqual(h._acc.get("stream_integrity"), "valid")
+                    self.assertEqual(h._acc["terminal_reason"], "empty_stream")
+                    types = [e.get("type") for e in self._wire_events(h)]
+                    self.assertNotIn("message_stop", types)
+                    self.assertNotIn("response.completed", types)
+
+    def test_event_only_followed_by_real_invalid_event_is_not_suppressed(self):
+        for source in self.PROTOCOLS:
+            for bad in (b"data: {bad}\n\n", b"event: x\ndata:\n\n",
+                        b'event: x\ndata: {"type":"y"}\n\n'):
+                with self.subTest(source=source, bad=bad):
+                    h, _ = self._run_event_only_actual(source, [b"event: ping\n\n" + bad])
+                    self.assertEqual(h._acc["terminal_reason"], "malformed_stream")
+
+    def test_event_only_followed_by_unknown_business_event_fails(self):
+        for source in ("anthropic", "responses"):
+            with self.subTest(source=source):
+                wire = b'event: ping\n\ndata: {"type":"not_real"}\n\n'
+                h, _ = self._run_event_only_actual(source, [wire])
+                self.assertNotEqual(h._acc.get("stream_integrity"), "valid")
+
+    def test_event_only_bytewise_and_eof_tail_on_three_writers(self):
+        for source in self.PROTOCOLS:
+            with self.subTest(source=source):
+                prefix = b"event: ping\r\n: c\nid: x\rretry: 3\r\n\r"
+                # Chat [DONE] ends reading before a tail; use a framed no-DONE payload instead.
+                if source == "chat":
+                    body = b"".join(self._frame(e, b"\r") for e in self._events(source))
+                else:
+                    body = self._payload(source, b"\r")
+                wire = prefix + body + b"event: ping"
+                h, adapter = self._run_event_only_actual(source, [bytes([c]) for c in wire])
+                self.assertEqual(h._acc["stream_integrity"], "valid")
+                self.assertEqual(adapter.usage_tuple(), (11, 7, 0))
+
+    def test_event_only_same_chunk_first_business_written_before_second_read(self):
+        for source in self.PROTOCOLS:
+            with self.subTest(source=source):
+                h = _Handler()
+                first = b"event: ping\n\n" + self._frame(self._events(source)[0], b"\n")
+                rest = b"".join(self._frame(e, b"\n") for e in self._events(source)[1:])
+                if source == "chat": rest += b"data: [DONE]\n\n"
+                marker = b"response.created" if source == "anthropic" else b"message_start"
+                def check(): self.assertIn(marker, _decode_chunked(h.wfile.getvalue()))
+                resp = _FramingUpstream([first, rest], check)
+                if source == "chat":
+                    writer, adapter = h._write_translated_stream, pt.OpenAIToAnthropicStreamAdapter({}, "m")
+                elif source == "anthropic":
+                    writer, adapter = h._write_responses_stream, pt.AnthropicToResponsesStreamAdapter("m")
+                else:
+                    writer, adapter = h._write_translated_stream_from_responses, pt.ResponsesToAnthropicStreamAdapter({}, "m")
+                writer(resp, adapter)
+                self.assertTrue(resp.checked)
+                self.assertEqual(h._acc["stream_integrity"], "valid")
+
+    def test_empty_event_name_three_writers_before_business(self):
+        for source in self.PROTOCOLS:
+            for event in (b"event:", b"event: "):
+                for ending in (b"\n", b"\r\n", b"\r"):
+                    wire = event + ending + ending + self._payload(source, ending)
+                    for chunks in ([wire], [bytes([b]) for b in wire]):
+                        with self.subTest(source=source, event=event, ending=ending,
+                                          bytewise=len(chunks) > 1):
+                            h, adapter = self._run_event_only_actual(source, chunks)
+                            self.assertEqual(h._acc["stream_integrity"], "valid")
+                            self.assertEqual(h._acc["terminal_status"], "completed")
+                            self.assertEqual(adapter.usage_tuple(), (11, 7, 0))
+
+    def test_empty_event_name_three_writers_alone_eof_not_success(self):
+        for source in self.PROTOCOLS:
+            for event in (b"event:", b"event: "):
+                for ending in (b"\n", b"\r\n", b"\r"):
+                    for wire in (event, event + ending, event + ending + ending):
+                        with self.subTest(source=source, event=event, ending=ending, wire=wire):
+                            h, _ = self._run_event_only_actual(source, [wire])
+                            self.assertEqual(h._acc["stream_integrity"], "invalid")
+                            self.assertEqual(h._acc["terminal_reason"], "empty_stream")
+                            types = [e.get("type") for e in self._wire_events(h)]
+                            self.assertNotIn("message_stop", types)
+                            self.assertNotIn("response.completed", types)
