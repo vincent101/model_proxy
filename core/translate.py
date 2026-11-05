@@ -3132,6 +3132,12 @@ class ResponsesToAnthropicStreamAdapter:
         if self._completed or self._failed:
             return []
         self._failed = True
+        # P1 观测：a2r 流内上游 failed/error 过去只透传 error 事件，真实
+        # error.type/message 未落日志，导致 terminal_reason=upstream_error 无详情。
+        # 仅打 warning，不改变客户端事件与终态语义。
+        logger.warning(
+            "upstream stream failed (a2r): type=%r code=%r reason=%r message=%r",
+            error.error_type, error.error_code, error.reason, str(error)[:1000])
         self._blocks.clear()
         self._pending_arguments.clear()
         return [{

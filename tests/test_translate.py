@@ -1625,6 +1625,26 @@ class TestARRequest(unittest.TestCase):
         rb, _ = pt.anthropic_to_responses_request(body)
         self.assertEqual(rb["instructions"], "A\nB")
 
+    def test_ar_stream_stop_reason_preserved_for_incomplete(self):
+        """completed/tool_use/incomplete 的 stop_reason 不被日志层覆盖。"""
+        for events, expected in [
+            (_ar_text_stream_events(), "end_turn"),
+            (_ar_tool_stream_events(), "tool_use"),
+        ]:
+            with self.subTest(expected=expected):
+                adapter = pt.ResponsesToAnthropicStreamAdapter({}, "m")
+                _run_ar_stream(adapter, events)
+                self.assertEqual(adapter.final_stop_reason, expected)
+
+        adapter = pt.ResponsesToAnthropicStreamAdapter({}, "m")
+        _run_ar_stream(adapter, [
+            ("response.created", {"response": {"id": "r"}}),
+            ("response.incomplete", {"response": {"status": "incomplete",
+                "incomplete_details": {"reason": "max_output_tokens"},
+                "usage": {"input_tokens": 1, "output_tokens": 1}}}),
+        ])
+        self.assertEqual(adapter.final_stop_reason, "max_tokens")
+
     def test_ar_unknown_system_message_role_dropped_with_details(self):
         """P1 定位：messages 里的 system 不是标准 Anthropic 输入 role，
         当前策略仍是丢弃，但要留 index/role/size/preview 定位内容。"""

@@ -38,7 +38,8 @@ class _Upstream:
 class _Handler(ModelProxyHandler):
     def __init__(self):
         self.wfile = io.BytesIO()
-        self._acc = {"status": 0}
+        self._acc = {"status": 0, "first_event_ms": "", "stop_reason": ""}
+        self._forward_started_monotonic = time.monotonic()
         self.headers_sent = []
 
     def send_response(self, status):
@@ -141,6 +142,48 @@ class TestResponsesToAnthropicHandler(unittest.TestCase):
         self.assertIn("bad tools", wire)
         self.assertNotIn("message_stop", wire)
         self.assertTrue(adapter._failed)
+        # 合法完整失败终态：valid/failed，但 ACCESS final_error 保留上游失败原因。
+        self.assertEqual(adapter.terminal_state(),
+                         pt.TerminalState(pt.TerminalStatus.FAILED, "upstream_error"))
+
+    def test_failed_stream_records_upstream_error_and_stop_reason(self):
+        h = _Handler()
+        payload = b"".join([
+            b'data: {"type":"response.created","response":{"status":"in_progress"}}\n\n',
+            b'data: {"type":"response.failed","response":{"status":"failed","error":'
+            b'{"type":"invalid_prompt","code":"bad","message":"bad tools"}}}\n\n',
+        ])
+        adapter = pt.ResponsesToAnthropicStreamAdapter({}, "m")
+        with self.assertLogs("core.translate", level="WARNING") as cap:
+            h._write_translated_stream_from_responses(_Upstream(payload), adapter)
+        self.assertEqual(h._acc["stream_integrity"], "valid")
+        self.assertEqual(h._acc["terminal_status"], "failed")
+        self.assertEqual(h._acc["terminal_reason"], "upstream_error")
+        self.assertEqual(h._acc["final_error"], "upstream_error")
+        # stop_reason 由 server 分支在 writer 返回后写；这里只看 writer 自身终态。
+        self.assertIsInstance(h._acc["first_event_ms"], int)
+        joined = "\n".join(r.getMessage() for r in cap.records)
+        self.assertIn("upstream stream failed (a2r)", joined)
+        self.assertIn("invalid_prompt", joined)
+        self.assertIn("bad tools", joined)
+
+    def test_completed_stream_records_stop_reason_and_first_event(self):
+        h = _Handler()
+        payload = b"".join([
+            b'data: {"type":"response.created","response":{"status":"in_progress"}}\n\n',
+            b'data: {"type":"response.output_text.delta","delta":"ok"}\n\n',
+            b'data: {"type":"response.completed","response":{"status":"completed",'
+            b'"usage":{"input_tokens":1,"output_tokens":2}}}\n\n',
+        ])
+        adapter = pt.ResponsesToAnthropicStreamAdapter({}, "m")
+        h._write_translated_stream_from_responses(_Upstream(payload), adapter)
+        self.assertEqual(h._acc["stream_integrity"], "valid")
+        self.assertEqual(h._acc["terminal_status"], "completed")
+        self.assertEqual(h._acc["terminal_reason"], "end_turn")
+        self.assertEqual(adapter.final_stop_reason, "end_turn")
+        self.assertEqual(adapter.usage_tuple(), (1, 2, 0))
+        self.assertIsInstance(h._acc["first_event_ms"], int)
+        self.assertGreaterEqual(h._acc["first_event_ms"], 0)
 
     def test_incomplete_max_tokens_finishes_once(self):
         wire, _ = self._run([
@@ -708,6 +751,9 @@ class TestConvertedSSEFraming(unittest.TestCase):
         self.assertEqual(result.h._acc["terminal_reason"], "end_turn")
         self.assertEqual(result.adapter.usage_tuple(), (11, 7, 0))
         self.assertIn(("status", 200), result.h.headers_sent)
+        # 转换流式也要有首包观测；不再只有 passthrough 有 first_event_ms。
+        self.assertIsInstance(result.h._acc["first_event_ms"], int)
+        self.assertGreaterEqual(result.h._acc["first_event_ms"], 0)
 
     def test_three_handlers_all_endings_every_cut_and_bytewise(self):
         for source in self.PROTOCOLS:
