@@ -1879,6 +1879,7 @@ class ModelProxyHandler(BaseHTTPRequestHandler):
             "terminal_status": "", "terminal_reason": "", "first_event_ms": "",
         }
         t0 = time.monotonic()
+        self._forward_started_monotonic = t0
         try:
             self._forward(method)
         except (BrokenPipeError, ConnectionResetError):
@@ -2761,6 +2762,9 @@ class ModelProxyHandler(BaseHTTPRequestHandler):
                         adapter = pt.ResponsesToAnthropicStreamAdapter(fwd_ctx, target_model or "")
                         self._write_translated_stream_from_responses(resp, adapter)
                         (self._acc["usage_in"], self._acc["usage_out"], _) = adapter.usage_tuple()
+                        # 观测补齐：与 chat/r2a 流式分支对齐，读取 adapter 推断的
+                        # Anthropic 域 stop_reason（completed 才有值，失败留空）。
+                        self._acc["stop_reason"] = adapter.final_stop_reason or ""
                         # ④b 流式不重试；本 adapter 未捕获 response.incomplete 状态，
                         # 流式截断检测此处不做（状态不允许，仅非流式生效）
                     else:
@@ -2795,6 +2799,13 @@ class ModelProxyHandler(BaseHTTPRequestHandler):
                         self._write_buffered_response(
                             200, [("Content-Type", "application/json")],
                             json.dumps(anthropic_resp, ensure_ascii=False).encode("utf-8"))
+                        # 非流式成功也补终态观测，避免 usage 有值但 terminal 字段全空。
+                        try:
+                            self._record_stream_terminal(pt.map_anthropic_terminal(
+                                anthropic_resp.get("stop_reason")))
+                        except pt.TranslationError:
+                            self._record_stream_terminal(pt.TerminalState(
+                                pt.TerminalStatus.FAILED, "upstream_error"))
                     return
 
                 # RESPONSES_TO_ANTHROPIC：anthropic 响应 → Responses
@@ -3316,6 +3327,10 @@ class ModelProxyHandler(BaseHTTPRequestHandler):
             self._acc["stream_integrity"] = "valid"
             self._acc["terminal_status"] = terminal.status.value
             self._acc["terminal_reason"] = terminal.reason
+            if terminal.status is pt.TerminalStatus.FAILED:
+                # 流内上游失败是合法完整终态（valid/failed），但要保留短 reason
+                # 到 final_error，避免只看 ACCESS 时误以为无错误出口。
+                self._acc["final_error"] = terminal.reason or "upstream_error"
 
     def _record_stream_error(self, error: "pt.TranslationError") -> None:
         if hasattr(self, "_acc"):
@@ -3367,6 +3382,13 @@ class ModelProxyHandler(BaseHTTPRequestHandler):
         """把一段已序列化的 SSE 字节按 HTTP chunked 编码写出并 flush。"""
         if not data:
             return
+        # 转换流式原缺 first_event_ms（此前只有 passthrough observer 会补）。
+        # 首个实际写出的 SSE chunk 即可代表转换链路首包；passthrough 后续会用
+        # observer 的业务事件时间覆写，转换路径保留这里的值。
+        started = getattr(self, "_forward_started_monotonic", None)
+        if started is not None and self._acc.get("first_event_ms", "") == "":
+            self._acc["first_event_ms"] = max(
+                0, int((time.monotonic() - started) * 1000))
         self.wfile.write(f"{len(data):X}\r\n".encode("ascii"))
         self.wfile.write(data)
         self.wfile.write(b"\r\n")
