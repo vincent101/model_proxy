@@ -268,9 +268,9 @@ class TestChatBoundaries(SyntheticCase):
         adapter = pt.OpenAIToAnthropicStreamAdapter()
         self.feed_chat(adapter, chat({"tool_calls": [call(0, '{"a":', "ca", "a"), call(7, '{}', "cb", "b")]}),
                        chat({"tool_calls": [call(0, '1}')]}, "tool_calls"))
-        # Preserve ca2b159: terminal_state() feeds the mapped "tool_use" back
-        # into map_chat_terminal(), which currently classifies it as FAILED.
-        self.assertEqual(adapter.terminal_state().status, pt.TerminalStatus.FAILED)
+        # The finish reason has already been mapped into the Anthropic domain.
+        self.assertEqual(adapter.terminal_state(),
+                         pt.TerminalState(pt.TerminalStatus.COMPLETED, "tool_use"))
         self.assertEqual(len(self.life.tools()), 1)
         self.assertEqual(self.life.tools()[0]["stops"], 0)
         self.feed_chat(adapter, {"choices": [], "usage": {"prompt_tokens": 11, "completion_tokens": 17,
@@ -666,12 +666,97 @@ class TestResponsesBoundaries(SyntheticCase):
         self.feed_responses(adapter, completed())
         self.assertEqual(self.life.events[-2]["delta"]["stop_reason"], "tool_use")
 
-    def test_tool_then_text_preserves_historical_end_turn_not_physical_tool(self):
+    def test_tool_then_text_preserves_response_tool_handoff(self):
         adapter = pt.ResponsesToAnthropicStreamAdapter()
         self.feed_responses(adapter, added(), argument('{}'), ("response.output_text.delta", {"delta": "tail"}))
         self.assertEqual(adapter.cur_type, "tool_use")
         self.feed_responses(adapter, completed())
-        self.assertEqual(self.life.events[-2]["delta"]["stop_reason"], "end_turn")
+        self.assertEqual([b["type"] for b in self.life.blocks], ["tool_use", "text"])
+        self.assertEqual(self.life.events[-2]["delta"]["stop_reason"], "tool_use")
+
+    def test_completed_tool_handoff_matches_nonstream_for_mixed_output(self):
+        tool_a = {"type": "function_call", "call_id": "ca", "name": "a", "arguments": '{"x":1}'}
+        tool_b = {"type": "function_call", "call_id": "cb", "name": "b", "arguments": '{"y":2}'}
+        text = {"type": "message", "content": [{"type": "output_text", "text": "tail!"}]}
+        thinking = {"type": "reasoning", "summary": [{"type": "summary_text", "text": "think"}]}
+        tool_a_events = [added(), argument('{"x":1}'), argument('{"x":1}', done=True), item_done()]
+        tool_b_events = [added("ib", 7, "cb", "b"), argument('{"y":2}', "ib", 7),
+                         item_done("ib", 7)]
+        text_events = [("response.output_item.added", {"item": {"type": "message"}}),
+                       ("response.output_text.delta", {"delta": "tail"}),
+                       ("response.output_text.delta", {"delta": "!"})]
+        thinking_events = [("response.output_item.added", {"item": {"type": "reasoning"}}),
+                           ("response.reasoning_summary_text.delta", {"delta": "think"}),
+                           ("response.reasoning_summary_text.done", {})]
+        cases = [
+            ([tool_a, text], tool_a_events + text_events),
+            ([tool_a, thinking], tool_a_events + thinking_events),
+            ([text, tool_a, text], text_events + tool_a_events + text_events),
+            ([tool_a, tool_b, text], tool_a_events + tool_b_events + text_events),
+        ]
+        ctx = {"tool_name_mapping": {"a": "restored"}, "request_model": "synthetic"}
+        for output, incoming in cases:
+            with self.subTest(output=output):
+                adapter = pt.ResponsesToAnthropicStreamAdapter(ctx)
+                life = BlockLifecycle(self)
+                for event in incoming + [completed()]:
+                    life.consume(adapter.feed(*event))
+                expected = pt.responses_to_anthropic_response(
+                    {"status": "completed", "output": output}, ctx)
+                self.assertEqual(life.normalized(), expected["content"])
+                self.assertEqual(life.events[-2]["delta"]["stop_reason"], "tool_use")
+                self.assertEqual(life.events[-2]["delta"]["stop_reason"], expected["stop_reason"])
+                self.assertEqual(adapter.feed(*completed()), [])
+                self.assertEqual(adapter.finalize(), [])
+                self.assertEqual(adapter.finalize(), [])
+
+    def test_completed_without_tools_stays_end_turn(self):
+        for event in (("response.output_text.delta", {"delta": "text"}),
+                      ("response.reasoning_text.delta", {"delta": "thinking"})):
+            with self.subTest(event=event):
+                adapter = pt.ResponsesToAnthropicStreamAdapter()
+                life = BlockLifecycle(self)
+                for incoming in (event, completed()):
+                    life.consume(adapter.feed(*incoming))
+                self.assertEqual(life.events[-2]["delta"]["stop_reason"], "end_turn")
+                self.assertEqual(life.terminal, "message_stop")
+
+    def test_explicit_stop_reason_is_not_overridden_by_tool(self):
+        # Exercise the existing priority branch; this does not add Responses refusal support.
+        adapter = pt.ResponsesToAnthropicStreamAdapter()
+        self.feed_responses(adapter, added(), argument('{}'))
+        adapter.final_stop_reason = "refusal"
+        self.feed_responses(adapter, completed())
+        self.assertEqual(self.life.events[-2]["delta"]["stop_reason"], "refusal")
+        self.assertEqual(adapter.terminal_state().status, pt.TerminalStatus.REFUSED)
+
+    def test_tool_does_not_override_incomplete_or_failure(self):
+        adapter = pt.ResponsesToAnthropicStreamAdapter()
+        self.feed_responses(adapter, added(), argument('{}'), completed("incomplete"))
+        self.assertEqual(self.life.events[-2]["delta"]["stop_reason"], "max_tokens")
+        self.assertEqual(adapter.terminal_state().status, pt.TerminalStatus.INCOMPLETE)
+        for terminal in (("response.failed", {"response": {"error": {"message": "bad"}}}),
+                         argument('{}', "unknown", 0)):
+            with self.subTest(terminal=terminal):
+                adapter = pt.ResponsesToAnthropicStreamAdapter()
+                life = BlockLifecycle(self)
+                for event in (added(), argument('{}'), terminal, completed()):
+                    life.consume(adapter.feed(*event))
+                self.assertEqual(life.terminal, "error")
+                self.assertNotIn("message_stop", [e["type"] for e in life.events])
+                self.assertEqual(adapter.finalize(), [])
+        for terminal in (("response.completed", {"response": {"status": "future"}}),
+                         ("response.refusal.delta", {"delta": "refused"})):
+            with self.subTest(terminal=terminal):
+                adapter = pt.ResponsesToAnthropicStreamAdapter()
+                life = BlockLifecycle(self)
+                for event in (added(), argument('{}')):
+                    life.consume(adapter.feed(*event))
+                with self.assertRaises(pt.TranslationError):
+                    adapter.feed(*terminal)
+                life.consume(adapter.finalize())
+                self.assertEqual(life.terminal, "error")
+                self.assertNotIn("message_stop", [e["type"] for e in life.events])
 
     def test_special_and_invalid_arguments_are_not_parsed_or_deduplicated(self):
         raw = json.dumps({"text": 'a  b,c\\"中文', "nested": [{}, []]}, ensure_ascii=False)

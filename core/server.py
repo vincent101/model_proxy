@@ -3375,39 +3375,37 @@ class ModelProxyHandler(BaseHTTPRequestHandler):
     def _write_translated_stream(self, upstream_resp, adapter) -> None:
         """正向流式（组合3）：上游 OpenAI chat SSE → Anthropic SSE。
 
-        上游为 chat completions SSE：每事件一行 `data: {json}`，以 `data: [DONE]` 收尾。
-        逐行解析 → adapter.feed(chunk) → 每个 Anthropic 事件经 pt.anthropic_sse_bytes 写出。
+        SSEFramer 逐事件解析 → adapter.feed(data) → pt.anthropic_sse_bytes 写出。
+        Chat [DONE] 立即停止消费尾流并 finalize；只有正常 EOF 接纳无空行末帧。
         """
         self._begin_sse_chunked()
-        buf = b""
+        framer = pt.SSEFramer()
         done = False
+
+        def consume(frame):
+            if frame.is_comment:
+                return False
+            if frame.is_done:
+                return True
+            for ev in adapter.feed(frame.data):
+                self._write_sse_chunk(pt.anthropic_sse_bytes(ev))
+            return False
+
         try:
             while not done:
                 data = upstream_resp.read(4096)
                 if not data:
+                    for frame in framer.finish():
+                        if consume(frame):
+                            break
                     break
-                buf += data
-                # 按行切分（chat SSE 单行 data:，事件间以空行分隔）
-                while b"\n" in buf:
-                    line, buf = buf.split(b"\n", 1)
-                    line = line.rstrip(b"\r").strip()
-                    if not line:
-                        continue
-                    if not line.startswith(b"data:"):
-                        continue
-                    payload = line[len(b"data:"):].lstrip()
-                    if payload == b"[DONE]":
-                        done = True
+                frames = framer.feed(data, max_events=1)
+                while frames:
+                    done = consume(frames[0])
+                    if done:
                         break
-                    try:
-                        chunk = json.loads(payload)
-                    except (json.JSONDecodeError, ValueError) as e:
-                        raise pt.TranslationError(
-                            f"malformed Chat SSE frame: {e}", source_type="chat",
-                            reason="malformed_stream") from e
-                    for ev in adapter.feed(chunk):
-                        self._write_sse_chunk(pt.anthropic_sse_bytes(ev))
-            # 流结束：收尾（[DONE] 或上游断流都走 finalize，幂等）
+                    frames = framer.feed(b"", max_events=1)
+            # 正常 EOF 或 Chat [DONE] 收尾；读取异常/客户端断连不 finalize。
             for ev in adapter.finalize():
                 self._write_sse_chunk(pt.anthropic_sse_bytes(ev))
             self._record_stream_terminal(adapter.terminal_state())
@@ -3440,48 +3438,37 @@ class ModelProxyHandler(BaseHTTPRequestHandler):
     def _write_responses_stream(self, upstream_resp, adapter) -> None:
         """反向流式（组合4）：上游网关 Anthropic SSE → Responses SSE。
 
-        上游 Anthropic SSE 为 `event:xxx\\ndata:{json}`（冒号后无空格），事件间空行分隔。
-        按 \\n\\n 切块，块内解析出 (event_type, data) → adapter.feed → pt.responses_sse_bytes 写出。
+        SSEFramer 逐事件解析出 event_type/data → adapter.feed → pt.responses_sse_bytes 写出。
         message_stop 由 adapter.feed 内部触发 response.completed；断流则 finalize 补收尾。
         """
         self._begin_sse_chunked()
-        buf = b""
+        framer = pt.SSEFramer()
+
+        def consume(frame):
+            if frame.is_comment:
+                return
+            if frame.is_done:
+                # 已确认终态后的冗余 DONE 容忍；终态前仍属 malformed。
+                if getattr(adapter, "completed", False) or getattr(adapter, "failed", False):
+                    return
+                raise pt.TranslationError("unexpected [DONE]", reason="malformed_stream")
+            if frame.event_type is None:
+                raise pt.TranslationError("malformed SSE frame", reason="malformed_stream")
+            for ev in adapter.feed(frame.event_type, frame.data):
+                self._write_sse_chunk(pt.responses_sse_bytes(ev))
+
         try:
             while True:
                 data = upstream_resp.read(4096)
                 if not data:
                     break
-                buf += data
-                # 按事件块（空行分隔）切分
-                while b"\n\n" in buf:
-                    block, buf = buf.split(b"\n\n", 1)
-                    ev_type, ev_data = self._parse_anthropic_sse_block(block)
-                    if ev_type is None and ev_data is None:
-                        continue  # SSE 注释/keep-alive 帧
-                    if ev_type == "__DONE__":
-                        # mcli 等网关会在语义完整的 Responses 流之后追加 OpenAI 风格
-                        # data: [DONE] 尾巴：终态已确认则忽略；未确认仍按 malformed。
-                        if getattr(adapter, "completed", False) or getattr(adapter, "failed", False):
-                            continue
-                        raise pt.TranslationError("unexpected [DONE]", reason="malformed_stream")
-                    if ev_type is None:
-                        raise pt.TranslationError("malformed SSE frame", reason="malformed_stream")
-                    for ev in adapter.feed(ev_type, ev_data):
-                        self._write_sse_chunk(pt.responses_sse_bytes(ev))
-            # 处理 buffer 残余块（末尾可能无空行）
-            if buf.strip():
-                ev_type, ev_data = self._parse_anthropic_sse_block(buf)
-                if ev_type is None and ev_data is None:
-                    pass  # SSE 注释/keep-alive 帧
-                elif ev_type == "__DONE__":
-                    # 同上：终态已确认的冗余 [DONE] 尾巴忽略；终态前出现仍报错。
-                    if not (getattr(adapter, "completed", False) or getattr(adapter, "failed", False)):
-                        raise pt.TranslationError("unexpected [DONE]", reason="malformed_stream")
-                elif ev_type is None:
-                    raise pt.TranslationError("malformed SSE frame", reason="malformed_stream")
-                else:
-                    for ev in adapter.feed(ev_type, ev_data):
-                        self._write_sse_chunk(pt.responses_sse_bytes(ev))
+                frames = framer.feed(data, max_events=1)
+                while frames:
+                    consume(frames[0])
+                    frames = framer.feed(b"", max_events=1)
+            # 只有正常 EOF 接纳无空行末帧；读取异常/客户端断连不走此路径。
+            for frame in framer.finish():
+                consume(frame)
             # 流意外结束（无 message_stop）时补收尾，幂等
             for ev in adapter.finalize():
                 self._write_sse_chunk(pt.responses_sse_bytes(ev))
@@ -3514,48 +3501,37 @@ class ModelProxyHandler(BaseHTTPRequestHandler):
     def _write_translated_stream_from_responses(self, upstream_resp, adapter) -> None:
         """新组合流式：上游 Responses SSE → Anthropic SSE。
 
-        上游 Responses SSE 为单行 `data:{json}`（无 event: 行、无 [DONE] 哨兵），
-        event_type 从 data.type 取（_parse_anthropic_sse_block 的 event: 行缺失兜底逻辑
-        自然覆盖此场景）。按 \\n\\n 切块 → adapter.feed(event_type, data) →
+        SSEFramer 支持 event: 行缺失时以 data.type 兜底。
+        逐事件 → adapter.feed(event_type, data) →
         pt.anthropic_sse_bytes 写出。断流则 finalize 补收尾。
         中断时补 `event: error`（输出侧已是 Anthropic 格式，不用 response.failed）。
         """
         self._begin_sse_chunked()
-        buf = b""
+        framer = pt.SSEFramer()
+
+        def consume(frame):
+            if frame.is_comment:
+                return
+            if frame.is_done:
+                if getattr(adapter, "_completed", False) or getattr(adapter, "_failed", False):
+                    return
+                raise pt.TranslationError("unexpected [DONE]", reason="malformed_stream")
+            if frame.event_type is None:
+                raise pt.TranslationError("malformed SSE frame", reason="malformed_stream")
+            for ev in adapter.feed(frame.event_type, frame.data):
+                self._write_sse_chunk(pt.anthropic_sse_bytes(ev))
+
         try:
             while True:
                 data = upstream_resp.read(4096)
                 if not data:
                     break
-                buf += data
-                while b"\n\n" in buf:
-                    block, buf = buf.split(b"\n\n", 1)
-                    ev_type, ev_data = self._parse_anthropic_sse_block(block)
-                    if ev_type is None and ev_data is None:
-                        continue  # SSE 注释/keep-alive 帧
-                    if ev_type == "__DONE__":
-                        # 同 passthrough 规则：终态已确认的冗余 [DONE] 尾巴忽略；
-                        # 终态前出现仍报错（真 malformed）。
-                        if getattr(adapter, "_completed", False) or getattr(adapter, "_failed", False):
-                            continue
-                        raise pt.TranslationError("unexpected [DONE]", reason="malformed_stream")
-                    if ev_type is None:
-                        raise pt.TranslationError("malformed SSE frame", reason="malformed_stream")
-                    for ev in adapter.feed(ev_type, ev_data):
-                        self._write_sse_chunk(pt.anthropic_sse_bytes(ev))
-            # 处理 buffer 残余块（末尾可能无空行）
-            if buf.strip():
-                ev_type, ev_data = self._parse_anthropic_sse_block(buf)
-                if ev_type is None and ev_data is None:
-                    pass  # SSE 注释/keep-alive 帧
-                elif ev_type == "__DONE__":
-                    if not (getattr(adapter, "_completed", False) or getattr(adapter, "_failed", False)):
-                        raise pt.TranslationError("unexpected [DONE]", reason="malformed_stream")
-                elif ev_type is None:
-                    raise pt.TranslationError("malformed SSE frame", reason="malformed_stream")
-                else:
-                    for ev in adapter.feed(ev_type, ev_data):
-                        self._write_sse_chunk(pt.anthropic_sse_bytes(ev))
+                frames = framer.feed(data, max_events=1)
+                while frames:
+                    consume(frames[0])
+                    frames = framer.feed(b"", max_events=1)
+            for frame in framer.finish():
+                consume(frame)
             # 流意外结束（无 response.completed）时补收尾，幂等
             for ev in adapter.finalize():
                 self._write_sse_chunk(pt.anthropic_sse_bytes(ev))
@@ -3586,30 +3562,6 @@ class ModelProxyHandler(BaseHTTPRequestHandler):
         finally:
             upstream_resp.close()
 
-    @staticmethod
-    def _parse_anthropic_sse_block(block: bytes):
-        """解析 SSE 事件块；无 event 行时以 data.type 兜底。"""
-        ev_type = None
-        payload = None
-        for raw in block.split(b"\n"):
-            raw = raw.rstrip(b"\r").strip()
-            if not raw:
-                continue
-            if raw.startswith(b"event:"):
-                ev_type = raw[len(b"event:"):].lstrip().decode("utf-8", "replace")
-            elif raw.startswith(b"data:"):
-                payload = raw[len(b"data:"):].lstrip()
-        if payload is None:
-            return None, None
-        if payload == b"[DONE]":
-            return "__DONE__", None
-        try:
-            data = json.loads(payload)
-        except (json.JSONDecodeError, ValueError):
-            return None, {}
-        if ev_type is None and isinstance(data, dict):
-            ev_type = data.get("type")
-        return ev_type, data
 
     # ------------------------------------------------------------------
     # helper

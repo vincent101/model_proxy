@@ -147,6 +147,9 @@ class SSEFramer:
 
     def __init__(self):
         self._buffer = bytearray()
+        self._scan_pos = 0
+        self._line_start = 0
+        self._after_cr = False
         self.saw_business_event = False
 
     @property
@@ -156,18 +159,36 @@ class SSEFramer:
     def feed(self, chunk: bytes, *, max_events: int | None = None) -> list[SSEEvent]:
         self._buffer.extend(chunk)
         events = []
-        while max_events is None or len(events) < max_events:
-            raw = bytes(self._buffer)
-            lf = raw.find(b"\n\n")
-            crlf = raw.find(b"\r\n\r\n")
-            candidates = [(lf, 2), (crlf, 4)]
-            candidates = [(p, n) for p, n in candidates if p >= 0]
-            if not candidates:
-                break
-            pos, sep_len = min(candidates)
+        while (self._scan_pos < len(self._buffer)
+               and (max_events is None or len(events) < max_events)):
+            pos = self._scan_pos
+            byte = self._buffer[pos]
+            if self._after_cr:
+                self._after_cr = False
+                if byte == 10:
+                    # CR 已终止该行；跨 chunk 后到的 LF 只配对，不再终止一行。
+                    self._scan_pos += 1
+                    self._line_start = self._scan_pos
+                    continue
+            if byte not in (10, 13):
+                self._scan_pos += 1
+                continue
+            blank_line = pos == self._line_start
+            self._scan_pos += 1
+            self._line_start = self._scan_pos
+            self._after_cr = byte == 13
+            if not blank_line:
+                continue
+            # 空行的 CR 本身即可发布帧，不等待下一 chunk 来判定 CRLF。
             block = bytes(self._buffer[:pos])
-            framed = bytes(self._buffer[:pos + sep_len])
-            del self._buffer[:pos + sep_len]
+            if (self._after_cr and self._scan_pos < len(self._buffer)
+                    and self._buffer[self._scan_pos] == 10):
+                # LF 已在 buffer 时仍保留在当前 raw；尚未到达时绝不等它。
+                self._scan_pos += 1
+                self._after_cr = False
+            framed = bytes(self._buffer[:self._scan_pos])
+            del self._buffer[:self._scan_pos]
+            self._scan_pos = self._line_start = 0
             event = self._parse(block, framed)
             if event is not None:
                 if not event.is_comment:
@@ -176,19 +197,29 @@ class SSEFramer:
         return events
 
     def finish(self) -> list[SSEEvent]:
+        events = self.feed(b"")
         if not self._buffer or not bytes(self._buffer).strip():
             self._buffer.clear()
-            return []
+            self._scan_pos = self._line_start = 0
+            self._after_cr = False
+            return events
         block = bytes(self._buffer)
         self._buffer.clear()
+        self._scan_pos = self._line_start = 0
+        self._after_cr = False
         # 完整末尾事件可无空行；只有 event/data 字段才视为完整。
         if not any(line.lstrip().startswith((b"event:", b"data:"))
                    for line in block.splitlines()):
-            if all(not line.strip() or line.lstrip().startswith(b":")
+            if all(not line.strip() or line.lstrip().startswith((b":", b"id:", b"retry:"))
                    for line in block.splitlines()):
-                return [SSEEvent(block, None, None, is_comment=True)]
+                return events + [SSEEvent(block, None, None, is_comment=True)]
             raise TranslationError("malformed trailing SSE frame", reason="malformed_stream")
-        return [self._parse(block, block)]
+        event = self._parse(block, block)
+        if event is not None:
+            if not event.is_comment:
+                self.saw_business_event = True
+            events.append(event)
+        return events
 
     @staticmethod
     def _parse(block: bytes, raw: bytes) -> SSEEvent | None:
@@ -205,7 +236,13 @@ class SSEFramer:
             only_comments = False
             if line.startswith(b"event:"):
                 has_field = True
-                event_type = line[6:].lstrip().decode("utf-8", "replace")
+                value = line[6:]
+                if value.startswith(b" "):
+                    value = value[1:]
+                try:
+                    event_type = value.decode("utf-8")
+                except UnicodeDecodeError as exc:
+                    raise TranslationError("malformed SSE UTF-8", reason="malformed_stream") from exc
             elif line.startswith(b"data:"):
                 has_field = True
                 value = line[5:]
@@ -220,7 +257,7 @@ class SSEFramer:
         if payload == b"[DONE]":
             return SSEEvent(raw, event_type, None, is_done=True)
         try:
-            data = json.loads(payload)
+            data = json.loads(payload.decode("utf-8"))
         except (json.JSONDecodeError, ValueError) as exc:
             raise TranslationError("malformed SSE JSON", reason="malformed_stream") from exc
         data_type = data.get("type") if isinstance(data, dict) else None
@@ -1530,14 +1567,14 @@ class OpenAIToAnthropicStreamAdapter:
     def terminal_state(self) -> TerminalState:
         """统一终态读取接口（server.py 流式成功路径调用）。
 
-        Chat adapter 的失败态只置 _failed；成功态以 final_stop_reason 映射
-        为准。未终态保持 OPEN，由调用方记录 unexpected_eof。
+        Chat adapter 的失败态只置 _failed；final_stop_reason 已转换为
+        Anthropic 域。未终态保持 OPEN，由调用方记录 unexpected_eof。
         """
         if self._failed:
             return TerminalState(TerminalStatus.FAILED, "upstream_error")
         if self.final_stop_reason is not None:
             try:
-                return map_chat_terminal(self.final_stop_reason)
+                return map_anthropic_terminal(self.final_stop_reason)
             except TranslationError:
                 return TerminalState(TerminalStatus.FAILED, "upstream_error")
         return TerminalState(TerminalStatus.OPEN, "")
@@ -2696,7 +2733,6 @@ class ResponsesToAnthropicStreamAdapter:
         self._tool_indexes = {}
         self._pending_arguments = []
         self._anonymous_tool = None
-        self._logical_type = None
 
     # ---- 事件构造 helper（复用 Anthropic 事件形态） ----
 
@@ -2851,7 +2887,6 @@ class ResponsesToAnthropicStreamAdapter:
                 source_id=item.get("call_id"), source_name=item.get("name"),
                 item_id=None, output_index=None, arguments_done=False)
             self._tools.append(tool)
-            self._logical_type = "tool_use"
         if item_id is not None:
             tool["item_id"] = item_id
             self._tool_items[item_id] = tool
@@ -2984,21 +3019,18 @@ class ResponsesToAnthropicStreamAdapter:
             if it == "message":
                 # 开一个 text block（时机对齐正向：text 首个 delta 前开亦可，这里 added 时开）
                 self._blocks.add("text")
-                self._logical_type = "text"
             elif it == "function_call":
                 self._add_tool(data)
             elif it == "reasoning":
                 # ①b：开 thinking block（reasoning item 在 output 中位于 message 之前，
                 # 对齐 anthropic 原生"thinking 在前"约定）
                 self._blocks.add("thinking")
-                self._logical_type = "thinking"
 
         elif event_type in ("response.reasoning_text.delta",           # glm 通道（实测词表）
                             "response.reasoning_summary_text.delta"):  # openai 官方通道
             self._ensure_message_start(events)
             txt = data.get("delta", "")
             self._blocks.content("thinking", txt)
-            self._logical_type = "thinking"
 
         elif event_type in ("response.reasoning_text.done",
                             "response.reasoning_summary_text.done"):
@@ -3010,7 +3042,6 @@ class ResponsesToAnthropicStreamAdapter:
             self._ensure_message_start(events)
             txt = data.get("delta", "")
             self._blocks.content("text", txt)
-            self._logical_type = "text"
 
         elif event_type == "response.function_call_arguments.delta":
             self._queue_arguments(data, "delta")
@@ -3045,7 +3076,7 @@ class ResponsesToAnthropicStreamAdapter:
             if state.status == TerminalStatus.INCOMPLETE:
                 self.final_stop_reason = "max_tokens"
             elif self.final_stop_reason is None:
-                self.final_stop_reason = "tool_use" if self._logical_type == "tool_use" else "end_turn"
+                self.final_stop_reason = "tool_use" if self._tools else "end_turn"
             events.extend(self._emit_finish())
 
         elif event_type in ("response.failed", "error"):

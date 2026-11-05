@@ -130,5 +130,135 @@ class TestPassthroughObserver(unittest.TestCase):
         self.assertTrue(h.close_connection)
 
 
+class TestPassthroughFramingIsolation(unittest.TestCase):
+    SOURCES = ("anthropic", "responses", "chat")
+    ENDINGS = (b"\n", b"\r\n", b"\r", None)
+
+    @staticmethod
+    def _wire(source, ending):
+        if source == "anthropic":
+            lines = [
+                b": ping", b"",
+                b'event: content_block_delta',
+                'data: {"type":"content_block_delta","delta":{"type":"text_delta","text":"合成🙂"}}'.encode(),
+                b"", b"event: message_delta",
+                b'data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":7}}',
+                b"", b"event: message_stop", b'data: {"type":"message_stop"}', b"",
+            ]
+        elif source == "responses":
+            lines = [
+                b": ping", b"",
+                'data: {"type":"response.output_text.delta","delta":"合成🙂"}'.encode(), b"",
+                b'data: {"type":"response.completed","response":{"status":"completed","usage":{"output_tokens":7}}}',
+                b"",
+            ]
+        else:
+            lines = [
+                b": ping", b"",
+                'data: {"choices":[{"delta":{"content":"合成🙂"},"finish_reason":null}]}'.encode(),
+                b"", b'data: {"choices":[{"delta":{},"finish_reason":"stop"}]}',
+                b"", b"data: [DONE]", b"",
+            ]
+        # 非空行用 LF/CRLF 交替；空行以 CR 即时结束，不拼出伪 CR+LF 空行。
+        return b"".join(line + (ending if ending is not None else
+                               (b"\r" if not line else (b"\n" if i % 2 else b"\r\n")))
+                        for i, line in enumerate(lines))
+
+    def _run(self, source, chunks, observer=None):
+        from types import SimpleNamespace
+        from unittest.mock import Mock
+
+        h = _make_handler()
+        h.server = SimpleNamespace(
+            config_store=SimpleNamespace(get_body_error_rules=lambda: []),
+            cooldown_store=Mock(), stream_health_store=Mock())
+        resp = _FakeUpstreamResp([c for c in chunks if c != b""])
+        observed = observer or pt.PassthroughStreamObserver(source, h._acc)
+        with patch("core.server.pt.PassthroughStreamObserver", return_value=observed):
+            h._write_streaming_response(200, [], resp, source)
+        self.assertTrue(resp.closed)
+        h.server.cooldown_store.cooldown.assert_not_called()
+        self.assertEqual(h.server.stream_health_store.mock_calls, [])
+        self.assertNotIn("body_error", h._acc)
+        return h
+
+    def test_three_protocols_all_endings_every_cut_and_bytewise_are_byte_exact(self):
+        for source in self.SOURCES:
+            for ending in self.ENDINGS:
+                wire = self._wire(source, ending)
+                for cut in range(len(wire) + 1):
+                    with self.subTest(source=source, ending=ending, cut=cut):
+                        h = self._run(source, [wire[:cut], wire[cut:]])
+                        self.assertEqual(_decode_chunked(h.wfile.getvalue()), wire)
+                        # Chat observer 原本不支持 business payload；不扩大其控制权/协议。
+                        self.assertEqual(h._acc["stream_integrity"],
+                                         "observer_error" if source == "chat" else "valid")
+                with self.subTest(source=source, ending=ending, bytewise=True):
+                    h = self._run(source, [wire[i:i + 1] for i in range(len(wire))])
+                    self.assertEqual(_decode_chunked(h.wfile.getvalue()), wire)
+
+    def test_observer_feed_and_finish_errors_never_change_forwarded_bytes(self):
+        for source in self.SOURCES:
+            for operation in ("feed", "finish"):
+                with self.subTest(source=source, operation=operation):
+                    wire = self._wire(source, None)
+                    observer = pt.PassthroughStreamObserver(source, {})
+                    with patch.object(observer._framer, operation,
+                                      side_effect=RuntimeError("synthetic observer error")):
+                        h = self._run(source, [wire[:13], wire[13:]], observer)
+                    self.assertEqual(_decode_chunked(h.wfile.getvalue()), wire)
+                    self.assertEqual(h._acc["stream_integrity"], "observer_error")
+                    self.assertEqual(h._acc["final_error"], "")
+
+    def test_observer_bad_json_tail_does_not_add_error_or_replace_bytes(self):
+        for source in self.SOURCES:
+            with self.subTest(source=source):
+                wire = self._wire(source, b"\r") + b"data: {bad}\r\r"
+                h = self._run(source, [wire])
+                self.assertEqual(_decode_chunked(h.wfile.getvalue()), wire)
+                self.assertEqual(h._acc["stream_integrity"], "observer_error")
+
+    def test_normal_eof_complete_terminal_without_blank_line_remains_byte_exact(self):
+        for source in ("anthropic", "responses"):
+            with self.subTest(source=source):
+                wire = self._wire(source, b"\r").rstrip(b"\r")
+                h = self._run(source, [wire])
+                self.assertEqual(_decode_chunked(h.wfile.getvalue()), wire)
+                self.assertEqual(h._acc["stream_integrity"], "valid")
+
+    def test_missing_terminal_eof_still_repairs_only_after_original_prefix(self):
+        prefixes = {
+            "anthropic": b'data: {"type":"message_start","message":{"usage":{}}}\r\r',
+            "responses": b'data: {"type":"response.created","response":{"status":"in_progress"}}\r\r',
+        }
+        for source, prefix in prefixes.items():
+            with self.subTest(source=source):
+                h = self._run(source, [prefix])
+                body = _decode_chunked(h.wfile.getvalue())
+                self.assertTrue(body.startswith(prefix))
+                self.assertIn(b"event: error" if source == "anthropic" else b"response.failed",
+                              body[len(prefix):])
+                self.assertEqual(h._acc["terminal_reason"], "unexpected_eof")
+
+    def test_read_exception_does_not_finish_observer_or_append_error(self):
+        for source in self.SOURCES:
+            with self.subTest(source=source):
+                prefix = b": ping\r\r"
+                observer = pt.PassthroughStreamObserver(source, {})
+                with patch.object(observer, "finish", wraps=observer.finish) as finish:
+                    h = self._run(source, [prefix, OSError("synthetic read error")], observer)
+                finish.assert_not_called()
+                self.assertEqual(_decode_chunked(h.wfile.getvalue()), prefix)
+                self.assertEqual(h._acc["terminal_reason"], "upstream_read_error")
+
+    def test_unknown_nonterminal_passthrough_keeps_existing_tolerance(self):
+        for source in ("anthropic", "responses"):
+            with self.subTest(source=source):
+                wire = b'data: {"type":"future_ping"}\r\r' + self._wire(source, b"\r")
+                h = self._run(source, [wire])
+                self.assertEqual(_decode_chunked(h.wfile.getvalue()), wire)
+                self.assertEqual(h._acc["stream_integrity"], "valid")
+
+
 if __name__ == "__main__":
     unittest.main()
