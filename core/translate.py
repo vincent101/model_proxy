@@ -2404,7 +2404,7 @@ def _messages_to_input(messages, tool_name_mapping: dict) -> list:
     - user tool_result → function_call_output item
     """
     items: list = []
-    for msg in messages or []:
+    for msg_index, msg in enumerate(messages or [], start=1):
         if not isinstance(msg, dict):
             continue
         role = msg.get("role")
@@ -2487,8 +2487,19 @@ def _messages_to_input(messages, tool_name_mapping: dict) -> list:
             if text_parts:
                 items.append({"type": "message", "role": "assistant", "content": text_parts})
         else:
+            # P1 临时定位日志：记录被丢消息的位置、体量与前缀，确认 system 内容后回收。
+            if isinstance(content, str):
+                preview = content
+            else:
+                try:
+                    preview = json.dumps(content, ensure_ascii=False)
+                except (TypeError, ValueError):
+                    preview = repr(content)
+            chars = len(preview)
+            preview = preview[:200]
             _rl.warning("unknown_role_dropped_a2r", logger,
-                        "unknown message role dropped (a2r): %r", role)
+                        "unknown message role dropped (a2r): index=%d role=%r chars=%d preview=%r",
+                        msg_index, role, chars, preview)
     return items
 
 
@@ -3028,6 +3039,11 @@ class ResponsesToAnthropicStreamAdapter:
 
         if event_type in ("response.created", "response.in_progress"):
             self._ensure_message_start(events)
+
+        elif event_type == "keepalive":
+            # 实测网关心跳帧：不带业务状态，不触发 message_start；
+            # 只容忍该词表，其他未知事件仍 fail-fast。
+            pass
 
         elif event_type == "response.output_item.added":
             self._ensure_message_start(events)

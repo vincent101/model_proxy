@@ -1625,6 +1625,27 @@ class TestARRequest(unittest.TestCase):
         rb, _ = pt.anthropic_to_responses_request(body)
         self.assertEqual(rb["instructions"], "A\nB")
 
+    def test_ar_unknown_system_message_role_dropped_with_details(self):
+        """P1 定位：messages 里的 system 不是标准 Anthropic 输入 role，
+        当前策略仍是丢弃，但要留 index/role/size/preview 定位内容。"""
+        pt._rl._state.clear()
+        body = {"messages": [
+            {"role": "system", "content": "hidden-system-context"},
+            {"role": "user", "content": "hi"},
+        ]}
+        with self.assertLogs("core.translate", level="WARNING") as cap:
+            rb, _ = pt.anthropic_to_responses_request(body)
+        joined = "\n".join(r.getMessage() for r in cap.records)
+        self.assertIn("unknown message role dropped (a2r)", joined)
+        self.assertIn("index=1", joined)
+        self.assertIn("role='system'", joined)
+        self.assertIn("chars=21", joined)
+        self.assertIn("hidden-system-context", joined)
+        self.assertEqual(rb["input"], [
+            {"type": "message", "role": "user",
+             "content": [{"type": "input_text", "text": "hi"}]},
+        ])
+
     def test_ar_user_text_to_input_message(self):
         body = {"messages": [{"role": "user", "content": "hello"}]}
         rb, _ = pt.anthropic_to_responses_request(body)
@@ -1926,6 +1947,31 @@ class TestARStream(unittest.TestCase):
         md = [e for e in evs if e["type"] == "message_delta"][0]
         self.assertEqual(md["usage"]["output_tokens"], 8)
         self.assertEqual(md["usage"]["input_tokens"], 8)
+
+    def test_ar_keepalive_event_tolerated(self):
+        """P0：上游网关 keepalive 不带业务状态，容忍但不启动 Anthropic 消息。"""
+        adapter = pt.ResponsesToAnthropicStreamAdapter({}, "m")
+        out = adapter.feed("keepalive", {})
+        self.assertEqual(out, [])
+        events = _ar_text_stream_events()
+        evs = _run_ar_stream(adapter, [("keepalive", {}), *events])
+        types = [e["type"] for e in evs]
+        self.assertEqual(types[0], "message_start")
+        self.assertEqual(types[-1], "message_stop")
+        text = "".join(e["delta"]["text"] for e in evs
+                       if e["type"] == "content_block_delta"
+                       and e["delta"]["type"] == "text_delta")
+        self.assertEqual(text, "Hi! 👋")
+
+    def test_ar_keepalone_after_created_tolerated(self):
+        """keepalive 可出现在 created/in_progress 后，仍不应重复 message_start。"""
+        adapter = pt.ResponsesToAnthropicStreamAdapter({}, "m")
+        evs = _run_ar_stream(adapter, [
+            ("response.created", {"response": {"id": "resp_c"}}),
+            ("keepalive", {}),
+            *_ar_text_stream_events()[1:],
+        ])
+        self.assertEqual(len([e for e in evs if e["type"] == "message_start"]), 1)
 
     def test_ar_usage_tuple(self):
         """usage_tuple() 统一接口：无 reasoning 时第三位为 0。"""
