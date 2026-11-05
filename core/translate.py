@@ -145,7 +145,8 @@ class SSEEvent:
 class SSEFramer:
     """增量 SSE framing；保留原始字节并严格解析业务事件。"""
 
-    def __init__(self):
+    def __init__(self, *, allow_event_only: bool = False):
+        self._allow_event_only = allow_event_only
         self._buffer = bytearray()
         self._scan_pos = 0
         self._line_start = 0
@@ -189,7 +190,7 @@ class SSEFramer:
             framed = bytes(self._buffer[:self._scan_pos])
             del self._buffer[:self._scan_pos]
             self._scan_pos = self._line_start = 0
-            event = self._parse(block, framed)
+            event = self._parse(block, framed, allow_event_only=self._allow_event_only)
             if event is not None:
                 if not event.is_comment:
                     self.saw_business_event = True
@@ -202,7 +203,7 @@ class SSEFramer:
             self._buffer.clear()
             self._scan_pos = self._line_start = 0
             self._after_cr = False
-            return events
+            return self._finish_events(events)
         block = bytes(self._buffer)
         self._buffer.clear()
         self._scan_pos = self._line_start = 0
@@ -212,17 +213,24 @@ class SSEFramer:
                    for line in block.splitlines()):
             if all(not line.strip() or line.lstrip().startswith((b":", b"id:", b"retry:"))
                    for line in block.splitlines()):
-                return events + [SSEEvent(block, None, None, is_comment=True)]
+                return self._finish_events(events + [SSEEvent(block, None, None, is_comment=True)])
             raise TranslationError("malformed trailing SSE frame", reason="malformed_stream")
-        event = self._parse(block, block)
+        event = self._parse(block, block, allow_event_only=self._allow_event_only)
         if event is not None:
             if not event.is_comment:
                 self.saw_business_event = True
             events.append(event)
+        return self._finish_events(events)
+
+    def _finish_events(self, events: list[SSEEvent]) -> list[SSEEvent]:
+        # Individual event-only frames are ignored. At normal EOF an entirely
+        # non-business stream must not make a conversion adapter report success.
+        if self._allow_event_only and not self.saw_business_event:
+            raise TranslationError("empty SSE stream", reason="empty_stream")
         return events
 
     @staticmethod
-    def _parse(block: bytes, raw: bytes) -> SSEEvent | None:
+    def _parse(block: bytes, raw: bytes, *, allow_event_only: bool = False) -> SSEEvent | None:
         event_type = None
         data_lines = []
         has_field = False
@@ -243,6 +251,10 @@ class SSEFramer:
                     event_type = value.decode("utf-8")
                 except UnicodeDecodeError as exc:
                     raise TranslationError("malformed SSE UTF-8", reason="malformed_stream") from exc
+            elif line == b"data" and allow_event_only:
+                # A bare data field is present but empty; it is not event-only.
+                has_field = True
+                data_lines.append(b"")
             elif line.startswith(b"data:"):
                 has_field = True
                 value = line[5:]
@@ -252,6 +264,8 @@ class SSEFramer:
         if only_comments or not has_field:
             return SSEEvent(raw, None, None, is_comment=True)
         if not data_lines:
+            if allow_event_only and event_type is not None:
+                return None
             raise TranslationError("SSE event has no data", reason="malformed_stream")
         payload = b"\n".join(data_lines)
         if payload == b"[DONE]":
@@ -2937,9 +2951,11 @@ class ResponsesToAnthropicStreamAdapter:
             if sealed:
                 raise self._association_error("Responses arguments delta arrived after tool/arguments done")
         gate = self._blocks.add("pending") if not anonymous and candidate is None else None
+        item = (data.get("item") or {}) if kind == "item_done" else {}
         self._pending_arguments.append({
             "item_id": item_id, "output_index": index, "anonymous": anonymous,
-            "candidate": candidate, "kind": kind, "fragment": fragment, "gate": gate})
+            "candidate": candidate, "kind": kind, "fragment": fragment, "gate": gate,
+            "call_id": item.get("call_id"), "name": item.get("name")})
         self._resolve_arguments()
 
     def _resolve_arguments(self, terminal=False):
@@ -2974,6 +2990,7 @@ class ResponsesToAnthropicStreamAdapter:
             elif kind == "arguments_done":
                 tool["arguments_done"] = True
             else:
+                self._accept_late_tool_metadata(tool, entry["call_id"], entry["name"])
                 tool["arguments_done"] = True
                 tool["done"] = True
             if entry["gate"] is not None:

@@ -1094,5 +1094,110 @@ class TestToolMetadataMissingEquivalence(SyntheticCase):
                 self.assert_failed(adapter)
 
 
+class TestResponsesDoneMetadata(SyntheticCase):
+    @staticmethod
+    def done(item_id="ia", output_index=0, call_id=_ABSENT, name=_ABSENT):
+        event = item_done(item_id, output_index, snapshot='MUST NOT REPLAY')
+        if call_id is not _ABSENT:
+            event[1]["item"]["call_id"] = call_id
+        if name is not _ABSENT:
+            event[1]["item"]["name"] = name
+        return event
+
+    def test_queued_tool_receives_done_metadata_before_publish(self):
+        a = pt.ResponsesToAnthropicStreamAdapter()
+        self.feed_responses(a, added(), argument('{"a":'), raw_added("ib", 7),
+                            argument('{"b":2}', "ib", 7),
+                            self.done("ib", 7, "callB", "nameB"))
+        self.assertEqual(len(self.life.tools()), 1)
+        self.feed_responses(a, argument('1}'), item_done(), completed())
+        self.assertEqual([(b["id"], b["name"], b["fragments"]) for b in self.life.tools()],
+                         [("ca", "a", ['{"a":', '1}']), ("callB", "nameB", ['{"b":2}'])])
+
+    def test_done_before_added_binds_metadata_and_gate_order(self):
+        a = pt.ResponsesToAnthropicStreamAdapter()
+        self.feed_responses(a, argument('{"b":2}', "ib", 7),
+                            self.done("ib", 7, "callB", "nameB"), added(),
+                            argument('{}'), item_done())
+        self.assertEqual(self.life.blocks, [])
+        self.feed_responses(a, raw_added("ib", 7), completed())
+        self.assertEqual([(b["id"], b["name"], b["fragments"]) for b in self.life.tools()],
+                         [("callB", "nameB", ['{"b":2}']), ("ca", "a", ['{}'])])
+
+    def test_published_metadata_stable_but_later_conflicts_are_checked(self):
+        for field in ("call_id", "name"):
+            with self.subTest(field=field):
+                self.life = BlockLifecycle(self)
+                a = pt.ResponsesToAnthropicStreamAdapter()
+                self.feed_responses(a, raw_added(), argument('{}'))
+                initial = (self.life.tools()[0]["id"], self.life.tools()[0]["name"])
+                self.feed_responses(a, self.done(call_id="source-id", name="source-name"))
+                self.assertEqual((self.life.tools()[0]["id"], self.life.tools()[0]["name"]), initial)
+                kwargs = {"call_id": "source-id", "name": "source-name"}
+                kwargs[field] = "different"
+                self.feed_responses(a, self.done(**kwargs))
+                self.assert_failed(a)
+
+    def test_duplicate_done_same_metadata_does_not_duplicate_output(self):
+        a = pt.ResponsesToAnthropicStreamAdapter()
+        d = self.done("ib", 7, "callB", "nameB")
+        self.feed_responses(a, added(), argument('{}'), raw_added("ib", 7),
+                            argument('{"b":2}', "ib", 7), d, d, item_done(), completed())
+        self.assertEqual([(b["id"], b["name"], b["fragments"], b["stops"]) for b in self.life.tools()],
+                         [("ca", "a", ['{}'], 1), ("callB", "nameB", ['{"b":2}'], 1)])
+
+    def test_added_done_explicit_metadata_conflicts(self):
+        for field in ("call_id", "name"):
+            with self.subTest(field=field):
+                self.life = BlockLifecycle(self)
+                a = pt.ResponsesToAnthropicStreamAdapter()
+                kwargs = {"call_id": "ca", "name": "a"}; kwargs[field] = "different"
+                self.feed_responses(a, added(), self.done(**kwargs))
+                self.assert_failed(a)
+
+    def test_missing_none_empty_do_not_conflict_or_erase_index_zero(self):
+        for missing in (_ABSENT, None, ""):
+            with self.subTest(missing=missing):
+                self.life = BlockLifecycle(self)
+                a = pt.ResponsesToAnthropicStreamAdapter()
+                self.feed_responses(a, raw_added(call_id=missing, name=missing), argument('{}'),
+                                    self.done(call_id="source-id", name="source-name"),
+                                    self.done(call_id=missing, name=missing), completed())
+                self.assertEqual(a._tools[0]["source_id"], "source-id")
+                self.assertEqual(a._tools[0]["source_name"], "source-name")
+                self.assertEqual(self.life.terminal, "message_stop")
+                self.assertEqual(self.life.tools()[0]["fragments"], ['{}'])
+
+    def test_pending_multiple_calls_cannot_exchange_metadata(self):
+        a = pt.ResponsesToAnthropicStreamAdapter()
+        self.feed_responses(a, argument('{"b":2}', "ib", 7), self.done("ib", 7, "cb", "b"),
+                            argument('{"c":3}', "ic", 19), self.done("ic", 19, "cc", "c"),
+                            raw_added("ic", 19), raw_added("ib", 7), completed())
+        self.assertEqual([(b["id"], b["name"], b["fragments"]) for b in self.life.tools()],
+                         [("cb", "b", ['{"b":2}']), ("cc", "c", ['{"c":3}'])])
+
+
+    def test_pending_done_conflicts_with_later_added(self):
+        for field in ("call_id", "name"):
+            with self.subTest(field=field):
+                self.life = BlockLifecycle(self)
+                a = pt.ResponsesToAnthropicStreamAdapter()
+                kw = {"call_id": "callB", "name": "nameB"}; kw[field] = "different"
+                self.feed_responses(a, argument('{}', "ib", 7),
+                                    self.done("ib", 7, "callB", "nameB"),
+                                    raw_added("ib", 7, **kw))
+                self.assert_failed(a)
+                self.assertEqual(self.life.tools(), [])
+
+    def test_pending_done_index_zero_and_mapped_name(self):
+        a = pt.ResponsesToAnthropicStreamAdapter({"tool_name_mapping": {"wire_name": "client_name"}})
+        self.feed_responses(a, argument('{"x":1}', None, 0),
+                            self.done(None, 0, "call-zero", "wire_name"),
+                            raw_added(_ABSENT, 0), completed())
+        self.assertEqual([(b["id"], b["name"], b["fragments"]) for b in self.life.tools()],
+                         [("call-zero", "client_name", ['{"x":1}'])])
+        self.assertEqual(a._tools[0]["source_name"], "wire_name")
+
+
 if __name__ == "__main__":
     unittest.main()

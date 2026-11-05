@@ -3379,7 +3379,7 @@ class ModelProxyHandler(BaseHTTPRequestHandler):
         Chat [DONE] 立即停止消费尾流并 finalize；只有正常 EOF 接纳无空行末帧。
         """
         self._begin_sse_chunked()
-        framer = pt.SSEFramer()
+        framer = pt.SSEFramer(allow_event_only=True)
         done = False
 
         def consume(frame):
@@ -3442,7 +3442,7 @@ class ModelProxyHandler(BaseHTTPRequestHandler):
         message_stop 由 adapter.feed 内部触发 response.completed；断流则 finalize 补收尾。
         """
         self._begin_sse_chunked()
-        framer = pt.SSEFramer()
+        framer = pt.SSEFramer(allow_event_only=True)
 
         def consume(frame):
             if frame.is_comment:
@@ -3507,7 +3507,7 @@ class ModelProxyHandler(BaseHTTPRequestHandler):
         中断时补 `event: error`（输出侧已是 Anthropic 格式，不用 response.failed）。
         """
         self._begin_sse_chunked()
-        framer = pt.SSEFramer()
+        framer = pt.SSEFramer(allow_event_only=True)
 
         def consume(frame):
             if frame.is_comment:

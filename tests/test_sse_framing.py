@@ -220,5 +220,88 @@ class TestSSEFraming(unittest.TestCase):
                 self.assertEqual(pt.SSEFramer().feed(raw)[0].raw, raw)
 
 
+class TestEventOnlyConversionCompat(unittest.TestCase):
+    def test_event_only_all_endings_chunk_cuts_and_real_frame_same_chunk(self):
+        for ending in (b"\n", b"\r\n", b"\r", None):
+            sep = ending or b"\r"
+            prefix = (b"event: ping" + sep + b": keep" + (ending or b"\r\n") +
+                      b"id: x" + (ending or b"\n") + b"retry: 5" + sep + sep)
+            wire = prefix + b'data: {"type":"real"}' + sep + sep
+            for cut in range(len(wire) + 1):
+                with self.subTest(ending=ending, cut=cut):
+                    f = pt.SSEFramer(allow_event_only=True)
+                    events = f.feed(wire[:cut]) + f.feed(wire[cut:]) + f.finish()
+                    self.assertEqual([(e.event_type, e.data) for e in events if not e.is_comment],
+                                     [("real", {"type": "real"})])
+                    self.assertTrue(f.saw_business_event)
+
+    def test_event_only_eof_is_not_business(self):
+        for ending in (b"", b"\n", b"\r", b"\r\n"):
+            f = pt.SSEFramer(allow_event_only=True)
+            events = f.feed(b"event: ping" + ending)
+            self.assertTrue(all(e.is_comment for e in events))
+            with self.assertRaises(pt.TranslationError) as caught:
+                f.finish()
+            self.assertEqual(caught.exception.reason, "empty_stream")
+            self.assertFalse(f.saw_business_event)
+
+    def test_event_only_eof_after_business_is_ignored(self):
+        f = pt.SSEFramer(allow_event_only=True)
+        events = f.feed(b'data: {"type":"real"}\n\nevent: ping') + f.finish()
+        self.assertEqual([(e.event_type, e.data) for e in events if not e.is_comment],
+                         [("real", {"type": "real"})])
+
+    def test_compat_does_not_suppress_data_errors_or_conflicts(self):
+        for wire in (b"event: x\ndata:\n\n", b"event: x\ndata\n\n",
+                     b"data\n\n", b"event: x\ndata: {bad}\n\n",
+                     b'event: x\ndata: {"type":"y"}\n\n', b"event: x\ndata: \n\n"):
+            with self.subTest(wire=wire):
+                with self.assertRaises(pt.TranslationError):
+                    pt.SSEFramer(allow_event_only=True).feed(wire)
+
+    def test_static_parse_default_remains_strict(self):
+        with self.assertRaises(pt.TranslationError):
+            pt.SSEFramer._parse(b"event: ping", b"event: ping\n\n")
+
+
+    def test_empty_event_name_compat_all_endings_cuts_and_following_business(self):
+        for event in (b"event:", b"event: "):
+            for ending in (b"\n", b"\r\n", b"\r"):
+                wire = (event + ending + b": comment" + ending + b"id: x" + ending + ending +
+                        b'data: {"type":"real"}' + ending + ending)
+                for cut in range(len(wire) + 1):
+                    with self.subTest(event=event, ending=ending, cut=cut):
+                        f = pt.SSEFramer(allow_event_only=True)
+                        events = f.feed(wire[:cut]) + f.feed(wire[cut:]) + f.finish()
+                        self.assertEqual([(e.event_type, e.data) for e in events if not e.is_comment],
+                                         [("real", {"type": "real"})])
+                        self.assertTrue(f.saw_business_event)
+
+    def test_empty_event_name_default_strict_and_data_errors_still_strict(self):
+        for event in (b"event:", b"event: "):
+            for ending in (b"\n", b"\r\n", b"\r"):
+                with self.subTest(event=event, ending=ending):
+                    with self.assertRaises(pt.TranslationError) as caught:
+                        pt.SSEFramer().feed(event + ending + ending)
+                    self.assertEqual(caught.exception.reason, "malformed_stream")
+                    for data in (b"data:", b"data", b"data: {bad}"):
+                        with self.assertRaises(pt.TranslationError) as caught:
+                            pt.SSEFramer(allow_event_only=True).feed(
+                                event + ending + data + ending + ending)
+                        self.assertEqual(caught.exception.reason, "malformed_stream")
+
+    def test_empty_event_name_alone_eof_is_empty_stream(self):
+        for event in (b"event:", b"event: "):
+            for ending in (b"", b"\n", b"\r\n", b"\r"):
+                with self.subTest(event=event, ending=ending):
+                    f = pt.SSEFramer(allow_event_only=True)
+                    events = f.feed(event + ending)
+                    self.assertEqual(events, [])
+                    with self.assertRaises(pt.TranslationError) as caught:
+                        f.finish()
+                    self.assertEqual(caught.exception.reason, "empty_stream")
+                    self.assertFalse(f.saw_business_event)
+
+
 if __name__ == "__main__":
     unittest.main()

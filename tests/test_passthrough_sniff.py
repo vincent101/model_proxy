@@ -260,5 +260,20 @@ class TestPassthroughFramingIsolation(unittest.TestCase):
                 self.assertEqual(h._acc["stream_integrity"], "valid")
 
 
+class TestEventOnlyPassthroughIsolation(unittest.TestCase):
+    def test_typed_empty_remains_observer_error_byte_exact(self):
+        wire = (b'event: ping\nid: x\n\n'
+                b'event: message_stop\ndata: {"type":"message_stop"}\n\n')
+        h = _make_handler()
+        h._acc.update(failover=0, route_failover=0, attempts=1)
+        resp = _FakeUpstreamResp([wire])
+        h._write_streaming_response(200, [], resp, "anthropic")
+        self.assertEqual(_decode_chunked(h.wfile.getvalue()), wire)
+        self.assertEqual(h._acc["stream_integrity"], "observer_error")
+        self.assertEqual((h._acc["failover"], h._acc["route_failover"], h._acc["attempts"]),
+                         (0, 0, 1))
+        self.assertTrue(resp.closed)
+
+
 if __name__ == "__main__":
     unittest.main()

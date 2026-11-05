@@ -953,3 +953,113 @@ class TestConvertedSSEFraming(unittest.TestCase):
                 self.assertEqual(types.count("response.failed" if source == "anthropic" else "error"), 1)
                 self.assertEqual(result.h._acc["terminal_status"],
                                  "failed" if source == "anthropic" else "open")
+
+    def _run_event_only_actual(self, source, chunks):
+        h = _Handler()
+        resp = _FramingUpstream(chunks)
+        if source == "chat":
+            adapter, writer = pt.OpenAIToAnthropicStreamAdapter({}, "m"), h._write_translated_stream
+        elif source == "anthropic":
+            adapter, writer = pt.AnthropicToResponsesStreamAdapter("m"), h._write_responses_stream
+        else:
+            adapter, writer = pt.ResponsesToAnthropicStreamAdapter({}, "m"), h._write_translated_stream_from_responses
+        writer(resp, adapter)
+        self.assertTrue(resp.closed)
+        return h, adapter
+
+    def test_event_only_real_three_writers_and_immediate_same_chunk(self):
+        for source in self.PROTOCOLS:
+            for ending in self.ENDINGS:
+                with self.subTest(source=source, ending=ending):
+                    sep = ending or b"\r"
+                    prefix = b"event: ping" + sep + b": comment" + sep + b"id: x" + sep + sep
+                    h, adapter = self._run_event_only_actual(source, [prefix + self._payload(source, ending)])
+                    self.assertEqual(h._acc["stream_integrity"], "valid")
+                    self.assertEqual(h._acc["terminal_status"], "completed")
+                    self.assertEqual(adapter.usage_tuple(), (11, 7, 0))
+
+    def test_event_only_real_three_writers_eof_never_success(self):
+        for source in self.PROTOCOLS:
+            for wire in (b"event: ping\n\n", b"event: ping", b"event: ping\r\n"):
+                with self.subTest(source=source, wire=wire):
+                    h, _ = self._run_event_only_actual(source, [wire])
+                    self.assertNotEqual(h._acc.get("stream_integrity"), "valid")
+                    self.assertEqual(h._acc["terminal_reason"], "empty_stream")
+                    types = [e.get("type") for e in self._wire_events(h)]
+                    self.assertNotIn("message_stop", types)
+                    self.assertNotIn("response.completed", types)
+
+    def test_event_only_followed_by_real_invalid_event_is_not_suppressed(self):
+        for source in self.PROTOCOLS:
+            for bad in (b"data: {bad}\n\n", b"event: x\ndata:\n\n",
+                        b'event: x\ndata: {"type":"y"}\n\n'):
+                with self.subTest(source=source, bad=bad):
+                    h, _ = self._run_event_only_actual(source, [b"event: ping\n\n" + bad])
+                    self.assertEqual(h._acc["terminal_reason"], "malformed_stream")
+
+    def test_event_only_followed_by_unknown_business_event_fails(self):
+        for source in ("anthropic", "responses"):
+            with self.subTest(source=source):
+                wire = b'event: ping\n\ndata: {"type":"not_real"}\n\n'
+                h, _ = self._run_event_only_actual(source, [wire])
+                self.assertNotEqual(h._acc.get("stream_integrity"), "valid")
+
+    def test_event_only_bytewise_and_eof_tail_on_three_writers(self):
+        for source in self.PROTOCOLS:
+            with self.subTest(source=source):
+                prefix = b"event: ping\r\n: c\nid: x\rretry: 3\r\n\r"
+                # Chat [DONE] ends reading before a tail; use a framed no-DONE payload instead.
+                if source == "chat":
+                    body = b"".join(self._frame(e, b"\r") for e in self._events(source))
+                else:
+                    body = self._payload(source, b"\r")
+                wire = prefix + body + b"event: ping"
+                h, adapter = self._run_event_only_actual(source, [bytes([c]) for c in wire])
+                self.assertEqual(h._acc["stream_integrity"], "valid")
+                self.assertEqual(adapter.usage_tuple(), (11, 7, 0))
+
+    def test_event_only_same_chunk_first_business_written_before_second_read(self):
+        for source in self.PROTOCOLS:
+            with self.subTest(source=source):
+                h = _Handler()
+                first = b"event: ping\n\n" + self._frame(self._events(source)[0], b"\n")
+                rest = b"".join(self._frame(e, b"\n") for e in self._events(source)[1:])
+                if source == "chat": rest += b"data: [DONE]\n\n"
+                marker = b"response.created" if source == "anthropic" else b"message_start"
+                def check(): self.assertIn(marker, _decode_chunked(h.wfile.getvalue()))
+                resp = _FramingUpstream([first, rest], check)
+                if source == "chat":
+                    writer, adapter = h._write_translated_stream, pt.OpenAIToAnthropicStreamAdapter({}, "m")
+                elif source == "anthropic":
+                    writer, adapter = h._write_responses_stream, pt.AnthropicToResponsesStreamAdapter("m")
+                else:
+                    writer, adapter = h._write_translated_stream_from_responses, pt.ResponsesToAnthropicStreamAdapter({}, "m")
+                writer(resp, adapter)
+                self.assertTrue(resp.checked)
+                self.assertEqual(h._acc["stream_integrity"], "valid")
+
+    def test_empty_event_name_three_writers_before_business(self):
+        for source in self.PROTOCOLS:
+            for event in (b"event:", b"event: "):
+                for ending in (b"\n", b"\r\n", b"\r"):
+                    wire = event + ending + ending + self._payload(source, ending)
+                    for chunks in ([wire], [bytes([b]) for b in wire]):
+                        with self.subTest(source=source, event=event, ending=ending,
+                                          bytewise=len(chunks) > 1):
+                            h, adapter = self._run_event_only_actual(source, chunks)
+                            self.assertEqual(h._acc["stream_integrity"], "valid")
+                            self.assertEqual(h._acc["terminal_status"], "completed")
+                            self.assertEqual(adapter.usage_tuple(), (11, 7, 0))
+
+    def test_empty_event_name_three_writers_alone_eof_not_success(self):
+        for source in self.PROTOCOLS:
+            for event in (b"event:", b"event: "):
+                for ending in (b"\n", b"\r\n", b"\r"):
+                    for wire in (event, event + ending, event + ending + ending):
+                        with self.subTest(source=source, event=event, ending=ending, wire=wire):
+                            h, _ = self._run_event_only_actual(source, [wire])
+                            self.assertEqual(h._acc["stream_integrity"], "invalid")
+                            self.assertEqual(h._acc["terminal_reason"], "empty_stream")
+                            types = [e.get("type") for e in self._wire_events(h)]
+                            self.assertNotIn("message_stop", types)
+                            self.assertNotIn("response.completed", types)
