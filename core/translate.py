@@ -2602,7 +2602,8 @@ def _a2r_translate_tool_choice(tc):
 # 模块 A''：请求转换 Anthropic → Responses（§3.1）
 # ============================================================================
 
-def anthropic_to_responses_request(body: dict, reasoning_fields: "dict | None" = None):
+def anthropic_to_responses_request(body: dict, reasoning_fields: "dict | None" = None,
+                                    tool_strict: bool = False):
     """Anthropic /v1/messages body → (responses_body, ctx)。
 
     ctx = {"tool_name_mapping": dict[str,str], "request_model": str}
@@ -2610,6 +2611,11 @@ def anthropic_to_responses_request(body: dict, reasoning_fields: "dict | None" =
     reasoning_fields：调用方（server.py）用 core.reasoning 已经 decode→align→encode 好的
     reasoning 字段片段（ResponsesReasoningCodec.encode 产出，即 reasoning.effort），
     本函数只负责 merge，不再自己算强度。非 reasoning 模型场景由调用方传 None/{} 实现。
+    tool_strict：supply 级工具 strict 策略（server.py 的 ToolStrictStore 决定）。
+    False（缺省）＝出站写 strict:false，阻止上游对 optional schema 的静默严格化
+    （2026-11-06 sol 实测：省略 strict 时上游把 required 扩成全字段，模型填齐
+    isolation 等 optional 参数）。True ＝显式严格模式（schema 须已 strict 兼容，
+    上游不兼容会 400，属诚实拒绝）。源工具自身显式声明的 strict 始终优先。
     """
     responses_body: dict = {}
     ctx = {"tool_name_mapping": {}, "request_model": ""}
@@ -2655,11 +2661,11 @@ def anthropic_to_responses_request(body: dict, reasoning_fields: "dict | None" =
             }
             # Responses 缺省 strict 行为实测（2026-11-06 sol）：省略时上游按严格
             # 模式规范化 schema，模型会自行填齐 optional 字段（如 Agent isolation）。
-            # 调用方未声明时必须显式 strict:false 保住可选参数语义；显式声明按原值。
+            # supply 级策略由调用方传入（tool_strict）；源工具显式声明优先。
             if "strict" in fn:
                 flat_tool["strict"] = bool(fn["strict"])
             else:
-                flat_tool["strict"] = False
+                flat_tool["strict"] = bool(tool_strict)
             flat.append(flat_tool)
         responses_body["tools"] = flat
         # 合并 tools 侧的截断映射（tool_use item 侧的已在 _messages_to_input 收集）

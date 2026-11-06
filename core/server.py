@@ -37,7 +37,9 @@ from . import session_identity
 from . import translate as pt
 from .thinking_guard import (
     ThinkingStripStore,
+    ToolStrictStore,
     is_invalid_signature_rejection,
+    is_strict_mode_rejection,
     strip_empty_signature_thinking,
 )
 from .listen_config import ListenConfigError, parse_host_authority, resolve_listen
@@ -2220,6 +2222,7 @@ class ModelProxyHandler(BaseHTTPRequestHandler):
 
         _reasoning_retried = False   # reasoning 语法重试只做一次，作用域覆盖整个请求周期
         _thinking_strip_retried = False   # thinking 签名 400 剥离重试只做一次（与语法重试独立互不消耗）
+        _tool_strict_retried = False      # Responses strict:false 被拒后的 strict:true 重试只做一次
         # raw_intent 必须在循环外、基于客户端原始 body_json 只 decode 一次。
         # body_json 在循环体内会被原地改写（model 改写为 target_model、reasoning_wire
         # 通过 apply_fields 写回），若在循环内重新 decode，第二轮起会对"已被上一轮写入
@@ -2472,8 +2475,11 @@ class ModelProxyHandler(BaseHTTPRequestHandler):
                     # 新组合：anthropic 请求 → responses 上游。转成 Responses body，打完整 /v1/responses。
                     # 请求转换失败（异常）→ 合法 Anthropic error，400
                     try:
+                        _ts_store = getattr(self.server, "tool_strict_store", None)
+                        _ts = _ts_store.snapshot(supply_id) if _ts_store else False
                         responses_body, fwd_ctx = pt.anthropic_to_responses_request(
-                            body_json or {}, reasoning_fields=reasoning_wire)
+                            body_json or {}, reasoning_fields=reasoning_wire,
+                            tool_strict=_ts)
                     except Exception as e:
                         log.error("ANTHROPIC_TO_RESPONSES request translate failed: %s", e)
                         self._write_buffered_response(
@@ -2580,6 +2586,20 @@ class ModelProxyHandler(BaseHTTPRequestHandler):
                         log.warning("thinking_strip_retry: supply=%s learned, stripping and retrying once",
                                     supply_id)
                         continue  # 重进 while：select_supply 复选同 supply，D 点命中刚 learn 的偏好自动剥离重发
+
+                    # Responses strict:false 被上游拒绝（400 提及 strict/additionalProperties）
+                    # → learn 该 supply 需要 strict:true，同模式重试一次（出站改写 strict 策略）。
+                    # 仅 ANTHROPIC_TO_RESPONSES 组合：r2a/passthrough 无本字段。
+                    _ts_store = getattr(self.server, "tool_strict_store", None)
+                    if (resp_status == 400 and not _tool_strict_retried and _ts_store
+                            and mode == ANTHROPIC_TO_RESPONSES
+                            and not _ts_store.snapshot(supply_id)
+                            and is_strict_mode_rejection(resp_body)):
+                        _ts_store.learn(supply_id, True)
+                        _tool_strict_retried = True
+                        log.warning("tool_strict_retry: supply=%s learned strict=true, retrying once",
+                                    supply_id)
+                        continue  # 重进 while：出站转换读取 store，strict:true 重发
 
                     # reasoning 语法自适应重试（仅一次，不 rotate/cooldown supply，
                     # 与 failover 重试的关键区别：不加入 tried_set、不调用 cd.cooldown）。
@@ -3737,6 +3757,8 @@ def main():
     server.pref_store = pref_store        # type: ignore[attr-defined]
     server.thinking_strip_store = thinking_strip_store  # type: ignore[attr-defined]
     server.thinking_strip_store = thinking_strip_store  # type: ignore[attr-defined]
+    tool_strict_store = ToolStrictStore()
+    server.tool_strict_store = tool_strict_store  # type: ignore[attr-defined]
     server.sidecar_store = sidecar_store  # type: ignore[attr-defined]
     # Host 头校验仅 listen.host 非 loopback 时装配（None = 未启用，loopback 无暴露面）
     server.host_validator = (  # type: ignore[attr-defined]
