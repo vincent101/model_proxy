@@ -79,3 +79,52 @@ class ThinkingStripStore:
         with self._lock:
             self._cache[supply_id] = {"at": time.time()}
         log.info("thinking_strip.learn: supply=%r (cached 48h)", supply_id)
+
+
+class ToolStrictStore:
+    """supply_id → {"strict": bool, "at": float}，TTL 48h（对齐 SyntaxPreferenceStore）。
+
+    语义：该 Responses 上游对未显式声明 strict 的工具应采用什么策略。
+    - 缺省（未 learn）：False —— 出站写 strict:false，阻止上游对 optional
+      schema 的静默严格化（2026-11-06 sol 实测会把 required 扩成全字段）。
+    - learn(supply_id, True)：上游显式拒绝 strict:false（400 提及 strict）后
+      学到，此后该 supply 出站写 strict:true（schema 不兼容时上游诚实 400）。
+
+    线程安全（Lock），内存态，重启丢失可接受（重启后首请求吃一次 400 再
+    learn，自愈——与 ThinkingStripStore 相同取舍）。
+    """
+
+    _TTL = 48 * 3600
+
+    def __init__(self):
+        self._cache: dict[str, dict] = {}
+        self._lock = threading.Lock()
+
+    def snapshot(self, supply_id: str) -> bool:
+        """该 supply 当前是否学到了需要 strict:true；过期或未学到返回 False。"""
+        with self._lock:
+            entry = self._cache.get(supply_id)
+            return bool(entry and time.time() - entry["at"] < self._TTL
+                        and entry["strict"])
+
+    def learn(self, supply_id: str, strict: bool) -> None:
+        with self._lock:
+            self._cache[supply_id] = {"strict": strict, "at": time.time()}
+        log.info("tool_strict.learn: supply=%r → strict=%r (cached 48h)",
+                 supply_id, strict)
+
+
+def is_strict_mode_rejection(resp_body: bytes) -> bool:
+    """识别 Responses 上游对 strict:false 的拒绝（400 提及 strict/schema 约束）。
+
+    匹配策略：lower 后 contains "strict"，或同时含 "additionalproperties" 与
+    "required"。刻意保守：只捕获明确指向 strict 模式冲突的报文，普通 schema
+    错误（如缺 type 字段）不命中，避免误 learn。
+    """
+    try:
+        t = resp_body.decode("utf-8", errors="ignore").lower()
+    except Exception:
+        return False
+    if "strict" in t:
+        return True
+    return "additionalproperties" in t and "required" in t

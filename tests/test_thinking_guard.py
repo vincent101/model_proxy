@@ -20,6 +20,8 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from core.thinking_guard import (  # noqa: E402
     ThinkingStripStore,
+    ToolStrictStore,
+    is_strict_mode_rejection,
     is_invalid_signature_rejection,
     strip_empty_signature_thinking,
 )
@@ -186,3 +188,49 @@ class TestThinkingStripStore(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+
+
+class TestToolStrictStore(unittest.TestCase):
+    """supply 级工具 strict 策略存储（2026-11-06 Agent isolation 填齐问题）。"""
+
+    def test_default_is_false(self):
+        store = ToolStrictStore()
+        self.assertFalse(store.snapshot("any-supply"))
+
+    def test_learn_true_then_snapshot(self):
+        store = ToolStrictStore()
+        store.learn("sol", True)
+        self.assertTrue(store.snapshot("sol"))
+        self.assertFalse(store.snapshot("other"))  # supply 隔离
+
+    def test_learn_false_resets(self):
+        store = ToolStrictStore()
+        store.learn("sol", True)
+        store.learn("sol", False)
+        self.assertFalse(store.snapshot("sol"))
+
+    def test_expiry(self):
+        store = ToolStrictStore()
+        store.learn("sol", True)
+        # 模拟过期
+        with store._lock:
+            store._cache["sol"]["at"] = 0
+        self.assertFalse(store.snapshot("sol"))
+
+
+class TestStrictModeRejection(unittest.TestCase):
+    def test_strict_keyword(self):
+        self.assertTrue(is_strict_mode_rejection(
+            b'{"error":{"message":"strict mode requires additionalProperties"}}'))
+
+    def test_additionalproperties_and_required(self):
+        self.assertTrue(is_strict_mode_rejection(
+            b'{"error":{"message":"additionalProperties is required to be false; '
+            b'all fields must be in required"}}'))
+
+    def test_normal_schema_error_no_match(self):
+        self.assertFalse(is_strict_mode_rejection(
+            b'{"error":{"message":"field x missing type"}}'))
+
+    def test_empty_body(self):
+        self.assertFalse(is_strict_mode_rejection(b""))
