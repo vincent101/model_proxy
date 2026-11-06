@@ -2559,19 +2559,18 @@ def _messages_to_input(messages, tool_name_mapping: dict) -> list:
             if text_parts:
                 items.append({"type": "message", "role": "assistant", "content": text_parts})
         else:
-            # P1 临时定位日志：记录被丢消息的位置、体量与前缀，确认 system 内容后回收。
+            # 定位日志回收（2026-11-06）：system 已透传，此告警只服务真正未知
+            # role。保留 role 与体量，不再 dump 内容前缀（避免日志噪音/隐私面）。
             if isinstance(content, str):
-                preview = content
+                chars = len(content)
+            elif isinstance(content, list):
+                chars = sum(len(b.get("text", "")) for b in content
+                            if isinstance(b, dict))
             else:
-                try:
-                    preview = json.dumps(content, ensure_ascii=False)
-                except (TypeError, ValueError):
-                    preview = repr(content)
-            chars = len(preview)
-            preview = preview[:200]
+                chars = 0
             _rl.warning("unknown_role_dropped_a2r", logger,
-                        "unknown message role dropped (a2r): index=%d role=%r chars=%d preview=%r",
-                        msg_index, role, chars, preview)
+                        "unknown message role dropped (a2r): index=%d role=%r chars=%d",
+                        msg_index, role, chars)
     return items
 
 
