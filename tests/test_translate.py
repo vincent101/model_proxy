@@ -1645,26 +1645,43 @@ class TestARRequest(unittest.TestCase):
         ])
         self.assertEqual(adapter.final_stop_reason, "max_tokens")
 
-    def test_ar_unknown_system_message_role_dropped_with_details(self):
-        """P1 定位：messages 里的 system 不是标准 Anthropic 输入 role，
-        当前策略仍是丢弃，但要留 index/role/size/preview 定位内容。"""
+    def test_ar_system_message_in_messages_preserved_in_order(self):
+        """Phase 2：messages 里的 system 消息按位置原样透传为 Responses
+        input message(role=system)，不再丢弃（2026-11-06 上游实测接受）。"""
+        body = {"messages": [
+            {"role": "user", "content": "hello"},
+            {"role": "system", "content": "hidden-system-context"},
+            {"role": "user", "content": "hi"},
+        ]}
+        rb, _ = pt.anthropic_to_responses_request(body)
+        self.assertEqual(rb["input"], [
+            {"type": "message", "role": "user",
+             "content": [{"type": "input_text", "text": "hello"}]},
+            {"type": "message", "role": "system",
+             "content": [{"type": "input_text", "text": "hidden-system-context"}]},
+            {"type": "message", "role": "user",
+             "content": [{"type": "input_text", "text": "hi"}]},
+        ])
+
+    def test_ar_system_message_blocks_preserved(self):
+        """Phase 2：system 消息 block 数组取 text 块透传；非 text 块丢弃
+        并保留 unsupported_system_block_a2r 告警。"""
         pt._rl._state.clear()
         body = {"messages": [
-            {"role": "system", "content": "hidden-system-context"},
+            {"role": "system", "content": [
+                {"type": "text", "text": "sys-text"},
+                {"type": "unknown_block", "foo": 1},
+            ]},
             {"role": "user", "content": "hi"},
         ]}
         with self.assertLogs("core.translate", level="WARNING") as cap:
             rb, _ = pt.anthropic_to_responses_request(body)
         joined = "\n".join(r.getMessage() for r in cap.records)
-        self.assertIn("unknown message role dropped (a2r)", joined)
-        self.assertIn("index=1", joined)
-        self.assertIn("role='system'", joined)
-        self.assertIn("chars=21", joined)
-        self.assertIn("hidden-system-context", joined)
-        self.assertEqual(rb["input"], [
-            {"type": "message", "role": "user",
-             "content": [{"type": "input_text", "text": "hi"}]},
-        ])
+        self.assertIn("unsupported system content block dropped (a2r)", joined)
+        self.assertEqual(rb["input"][0], {
+            "type": "message", "role": "system",
+            "content": [{"type": "input_text", "text": "sys-text"}],
+        })
 
     def test_ar_user_text_to_input_message(self):
         body = {"messages": [{"role": "user", "content": "hello"}]}
@@ -2373,3 +2390,132 @@ class TestRateLimitedLogger(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+
+
+class TestARReasoningEncryptedRoundtrip(unittest.TestCase):
+    """Phase 2+：encrypted_content 经 thinking.signature 借道回传（a2r）。"""
+
+    def test_ar_request_includes_encrypted_reasoning(self):
+        body = {"model": "claude-opus",
+                "messages": [{"role": "user", "content": "hi"}]}
+        rb, _ = pt.anthropic_to_responses_request(body)
+        self.assertEqual(rb["include"], ["reasoning.encrypted_content"])
+
+    def test_ar_request_restores_resp_signed_thinking(self):
+        body = {"messages": [
+            {"role": "user", "content": "q"},
+            {"role": "assistant", "content": [
+                {"type": "thinking", "thinking": "chain",
+                 "signature": "resp:QUJD"},
+                {"type": "text", "text": "answer"}]},
+        ]}
+        rb, _ = pt.anthropic_to_responses_request(body)
+        self.assertEqual(rb["input"][1], {
+            "type": "reasoning", "summary": [], "encrypted_content": "QUJD"})
+        self.assertEqual(rb["input"][2], {
+            "type": "message", "role": "assistant",
+            "content": [{"type": "output_text", "text": "answer"}]})
+
+    def test_ar_request_still_drops_native_signature_thinking(self):
+        body = {"messages": [
+            {"role": "assistant", "content": [
+                {"type": "thinking", "thinking": "chain",
+                 "signature": "real-anthropic-sig"},
+                {"type": "text", "text": "answer"}]},
+        ]}
+        rb, _ = pt.anthropic_to_responses_request(body)
+        self.assertEqual(rb["input"][0], {
+            "type": "message", "role": "assistant",
+            "content": [{"type": "output_text", "text": "answer"}]})
+
+    def test_ar_nonstream_reasoning_attaches_resp_signature(self):
+        resp = {"status": "completed", "output": [
+            {"type": "reasoning",
+             "summary": [{"type": "summary_text", "text": "chain"}],
+             "encrypted_content": "QUJD"},
+            {"type": "message", "role": "assistant",
+             "content": [{"type": "output_text", "text": "ok"}]},
+        ]}
+        a = pt.responses_to_anthropic_response(resp, {})
+        self.assertEqual(a["content"][0], {
+            "type": "thinking", "thinking": "chain",
+            "signature": "resp:QUJD"})
+
+    def test_ar_stream_reasoning_emits_signature_delta(self):
+        adapter = pt.ResponsesToAnthropicStreamAdapter(
+            ctx={}, model="gpt-6.1-sol")
+        events = []
+        events += adapter.feed("response.created", {"response": {"id": "r"}})
+        events += adapter.feed("response.output_item.added", {
+            "item": {"type": "reasoning", "id": "rs1"}})
+        events += adapter.feed("response.output_item.done", {
+            "item": {"type": "reasoning", "id": "rs1",
+                     "encrypted_content": "QUJD"}})
+        events += adapter.feed("response.output_item.added", {
+            "item": {"type": "message", "id": "m1"}})
+        events += adapter.feed("response.output_text.delta",
+                               {"delta": "hi"})
+        events += adapter.feed("response.completed", {"response": {
+            "id": "r", "status": "completed",
+            "usage": {"input_tokens": 1, "output_tokens": 1}}})
+        sigs = [e for e in events
+                if e.get("type") == "content_block_delta"
+                and e["delta"].get("type") == "signature_delta"]
+        self.assertEqual(len(sigs), 1)
+        self.assertEqual(sigs[0]["delta"]["signature"], "resp:QUJD")
+
+
+class TestRAResponsesRequestFidelity(unittest.TestCase):
+    """Phase 2+：r2a（Responses -> Anthropic）请求侧 system/developer/reasoning 保真。"""
+
+    def test_ra_system_message_role_preserved_in_order(self):
+        """input[] 里 system/developer 按位置转 messages[] 的 system。"""
+        body = {"input": [
+            {"type": "message", "role": "system",
+             "content": [{"type": "input_text", "text": "sys1"}]},
+            {"type": "message", "role": "user",
+             "content": [{"type": "input_text", "text": "hello"}]},
+            {"type": "message", "role": "developer",
+             "content": [{"type": "input_text", "text": "dev-mid"}]},
+            {"type": "message", "role": "user",
+             "content": [{"type": "input_text", "text": "next"}]},
+        ]}
+        ab = pt.responses_to_anthropic_request(body)
+        self.assertEqual([m["role"] for m in ab["messages"]],
+                         ["system", "user", "system", "user"])
+        self.assertEqual(ab["messages"][1]["content"],
+                         [{"type": "text", "text": "hello"}])
+        self.assertEqual(ab["messages"][2]["content"],
+                         [{"type": "text", "text": "dev-mid"}])
+
+    def test_ra_encrypted_reasoning_restored_as_thinking(self):
+        """带 encrypted_content 的 reasoning item 还原为 resp: 签名 thinking。"""
+        body = {"input": [
+            {"type": "message", "role": "user",
+             "content": [{"type": "input_text", "text": "q"}]},
+            {"type": "reasoning",
+             "summary": [{"type": "summary_text", "text": "prior chain"}],
+             "encrypted_content": "QUJD"},
+            {"type": "message", "role": "assistant",
+             "content": [{"type": "output_text", "text": "answer"}]},
+        ]}
+        ab = pt.responses_to_anthropic_request(body)
+        self.assertEqual(ab["messages"][1], {
+            "role": "assistant",
+            "content": [{"type": "thinking", "thinking": "prior chain",
+                         "signature": "resp:QUJD"}],
+        })
+        self.assertEqual(ab["messages"][2]["content"],
+                         [{"type": "text", "text": "answer"}])
+
+    def test_ra_summary_only_reasoning_dropped(self):
+        """无 encrypted_content 的纯展示 reasoning 不注入明文（上游不吃）。"""
+        body = {"input": [
+            {"type": "reasoning",
+             "summary": [{"type": "summary_text", "text": "display only"}]},
+            {"type": "message", "role": "user",
+             "content": [{"type": "input_text", "text": "q"}]},
+        ]}
+        ab = pt.responses_to_anthropic_request(body)
+        self.assertEqual(len(ab["messages"]), 1)
+        self.assertEqual(ab["messages"][0]["role"], "user")

@@ -37,7 +37,8 @@ def strip_empty_signature_thinking(body_json: dict) -> int:
             continue
         kept = [b for b in content
                 if not (isinstance(b, dict) and b.get("type") == "thinking"
-                        and not b.get("signature"))]
+                        and (not b.get("signature")
+                             or str(b.get("signature", "")).startswith("resp:")))]
         removed += len(content) - len(kept)
         if len(kept) != len(content):
             msg["content"] = kept
