@@ -20,7 +20,6 @@ from _format_ops import (
     DEGRADED_FAIL_PCT,
     DEGRADED_MIN_REQUESTS,
     _format_active_sessions,
-    _format_protocol_conversion_traffic,
     _format_status_from_json,
     _supply_refs,
     display_width,
@@ -28,7 +27,6 @@ from _format_ops import (
     format_strategies,
     format_supplies,
     load_active_sessions,
-    load_protocol_conversion_traffic,
     load_supply_health,
     mask_appkey,
     normalize_supply,
@@ -97,46 +95,6 @@ class TestLoadSupplyHealth(unittest.TestCase):
             health = load_supply_health(path)
         self.assertIn("(none)", health)
         self.assertEqual(health["(none)"]["fail"], 5)
-
-
-class TestProtocolConversionTraffic(unittest.TestCase):
-    def test_new_format_only_and_passthrough_excluded(self):
-        now = datetime(2026, 8, 22, 12, 0, 0)
-        hints = [{"route": "r1", "tier": "opus", "supply": "s1", "source": "anthropic"}]
-        prefix = "2026-08-22 11:00:00,000 req_id=x ACCESS ms=1 "
-        lines = [
-            prefix + "status=200 source=anthropic operation=messages route=r1 tier=opus supply=s1 target_protocol=responses conversion_kind=a2r usage_in=1 usage_out=3 token=cc builtin=\n",
-            prefix + "status=501 source=anthropic operation=messages route=r1 tier=opus supply=s1 target_protocol=responses conversion_kind=a2r usage_in=0 usage_out=0 token=cc builtin=\n",
-            prefix + "status=200 source=anthropic operation=messages route=r1 tier=opus supply=s1 usage_out=2 token=cc builtin=\n",
-            prefix + "status=200 source=anthropic operation=messages route=r1 tier=opus supply=s1 target_protocol=anthropic conversion_kind=passthrough usage_out=2 token=cc builtin=\n",
-        ]
-        with tempfile.NamedTemporaryFile("w", encoding="utf-8", delete=False) as f:
-            f.writelines(lines)
-            path = f.name
-        try:
-            result = load_protocol_conversion_traffic(path, hints, now=now)
-        finally:
-            os.unlink(path)
-        self.assertEqual(len(result), 1)
-        self.assertEqual(result[0]["n"], 2)
-        self.assertEqual(result[0]["success"], 1)
-        self.assertEqual(result[0]["rejected_501"], 1)
-
-    def test_summary_four_states(self):
-        base = {"token": "cc", "source": "anthropic", "route": "r", "tier": "opus",
-                "supply": "s", "target_protocol": "responses", "conversion_kind": "a2r",
-                "rejected_501": 0, "empty": 0, "success": 0, "other_failure": 0}
-        cases = [
-            ({"n": 2, "rejected_501": 2}, "n=2 · all-501"),
-            ({"n": 3, "empty": 2, "success": 1}, "n=3 · 2 empty"),
-            ({"n": 4, "rejected_501": 1, "other_failure": 2, "success": 1}, "n=4 · 3 failed"),
-            ({"n": 5, "empty": 2, "other_failure": 1, "success": 2}, "n=5 · 2 empty, 1 failed"),
-            ({"n": 2, "success": 2}, "n=2"),
-        ]
-        for updates, suffix in cases:
-            item = {**base, **updates}
-            line = _format_protocol_conversion_traffic([item])[1]
-            self.assertTrue(line.endswith(suffix), line)
 
 
 # ---------------------------------------------------------------------------
