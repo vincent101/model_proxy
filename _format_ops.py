@@ -329,8 +329,8 @@ def _format_protocol_conversion_traffic(items: list[dict]) -> list[str]:
         lines.append(
             f"  ⚠ {x['token']}[{x['source']}] → {x['route']}.{x['tier']} → "
             f"{x['supply']}[{x['target_protocol']}] ({x['conversion_kind']}) n={n}{suffix}")
-    lines.append("  hint: cross-protocol paths risk semantic loss; "
-                 "prefer same-protocol native endpoints")
+    # 2026-11-06：a2r/r2a 转换链路已系统性补齐（system/strict/encrypted reasoning/
+    # 工具/终态全实测），跨协议语义损失提示不再适用，移除。
     return lines
 
 
