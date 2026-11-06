@@ -378,13 +378,12 @@ def _format_active_sessions(result: dict, cfg: dict | None = None,
                             session_names: dict[str, str] | None = None) -> list[str]:
     """渲染活跃 session 段（header + 每 session 一行 + FAIL err 续行）。
 
-    行格式：`[name · ]sid8  state n=N fail=F [fo=K]  HH:MM status  route(tokens) tier/supply(pct%) ...`
+    行格式：`[name · ]sid8  state n=N fail=F [fo=K] [client]  HH:MM status  route tier/supply(pct%) ...`
     session_names 为 ~/.claude/sessions 注册快照（{sessionId: name}），命中时
     行首附 name；id 列宽随内容动态放宽（≥8），命名行与未命名行各自对齐。
-    链路为窗口内 (tier, supply) 分布按次数降序；route 取窗口内主 route，括注引用它的 strategy。
+    链路为窗口内 (tier, supply) 分布按次数降序；route 取窗口内主 route。
     排序：FAIL → warn → ok，同档按最近请求时间倒序。
     """
-    route_tokens = _route_tokens(cfg) if cfg else {}
     sessions = result["sessions"]
     truncated = result["truncated"]
     log_missing = result["log_missing"]
@@ -453,14 +452,14 @@ def _format_active_sessions(result: dict, cfg: dict | None = None,
         fo_part = f" fo={agg['fo']}" if agg["fo"] > 0 else ""
         ts_str = agg["last_ts"].strftime("%H:%M") if agg["last_ts"] else "--:--"
 
-        # 主 route + strategy 括注
+        # 主 route（2026-11-06：去掉 strategy token 括注——行内已有 [token] client
+        # 标注，route 后的 (cc,codex) 重复且与 client 标注混淆）
         main_route = ""
         if agg["routes"]:
             main_route = max(agg["routes"].items(), key=lambda kv: kv[1])[0]
         elif agg["last_route"]:
             main_route = agg["last_route"]
-        toks = route_tokens.get(main_route, [])
-        route_part = f"{main_route}({','.join(toks)})" if toks else main_route
+        route_part = main_route
 
         # client 标注：窗口内主 token（cc=ClaudeCode / codex=Codex），多 token 并列
         toks_part = ""

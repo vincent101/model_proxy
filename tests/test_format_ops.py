@@ -910,8 +910,8 @@ class TestFormatActiveSessions(unittest.TestCase):
         self.assertIn("err:", joined)
         self.assertIn("req=deadbeef", joined)
 
-    def test_chain_distribution_with_route_tokens(self):
-        """行尾展示 route(tokens) + 窗口内 tier/supply 分布占比。"""
+    def test_chain_distribution_route_plain(self):
+        """route 后不带 strategy token 括注（[client] 标注已覆盖该信息）。"""
         sessions = {"abc12345-xxxx": self._make_agg(
             n=10,
             chains={("sonnet", "glm-52-sankuai-3339"): 6,
@@ -922,7 +922,8 @@ class TestFormatActiveSessions(unittest.TestCase):
                                "route_pool": [{"route_id": "nation1", "weight": 1}]}]}
         lines = _format_active_sessions(self._make_result(sessions), cfg)
         joined = "\n".join(lines)
-        self.assertIn("nation1(cc)", joined)
+        self.assertIn("nation1 ", joined)
+        self.assertNotIn("nation1(", joined)
         self.assertIn("sonnet/glm-52-3339(60%)", joined)
         self.assertIn("opus/kimi-k3-3339(40%)", joined)
         # 分布降序：sonnet(60%) 在 opus(40%) 前
