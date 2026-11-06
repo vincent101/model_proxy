@@ -2390,3 +2390,76 @@ class TestRateLimitedLogger(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+
+
+class TestARReasoningEncryptedRoundtrip(unittest.TestCase):
+    """Phase 2+：encrypted_content 经 thinking.signature 借道回传（a2r）。"""
+
+    def test_ar_request_includes_encrypted_reasoning(self):
+        body = {"model": "claude-opus",
+                "messages": [{"role": "user", "content": "hi"}]}
+        rb, _ = pt.anthropic_to_responses_request(body)
+        self.assertEqual(rb["include"], ["reasoning.encrypted_content"])
+
+    def test_ar_request_restores_resp_signed_thinking(self):
+        body = {"messages": [
+            {"role": "user", "content": "q"},
+            {"role": "assistant", "content": [
+                {"type": "thinking", "thinking": "chain",
+                 "signature": "resp:QUJD"},
+                {"type": "text", "text": "answer"}]},
+        ]}
+        rb, _ = pt.anthropic_to_responses_request(body)
+        self.assertEqual(rb["input"][1], {
+            "type": "reasoning", "summary": [], "encrypted_content": "QUJD"})
+        self.assertEqual(rb["input"][2], {
+            "type": "message", "role": "assistant",
+            "content": [{"type": "output_text", "text": "answer"}]})
+
+    def test_ar_request_still_drops_native_signature_thinking(self):
+        body = {"messages": [
+            {"role": "assistant", "content": [
+                {"type": "thinking", "thinking": "chain",
+                 "signature": "real-anthropic-sig"},
+                {"type": "text", "text": "answer"}]},
+        ]}
+        rb, _ = pt.anthropic_to_responses_request(body)
+        self.assertEqual(rb["input"][0], {
+            "type": "message", "role": "assistant",
+            "content": [{"type": "output_text", "text": "answer"}]})
+
+    def test_ar_nonstream_reasoning_attaches_resp_signature(self):
+        resp = {"status": "completed", "output": [
+            {"type": "reasoning",
+             "summary": [{"type": "summary_text", "text": "chain"}],
+             "encrypted_content": "QUJD"},
+            {"type": "message", "role": "assistant",
+             "content": [{"type": "output_text", "text": "ok"}]},
+        ]}
+        a = pt.responses_to_anthropic_response(resp, {})
+        self.assertEqual(a["content"][0], {
+            "type": "thinking", "thinking": "chain",
+            "signature": "resp:QUJD"})
+
+    def test_ar_stream_reasoning_emits_signature_delta(self):
+        adapter = pt.ResponsesToAnthropicStreamAdapter(
+            ctx={}, model="gpt-6.1-sol")
+        events = []
+        events += adapter.feed("response.created", {"response": {"id": "r"}})
+        events += adapter.feed("response.output_item.added", {
+            "item": {"type": "reasoning", "id": "rs1"}})
+        events += adapter.feed("response.output_item.done", {
+            "item": {"type": "reasoning", "id": "rs1",
+                     "encrypted_content": "QUJD"}})
+        events += adapter.feed("response.output_item.added", {
+            "item": {"type": "message", "id": "m1"}})
+        events += adapter.feed("response.output_text.delta",
+                               {"delta": "hi"})
+        events += adapter.feed("response.completed", {"response": {
+            "id": "r", "status": "completed",
+            "usage": {"input_tokens": 1, "output_tokens": 1}}})
+        sigs = [e for e in events
+                if e.get("type") == "content_block_delta"
+                and e["delta"].get("type") == "signature_delta"]
+        self.assertEqual(len(sigs), 1)
+        self.assertEqual(sigs[0]["delta"]["signature"], "resp:QUJD")

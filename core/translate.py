@@ -1224,6 +1224,9 @@ class _AnthropicStreamBlocks:
             block["fragments"].clear()
             if not block["done"]:
                 break
+            if kind == "thinking" and block.get("signature"):
+                events.append(owner._content_block_signature_delta(
+                    index, block["signature"]))
             events.append(owner._content_block_stop(index))
             block["stopped"] = True
             owner.block_open = False
@@ -2391,6 +2394,11 @@ class AnthropicToResponsesStreamAdapter:
 # 响应/事件还原为 Anthropic 格式，工具名经 ctx["tool_name_mapping"] 还原。
 # ############################################################################
 
+# thinking.signature 借用前缀：resp:<base64 encrypted_content>。
+# 借用理由：客户端把 signature 视为不透明值回传，是唯一保证 encrypted_content
+# 能随历史回到代理的载体；前缀用于与真 Anthropic 签名区分，防止跨协议泄漏。
+_RESPONSES_REASONING_SIG_PREFIX = "resp:"
+
 # ============================================================================
 # 辅助：messages → Responses input items（§3，方向与 _input_to_messages 相反）
 # ============================================================================
@@ -2505,8 +2513,24 @@ def _messages_to_input(messages, tool_name_mapping: dict) -> list:
                         "name": truncated,
                         "arguments": json.dumps(block.get("input", {}), ensure_ascii=False),
                     })
-                elif bt in ("thinking", "redacted_thinking"):
-                    logger.debug("thinking block dropped in assistant message (a2r)")
+                elif bt == "thinking":
+                    sig = block.get("signature") or ""
+                    # resp: 前缀 = 代理上轮藏入的 encrypted_content，还原回传；
+                    # 其他签名（真 Anthropic）在上游无对应验签语义，维持丢弃。
+                    if sig.startswith(_RESPONSES_REASONING_SIG_PREFIX):
+                        enc = sig[len(_RESPONSES_REASONING_SIG_PREFIX):]
+                        if enc:
+                            items.append({
+                                "type": "reasoning",
+                                "summary": [],
+                                "encrypted_content": enc,
+                            })
+                        else:
+                            logger.debug("empty resp: thinking signature dropped (a2r)")
+                    else:
+                        logger.debug("thinking block dropped in assistant message (a2r)")
+                elif bt == "redacted_thinking":
+                    logger.debug("redacted_thinking block dropped in assistant message (a2r)")
                 else:
                     _rl.warning("unsupported_assistant_block_a2r", logger,
                                 "unsupported assistant content block dropped (a2r): %r", bt)
@@ -2608,6 +2632,10 @@ def anthropic_to_responses_request(body: dict, reasoning_fields: "dict | None" =
     if "tool_choice" in body:
         responses_body["tool_choice"] = _a2r_translate_tool_choice(body["tool_choice"])
 
+    # encrypted reasoning 回传：索取加密块，响应侧藏入 thinking.signature，
+    # 客户端回显历史时代理再还原（2026-11-06 上游实测闭环）。
+    responses_body["include"] = ["reasoning.encrypted_content"]
+
     # stop_sequences 丢弃（Responses 无对应字段）
     if "stop_sequences" in body:
         logger.debug("stop_sequences dropped (a2r): Responses 无对应字段")
@@ -2708,8 +2736,12 @@ def responses_to_anthropic_response(resp: dict, ctx: dict = None) -> dict:
         elif it == "reasoning":
             # ①b：reasoning→thinking 回传（glm content 通道 + openai summary 通道）
             thinking = _extract_reasoning_thinking_text(item)
-            if thinking:
-                content_blocks.append({"type": "thinking", "thinking": thinking})
+            enc = item.get("encrypted_content") or ""
+            if thinking or enc:
+                blk = {"type": "thinking", "thinking": thinking}
+                if enc:
+                    blk["signature"] = _RESPONSES_REASONING_SIG_PREFIX + enc
+                content_blocks.append(blk)
         else:
             raise TranslationError(f"unknown Responses output item type: {it!r}", path="output[].type",
                                    source_type="responses", reason=f"unknown:{it}")
@@ -2854,6 +2886,15 @@ class ResponsesToAnthropicStreamAdapter:
             "type": "content_block_delta",
             "index": index,
             "delta": {"type": "thinking_delta", "thinking": thinking},
+        }
+
+    @staticmethod
+    def _content_block_signature_delta(index: int, signature: str) -> dict:
+        """thinking 封口 signature_delta：载体为 resp:<encrypted_content>。"""
+        return {
+            "type": "content_block_delta",
+            "index": index,
+            "delta": {"type": "signature_delta", "signature": signature},
         }
 
     @staticmethod
@@ -3109,8 +3150,18 @@ class ResponsesToAnthropicStreamAdapter:
             self._queue_arguments(data, "arguments_done")
 
         elif event_type == "response.output_item.done":
-            if (data.get("item") or {}).get("type") == "function_call":
+            done_item = data.get("item") or {}
+            if done_item.get("type") == "function_call":
                 self._queue_arguments(data, "item_done")
+            elif done_item.get("type") == "reasoning":
+                # 上游可能只在 done 帧携带 encrypted_content（added 帧缺失，
+                # 2026-11-06 实测）：补记到当前 thinking 块，封口时发 signature_delta。
+                enc = done_item.get("encrypted_content") or ""
+                if enc:
+                    blk = self._blocks.last
+                    if blk is not None and blk["type"] == "thinking" and not blk.get("signature"):
+                        blk["signature"] = _RESPONSES_REASONING_SIG_PREFIX + enc
+                    # 无匹配 thinking 块时保守丢弃（非流态边界，无主可挂）。
 
         elif event_type in ("response.output_text.done",
                              "response.content_part.done",
