@@ -3255,7 +3255,7 @@ class ModelProxyHandler(BaseHTTPRequestHandler):
         try:
             while True:
                 try:
-                    chunk = resp.read(8192)
+                    chunk = self._read_stream_chunk(resp, 8192)
                 except OSError as exc:
                     self._record_stream_error(pt.TranslationError(
                         f"upstream read failed: {exc}", reason="upstream_read_error"))
@@ -3442,7 +3442,7 @@ class ModelProxyHandler(BaseHTTPRequestHandler):
 
         try:
             while not done:
-                data = upstream_resp.read(4096)
+                data = self._read_stream_chunk(upstream_resp, 4096)
                 if not data:
                     for frame in framer.finish():
                         if consume(frame):
@@ -3508,7 +3508,7 @@ class ModelProxyHandler(BaseHTTPRequestHandler):
 
         try:
             while True:
-                data = upstream_resp.read(4096)
+                data = self._read_stream_chunk(upstream_resp, 4096)
                 if not data:
                     break
                 frames = framer.feed(data, max_events=1)
@@ -3572,7 +3572,7 @@ class ModelProxyHandler(BaseHTTPRequestHandler):
 
         try:
             while True:
-                data = upstream_resp.read(4096)
+                data = self._read_stream_chunk(upstream_resp, 4096)
                 if not data:
                     break
                 frames = framer.feed(data, max_events=1)
@@ -3615,6 +3615,35 @@ class ModelProxyHandler(BaseHTTPRequestHandler):
     # ------------------------------------------------------------------
     # helper
     # ------------------------------------------------------------------
+
+    @staticmethod
+    def _read_stream_chunk(resp, amt: int = 4096) -> bytes:
+        """Phase D：单次读取流数据，有啥读啥，不跨 chunk 累积。
+
+        背景（2026-11-06 实测）：http.client.HTTPResponse.read(amt) 在 chunked
+        响应上会跨 chunk 循环累积直到凑满 amt 或 EOF，转换链路（a2r/r2a）因此
+        首事件被压到流接近结束才交付（线上 first_event_ms/total p50≈0.86）。
+
+        read1(n) 语义（CPython stdlib）：
+        - chunked：读当前 chunk 的最多 n 字节（或整 chunk，取小者），不跨 chunk；
+        - 非 chunked：底层 fp.read1(n)，至多一次系统调用；
+        - 返回 b'' 仅表示 EOF；chunk 中途连接断抛 IncompleteRead。
+
+        兼容边界：自定义/fake response 无 read1 属性时回退 read(amt)（现有测试
+        fake 即此形态）；属性存在但不可调用明确报错（fail-closed，不静默走 read）。
+        """
+        read1 = getattr(resp, "read1", None)
+        if read1 is None:
+            return resp.read(amt)
+        if not callable(read1):
+            raise TypeError(f"stream response read1 is not callable: {type(resp).__name__}")
+        data = read1(amt)
+        # 防 fake/mock reader：read1 返回非 bytes 时不能当有效流数据
+        # （MagicMock 自动生成 read1 属性会绕过 read fallback 造成死循环）。
+        # 非正确类型 → 回退 read(amt)，由既有路径处理。
+        if not isinstance(data, (bytes, bytearray)):
+            return resp.read(amt)
+        return bytes(data)
 
     def _send_json(self, status: int, body: Any):
         data = json.dumps(body, ensure_ascii=False).encode("utf-8")
