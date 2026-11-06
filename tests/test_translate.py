@@ -2519,3 +2519,67 @@ class TestRAResponsesRequestFidelity(unittest.TestCase):
         ab = pt.responses_to_anthropic_request(body)
         self.assertEqual(len(ab["messages"]), 1)
         self.assertEqual(ab["messages"][0]["role"], "user")
+
+
+class TestARToolStrictFidelity(unittest.TestCase):
+    """a2r 工具 strict 语义保真（2026-11-06 Responses 上游实测）。
+
+    上游省略 strict 时按严格模式规范化 schema，模型会填齐 optional 字段
+    （如 Agent isolation）；必须显式 strict:false 才保持可选参数语义。
+    """
+
+    def _agent_tool(self, **extra):
+        tool = {
+            "name": "Agent",
+            "description": "Launch agent",
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "description": {"type": "string"},
+                    "prompt": {"type": "string"},
+                    "subagent_type": {"type": "string"},
+                    "isolation": {"type": "string",
+                                  "enum": ["none", "worktree", "sandbox"]},
+                },
+                "required": ["description", "prompt", "subagent_type"],
+            },
+        }
+        tool.update(extra)
+        return {"messages": [{"role": "user", "content": "x"}],
+                "tools": [tool]}
+
+    def test_undeclared_strict_defaults_false_and_schema_untouched(self):
+        """Agent schema：required 三字段、isolation 可选 → strict=false，不改 schema。"""
+        rb, _ = pt.anthropic_to_responses_request(self._agent_tool())
+        tool = rb["tools"][0]
+        self.assertIs(tool["strict"], False)
+        self.assertEqual(tool["parameters"]["required"],
+                         ["description", "prompt", "subagent_type"])
+        self.assertIn("isolation", tool["parameters"]["properties"])
+
+    def test_explicit_false_preserved(self):
+        rb, _ = pt.anthropic_to_responses_request(
+            self._agent_tool(strict=False))
+        self.assertIs(rb["tools"][0]["strict"], False)
+
+    def test_explicit_true_preserved(self):
+        rb, _ = pt.anthropic_to_responses_request(
+            self._agent_tool(strict=True))
+        self.assertIs(rb["tools"][0]["strict"], True)
+
+    def test_source_schema_not_mutated(self):
+        schema = {"type": "object", "properties": {"a": {"type": "string"}},
+                  "required": ["a"]}
+        body = {"messages": [{"role": "user", "content": "x"}],
+                "tools": [{"name": "t", "description": "d",
+                           "input_schema": schema, "strict": True}]}
+        pt.anthropic_to_responses_request(body)
+        self.assertNotIn("strict", schema)
+
+    def test_source_tool_object_not_mutated(self):
+        tool = {"name": "t2", "description": "d",
+                "input_schema": {"type": "object", "properties": {}}}
+        body = {"messages": [{"role": "user", "content": "x"}],
+                "tools": [tool]}
+        pt.anthropic_to_responses_request(body)
+        self.assertNotIn("strict", tool)

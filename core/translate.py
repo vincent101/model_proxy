@@ -782,6 +782,10 @@ def _translate_tools(anthropic_tools):
             "description": tool.get("description", ""),
             "parameters": tool.get("input_schema", {"type": "object", "properties": {}}),
         }
+        # strict 语义保真（2026-11-06）：显式声明按原值保留；未声明不在此处
+        # 填默认（a2r/chat 出口的缺省策略不同，见各自摊平点）。
+        if "strict" in tool:
+            func["strict"] = bool(tool["strict"])
         openai_tools.append({"type": "function", "function": func})
     return openai_tools, tool_name_mapping
 
@@ -2643,12 +2647,20 @@ def anthropic_to_responses_request(body: dict, reasoning_fields: "dict | None" =
         flat = []
         for t in openai_tools:
             fn = t.get("function") or {}
-            flat.append({
+            flat_tool = {
                 "type": "function",
                 "name": fn.get("name", ""),
                 "description": fn.get("description", ""),
                 "parameters": fn.get("parameters", {"type": "object", "properties": {}}),
-            })
+            }
+            # Responses 缺省 strict 行为实测（2026-11-06 sol）：省略时上游按严格
+            # 模式规范化 schema，模型会自行填齐 optional 字段（如 Agent isolation）。
+            # 调用方未声明时必须显式 strict:false 保住可选参数语义；显式声明按原值。
+            if "strict" in fn:
+                flat_tool["strict"] = bool(fn["strict"])
+            else:
+                flat_tool["strict"] = False
+            flat.append(flat_tool)
         responses_body["tools"] = flat
         # 合并 tools 侧的截断映射（tool_use item 侧的已在 _messages_to_input 收集）
         tool_name_mapping.update(tmap)
