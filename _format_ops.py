@@ -316,8 +316,13 @@ def load_active_sessions(log_path: str, *, now: datetime | None = None,
             "last_ts": None, "last_status": "", "last_route": "",
             "last_tier": "", "last_supply": "", "last_error": "",
             "last_req_id": "", "builtin_only": True,
-            "chains": {}, "routes": {},
+            "chains": {}, "routes": {}, "tokens": {},
         })
+        # token 即 client 身份（cc=ClaudeCode / codex=Codex / ailoan 等），
+        # 聚合后按次数取主 token 渲染，区分不同 SDK 的 session。
+        _tok = parsed["token"]
+        if _tok:
+            agg["tokens"][_tok] = agg["tokens"].get(_tok, 0) + 1
         is_builtin = parsed["builtin"] == "route"
         if is_builtin:
             # builtin 行只在 builtin_only session 上更新 last_*（用于活跃判定）
@@ -457,9 +462,15 @@ def _format_active_sessions(result: dict, cfg: dict | None = None,
         toks = route_tokens.get(main_route, [])
         route_part = f"{main_route}({','.join(toks)})" if toks else main_route
 
+        # client 标注：窗口内主 token（cc=ClaudeCode / codex=Codex），多 token 并列
+        toks_part = ""
+        if agg.get("tokens"):
+            toks_sorted = sorted(agg.get("tokens", {}).items(), key=lambda kv: -kv[1])
+            toks_part = "  [" + ",".join(t for t, _ in toks_sorted) + "]"
+
         if agg["builtin_only"]:
             line = (f"  {_pad(id_str, id_w)}  {_pad(state, 4)} n=0 fail=0"
-                    f"  {ts_str} 200"
+                    f"{toks_part}  {ts_str} 200"
                     f"  {route_part}（仅 $route)")
         else:
             # 窗口内链路分布：tier/supply(pct%)，按次数降序
@@ -469,7 +480,7 @@ def _format_active_sessions(result: dict, cfg: dict | None = None,
                 pct = round(cnt / agg["n"] * 100) if agg["n"] else 0
                 chain_parts.append(f"{tier}/{_short_supply(supply)}({pct}%)")
             line = (f"  {_pad(id_str, id_w)}  {_pad(state, 4)}"
-                    f" n={agg['n']} fail={agg['fail']}{fo_part}"
+                    f" n={agg['n']} fail={agg['fail']}{fo_part}{toks_part}"
                     f"  {ts_str} {agg['last_status']}"
                     f"  {route_part} {' '.join(chain_parts)}")
         lines.append(line.rstrip())

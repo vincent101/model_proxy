@@ -1258,3 +1258,40 @@ class TestStatusFormatWithSessions(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestActiveSessionClientLabel(unittest.TestCase):
+    """active session 行的 client 标注（token=cc/codex 区分 ClaudeCode/Codex）。"""
+
+    def _result(self, tokens):
+        agg = {
+            "n": 5, "fail": 0, "fo": 0,
+            "last_ts": datetime.now() - timedelta(minutes=1),
+            "last_status": "200", "last_route": "r1", "last_tier": "opus",
+            "last_supply": "s1", "last_error": "", "last_req_id": "x",
+            "builtin_only": False, "chains": {("opus", "s1"): 5},
+            "routes": {"r1": 5}, "tokens": tokens,
+        }
+        return {"sessions": {"abc12345-xxxx": agg},
+                "truncated": False, "log_missing": False}
+
+    def test_cc_label(self):
+        lines = _format_active_sessions(self._result({"cc": 5}))
+        self.assertIn("[cc]", lines[1])
+        self.assertNotIn("[codex]", lines[1])
+
+    def test_codex_label(self):
+        lines = _format_active_sessions(self._result({"codex": 5}))
+        self.assertIn("[codex]", lines[1])
+
+    def test_mixed_tokens_major_first(self):
+        lines = _format_active_sessions(self._result({"codex": 4, "cc": 1}))
+        self.assertIn("[codex,cc]", lines[1])
+
+    def test_missing_tokens_no_label(self):
+        agg = self._result({"cc": 1})["sessions"]["abc12345-xxxx"]
+        del agg["tokens"]
+        lines = _format_active_sessions(
+            {"sessions": {"abc12345-xxxx": agg}, "truncated": False,
+             "log_missing": False})
+        self.assertNotIn("[", lines[1])
