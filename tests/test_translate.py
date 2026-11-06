@@ -2463,3 +2463,59 @@ class TestARReasoningEncryptedRoundtrip(unittest.TestCase):
                 and e["delta"].get("type") == "signature_delta"]
         self.assertEqual(len(sigs), 1)
         self.assertEqual(sigs[0]["delta"]["signature"], "resp:QUJD")
+
+
+class TestRAResponsesRequestFidelity(unittest.TestCase):
+    """Phase 2+：r2a（Responses -> Anthropic）请求侧 system/developer/reasoning 保真。"""
+
+    def test_ra_system_message_role_preserved_in_order(self):
+        """input[] 里 system/developer 按位置转 messages[] 的 system。"""
+        body = {"input": [
+            {"type": "message", "role": "system",
+             "content": [{"type": "input_text", "text": "sys1"}]},
+            {"type": "message", "role": "user",
+             "content": [{"type": "input_text", "text": "hello"}]},
+            {"type": "message", "role": "developer",
+             "content": [{"type": "input_text", "text": "dev-mid"}]},
+            {"type": "message", "role": "user",
+             "content": [{"type": "input_text", "text": "next"}]},
+        ]}
+        ab = pt.responses_to_anthropic_request(body)
+        self.assertEqual([m["role"] for m in ab["messages"]],
+                         ["system", "user", "system", "user"])
+        self.assertEqual(ab["messages"][1]["content"],
+                         [{"type": "text", "text": "hello"}])
+        self.assertEqual(ab["messages"][2]["content"],
+                         [{"type": "text", "text": "dev-mid"}])
+
+    def test_ra_encrypted_reasoning_restored_as_thinking(self):
+        """带 encrypted_content 的 reasoning item 还原为 resp: 签名 thinking。"""
+        body = {"input": [
+            {"type": "message", "role": "user",
+             "content": [{"type": "input_text", "text": "q"}]},
+            {"type": "reasoning",
+             "summary": [{"type": "summary_text", "text": "prior chain"}],
+             "encrypted_content": "QUJD"},
+            {"type": "message", "role": "assistant",
+             "content": [{"type": "output_text", "text": "answer"}]},
+        ]}
+        ab = pt.responses_to_anthropic_request(body)
+        self.assertEqual(ab["messages"][1], {
+            "role": "assistant",
+            "content": [{"type": "thinking", "thinking": "prior chain",
+                         "signature": "resp:QUJD"}],
+        })
+        self.assertEqual(ab["messages"][2]["content"],
+                         [{"type": "text", "text": "answer"}])
+
+    def test_ra_summary_only_reasoning_dropped(self):
+        """无 encrypted_content 的纯展示 reasoning 不注入明文（上游不吃）。"""
+        body = {"input": [
+            {"type": "reasoning",
+             "summary": [{"type": "summary_text", "text": "display only"}]},
+            {"type": "message", "role": "user",
+             "content": [{"type": "input_text", "text": "q"}]},
+        ]}
+        ab = pt.responses_to_anthropic_request(body)
+        self.assertEqual(len(ab["messages"]), 1)
+        self.assertEqual(ab["messages"][0]["role"], "user")

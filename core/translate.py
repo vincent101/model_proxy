@@ -1785,6 +1785,12 @@ def _input_to_messages(input_items) -> list:
             elif role == "assistant":
                 flush_user()
                 messages.append({"role": "assistant", "content": blocks})
+            elif role in ("system", "developer"):
+                # 2026-11-06 实测：Anthropic 上游接受 messages[] 内 system role，
+                # 且首条与中段均内容可达（E11/E12）；developer 映射为 system 语义。
+                # 按位置原样插入，不并入顶层 system，保留 mid-conversation 语义。
+                flush_user()
+                messages.append({"role": "system", "content": blocks})
             # 其他 role 忽略
 
         elif t == "function_call":
@@ -1803,7 +1809,23 @@ def _input_to_messages(input_items) -> list:
                 "tool_use_id": item.get("call_id"),
                 "content": item.get("output", ""),
             })
-        # 其他 type（如 reasoning item 回放）忽略
+        elif t == "reasoning":
+            # codex 历史回放：带 encrypted_content 的 reasoning item 说明是
+            # 代理上轮藏入的 Responses 加密推理，还原为 thinking block
+            # （signature 带 resp: 前缀，与 a2r 出站侧同一约定）。
+            enc = item.get("encrypted_content") or ""
+            if enc:
+                flush_user()
+                summary = _extract_reasoning_thinking_text(item)
+                messages.append({"role": "assistant", "content": [{
+                    "type": "thinking",
+                    "thinking": summary,
+                    "signature": _RESPONSES_REASONING_SIG_PREFIX + enc,
+                }]})
+            # 无 encrypted_content 的 reasoning（纯 summary 展示项）丢弃：
+            # Anthropic 上游不吃明文 reasoning 注入，无有效载体。
+
+        # 其他 type 忽略
 
     flush_user()
     return messages
