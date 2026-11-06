@@ -260,80 +260,6 @@ def parse_access_line(line: str) -> dict | None:
     }
 
 
-def load_protocol_conversion_traffic(log_path: str, hints: list[dict] | None, *,
-                                     now: datetime | None = None,
-                                     window_days: int = PROTOCOL_HINT_WINDOW_DAYS) -> list[dict]:
-    """流式扫描窗口内新格式 ACCESS，聚合当前配置仍存在的跨协议链路。"""
-    if not hints or not log_path or not os.path.isfile(log_path):
-        return []
-    now = now or datetime.now()
-    start = now - timedelta(days=window_days)
-    valid = {(h.get("route"), h.get("tier"), h.get("supply"), h.get("source"))
-             for h in hints}
-    aggs: dict[tuple, dict] = {}
-    try:
-        with open(log_path, "r", encoding="utf-8", errors="replace") as f:
-            for line in f:
-                p = parse_access_line(line)
-                if not p or p["ts"] < start:
-                    continue
-                if not all(p.get(k) for k in ("operation", "target_protocol", "conversion_kind")):
-                    continue
-                if (p["builtin"] or p["operation"] == "count_tokens"
-                        or p["conversion_kind"] == "passthrough"
-                        or p["operation"] not in {"messages", "responses", "chat_completions"}):
-                    continue
-                if (p["route"], p["tier"], p["supply"], p["source"]) not in valid:
-                    continue
-                key = (p["token"], p["source"], p["route"], p["tier"], p["supply"],
-                       p["target_protocol"], p["conversion_kind"])
-                a = aggs.setdefault(key, {"n": 0, "rejected_501": 0, "empty": 0,
-                                          "success": 0, "other_failure": 0})
-                a["n"] += 1
-                if p["status"] == "501":
-                    a["rejected_501"] += 1
-                elif p["status"] == "200":
-                    try:
-                        usage_out = int(p["usage_out"] or 0)
-                    except ValueError:
-                        usage_out = 0
-                    a["success" if usage_out > 0 else "empty"] += 1
-                else:
-                    a["other_failure"] += 1
-    except OSError:
-        return []
-    result = []
-    names = ("token", "source", "route", "tier", "supply", "target_protocol", "conversion_kind")
-    for key, agg in aggs.items():
-        result.append({**dict(zip(names, key)), **agg})
-    return sorted(result, key=lambda x: (-x["n"], tuple(x[k] for k in names)))
-
-
-def _format_protocol_conversion_traffic(items: list[dict]) -> list[str]:
-    if not items:
-        return []
-    lines = ["protocol conversions (last 7d):"]
-    for x in items:
-        n = x["n"]
-        if x["rejected_501"] == n:
-            summary = "all-501"
-        else:
-            parts = []
-            if x["empty"]:
-                parts.append(f"{x['empty']} empty")
-            failures = x["rejected_501"] + x["other_failure"]
-            if failures:
-                parts.append(f"{failures} failed")
-            summary = ", ".join(parts)
-        suffix = f" · {summary}" if summary else ""
-        lines.append(
-            f"  ⚠ {x['token']}[{x['source']}] → {x['route']}.{x['tier']} → "
-            f"{x['supply']}[{x['target_protocol']}] ({x['conversion_kind']}) n={n}{suffix}")
-    # 2026-11-06：a2r/r2a 转换链路已系统性补齐（system/strict/encrypted reasoning/
-    # 工具/终态全实测），跨协议语义损失提示不再适用，移除。
-    return lines
-
-
 def _short_supply(sid: str) -> str:
     """supply id 缩写：去掉 vendor 段（-sankuai / -openai）。
 
@@ -786,13 +712,9 @@ def _format_status_from_json(data: dict, config_path: str, totals_path: str,
         lines.extend(_format_active_sessions(load_active_sessions(log_path), cfg,
                                              session_names))
 
-    hints = data.get("protocol_conversion_hints")
-    if log_path and hints is not None:
-        conversion_lines = _format_protocol_conversion_traffic(
-            load_protocol_conversion_traffic(log_path, hints))
-        if conversion_lines:
-            lines.append("")
-            lines.extend(conversion_lines)
+    # 2026-11-06：跨协议转换链路已系统性补齐（system/strict/encrypted
+    # reasoning/工具/终态全实测），protocol conversions 专属展示段整体移除，
+    # 不再把跨协议当作需要特别提示的特殊路径。
 
     if cooldown and not cooldown_unknown:
         lines.append("")
