@@ -3033,8 +3033,15 @@ class ModelProxyHandler(BaseHTTPRequestHandler):
                 self._write_sse_chunk(pt.responses_sse_bytes(ev))
             self.wfile.write(b"0\r\n\r\n")
             self.wfile.flush()
+            # Responses builtin 回执成功封口：与 Anthropic builtin 同口径。
+            self._acc["stop_reason"] = "end_turn"
+            self._acc["response_committed"] = 1
+            self._acc["stream_integrity"] = "valid"
+            self._acc["terminal_status"] = "completed"
+            self._acc["terminal_reason"] = "end_turn"
         except (BrokenPipeError, ConnectionResetError):
-            pass
+            self._acc["response_committed"] = 1
+            self._acc["stream_integrity"] = "client_disconnect"
 
     def _write_builtin_responses_buffered_response(self, receipt_text: str,
                                                      request_model) -> None:
@@ -3066,6 +3073,12 @@ class ModelProxyHandler(BaseHTTPRequestHandler):
         self._write_buffered_response(
             200, [("Content-Type", "application/json")],
             json.dumps(resp, ensure_ascii=False).encode("utf-8"))
+        # Responses builtin 非流式成功收口：与流式同口径。
+        self._acc["stop_reason"] = "end_turn"
+        self._acc["response_committed"] = 1
+        self._acc["stream_integrity"] = "valid"
+        self._acc["terminal_status"] = "completed"
+        self._acc["terminal_reason"] = "end_turn"
 
     def _write_builtin_stream_response(self, receipt_text: str, request_model) -> None:
         """自造 anthropic 流式回执（§3.2 事件序列），复用 translate.py 既有事件构造
@@ -3093,8 +3106,16 @@ class ModelProxyHandler(BaseHTTPRequestHandler):
                 self._write_sse_chunk(pt.anthropic_sse_bytes(ev))
             self.wfile.write(b"0\r\n\r\n")
             self.wfile.flush()
+            # builtin 回执成功封口：显式记终态，避免统一 finally 兜底误标
+            # invalid/open/internal_escape（2026-11-06 实测发现）。
+            self._acc["stop_reason"] = "end_turn"
+            self._acc["response_committed"] = 1
+            self._acc["stream_integrity"] = "valid"
+            self._acc["terminal_status"] = "completed"
+            self._acc["terminal_reason"] = "end_turn"
         except (BrokenPipeError, ConnectionResetError):
-            pass
+            self._acc["response_committed"] = 1
+            self._acc["stream_integrity"] = "client_disconnect"
 
     def _write_builtin_buffered_response(self, receipt_text: str, request_model) -> None:
         """自造 anthropic 非流式回执（§3.4）。"""
@@ -3116,6 +3137,12 @@ class ModelProxyHandler(BaseHTTPRequestHandler):
         self._write_buffered_response(
             200, [("Content-Type", "application/json")],
             json.dumps(resp, ensure_ascii=False).encode("utf-8"))
+        # builtin 回执成功收口：同流式口径（§ P1 观测修复）。
+        self._acc["stop_reason"] = "end_turn"
+        self._acc["response_committed"] = 1
+        self._acc["stream_integrity"] = "valid"
+        self._acc["terminal_status"] = "completed"
+        self._acc["terminal_reason"] = "end_turn"
 
     # ------------------------------------------------------------------
     # control API dispatch
