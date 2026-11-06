@@ -1089,7 +1089,7 @@ def test_B_tool_use_response():
     eq(out["status"], "completed", "B tool_use 仍 status=completed")
     item = out["output"][0]
     eq(item["type"], "function_call", "B item type=function_call")
-    check(item["id"].startswith("item_"), "B function_call item id item_ 前缀")
+    check(item["id"].startswith("fc_"), "B function_call item id fc_ 前缀")
     eq(item["call_id"], "call_TVk", "B call_id 透传 tool_use.id")
     eq(item["name"], "get_weather", "B name 透传")
     # arguments 必须是 JSON 字符串（不是 dict）
@@ -1350,7 +1350,7 @@ def test_C_tool_stream():
     eq(added_items[0]["output_index"], 0, "C reasoning item output_index 0")
     added = added_items[1]
     eq(added["output_index"], 1, "C 工具 output_index 顺延到 1")
-    check(added["item"]["id"].startswith("item_"), "C function_call item id item_ 前缀")
+    check(added["item"]["id"].startswith("fc_"), "C function_call item id fc_ 前缀")
     eq(added["item"]["call_id"], "toolu_01", "C call_id 透传 tool_use.id")
     eq(added["item"]["name"], "get_weather", "C name 透传")
     eq(added["item"]["arguments"], "", "C added 初始 arguments 空串")
@@ -1533,8 +1533,8 @@ def test_id_formats():
           "id resp_ + 32 hex")
     check(pt.gen_message_id().startswith("msg_") and len(pt.gen_message_id()) == 4 + 32,
           "id msg_ + 32 hex")
-    check(pt.gen_item_id().startswith("item_") and len(pt.gen_item_id()) == 5 + 32,
-          "id item_ + 32 hex")
+    check(pt.gen_item_id().startswith("fc_") and len(pt.gen_item_id()) == 3 + 32,
+          "id fc_ + 32 hex")
     check(pt.gen_call_id().startswith("call_") and len(pt.gen_call_id()) == 5 + 24,
           "id call_ + 24 hex（兜底）")
 

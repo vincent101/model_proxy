@@ -590,7 +590,11 @@ def gen_message_id() -> str:
 
 
 def gen_item_id() -> str:
-    return "item_" + secrets.token_hex(16)      # function_call item id
+    # fc_ 前缀：Responses 上游对 function_call item.id 有前缀校验（2026-11-06
+    # 实测 terra 拒绝 item_ 前缀 "Expected an ID that begins with 'fc'"）。
+    # r2a 产出的 item.id 会随 codex 历史回放到其他 Responses 上游，必须用
+    # 跨上游兼容的标准前缀。
+    return "fc_" + secrets.token_hex(16)      # function_call item id
 
 
 def gen_call_id() -> str:
