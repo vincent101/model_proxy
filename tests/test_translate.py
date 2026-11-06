@@ -1645,26 +1645,43 @@ class TestARRequest(unittest.TestCase):
         ])
         self.assertEqual(adapter.final_stop_reason, "max_tokens")
 
-    def test_ar_unknown_system_message_role_dropped_with_details(self):
-        """P1 定位：messages 里的 system 不是标准 Anthropic 输入 role，
-        当前策略仍是丢弃，但要留 index/role/size/preview 定位内容。"""
+    def test_ar_system_message_in_messages_preserved_in_order(self):
+        """Phase 2：messages 里的 system 消息按位置原样透传为 Responses
+        input message(role=system)，不再丢弃（2026-11-06 上游实测接受）。"""
+        body = {"messages": [
+            {"role": "user", "content": "hello"},
+            {"role": "system", "content": "hidden-system-context"},
+            {"role": "user", "content": "hi"},
+        ]}
+        rb, _ = pt.anthropic_to_responses_request(body)
+        self.assertEqual(rb["input"], [
+            {"type": "message", "role": "user",
+             "content": [{"type": "input_text", "text": "hello"}]},
+            {"type": "message", "role": "system",
+             "content": [{"type": "input_text", "text": "hidden-system-context"}]},
+            {"type": "message", "role": "user",
+             "content": [{"type": "input_text", "text": "hi"}]},
+        ])
+
+    def test_ar_system_message_blocks_preserved(self):
+        """Phase 2：system 消息 block 数组取 text 块透传；非 text 块丢弃
+        并保留 unsupported_system_block_a2r 告警。"""
         pt._rl._state.clear()
         body = {"messages": [
-            {"role": "system", "content": "hidden-system-context"},
+            {"role": "system", "content": [
+                {"type": "text", "text": "sys-text"},
+                {"type": "unknown_block", "foo": 1},
+            ]},
             {"role": "user", "content": "hi"},
         ]}
         with self.assertLogs("core.translate", level="WARNING") as cap:
             rb, _ = pt.anthropic_to_responses_request(body)
         joined = "\n".join(r.getMessage() for r in cap.records)
-        self.assertIn("unknown message role dropped (a2r)", joined)
-        self.assertIn("index=1", joined)
-        self.assertIn("role='system'", joined)
-        self.assertIn("chars=21", joined)
-        self.assertIn("hidden-system-context", joined)
-        self.assertEqual(rb["input"], [
-            {"type": "message", "role": "user",
-             "content": [{"type": "input_text", "text": "hi"}]},
-        ])
+        self.assertIn("unsupported system content block dropped (a2r)", joined)
+        self.assertEqual(rb["input"][0], {
+            "type": "message", "role": "system",
+            "content": [{"type": "input_text", "text": "sys-text"}],
+        })
 
     def test_ar_user_text_to_input_message(self):
         body = {"messages": [{"role": "user", "content": "hello"}]}

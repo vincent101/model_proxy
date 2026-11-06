@@ -2410,6 +2410,32 @@ def _messages_to_input(messages, tool_name_mapping: dict) -> list:
         role = msg.get("role")
         content = msg.get("content")
 
+        if role == "system":
+            # Phase 2 前提验证（2026-11-06 上游实测）：Responses input 接受
+            # role=system 的 message item 且内容可达；按消息顺序原样透传，
+            # 不并入 instructions（保留位置语义，E3b 实测 mid-conversation
+            # system 生效）。
+            if isinstance(content, str):
+                if content:
+                    items.append({
+                        "type": "message", "role": "system",
+                        "content": [{"type": "input_text", "text": content}],
+                    })
+                continue
+            sys_parts = []
+            for block in content or []:
+                if not isinstance(block, dict):
+                    continue
+                bt = block.get("type")
+                if bt == "text":
+                    sys_parts.append({"type": "input_text", "text": block.get("text", "")})
+                else:
+                    _rl.warning("unsupported_system_block_a2r", logger,
+                                "unsupported system content block dropped (a2r): %r", bt)
+            if sys_parts:
+                items.append({"type": "message", "role": "system", "content": sys_parts})
+            continue
+
         if role == "user":
             if isinstance(content, str):
                 if content:
