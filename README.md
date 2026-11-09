@@ -322,6 +322,16 @@ nc -vz <主机名>.local 18889   # 三端口各测一次；通则 TCP 可达
 - 已支持五种协议组合的转发/转换：anthropic→anthropic、responses→responses（均字节透传，含
   thinking 方言自适应）、anthropic→chat、anthropic→responses、responses→anthropic（经
   `core/translate.py` 转换）。其余组合返回 501。
+- **跨协议语义保真（2026-11-06 全向补齐）**：a2r/r2a 双向支持 messages/input 内 system 消息
+  按位置透传（原先静默丢弃）；工具 strict 语义 supply 级保真（Responses 上游缺省 strict:false +
+  学习升级）；r2a 生成 function_call item id 用 `fc_` 前缀（跨上游历史回放兼容）。
+- **转换链路观测**：a2r/r2a 的 ACCESS 行补齐 `stop_reason` / `first_event_ms` /
+  `terminal_status`；builtin（`$route`）回执正确记录终态。跨协议链路已系统性实测无损
+  （system/strict/encrypted reasoning/工具/终态），2026-11-06 起 CLI status 不再对
+  跨协议路径做特别风险提示。
+- **流式首事件及时性（Phase D）**：`HTTPResponse.read(amt)` 在 chunked 流上会跨块累积，
+  导致转换链路首事件延迟到流近结束；四个流式 writer 已改用 `read1` 单次读取
+  （实测 r2a 首事件 p50 从 ~14.9s 降至 ~1.5-3.5s）。
 - cross-supply failover：上游 401/403/429/5xx 触发对应 supply 冷却并按 route 顺序切换到下一个
   supply（不限协议，跨供给单元）。
 - thinking/effort 方言自适应：Anthropic 有 `enabled`/`adaptive` 双变体，默认 `adaptive`；识别
@@ -372,12 +382,23 @@ nc -vz <主机名>.local 18889   # 三端口各测一次；通则 TCP 可达
 - 只在 Claude Code 会话启动时（SessionStart hook）拉起一次，会话运行期间进程崩溃不会自动
   重启/自愈，需手动 `on`。
 - 反向（responses→anthropic、chat→anthropic）的 reasoning→thinking 回传：2026-08-07 已补齐（①b
-  + ①b-chat 镜像），上游 reasoning 内容块会回传为 anthropic thinking block（th_chars>0）。**已知
-  限制**：产出的 thinking block 没有 `signature` 字段（正向转换不保留 signature_delta，反向无来源）
-  ——对只读评估无影响，对会把 thinking 回传上游的多轮客户端（Claude Code）是已知限制。
+  + ①b-chat 镜像），上游 reasoning 内容块会回传为 anthropic thinking block。**2026-11-06 起加密
+  回传闭环**：a2r（anthropic→responses）方向，Responses 上游的 `encrypted_content` 会藏入
+  thinking block 的 `signature`（`resp:` 前缀），客户端历史回显时代理还原为 reasoning item，
+  多轮推理连续性保持（上游实测 `include:["reasoning.encrypted_content"]` 通道）；
+  passthrough 出站前剥离 `resp:` 伪签名块防跨协议泄漏。真 Anthropic 签名（非 resp: 前缀）
+  跨协议时仍丢弃（上游无对应验签语义，属协议不对等的结构性限制）。
 - 未接入自动化测试覆盖真实上游网络调用（转换器单测均为脱网络单测，转发编排本身未做端到端自动化
   测试，依赖手动 curl 验证）。
 - effort 探测（`supply test`）解析结果不保证准确，仅供人工审阅参考。
+- **astra 加密块间歇解密失败**（2026-11-07~09 观测）：`openai-astra-sankuai-2023` 偶发
+  400 `invalid_encrypted_content`（3 天 32 次 / 约 5 万笔 a2r 的 0.06%），因 fable 档无
+  failover 兜底全部 503，15s~2min 自愈。直接实验已排除「跨 supply 加密域不兼容」与
+  「代理损坏密文」（sol→astra 回传、8.6k 长块原文回传均成功）；根因定位中，
+  已备学习式剥离预案，再遇到时按预案继续定位（详见
+  [设计记录](docs/designs/2026-11-09-astra加密块间歇解密失败与学习式剥离预案.md)）。
+- count_tokens 端点 404：mcli 系网关不支持 `/v1/messages/count_tokens`（Claude Code 的
+  token 计数功能），仅观测噪音，不影响对话请求。
 
 ## 附录 A: 目录结构
 
@@ -420,3 +441,6 @@ tools/model_proxy/
 | 协议转换规格 | Anthropic⇄Chat/Responses⇄Anthropic 字段映射 | docs/designs/model_proxy_translate_spec.md |
 | 设计记录 | 当期设计决策 | docs/designs/ |
 | 历史归档 | 已完成/已替代设计 | docs/archive/ |
+
+当期重点设计记录：[跨协议保真与流质量](docs/designs/2026-11-05-modelproxy-protocol-and-stream-quality.md)、
+[astra 加密块间歇失败预案](docs/designs/2026-11-09-astra加密块间歇解密失败与学习式剥离预案.md)。

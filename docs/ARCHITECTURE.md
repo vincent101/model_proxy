@@ -107,6 +107,28 @@
 关键点：入站阶段代理不关心客户端把 base_url 后面拼了什么 path（③ 用 body.model
 选 tier，出站 ⑤ 只用配置的 `supply.url`），所以各 SDK 的 path 拼接差异不影响转发目标。
 
+### 跨协议语义保真（2026-11-06 全向补齐）
+
+转换组合（a2r/r2a/a2chat 等）在字段映射之外维护以下保真机制：
+
+- **messages 内 system 消息**：a2r 把 `role="system"` 的消息按位置转为 Responses
+  input 的 `role:"system"` message item（上游实测内容可达、mid-conversation 生效）；
+  r2a 反向同理（含 developer role）。此前静默丢弃导致 "Today's date" 类注入失效。
+- **encrypted reasoning 回传**：a2r 出站请求带 `include:["reasoning.encrypted_content"]`；
+  响应侧把 reasoning item 的 `encrypted_content` 藏入 thinking block 的 `signature`
+  （`resp:` 前缀），客户端历史回显时代理还原为 reasoning item（闭环实测：上游能基于
+  回传推理继续计算）。passthrough（anthropic 上游）出站前剥离 `resp:` 伪签名块防泄漏。
+- **工具 strict 语义**：Responses 上游对省略 strict 的工具做严格化规范化（实测会把
+  optional 字段扩进 required，模型填齐 Agent isolation 等可选参数）。a2r 出站默认
+  `strict:false`；源工具显式声明优先；`ToolStrictStore` 支持从 strict 类 400 学习
+  升级到 `strict:true`（48h TTL，同 ThinkingStripStore 模式）。
+- **r2a item ID 前缀**：生成 function_call item id 用 `fc_` 前缀（Responses 上游
+  校验），跨上游历史回放不再 400。
+- **流式首事件（Phase D）**：`HTTPResponse.read(amt)` 在 chunked 流上跨块累积到 amt
+  才返回，首事件被压到流近结束；四个流式 writer 改用 `read1`（`_read_stream_chunk`）
+  单次读取。fake/mock response 无 read1 属性时回退 read；read1 返回非 bytes 时回退
+  （MagicMock 防护）。
+
 ## 6. 启动与停止
 
 ```bash
