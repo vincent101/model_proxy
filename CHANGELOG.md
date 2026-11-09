@@ -1,5 +1,41 @@
 # Changelog
 
+## 0.13 (2026-11-09)
+
+### 跨协议链路语义保真与观测补齐（2026-11-06，a2r/r2a 全向）
+
+- **a2r/r2r 观测补齐**：转换链路 ACCESS 行补 `stop_reason` / `first_event_ms` /
+  `terminal_status`（原先全空，跨协议请求无法观测）；上游流内 failed/error 补 WARNING 详情
+- **messages 内 system 消息透传（a2r/r2a 双向）**：ClaudeCode/codex 历史中 `role="system"`
+  的消息原先被静默丢弃（实测模型收不到，"Today's date" 类注入失效），现按位置原样透传；
+  r2a 方向同步支持 input 内 system/developer role
+- **encrypted reasoning 回传（a2r→客户端→a2r 闭环）**：Responses 上游的
+  `encrypted_content` 藏入 thinking block 的 `signature`（`resp:` 前缀），客户端历史回显时
+  代理还原为 reasoning item——多轮推理连续性保持；跨协议防护：passthrough 出站前剥离
+  `resp:` 伪签名块
+- **builtin 回执观测口径**：`$route` 等内建命令回执的 ACCESS 从误标
+  `invalid/open/internal_escape` 修正为 `valid/completed/end_turn`
+- **Phase D 读取及时性**：`HTTPResponse.read(amt)` 在 chunked 流上跨块累积到 amt 才返回，
+  转换链路首事件被压到流近结束（实测 first_event_ms/total p50≈0.86）；改为 `read1`
+  单次读取，首事件 p50 从 ~14.9s（r2a）降至 ~1.5-3.5s；三门槛合成验证（D1 及时性 /
+  D2 字节等价 / D3 吞吐不退化）
+- **工具 strict 语义保真（supply 级学习）**：Responses 上游对省略 strict 的工具做严格化
+  规范化（实测 sol 把 optional 字段扩进 required，模型自行填齐 Agent isolation 等
+  可选参数）；a2r 出站默认 `strict:false` 保住可选参数语义；源工具显式声明优先；
+  `ToolStrictStore` 支持从上游 strict 类 400 学习升级（48h TTL 自愈）
+- **r2a item ID 前缀**：生成的 function_call item id 从 `item_` 改为 `fc_`
+  （Responses 上游校验 fc 前缀，旧前缀导致跨上游历史回放 400）
+- **CLI status**：active sessions 行增加 `[token]` client 标注（区分 ClaudeCode/Codex）；
+  移除 protocol conversions 专属段与跨协议风险 hint（链路已无损，不再特别展示）；
+  route 后 strategy token 括注移除（与 client 标注重复）
+
+### 已知事项
+
+- astra 加密块间歇解密失败（0.06%，32 次/3 天，均 503 后自愈）：根因定位中，
+  已备学习式剥离预案（docs/designs/2026-11-09-astra加密块间歇解密失败与学习式剥离预案.md），
+  再遇到时按预案 §4 继续定位
+- count_tokens 404（mcli 网关对该端点不支持）：仅观测噪音，不影响对话
+
 ## 0.12 (2026-10-10)
 
 ### 新功能：正文错误识别——mcli 200+错误文本转 failover/冷却（2026-10-10）
