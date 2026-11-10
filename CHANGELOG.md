@@ -35,6 +35,15 @@
   的 count_tokens 请求本地直接返 404（0ms），不打上游。客户端行为不变（CC 拿不到就本地
   估算）；支持该端点的其他 supply（如 ds-flash 返回 `{"input_tokens":N}`）不受影响。
 
+- **存量 item_ id 出站规范化（2026-11-10）**：r2a 早期生成的 function_call item id 为
+  `item_` 前缀（规范要求 `fc_`，已由 cd0cd49 修正生成侧），但**存量 codex session 历史**
+  里仍是旧前缀，回放到 responses 上游（terra/sol）时上游校验前缀直接 400
+  （"Expected an ID that begins with 'fc'"），每次白耗一次 failover（11-10 单 session 42 次）。
+  新增 `core/item_id_normalize.py`：responses 目标出站前把 `function_call`/`custom_tool_call`
+  的 `item_` id 前缀改写为 `fc_`（保留原 hex、不动 `call_id`，配对安全已上游实测），
+  仅改出站副本、不改客户端数据；`target == "responses"` 门控，anthropic 上游零影响。
+  属无条件规范化（本方历史格式不合规，非上游怪癖，无需 learn/TTL）。
+
 ### 已知事项
 
 - astra 加密块间歇解密失败（0.06%，32 次/3 天，均 503 后自愈）：根因定位中，
