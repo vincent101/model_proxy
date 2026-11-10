@@ -29,6 +29,12 @@
   移除 protocol conversions 专属段与跨协议风险 hint（链路已无损，不再特别展示）；
   route 后 strategy token 括注移除（与 client 标注重复）
 
+- **count_tokens 404 本地短接**：mcli 系网关不支持 `/v1/messages/count_tokens`（实测直接
+  404），原实现每笔请求白跑一次上游往返（avg 178ms，11-10 单日 444 笔）。新增
+  `CountTokensUnsupportedStore`（supply 级学习，48h TTL）：首次 404 后 learn，后续该 supply
+  的 count_tokens 请求本地直接返 404（0ms），不打上游。客户端行为不变（CC 拿不到就本地
+  估算）；支持该端点的其他 supply（如 ds-flash 返回 `{"input_tokens":N}`）不受影响。
+
 ### 已知事项
 
 - astra 加密块间歇解密失败（0.06%，32 次/3 天，均 503 后自愈）：根因定位中，
