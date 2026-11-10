@@ -1,4 +1,11 @@
-"""Responses guard removal: synthetic upstream only, no real HTTP or configuration."""
+"""Responses guard removal: synthetic upstream only, no real HTTP or configuration.
+
+2026-11-10 更新：新增「出站无条件规范化 item_ → fc_ 前缀」（core/item_id_normalize）。
+本文件守卫的不变量随之收敛为：
+- 400 不做 ID guard 重试（attempts / failover / cooldown 行为不变）；
+- 不注入 store、不改 call_id、不动 reasoning/message 的 id；
+- 出站 body 除 target_model 替换 + 旧前缀规范化外，其余字段一字不改。
+"""
 
 import io
 import json
@@ -82,8 +89,22 @@ class TestResponsesGuardRemoval(unittest.TestCase):
         urls = [call.args[0].full_url for call in upstream.call_args_list]
         return handler, cooldown, sent, urls, line, warning_text
 
-    def _assert_untouched(self, original, sent):
-        expected = dict(original, model="m1")  # existing target_model substitution
+    @staticmethod
+    def _expect_forwarded(original):
+        """期望的出站 body：target_model 替换 + 旧 item_ id 规范化（其他不动）。"""
+        expected = json.loads(json.dumps(original))  # deep copy
+        expected["model"] = "m1"
+        for item in expected.get("input") or []:
+            if not isinstance(item, dict):
+                continue
+            if item.get("type") in ("function_call", "custom_tool_call"):
+                iid = item.get("id")
+                if isinstance(iid, str) and iid.startswith("item_"):
+                    item["id"] = "fc_" + iid[len("item_"):]
+        return expected
+
+    def _assert_forwarded(self, original, sent):
+        expected = self._expect_forwarded(original)
         for outgoing in sent:
             self.assertEqual(outgoing, expected)
 
@@ -105,10 +126,11 @@ class TestResponsesGuardRemoval(unittest.TestCase):
                       "terminal_status= ", "terminal_reason= ", "first_event_ms="):
             self.assertIn(field, line)
 
-    def test_id_rejection_failover_off_no_retry_or_rewrite(self):
+    def test_id_rejection_failover_off_no_retry(self):
+        """400 不触发 ID guard 重试（历史上已撤除）；出站仅做前缀规范化，不改其他。"""
         body = _body(False)
         h, cd, sent, urls, line, warnings = self._run_case(body, "off", _ID_ERROR)
-        self._assert_untouched(body, sent)
+        self._assert_forwarded(body, sent)
         self.assertEqual(urls, ["http://s1.invalid/v1/responses"])
         self.assertEqual(cd.calls, [])
         self._assert_observation(h, line, warnings, 1, 400)
@@ -118,7 +140,7 @@ class TestResponsesGuardRemoval(unittest.TestCase):
             with self.subTest(store=store):
                 body = _body(store)
                 h, cd, sent, urls, line, warnings = self._run_case(body, "off", _STORE_ERROR)
-                self._assert_untouched(body, sent)
+                self._assert_forwarded(body, sent)
                 self.assertEqual(urls, ["http://s1.invalid/v1/responses"])
                 self.assertEqual(cd.calls, [])
                 self._assert_observation(h, line, warnings, 1, 400)
@@ -129,7 +151,7 @@ class TestResponsesGuardRemoval(unittest.TestCase):
                 with self.subTest(error=error, store=store):
                     body = _body(store)
                     h, cd, sent, urls, line, warnings = self._run_case(body, "on", error)
-                    self._assert_untouched(body, sent)
+                    self._assert_forwarded(body, sent)
                     self.assertEqual(urls, ["http://s1.invalid/v1/responses",
                                             "http://s2.invalid/v1/responses"])
                     self.assertEqual(cd.calls, [("s1", 60, "http_400")])
@@ -141,7 +163,7 @@ class TestResponsesGuardRemoval(unittest.TestCase):
             with self.subTest(store=store):
                 body = _body(store)
                 h, cd, sent, urls, line, warnings = self._run_case(body, "off")
-                self._assert_untouched(body, sent)
+                self._assert_forwarded(body, sent)
                 self.assertEqual(urls, ["http://s1.invalid/v1/responses"])
                 self.assertEqual(cd.calls, [])
                 self._assert_observation(h, line, warnings, 1, 200)
