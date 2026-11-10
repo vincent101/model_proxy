@@ -128,3 +128,33 @@ def is_strict_mode_rejection(resp_body: bytes) -> bool:
     if "strict" in t:
         return True
     return "additionalproperties" in t and "required" in t
+
+
+class CountTokensUnsupportedStore:
+    """supply_id → {"at": float}，TTL 48h（对齐 ThinkingStripStore/ToolStrictStore）。
+
+    语义：该 anthropic 上游不支持 `/v1/messages/count_tokens` 端点（实测 mcli 返 404）。
+    - 未 learn：正常转发到上游（其他网关可能支持，不能预设不支持）。
+    - learn 后：该 supply 的 count_tokens 请求直接本地返 404，不打上游
+      （省一次无用往返 + 日志噪音；客户端行为不变——CC 拿不到就本地估算）。
+
+    线程安全（Lock），内存态，重启丢失可接受（重启后首次请求吃一次 404 再 learn，
+    自愈——与 ThinkingStripStore 相同取舍）。
+    """
+
+    _TTL = 48 * 3600
+
+    def __init__(self):
+        self._cache: dict[str, dict] = {}
+        self._lock = threading.Lock()
+
+    def snapshot(self, supply_id: str) -> bool:
+        """该 supply 是否已学到不支持 count_tokens；过期或未学到返回 False。"""
+        with self._lock:
+            entry = self._cache.get(supply_id)
+            return bool(entry and time.time() - entry["at"] < self._TTL)
+
+    def learn(self, supply_id: str) -> None:
+        with self._lock:
+            self._cache[supply_id] = {"at": time.time()}
+        log.info("count_tokens_unsupported.learn: supply=%r (cached 48h)", supply_id)

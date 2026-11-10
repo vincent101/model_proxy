@@ -36,6 +36,7 @@ from . import claudian_titles
 from . import session_identity
 from . import translate as pt
 from .thinking_guard import (
+    CountTokensUnsupportedStore,
     ThinkingStripStore,
     ToolStrictStore,
     is_invalid_signature_rejection,
@@ -1976,6 +1977,16 @@ class ModelProxyHandler(BaseHTTPRequestHandler):
             self._acc["attempts"] += 1
             self._acc["target_protocol"] = target
             self._acc["conversion_kind"] = protocol_conversion_kind("anthropic", target)
+            # 该 supply 已学到不支持 count_tokens → 本地直接 404，不打上游
+            # （实测 mcli 返 404；客户端拿不到即本地估算，行为等价，省一次往返）。
+            _ct_store = getattr(self.server, "count_tokens_store", None)
+            if _ct_store is not None and _ct_store.snapshot(sid):
+                self._acc["final_error"] = "count_tokens_unsupported_local"
+                self._write_buffered_response(
+                    404, [], error_body_for_source(
+                        "anthropic", 404,
+                        f"count_tokens not supported by supply {sid} (short-circuited)"))
+                return
             try:
                 target_url = build_target_url(supply.get("url", ""), self.path, OP_COUNT_TOKENS)
             except ValueError as e:
@@ -2018,6 +2029,13 @@ class ModelProxyHandler(BaseHTTPRequestHandler):
                 status = e.code
                 resp_headers = list(e.headers.items())
                 resp_body = e.read()
+                # count_tokens 404 = 该 supply 不支持该端点（实测 mcli）→ learn，
+                # 后续请求本地短接（不打上游、不 cooldown/failover——非故障）。
+                if status == 404:
+                    _ct_store = getattr(self.server, "count_tokens_store", None)
+                    if _ct_store is not None:
+                        _ct_store.learn(sid)
+                        log.info("count_tokens_unsupported.learn: supply=%s (404)", sid)
                 secs = resolve_cooldown_seconds(status, cs)
                 if failover == "on" and secs is not None:
                     self._acc["failover"] = 1
@@ -3759,6 +3777,8 @@ def main():
     server.thinking_strip_store = thinking_strip_store  # type: ignore[attr-defined]
     tool_strict_store = ToolStrictStore()
     server.tool_strict_store = tool_strict_store  # type: ignore[attr-defined]
+    count_tokens_store = CountTokensUnsupportedStore()
+    server.count_tokens_store = count_tokens_store  # type: ignore[attr-defined]
     server.sidecar_store = sidecar_store  # type: ignore[attr-defined]
     # Host 头校验仅 listen.host 非 loopback 时装配（None = 未启用，loopback 无暴露面）
     server.host_validator = (  # type: ignore[attr-defined]

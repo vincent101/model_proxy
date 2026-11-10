@@ -19,6 +19,7 @@ from unittest.mock import patch
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from core.thinking_guard import (  # noqa: E402
+    CountTokensUnsupportedStore,
     ThinkingStripStore,
     ToolStrictStore,
     is_strict_mode_rejection,
@@ -234,3 +235,24 @@ class TestStrictModeRejection(unittest.TestCase):
 
     def test_empty_body(self):
         self.assertFalse(is_strict_mode_rejection(b""))
+
+
+class TestCountTokensUnsupportedStore(unittest.TestCase):
+    """supply 级 count_tokens 不支持标记（mcli 返 404，learn 后本地短接）。"""
+
+    def test_default_false(self):
+        store = CountTokensUnsupportedStore()
+        self.assertFalse(store.snapshot("any"))
+
+    def test_learn_then_snapshot(self):
+        store = CountTokensUnsupportedStore()
+        store.learn("mcli-a")
+        self.assertTrue(store.snapshot("mcli-a"))
+        self.assertFalse(store.snapshot("mcli-b"))  # supply 隔离
+
+    def test_expiry(self):
+        store = CountTokensUnsupportedStore()
+        store.learn("mcli-a")
+        with store._lock:
+            store._cache["mcli-a"]["at"] = 0
+        self.assertFalse(store.snapshot("mcli-a"))
