@@ -35,6 +35,7 @@ from typing import Any, Callable
 from . import claudian_titles
 from . import session_identity
 from . import translate as pt
+from .item_id_normalize import normalize_responses_item_ids
 from .thinking_guard import (
     CountTokensUnsupportedStore,
     ThinkingStripStore,
@@ -2448,6 +2449,17 @@ class ModelProxyHandler(BaseHTTPRequestHandler):
                         if _n:
                             log.warning("thinking_strip: supply=%s removed %d empty-signature thinking blocks",
                                         supply_id, _n)
+                            send_body = json.dumps(body_json, ensure_ascii=False).encode("utf-8")
+                    # responses 上游：历史 function_call item id 前缀规范化（item_ → fc_）。
+                    # 无条件修（本方历史格式不合规，非上游怪癖）：存量 codex 历史里的旧
+                    # item_ id 会让 terra/sol 直接 400（上游校验 fc 前缀）。仅影响出站副本。
+                    # 门控按目标协议（非 supply id）：未来新增 responses 上游自动覆盖，
+                    # anthropic 上游不受影响（其 id 字段在 r2a 转换时根本不使用）。
+                    if target == "responses" and isinstance(body_json, dict):
+                        _nid = normalize_responses_item_ids(body_json)
+                        if _nid:
+                            log.info("item_id_normalize: supply=%s rewritten %d legacy item_ ids",
+                                     supply_id, _nid)
                             send_body = json.dumps(body_json, ensure_ascii=False).encode("utf-8")
                     # reasoning 字段按目标 capability 相对映射后原地 merge（含 anthropic→anthropic 与
                     # responses→responses：source==target 时 syntax_adapt 的 variant 就是该协议唯一/
