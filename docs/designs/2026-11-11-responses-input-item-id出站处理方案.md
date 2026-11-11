@@ -2,7 +2,7 @@
 created: 2026-11-11
 modified: 2026-11-11
 type: design-decision
-status: draft
+status: confirmed
 target: /Users/vincentwang/Documents/NoteVault/tools/model_proxy
 tags:
   - architect
