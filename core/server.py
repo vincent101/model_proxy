@@ -35,7 +35,7 @@ from typing import Any, Callable
 from . import claudian_titles
 from . import session_identity
 from . import translate as pt
-from .item_id_normalize import normalize_responses_item_ids
+from .item_id_normalize import sanitize_responses_input_ids
 from .thinking_guard import (
     CountTokensUnsupportedStore,
     ThinkingStripStore,
@@ -2450,17 +2450,27 @@ class ModelProxyHandler(BaseHTTPRequestHandler):
                             log.warning("thinking_strip: supply=%s removed %d empty-signature thinking blocks",
                                         supply_id, _n)
                             send_body = json.dumps(body_json, ensure_ascii=False).encode("utf-8")
-                    # responses 上游：历史 function_call item id 前缀规范化（item_ → fc_）。
-                    # 无条件修（本方历史格式不合规，非上游怪癖）：存量 codex 历史里的旧
-                    # item_ id 会让 terra/sol 直接 400（上游校验 fc 前缀）。仅影响出站副本。
-                    # 门控按目标协议（非 supply id）：未来新增 responses 上游自动覆盖，
-                    # anthropic 上游不受影响（其 id 字段在 r2a 转换时根本不使用）。
+                    # responses 上游：剥离 input item 上无法兑现的 id（2026-11-11）。
+                    # 上游对 item id 有两条独立校验：前缀（fc_/msg_/rs_）与存在性/绑定
+                    # （encrypted_content 内部 item_id 必须与声明 id 一致）。改名只能过第一条，
+                    # 而代理生成的 id 与密文内部 id 永不可能匹配（gen_reasoning_id 是随机值），
+                    # 故改名是把不合规伪装得更隐蔽，剥离才是诚实解。
+                    # 实测（terra）：伪造 rs_ id + 真实 encrypted_content → 400
+                    # "item_id did not match"；同一密文不带 id → 200。
+                    # 引用形态（item_reference / 裸 id）豁免：剥离会变成空 item。
+                    # 门控按目标协议（非 supply/store）：协议级不变量；store 缺省 true 且
+                    # failover 换 supply 后 id 必悬空，按 store 分流会让 failover 失效。
                     if target == "responses" and isinstance(body_json, dict):
-                        _nid = normalize_responses_item_ids(body_json)
-                        if _nid:
-                            log.info("item_id_normalize: supply=%s rewritten %d legacy item_ ids",
-                                     supply_id, _nid)
+                        _stripped, _kept_refs = sanitize_responses_input_ids(body_json)
+                        if _stripped:
+                            log.info("input_item_id_strip: supply=%s stripped %d item ids",
+                                     supply_id, _stripped)
                             send_body = json.dumps(body_json, ensure_ascii=False).encode("utf-8")
+                        if _kept_refs:
+                            # 引用形态不剥离（会变空 item），但不保证可解析：
+                            # 交上游 fail-fast，仅以 warning 暴露。
+                            log.warning("input_item_id_strip: supply=%s kept %d reference-shaped item ids",
+                                        supply_id, _kept_refs)
                     # reasoning 字段按目标 capability 相对映射后原地 merge（含 anthropic→anthropic 与
                     # responses→responses：source==target 时 syntax_adapt 的 variant 就是该协议唯一/
                     # 学到的语法，PASSTHROUGH 不代表"不处理 reasoning"，只代表 body 结构本身不用转换）
