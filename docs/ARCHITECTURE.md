@@ -122,8 +122,11 @@
   optional 字段扩进 required，模型填齐 Agent isolation 等可选参数）。a2r 出站默认
   `strict:false`；源工具显式声明优先；`ToolStrictStore` 支持从 strict 类 400 学习
   升级到 `strict:true`（48h TTL，同 ThinkingStripStore 模式）。
-- **r2a item ID 前缀**：生成 function_call item id 用 `fc_` 前缀（Responses 上游
-  校验），跨上游历史回放不再 400。
+- **r2a item ID 前缀**：生成 function_call item id 用 `fc_` 前缀（Responses 上游校验前缀）。
+- **passthrough responses 出站剥离 input item id（2026-11-11）**：上游除前缀外还校验
+  「id 是否存在 / `encrypted_content` 内部 item_id 是否与声明 id 一致」，改名过不了第二条；
+  代理生成的 id 与密文内部 id 永不匹配，故出站剥离有负载 item 的 `id`
+  （`item_reference` 等引用形态豁免）。与 a2r 的「无 id」形态对齐。
 - **流式首事件（Phase D）**：`HTTPResponse.read(amt)` 在 chunked 流上跨块累积到 amt
   才返回，首事件被压到流近结束；四个流式 writer 改用 `read1`（`_read_stream_chunk`）
   单次读取。fake/mock response 无 read1 属性时回退 read；read1 返回非 bytes 时回退

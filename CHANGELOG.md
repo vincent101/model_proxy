@@ -44,6 +44,17 @@
   仅改出站副本、不改客户端数据；`target == "responses"` 门控，anthropic 上游零影响。
   属无条件规范化（本方历史格式不合规，非上游怪癖，无需 learn/TTL）。
 
+- **Responses input item id 出站剥离（2026-11-11，取代 11-10 的前缀改名）**：上游对 item id
+  有两条独立校验——前缀（`fc_`/`msg_`/`rs_`）与存在性/绑定（`encrypted_content` 内部
+  item_id 必须与声明 id 一致）。改前缀只能过第一条：实测（terra）带伪造 `rs_` id + 真实
+  encrypted_content → 400 `Encrypted content item_id did not match the target item id`，
+  同一密文**不带 id** → 200。代理的 `gen_reasoning_id` 产出随机 id，与密文内部 id 永不可能
+  匹配；真实 id 只存在于产出它的上游存储里，proxy 无状态且 failover 会换上游，拿不到。
+  故改为 `core/item_id_normalize.sanitize_responses_input_ids`：passthrough responses 出站时
+  剥离有负载 item 的 `id`（`item_reference`／裸 id 等引用形态豁免，剥离会变空 item）；
+  不看前缀、不做类型白名单、不读 store、不改 `call_id`/`encrypted_content`。
+  与 a2r 出站形态一致（a2r 一直是「无 id」，2026-11-06 已闭环实测）。
+
 ### 已知事项
 
 - astra 加密块间歇解密失败（0.06%，32 次/3 天，均 503 后自愈）：根因定位中，

@@ -1,10 +1,10 @@
 """Responses guard removal: synthetic upstream only, no real HTTP or configuration.
 
-2026-11-10 更新：新增「出站无条件规范化 item_ → fc_ 前缀」（core/item_id_normalize）。
-本文件守卫的不变量随之收敛为：
+2026-11-11 更新：出站由「item_ → fc_ 前缀改写」收敛为「剥离无法兑现的 input item id」
+（core/item_id_normalize.sanitize_responses_input_ids）。本文件守卫的不变量：
 - 400 不做 ID guard 重试（attempts / failover / cooldown 行为不变）；
-- 不注入 store、不改 call_id、不动 reasoning/message 的 id；
-- 出站 body 除 target_model 替换 + 旧前缀规范化外，其余字段一字不改。
+- 不注入 store、不改 call_id、不动 encrypted_content / arguments / output；
+- 出站 body = target_model 替换 + 有负载 item 的 id 剥离（引用形态豁免），其余一字不改。
 """
 
 import io
@@ -89,24 +89,33 @@ class TestResponsesGuardRemoval(unittest.TestCase):
         urls = [call.args[0].full_url for call in upstream.call_args_list]
         return handler, cooldown, sent, urls, line, warning_text
 
-    @staticmethod
-    def _expect_forwarded(original):
-        """期望的出站 body：target_model 替换 + 旧 item_ id 规范化（其他不动）。"""
-        expected = json.loads(json.dumps(original))  # deep copy
-        expected["model"] = "m1"
-        for item in expected.get("input") or []:
-            if not isinstance(item, dict):
-                continue
-            if item.get("type") in ("function_call", "custom_tool_call"):
-                iid = item.get("id")
-                if isinstance(iid, str) and iid.startswith("item_"):
-                    item["id"] = "fc_" + iid[len("item_"):]
-        return expected
-
     def _assert_forwarded(self, original, sent):
-        expected = self._expect_forwarded(original)
+        """出站契约：target_model 替换 + 有负载 item 的 id 剥离（引用形态豁免）。
+
+        显式断言「源有 id 的 outgoing 必无 id」，其余字段逐项深等——不复制剥离规则，
+        避免测试镜像实现导致漂移。
+        """
+        src_items = original.get("input") or []
         for outgoing in sent:
-            self.assertEqual(outgoing, expected)
+            self.assertEqual(outgoing.get("model"), "m1")  # existing target_model substitution
+            out_items = outgoing.get("input") or []
+            self.assertEqual(len(out_items), len(src_items))
+            for src, out in zip(src_items, out_items):
+                if not isinstance(src, dict) or not isinstance(out, dict):
+                    self.assertEqual(out, src)
+                    continue
+                had_id = "id" in src
+                is_ref = src.get("type") == "item_reference"
+                if had_id and not is_ref:
+                    self.assertNotIn("id", out,
+                                     f"payload item id must be stripped: {out}")
+                if had_id and is_ref:
+                    self.assertEqual(out.get("id"), src.get("id"),
+                                     "reference-shaped id must be kept")
+                # 其余字段（call_id/arguments/output/summary/status/content/...）深等
+                src_rest = {k: v for k, v in src.items() if k != "id"}
+                out_rest = {k: v for k, v in out.items() if k != "id"}
+                self.assertEqual(out_rest, src_rest)
 
     def _assert_observation(self, handler, line, warnings, attempts, status):
         for name in ("responses_id_rewrite", "responses_store_retry"):
@@ -167,6 +176,36 @@ class TestResponsesGuardRemoval(unittest.TestCase):
                 self.assertEqual(urls, ["http://s1.invalid/v1/responses"])
                 self.assertEqual(cd.calls, [])
                 self._assert_observation(h, line, warnings, 1, 200)
+
+    def test_failover_second_round_body_also_stripped(self):
+        """failover 换 supply 后，第二轮出站 body 同样无 payload id（幂等复用 body_json）。"""
+        body = _body(False)
+        h, cd, sent, urls, line, warnings = self._run_case(body, "on", _ID_ERROR)
+        self.assertEqual(len(sent), 2)
+        self._assert_forwarded(body, sent)  # 两轮都满足剥离契约
+
+    def test_reference_shaped_item_id_kept(self):
+        """item_reference 形态豁免：id 保留（剥离会变空 item），并发 warning 计数。"""
+        body = {
+            "model": "claude-opus",
+            "input": [
+                {"type": "message", "id": "msg_keep_payload", "role": "user",
+                 "content": [{"type": "input_text", "text": "q"}]},
+                {"type": "item_reference", "id": "fc_ref_keep"},
+            ],
+        }
+        h, cd, sent, urls, line, warnings = self._run_case(body, "off")
+        self.assertEqual(len(sent), 1)
+        outgoing = sent[0]
+        self.assertEqual(outgoing["model"], "m1")
+        items = outgoing["input"]
+        # 有负载的 message id 被剥离
+        self.assertNotIn("id", items[0])
+        self.assertEqual(items[0]["content"], [{"type": "input_text", "text": "q"}])
+        # 引用形态 id 保留
+        self.assertEqual(items[1]["id"], "fc_ref_keep")
+        # 观测：kept reference 走 warning
+        self.assertIn("reference-shaped", warnings)
 
     def test_protocol_conversion_preserves_tool_use_and_result_pair(self):
         anthropic = {"model": "claude-opus", "messages": [

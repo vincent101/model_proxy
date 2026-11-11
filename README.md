@@ -399,6 +399,9 @@ nc -vz <主机名>.local 18889   # 三端口各测一次；通则 TCP 可达
   [设计记录](docs/designs/2026-11-09-astra加密块间歇解密失败与学习式剥离预案.md)）。
 - count_tokens 端点 404：mcli 系网关不支持 `/v1/messages/count_tokens`（Claude Code 的
   token 计数功能），仅观测噪音，不影响对话请求。
+- passthrough（responses→responses）出站会剥离 input item 的 `id`（`item_reference` 等
+  引用形态除外）。原因：上游除前缀外还校验 id 存在性与 `encrypted_content` 内部绑定，
+  代理无法兑现这些 id；剥离后与 a2r 的「无 id」形态一致，语义无损（配对只依赖 `call_id`）。
 
 ## 附录 A: 目录结构
 
