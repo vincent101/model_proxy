@@ -1,8 +1,8 @@
 {
   "log": ".model_proxy.log",
   "totals": ".model_proxy_totals.json",
-  "lock": "/tmp/mp_wt_strip.lock",
-  "pid": "/tmp/mp_wt_strip.pid",
-  "ensure_log": "/tmp/mp_wt_strip_ensure.log",
-  "start_lock": "/tmp/mp_wt_strip_start.lock"
+  "lock": "/tmp/model_proxy.lock",
+  "pid": "/tmp/model_proxy.pid",
+  "ensure_log": "/tmp/model_proxy_ensure.log",
+  "start_lock": "/tmp/model_proxy_start.lock"
 }
