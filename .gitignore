@@ -11,3 +11,10 @@ config/session_overrides.json.tmp*
 .pytest_cache/
 .DS_Store
 config/model_proxy_config.json.bk*
+
+# Fixed discovery state (private runtime data)
+.model_proxy_runtime/
+.runtime/
+
+# Disposable offline test fixtures
+/.isolated-run.*/

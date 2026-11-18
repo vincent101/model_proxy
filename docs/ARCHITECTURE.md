@@ -141,24 +141,26 @@ tools/model_proxy/model_proxy_cli.sh on
 或手动：
 
 ```bash
-MODEL_PROXY_PORT=18889 python3 tools/model_proxy/model_proxy.py &
+MODEL_PROXY_PORT=18889 python3 tools/model_proxy/core/cli/model_proxy.py
 ```
 
-端口默认 18889，可用 `MODEL_PROXY_PORT` 环境变量覆盖。日志写到本目录
-`.model_proxy.log`（启动时自动截断保留最后 5000 行），进程锁在
-`/tmp/model_proxy.lock`（防止同时起多个实例）。路径配置见
-`config/runtime_paths.json`。
+端口默认 18889，可用 `MODEL_PROXY_PORT` 环境变量覆盖。六个运行文件默认全部落在
+项目根 `.runtime/`：`model_proxy.log`（启动时自动截断保留最后 5000 行）、
+`model_proxy_totals.json`、`model_proxy.lock`（单实例锁）、`model_proxy.pid`、
+`model_proxy_ensure.log`、`model_proxy_start.lock`；另有 CLI 独占的 `tmp/` 与
+`backups/`。路径配置见 `config/runtime_paths.json`，`.runtime/` 由 CLI 独占创建并校验
+私有权（0700/属主/扩展属性），不写 `/tmp` 或盘根。显式选择的外部配置目标及其
+派生的 sidecar 仍按原路径写入，仅在其与项目暂存跨卷时才使用该目标父目录的私有短期暂存。
 
-`tools/model_proxy/hooker/ensure_model_proxy.sh` 已注册到 `.claude/settings.json` 的
-`hooks.SessionStart`，随 Claude Code 会话启动自动拉起（幂等：已运行则直接退出，未运行则启动
-并等待就绪最多 5 秒；PID 文件 `/tmp/model_proxy.pid`、锁 `/tmp/model_proxy_start.lock`）。
-这条 hook 的路径正确性由 `install` 流程负责
-维护——`install` 每次运行都会检测 `SessionStart` 里是否存在一条正确指向当前 model_proxy 实际
-安装位置的 hook 条目，缺失/路径错误（如目录被移动过）时清理旧条目并预览确认后补齐，不需要
-手动同步维护这条硬编码路径。
+首次初始化须在交互终端确认安装来源和旧启动者等前提。`hooker/ensure_model_proxy.sh`
+只委托同一 CLI 执行 `on`；非交互 hook 不能代替首次确认。`install` 仅在识别到标准
+vault 布局时维护 SessionStart hook，不在独立目录或 worktree 中向上猜测。
 
-停止用 `model_proxy_cli.sh off`：只按本脚本同目录下 `model_proxy.py` 的绝对路径精确匹配进程，
-并额外反查监听该端口、命令行含 `model_proxy.py` 的 PID 兜底。
+停止用 `model_proxy_cli.sh off`：核验安装路径、服务入口、PID 和进程启动身份后
+停止；不按端口或文件名宽泛杀进程。身份检查与信号并非原子操作，不承诺消除 PID
+竞争或同用户仿冒风险。`status`/`reload` 发送管理 token 前还会核验同一连接的对端。
+Windows 的锁、ACL 与控制链路共用同一份 Python 实现（`.bat` 只做解释器选择与转调），
+已在虚拟 Win32 后端回归，但尚无原生 Windows 验收，不应视为可用。
 
 ### HTTP 协议层行为（2026-08-20 起）
 

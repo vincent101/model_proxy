@@ -330,7 +330,7 @@ class TestValidateSupplyExt(unittest.TestCase):
 
     def test_appkey_and_appkey_file_mutex_raises(self):
         with self.assertRaises(ValueError):
-            validate_supply_ext(_supply(appkey_file="/tmp/kf.yaml"))
+            validate_supply_ext(_supply(appkey_file=str(Path(tempfile.gettempdir()) / "fake-kf.yaml")))
 
     def test_neither_appkey_nor_file_raises(self):
         s = _supply()
@@ -341,7 +341,7 @@ class TestValidateSupplyExt(unittest.TestCase):
     def test_appkey_file_only_ok(self):
         s = _supply()
         del s["appkey"]
-        s["appkey_file"] = "/tmp/kf.yaml"
+        s["appkey_file"] = str(Path(tempfile.gettempdir()) / "fake-kf.yaml")
         validate_supply_ext(s)
 
 
@@ -384,7 +384,7 @@ class TestResolveAppkey(unittest.TestCase):
                 resolve_appkey(s)
 
     def test_file_missing_raises(self):
-        s = {"id": "s9", "appkey_file": "/nonexistent/__no_such__.yaml"}
+        s = {"id": "s9", "appkey_file": str(Path(tempfile.gettempdir()) / "missing-fake-key.yaml")}
         with self.assertRaises(ValueError) as ctx:
             resolve_appkey(s)
         self.assertIn("s9", str(ctx.exception))
@@ -540,7 +540,7 @@ class TestAppkeyFileE2E(unittest.TestCase):
         """文件缺失：出站前 500、不触发 cooldown、错误体指向配置。"""
         s = _supply()
         del s["appkey"]
-        s["appkey_file"] = "/nonexistent/__no_such__.yaml"
+        s["appkey_file"] = str(Path(tempfile.gettempdir()) / "missing-fake-key.yaml")
         ns, cd = _make_server([s])  # failover=on + cooldown rules 含 500/502
         h = _make_handler(ns, {"model": "claude-opus", "max_tokens": 16,
                                 "messages": [{"role": "user", "content": "hi"}]})
@@ -556,7 +556,7 @@ class TestAppkeyFileE2E(unittest.TestCase):
     def test_count_tokens_missing_file_500(self):
         s = _supply()
         del s["appkey"]
-        s["appkey_file"] = "/nonexistent/__no_such__.yaml"
+        s["appkey_file"] = str(Path(tempfile.gettempdir()) / "missing-fake-key.yaml")
         ns, cd = _make_server([s])
         h = _make_handler(ns, {"model": "claude-opus",
                                 "messages": [{"role": "user", "content": "hi"}]},
@@ -581,8 +581,9 @@ class TestConfigValidationDualTrack(unittest.TestCase):
         """启动路径 fail-fast：非法配置（appkey+appkey_file 互斥）加载即抛。"""
         with tempfile.TemporaryDirectory() as d:
             p = Path(d) / "cfg.json"
-            p.write_text(json.dumps(self._cfg(_supply(appkey_file="/tmp/kf.yaml"))),
+            p.write_text(json.dumps(self._cfg(_supply(appkey_file=str(Path(tempfile.gettempdir()) / "fake-kf.yaml")))),
                          encoding="utf-8")
+            p.chmod(0o600)
             with self.assertRaises(ValueError):
                 ConfigStore(p)
 
@@ -599,6 +600,7 @@ class TestConfigValidationDualTrack(unittest.TestCase):
             with tempfile.TemporaryDirectory() as d:
                 p = Path(d) / "cfg.json"
                 p.write_text(json.dumps(self._cfg(supply)), encoding="utf-8")
+                p.chmod(0o600)
                 with self.assertRaises(ValueError):
                     ConfigStore(p)
 
@@ -607,12 +609,13 @@ class TestConfigValidationDualTrack(unittest.TestCase):
         with tempfile.TemporaryDirectory() as d:
             p = Path(d) / "cfg.json"
             p.write_text(json.dumps(self._cfg(_supply())), encoding="utf-8")
+            p.chmod(0o600)
             cs = ConfigStore(p)
             # 改写为非法配置（互斥）后强制热重载：不抛异常，新配置生效
-            p.write_text(json.dumps(self._cfg(_supply(appkey_file="/tmp/kf.yaml"))),
+            p.write_text(json.dumps(self._cfg(_supply(appkey_file=str(Path(tempfile.gettempdir()) / "fake-kf.yaml")))),
                          encoding="utf-8")
             cs.reload()
-            self.assertEqual(cs.get_supply_map()["s1"].get("appkey_file"), "/tmp/kf.yaml")
+            self.assertEqual(cs.get_supply_map()["s1"].get("appkey_file"), str(Path(tempfile.gettempdir()) / "fake-kf.yaml"))
 
     def test_legal_new_fields_load(self):
         """三新字段齐配的合法配置正常加载（mcli 形态）。"""
@@ -625,6 +628,7 @@ class TestConfigValidationDualTrack(unittest.TestCase):
         with tempfile.TemporaryDirectory() as d:
             p = Path(d) / "cfg.json"
             p.write_text(json.dumps(self._cfg(supply)), encoding="utf-8")
+            p.chmod(0o600)
             cs = ConfigStore(p)
             self.assertEqual(cs.get_supply_map()["catpaw"]["extra_headers"],
                              {"X-Working-Dir": "/"})

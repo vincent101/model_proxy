@@ -1,8 +1,8 @@
 {
-  "log": ".model_proxy.log",
-  "totals": ".model_proxy_totals.json",
-  "lock": "/tmp/model_proxy.lock",
-  "pid": "/tmp/model_proxy.pid",
-  "ensure_log": "/tmp/model_proxy_ensure.log",
-  "start_lock": "/tmp/model_proxy_start.lock"
+  "log": ".runtime/model_proxy.log",
+  "totals": ".runtime/model_proxy_totals.json",
+  "lock": ".runtime/model_proxy.lock",
+  "pid": ".runtime/model_proxy.pid",
+  "ensure_log": ".runtime/model_proxy_ensure.log",
+  "start_lock": ".runtime/model_proxy_start.lock"
 }

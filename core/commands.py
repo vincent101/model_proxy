@@ -26,6 +26,7 @@ import re
 import tempfile
 import threading
 import time
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
@@ -179,21 +180,117 @@ def _atomic_write_json(path: Path, obj: dict) -> None:
     敏感 session id，见设计文档 §4.1 对 _config_ops.atomic_write 的既有口径）。
     """
     _dir = str(path.parent)
-    fd, tmp = tempfile.mkstemp(dir=_dir, suffix=".tmp")
     try:
-        with os.fdopen(fd, "w", encoding="utf-8") as f:
+        fd, tmp = tempfile.mkstemp(dir=_dir, suffix=".tmp")
+    except BaseException as exc:
+        # An interrupted mkstemp may have allocated an unreturned descriptor.
+        interrupted = not isinstance(exc, Exception)
+        raise SidecarWriteError("UNKNOWN" if interrupted else "NOT_REPLACED",
+                                release_unknown=interrupted, close_unknown=interrupted) from None
+    replacing = False
+    fd_owned = True
+    close_unknown = False
+    try:
+        # On successful fdopen the file object owns the descriptor; never close
+        # the raw fd again after transfer, even when its close result is unclear.
+        f = os.fdopen(fd, "w", encoding="utf-8")
+        fd_owned = False
+        try:
             json.dump(obj, f, indent=2, ensure_ascii=False)
+        finally:
+            try:
+                f.close()
+            except BaseException:
+                close_unknown = True
+                raise
+        replacing = True
         os.replace(tmp, str(path))
-    except Exception:
+        os.chmod(path, 0o600)
+    except BaseException:
+        if fd_owned:
+            try:
+                os.close(fd)
+            except BaseException:
+                close_unknown = True
+        cleanup_unknown = False
         try:
             os.unlink(tmp)
-        except OSError:
+        except FileNotFoundError:
             pass
-        raise
+        except BaseException:
+            cleanup_unknown = True
+        raise SidecarWriteError(
+            "UNKNOWN" if replacing or close_unknown or cleanup_unknown else "NOT_REPLACED",
+            release_unknown=close_unknown, close_unknown=close_unknown,
+            cleanup_unknown=cleanup_unknown) from None
+
+
+@dataclass(frozen=True)
+class SidecarSnapshot:
+    """Adapter-verified stable bytes and opaque parent/target/protection evidence.
+
+    ``contents=None`` means *proved absent*, not a failed read. ``identity`` must
+    identify the protected parent and either the single-link target or its proved
+    absence; equality must include all relevant protection evidence. The adapter
+    owns verification and resource-release checks; this class cannot prove them.
+    """
+    contents: bytes | None = field(repr=False)
+    identity: Any = field(repr=False)
+    mtime: float = 0.0
+
+
+class SidecarWriteError(RuntimeError):
+    """Commit outcome; UNKNOWN may include the candidate's identity evidence."""
+
+    def __init__(self, state: str, candidate: SidecarSnapshot | None = None, *,
+                 previous_recovered: bool = False, legacy_unverifiable: bool = False,
+                 release_unknown: bool = False, close_unknown: bool = False,
+                 cleanup_unknown: bool = False):
+        super().__init__(state)
+        self.state = state
+        self.candidate = candidate
+        self.previous_recovered = previous_recovered
+        self.legacy_unverifiable = legacy_unverifiable
+        self.release_unknown = release_unknown
+        self.close_unknown = close_unknown
+        self.cleanup_unknown = cleanup_unknown
+
+
+def _sidecar_error_flag(exc: BaseException, name: str) -> bool:
+    """Preserve only boolean uncertainty, never exception text or arbitrary fields."""
     try:
-        os.chmod(path, 0o600)
-    except OSError:
+        return getattr(exc, name, False) is True
+    except BaseException:
+        # An uninspectable resource state is not proof of a clean release.
+        return True
+
+
+
+@dataclass(frozen=True)
+class _SidecarResourceUncertainty:
+    """Sticky process-local evidence; target B/C never proves resource cleanup."""
+    release_unknown: bool = False
+    close_unknown: bool = False
+    cleanup_unknown: bool = False
+
+    def __bool__(self):
+        return self.release_unknown or self.close_unknown or self.cleanup_unknown
+
+    def merge(self, *, release_unknown=False, close_unknown=False, cleanup_unknown=False):
+        return _SidecarResourceUncertainty(
+            self.release_unknown or release_unknown,
+            self.close_unknown or close_unknown,
+            self.cleanup_unknown or cleanup_unknown)
+
+def _sidecar_candidate(value, payload):
+    """Accept only comparable evidence of exactly this candidate, without logging it."""
+    try:
+        if (isinstance(value, SidecarSnapshot) and value.identity is not None
+                and value.contents == payload):
+            return value
+    except BaseException:
         pass
+    return None
 
 
 def normalize_override_entry(entry) -> "str | None":
@@ -223,13 +320,181 @@ class SessionOverridesSidecar:
       才会把内存中已记录的时间戳刷入对应 sidecar 条目，随后一次性原子写盘。
     """
 
-    def __init__(self, path: Path):
+    def __init__(self, path: Path, *, secure_io=None):
+        """secure_io.capture(path) -> SidecarSnapshot;
+        secure_io.commit(path, baseline, bytes) -> verified SidecarSnapshot.
+
+        commit must revalidate the baseline immediately before atomic submission,
+        verify the result and report SidecarWriteError(NOT_REPLACED|UNKNOWN).
+        UNKNOWN may carry candidate identity evidence. Unclassified exceptions
+        after entering commit are UNKNOWN. Unknown resource release is UNKNOWN
+        even if the target was previously verified, and the adapter must not
+        turn that observation alone into candidate identity evidence. The adapter
+        also owns runtime staging, cross-volume policy, role collisions and
+        platform-specific protection. Resource uncertainty is latched for this
+        store's lifetime: B/C target evidence cannot prove cleanup or release.
+        No resource-resolution API or persistent restart marker exists here.
+
+        The no-argument compatibility path is the historical writer, NOT the
+        new platform security protocol. It cannot verify B/C after UNKNOWN and
+        must remain blocked. Production must inject the real adapter before use.
+        """
         self._path = Path(path)
+        self._secure_io = secure_io
         self._lock = threading.Lock()
         self._mtime: float = 0.0
         self._data: dict[str, dict[str, Any]] = {}
         self._mem_last_seen: dict[tuple[str, str], float] = {}
-        self._reload_locked()
+        self._baseline: SidecarSnapshot | None = None
+        self._unknown = None
+        self._resource_unknown = _SidecarResourceUncertainty()
+        self._unavailable = False
+        if secure_io is None:
+            log.warning("sidecar: legacy compatibility writer; secure adapter required for production")
+            self._reload_locked()
+        else:
+            self._refresh_secure_locked()
+
+    @staticmethod
+    def _decode_snapshot(snapshot: SidecarSnapshot) -> dict:
+        if not isinstance(snapshot, SidecarSnapshot) or snapshot.identity is None:
+            raise ValueError("sidecar evidence unavailable")
+        if snapshot.contents is None:
+            return {}
+        if not isinstance(snapshot.contents, bytes):
+            raise ValueError("sidecar contents unavailable")
+        loaded = json.loads(snapshot.contents.decode("utf-8"))
+        if not isinstance(loaded, dict) or any(not isinstance(v, dict) for v in loaded.values()):
+            raise ValueError("invalid sidecar structure")
+        return loaded
+
+    @staticmethod
+    def _same_snapshot(a, b) -> bool:
+        return (isinstance(a, SidecarSnapshot) and isinstance(b, SidecarSnapshot)
+                and a.identity is not None and b.identity is not None
+                and a.identity == b.identity and a.contents == b.contents)
+
+    def _capture_secure_locked(self):
+        snapshot = self._secure_io.capture(self._path)
+        return snapshot, self._decode_snapshot(snapshot)
+
+    def _remember_resource_unknown(self, exc: BaseException) -> _SidecarResourceUncertainty:
+        # Some underlying platform errors expose only a fixed code. Inspect no
+        # message or arbitrary payload; uninspectable evidence is UNKNOWN.
+        try:
+            code = getattr(exc, "code", None)
+        except BaseException:
+            code = "release_unknown"
+        if type(code) is not str:
+            code = None
+        self._resource_unknown = self._resource_unknown.merge(
+            release_unknown=(_sidecar_error_flag(exc, "release_unknown") or code in (
+                "release_unknown", "close_failed", "handle_close_failed", "resource_release_failed")),
+            close_unknown=(_sidecar_error_flag(exc, "close_unknown") or code in (
+                "fd_close_unknown", "parent_close_unknown", "parent_close_unknown_after_verified",
+                "parent_close_and_cleanup_unknown", "staging_close_unknown", "staging_close_and_cleanup_unknown")),
+            cleanup_unknown=(_sidecar_error_flag(exc, "cleanup_unknown") or code in (
+                "staging_cleanup_failed", "staging_cleanup_unknown",
+                "parent_close_and_cleanup_unknown", "staging_close_and_cleanup_unknown")))
+        return self._resource_unknown
+
+    def _resource_error(self) -> SidecarWriteError:
+        flags = self._resource_unknown
+        return SidecarWriteError("UNKNOWN", legacy_unverifiable=self._secure_io is None,
+                                 release_unknown=flags.release_unknown,
+                                 close_unknown=flags.close_unknown,
+                                 cleanup_unknown=flags.cleanup_unknown)
+
+    def _refresh_secure_locked(self) -> bool:
+        # A successful target snapshot cannot prove a previously uncertain FD,
+        # handle or temporary artifact has been released/cleaned.
+        if self._resource_unknown:
+            self._unavailable = True
+            return False
+        try:
+            snapshot, loaded = self._capture_secure_locked()
+        except BaseException as exc:
+            flags = self._remember_resource_unknown(exc)
+            self._unavailable = True
+            if not flags and not isinstance(exc, Exception):
+                raise
+            if flags:
+                log.warning("sidecar: resource state unverified; writes remain blocked")
+            else:
+                log.warning("sidecar: read or verification unavailable; retaining verified overrides")
+            return False
+        self._data = loaded
+        self._baseline = snapshot
+        self._mtime = snapshot.mtime
+        self._unavailable = False
+        return True
+
+    def _recover_locked(self) -> bool:
+        if self._resource_unknown:
+            log.warning("sidecar: resource state unverified; B/C cannot resolve it")
+            return False
+        if self._unknown is None:
+            if self._secure_io is None:
+                return not self._unavailable
+            return self._refresh_secure_locked()
+        if self._secure_io is None:
+            log.warning("sidecar: legacy UNKNOWN cannot be verified; writes blocked; "
+                        "production requires secure adapter")
+            return False
+        pending = self._unknown
+        baseline, candidate, candidate_data, candidate_mem, removed = pending
+        old_data, old_mem, old_baseline, old_mtime = (
+            self._data, self._mem_last_seen, self._baseline, self._mtime)
+        old_unavailable = self._unavailable
+        publishing = False
+        try:
+            observed, loaded = self._capture_secure_locked()
+            if self._same_snapshot(observed, baseline):
+                recovered_data = loaded
+                recovered_mem = old_mem
+            elif self._same_snapshot(observed, candidate):
+                recovered_data = candidate_data
+                # Build the complete memory publication independently: touches
+                # made during isolation survive except for keys removed by C.
+                recovered_mem = old_mem.copy()
+                for key in removed:
+                    recovered_mem.pop(key, None)
+                for key, value in candidate_mem.items():
+                    recovered_mem[key] = max(value, recovered_mem.get(key, value))
+            else:
+                log.warning("sidecar: UNKNOWN; target does not match verified B or C")
+                return False
+            publishing = True
+            self._data = recovered_data
+            self._mem_last_seen = recovered_mem
+            self._baseline = observed
+            self._mtime = observed.mtime
+            self._unavailable = False
+            self._unknown = None
+            log.warning("sidecar: UNKNOWN resolved against verified snapshot")
+            return True
+        except BaseException as exc:
+            # Re-arm before restoring every field if publication was interrupted.
+            self._unknown = pending
+            self._data, self._mem_last_seen = old_data, old_mem
+            self._baseline, self._mtime = old_baseline, old_mtime
+            self._unavailable = old_unavailable
+            flags = self._remember_resource_unknown(exc)
+            close_unknown = flags.close_unknown
+            cleanup_unknown = flags.cleanup_unknown
+            release_unknown = flags.release_unknown
+            if (not publishing and isinstance(exc, Exception)
+                    and not (close_unknown or cleanup_unknown or release_unknown)):
+                log.warning("sidecar: UNKNOWN; verification unavailable")
+                return False
+            raise SidecarWriteError("UNKNOWN", close_unknown=close_unknown,
+                                    cleanup_unknown=cleanup_unknown,
+                                    release_unknown=release_unknown) from None
+
+    def recover(self) -> bool:
+        """Explicitly verify and recover; never infer a previous process outcome."""
+        with self._lock:
+            return self._recover_locked()
 
     # ------------------------------------------------------------------
     # 读取 + 热重载
@@ -237,19 +502,29 @@ class SessionOverridesSidecar:
 
     def _reload_locked(self) -> None:
         """持锁加载文件；缺失视为 {}；非法 JSON 保留旧值 + warning。调用方需持锁。"""
-        if not self._path.exists():
+        try:
+            f = open(self._path, "r", encoding="utf-8")
+        except FileNotFoundError:
             self._data = {}
             self._mtime = 0.0
+            self._unavailable = False
+            return
+        except OSError:
+            self._unavailable = True
+            log.warning("sidecar: read unavailable; retaining last known overrides")
             return
         try:
-            with open(self._path, "r", encoding="utf-8") as f:
+            with f:
                 loaded = json.load(f)
-            if not isinstance(loaded, dict):
+            if not isinstance(loaded, dict) or any(not isinstance(v, dict) for v in loaded.values()):
                 raise ValueError("sidecar root is not a dict")
+            mtime = self._path.stat().st_mtime
             self._data = loaded
-            self._mtime = self._path.stat().st_mtime
-        except (json.JSONDecodeError, ValueError, OSError) as e:
-            log.warning("session_overrides sidecar corrupt, keeping last known value: %s", e)
+            self._mtime = mtime
+            self._unavailable = False
+        except (ValueError, OSError, UnicodeError):
+            self._unavailable = True
+            log.warning("sidecar: read unavailable; retaining last known overrides")
 
     def _maybe_reload_locked(self) -> None:
         """`maybe_reload` 的持锁版本：假设调用方已持有 `self._lock`，只做一次
@@ -257,18 +532,36 @@ class SessionOverridesSidecar:
         `apply_command` 等已持锁的写路径必须调用这个版本，不能调用 `maybe_reload`，
         否则会对同一把锁二次获取导致死锁）。
         """
+        if self._unknown is not None or self._resource_unknown:
+            return
+        if self._unavailable:
+            if self._secure_io is not None:
+                self._refresh_secure_locked()
+            else:
+                self._reload_locked()
+            return
         try:
             mtime = self._path.stat().st_mtime
         except FileNotFoundError:
+            if self._secure_io is not None:
+                self._refresh_secure_locked()
+                return
             # 文件被删除：视为空（与 __init__/_reload_locked 的文件缺失语义一致），
             # 必须清空内存，否则已删除的 sidecar 数据会残留在内存里（曾导致 status 误报 +6）
             if self._data or self._mtime:
                 self._data = {}
                 self._mtime = 0.0
             return
+        except OSError:
+            self._unavailable = True
+            log.warning("sidecar: stat unavailable; retaining last known overrides")
+            return
         if mtime <= self._mtime:
             return
-        self._reload_locked()
+        if self._secure_io is None:
+            self._reload_locked()
+        else:
+            self._refresh_secure_locked()
 
     def maybe_reload(self) -> None:
         """mtime 比对 + 双重检查，与 ConfigStore.maybe_reload 同一模式。
@@ -282,9 +575,17 @@ class SessionOverridesSidecar:
         不能在无锁快速路径直接 return——否则已删除的 sidecar 数据会残留在内存里
         （曾导致 status 误报 +6）。
         """
+        if self._unknown is not None or self._resource_unknown or self._unavailable:
+            with self._lock:
+                self._maybe_reload_locked()
+            return
         try:
             mtime = self._path.stat().st_mtime
         except FileNotFoundError:
+            with self._lock:
+                self._maybe_reload_locked()
+            return
+        except OSError:
             with self._lock:
                 self._maybe_reload_locked()
             return
@@ -337,12 +638,33 @@ class SessionOverridesSidecar:
             raise ValueError(f"unknown action: {action!r}")
 
         with self._lock:
-            self._maybe_reload_locked()
+            if self._resource_unknown:
+                raise self._resource_error() from None
+            previous_recovered = False
+            if self._unknown is not None:
+                previous_baseline, previous_candidate = self._unknown[:2]
+                if not self._recover_locked():
+                    raise self._resource_error() from None
+                previous_recovered = (
+                    not self._same_snapshot(previous_baseline, previous_candidate)
+                    and self._same_snapshot(self._baseline, previous_candidate))
+            elif self._secure_io is not None:
+                # A fresh protected baseline is mandatory for every command.
+                if not self._refresh_secure_locked():
+                    if self._resource_unknown:
+                        raise self._resource_error() from None
+                    raise SidecarWriteError("NOT_REPLACED")
+            else:
+                self._maybe_reload_locked()
+                if self._unavailable:
+                    raise SidecarWriteError("NOT_REPLACED")
             data = copy.deepcopy(self._data)
+            candidate_mem = self._mem_last_seen.copy()
+            removed = set()
 
             # 1. 把内存记账里已存在于 sidecar 的条目的 last_seen 刷新（用较新值），
             #    避免「写入时刻」之后持续活跃却因为没有再次 $route 而被误判过期。
-            for (ct, sid), ts in self._mem_last_seen.items():
+            for (ct, sid), ts in candidate_mem.items():
                 token_map = data.get(ct)
                 if not token_map or sid not in token_map:
                     continue
@@ -365,10 +687,11 @@ class SessionOverridesSidecar:
                     "last_seen": now_iso,
                     "created": created or now_iso,
                 }
-                self._mem_last_seen[(client_token, session_id)] = time.time()
+                candidate_mem[(client_token, session_id)] = time.time()
             else:  # reset
                 token_map.pop(session_id, None)
-                self._mem_last_seen.pop((client_token, session_id), None)
+                candidate_mem.pop((client_token, session_id), None)
+                removed.add((client_token, session_id))
 
             # 3. 7 天清理（只清 sidecar；无 last_seen 的条目不参与；当前 session 永不清理）
             cleaned: list[tuple[str, str]] = []
@@ -390,22 +713,85 @@ class SessionOverridesSidecar:
                     if ts < cutoff:
                         sessions.pop(sid)
                         cleaned.append((ct, sid))
-                        self._mem_last_seen.pop((ct, sid), None)
+                        candidate_mem.pop((ct, sid), None)
+                        removed.add((ct, sid))
                 if not sessions:
                     data.pop(ct, None)
 
-            # 4. 一次性原子写
-            _atomic_write_json(self._path, data)
-            self._data = data
+            # 4. 保留 B，先建立隔离态，再进入可能提交的区间。这样即使
+            # 中断发生在 adapter 返回、验证或分步发布期间，也不会触发热加载。
+            baseline = self._baseline
+            old_data, old_mem, old_mtime = self._data, self._mem_last_seen, self._mtime
+            old_unavailable = self._unavailable
+            payload = json.dumps(data, indent=2, ensure_ascii=False).encode("utf-8")
+            committed = None
+            commit_returned = False
+            self._unknown = (baseline, None, data, candidate_mem, removed)
             try:
-                self._mtime = self._path.stat().st_mtime
-            except OSError:
-                pass
+                if self._secure_io is None:
+                    _atomic_write_json(self._path, data)
+                    commit_returned = True
+                    legacy_mtime = self._path.stat().st_mtime
+                else:
+                    committed = self._secure_io.commit(self._path, baseline, payload)
+                    commit_returned = True
+                    if (self._decode_snapshot(committed) != data
+                            or committed.contents != payload):
+                        raise SidecarWriteError("UNKNOWN", committed)
+                self._data = data
+                self._mem_last_seen = candidate_mem
+                if self._secure_io is not None:
+                    self._baseline = committed
+                    self._mtime = committed.mtime
+                else:
+                    self._mtime = legacy_mtime
+                self._unknown = None
+                log.info("sidecar.write action=%s", action)
+                return {"cleaned": cleaned}
+            except BaseException as exc:
+                # Only a classified, unambiguously pre-return result can prove
+                # NOT_REPLACED. An interrupt/unclassified error, including one
+                # after any partial memory publication, must quarantine.
+                classified = isinstance(exc, SidecarWriteError)
+                flags = self._remember_resource_unknown(exc)
+                close_unknown = flags.close_unknown
+                cleanup_unknown = flags.cleanup_unknown
+                release_unknown = flags.release_unknown
+                try:
+                    not_replaced = (classified and exc.state == "NOT_REPLACED"
+                                    and not commit_returned
+                                    and not (close_unknown or cleanup_unknown or release_unknown))
+                except BaseException:
+                    not_replaced = False
+                    release_unknown = True
+                    self._resource_unknown = self._resource_unknown.merge(release_unknown=True)
+                candidate = _sidecar_candidate(committed, payload)
+                if candidate is None and classified:
+                    try:
+                        candidate = _sidecar_candidate(exc.candidate, payload)
+                    except BaseException:
+                        candidate = None
+                # Re-arm first, then undo any partially published C. No other
+                # thread can observe the intermediate state while this lock is held.
+                self._unknown = (baseline, candidate, data, candidate_mem, removed)
+                self._data, self._mem_last_seen = old_data, old_mem
+                self._baseline, self._mtime = baseline, old_mtime
+                self._unavailable = old_unavailable
+                if not_replaced:
+                    self._unknown = None
+                    log.warning("sidecar: commit not performed")
+                    raise SidecarWriteError(
+                        "NOT_REPLACED", previous_recovered=previous_recovered) from None
+                if self._secure_io is None:
+                    log.warning("sidecar: legacy commit UNKNOWN; verification unavailable; "
+                                "writes blocked; production requires secure adapter")
+                else:
+                    log.warning("sidecar: commit UNKNOWN; retaining last known overrides")
+                raise SidecarWriteError(
+                    "UNKNOWN", legacy_unverifiable=self._secure_io is None,
+                    release_unknown=release_unknown, close_unknown=close_unknown,
+                    cleanup_unknown=cleanup_unknown) from None
 
-            log.info("sidecar.write token=%s session=%s action=%s target_route=%s",
-                     client_token or "",
-                     session_id, action, target_route_id or "")
-            return {"cleaned": cleaned}
 
 
 # ---------------------------------------------------------------------------
@@ -487,7 +873,10 @@ def handle_route_command(ctx: CommandContext) -> CommandResult:
         )
 
     if ctx.arg == "reset":
-        result = ctx.sidecar.apply_command(client_token, ctx.session_key, "reset")
+        try:
+            result = ctx.sidecar.apply_command(client_token, ctx.session_key, "reset")
+        except SidecarWriteError as exc:
+            return _sidecar_failure_receipt(exc)
         cleaned = result["cleaned"]
         text = (
             f"已清除 session {_short_session(ctx.session_key)} 的 route override，"
@@ -501,13 +890,33 @@ def handle_route_command(ctx: CommandContext) -> CommandResult:
         text = f"route \"{target_id}\" 不存在。可用 route id: {available}"
         return CommandResult(text, wrote=False)
 
-    result = ctx.sidecar.apply_command(client_token, ctx.session_key, "set", target_route_id=target_id)
+    try:
+        result = ctx.sidecar.apply_command(client_token, ctx.session_key, "set", target_route_id=target_id)
+    except SidecarWriteError as exc:
+        return _sidecar_failure_receipt(exc)
     cleaned = result["cleaned"]
     text = (
         f"已把 session {_short_session(ctx.session_key)} 切到 route \"{target_id}\"，"
         f"下一条消息起生效。撤销请发 $route reset。\n{_format_cleaned(cleaned)}"
     )
     return CommandResult(text, wrote=True)
+
+
+def _sidecar_failure_receipt(exc: SidecarWriteError) -> CommandResult:
+    if exc.state == "UNKNOWN":
+        if exc.release_unknown or exc.close_unknown or exc.cleanup_unknown:
+            return CommandResult("route 写入或资源状态未知；暂用最后已知的 override，"
+                                 "资源释放和清理未确认，单独核验 B/C 不能解除写入暂停。",
+                                 wrote=False)
+        if exc.legacy_unverifiable:
+            return CommandResult("route 写入结果未知，当前实例无法安全核验；已暂停 route 写入，"
+                                 "生产环境必须接入真实安全适配器。", wrote=False)
+        return CommandResult("route 写入结果未知，暂用最后已知的 override；"
+                             "重新验证前不会覆盖 sidecar。", wrote=False)
+    if exc.previous_recovered:
+        return CommandResult("先前未知结果已验证恢复；本次 route 写入未提交，"
+                             "当前 override 保持恢复后的状态。", wrote=False)
+    return CommandResult("route 写入未提交或无法安全验证；当前 override 未变。", wrote=False)
 
 
 def _handle_query(ctx: CommandContext) -> CommandResult:

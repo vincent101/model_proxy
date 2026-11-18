@@ -252,7 +252,7 @@ class TestSingleAtomicWrite(unittest.TestCase):
         with tempfile.TemporaryDirectory() as d:
             path = Path(d) / "session_overrides.json"
             sc = SessionOverridesSidecar(path)
-            with patch("os.replace") as mock_replace:
+            with patch("os.replace", wraps=os.replace) as mock_replace:
                 sc.apply_command("cc", "sess-1", "set", target_route_id="nation")
                 self.assertEqual(mock_replace.call_count, 1)
 
@@ -261,7 +261,7 @@ class TestSingleAtomicWrite(unittest.TestCase):
             path = Path(d) / "session_overrides.json"
             sc = SessionOverridesSidecar(path)
             sc.apply_command("cc", "sess-1", "set", target_route_id="nation")
-            with patch("os.replace") as mock_replace:
+            with patch("os.replace", wraps=os.replace) as mock_replace:
                 sc.apply_command("cc", "sess-1", "reset")
                 self.assertEqual(mock_replace.call_count, 1)
 
@@ -334,6 +334,12 @@ class TestCleanupThreshold(unittest.TestCase):
 
 class TestNoAliasPollution(unittest.TestCase):
 
+    def setUp(self):
+        # Synthetic config only; native Mac config security is tested separately.
+        p = patch("core.server._mac_business_enabled", return_value=False)
+        p.start()
+        self.addCleanup(p.stop)
+
     def test_config_store_internal_dict_untouched_after_switch(self):
         with tempfile.TemporaryDirectory() as d:
             cfg_path = Path(d) / "model_proxy_config.json"
@@ -347,6 +353,7 @@ class TestNoAliasPollution(unittest.TestCase):
                 }],
             }
             cfg_path.write_text(json.dumps(cfg), encoding="utf-8")
+            cfg_path.chmod(0o600)
             cs = ConfigStore(cfg_path)
             sidecar = SessionOverridesSidecar(Path(d) / "session_overrides.json")
 
@@ -593,6 +600,9 @@ def _send(h, text, session_id, stream=False):
 class TestForwardInterceptEndToEnd(unittest.TestCase):
 
     def setUp(self):
+        p = patch("core.server._mac_business_enabled", return_value=False)
+        p.start()
+        self.addCleanup(p.stop)
         # 隔离真实 HOME 与 vault：$route 回执会读 ~/.claude/sessions 注册表和
         # .claudian/sessions 会话标题，统一 patch 到临时空目录（未命中 → 回执
         # 仅附 uuid8，输出确定性；真实 vault 恰有同 UUID conv 会污染断言）。
@@ -631,6 +641,7 @@ class TestForwardInterceptEndToEnd(unittest.TestCase):
             }],
         }
         cfg_path.write_text(json.dumps(cfg), encoding="utf-8")
+        cfg_path.chmod(0o600)
         return cfg_path
 
     def test_switch_query_reset_query_roundtrip(self):
@@ -656,6 +667,31 @@ class TestForwardInterceptEndToEnd(unittest.TestCase):
             self.assertEqual(acc["route"], "claude")
 
             self.assertEqual(h.server.sidecar_store.get_overrides_for("cc"), {})
+
+    def test_unknown_keeps_b_on_real_forward_reload_path(self):
+        from tests.test_route_sidecar_unknown import FakeSecureIO
+
+        with tempfile.TemporaryDirectory() as d:
+            cfg_path = self._write_cfg(d)
+            sidecar_path = Path(d) / "session_overrides.json"
+            h = _make_forward_handler(cfg_path, sidecar_path)
+            io_backend = FakeSecureIO()
+            h.server.sidecar_store = SessionOverridesSidecar(sidecar_path, secure_io=io_backend)
+            sid = "sess-e2e-unknown"
+            acc, _ = _send(h, "$route claude", sid)
+            self.assertEqual(acc["route"], "claude")
+            io_backend.mode = "unknown_after"
+            acc, raw = _send(h, "$route nation", sid)
+            self.assertEqual(acc["route"], "claude")
+            self.assertIn("结果未知", raw.decode("utf-8"))
+            self.assertEqual(json.loads(sidecar_path.read_text())["cc"][sid]["route_id"], "nation")
+            acc, _ = _send(h, "ordinary request", sid)
+            self.assertEqual(acc["route"], "claude")
+            acc, _ = _send(h, "$route", sid)
+            self.assertEqual(acc["route"], "claude")
+            self.assertTrue(h.server.sidecar_store.recover())
+            acc, _ = _send(h, "$route", sid)
+            self.assertEqual(acc["route"], "nation")
 
     def test_stream_response_event_sequence(self):
         with tempfile.TemporaryDirectory() as d:
@@ -692,6 +728,9 @@ class TestRouteReceiptSessionIdentity(unittest.TestCase):
     """
 
     def setUp(self):
+        p = patch("core.server._mac_business_enabled", return_value=False)
+        p.start()
+        self.addCleanup(p.stop)
         # 同 TestForwardInterceptEndToEnd：隔离真实 HOME 与 vault 的两个外部
         # 状态源，回执输出确定性（真实 vault 恰有同 UUID conv 会污染断言）。
         self._sessions_td = tempfile.TemporaryDirectory()
@@ -720,6 +759,7 @@ class TestRouteReceiptSessionIdentity(unittest.TestCase):
             }],
         }
         cfg_path.write_text(json.dumps(cfg), encoding="utf-8")
+        cfg_path.chmod(0o600)
         return cfg_path
 
     def _write_session_registry(self, sid, name):
@@ -795,6 +835,9 @@ class TestRouteReceiptClaudianTitle(unittest.TestCase):
     """
 
     def setUp(self):
+        p = patch("core.server._mac_business_enabled", return_value=False)
+        p.start()
+        self.addCleanup(p.stop)
         self._sessions_td = tempfile.TemporaryDirectory()
         sessions_dir = Path(self._sessions_td.name) / "sessions"
         sessions_dir.mkdir()
@@ -821,6 +864,7 @@ class TestRouteReceiptClaudianTitle(unittest.TestCase):
             }],
         }
         cfg_path.write_text(json.dumps(cfg), encoding="utf-8")
+        cfg_path.chmod(0o600)
         return cfg_path
 
     def _write_session_registry(self, sid, name):

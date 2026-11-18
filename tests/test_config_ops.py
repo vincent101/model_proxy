@@ -1,4 +1,4 @@
-"""_config_ops.py effort 探测 helper 单测（_fix_mojibake / _is_response_complete /
+"""core.cli._config_ops.py effort 探测 helper 单测（_fix_mojibake / _is_response_complete /
 正则抽取），脱网络纯标准库 unittest。
 
 fixture 来源：本次会话中真实拿到的样本（claude类 expected one of 措辞、glm-52
@@ -23,7 +23,7 @@ from unittest.mock import patch
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from _config_ops import (
+from core.cli._config_ops import (
     PROBE_VALUE,
     _split_supply_ids,
     atomic_write,
@@ -135,7 +135,7 @@ class TestProbeEffortReturnShape(unittest.TestCase):
         # （不仅是 str(e)），供 classify_supply_reachability 按类型判断。
         supply = {"protocol": "anthropic", "url": "http://x", "target_model": "m", "appkey": "k"}
         gaierror = socket.gaierror("Name or service not known")
-        with patch("_config_ops.urllib.request.urlopen", side_effect=gaierror):
+        with patch("core.cli._config_ops.urllib.request.urlopen", side_effect=gaierror):
             status, text, cands, is_complete, exc = probe_effort(supply)
         self.assertIsNone(status)
         self.assertIsNone(cands)
@@ -148,7 +148,7 @@ class TestProbeEffortReturnShape(unittest.TestCase):
         # probe_effort 原样保留这个 URLError（不拆包、不吞掉 .reason）。
         supply = {"protocol": "anthropic", "url": "http://x", "target_model": "m", "appkey": "k"}
         real_exc = urllib.error.URLError(socket.gaierror("nodename nor servname provided, or not known"))
-        with patch("_config_ops.urllib.request.urlopen", side_effect=real_exc):
+        with patch("core.cli._config_ops.urllib.request.urlopen", side_effect=real_exc):
             status, text, cands, is_complete, exc = probe_effort(supply)
         self.assertIsNone(status)
         self.assertIs(exc, real_exc)
@@ -262,20 +262,20 @@ class TestRunProbeAndMaybeAcceptFlow(unittest.TestCase):
                 "url": "http://x", "target_model": "m", "appkey": "k"}
 
     def test_a_branch_success_writes_regex_candidates_on_confirm(self):
-        with patch("_config_ops.probe_effort",
+        with patch("core.cli._config_ops.probe_effort",
                    return_value=(400, '{"error":{"message":"expected one of `low`, `high`"}}',
                                  ["low", "high"], True, None)), \
              patch("builtins.input", return_value=""), \
-             patch("_config_ops.confirm", return_value=True):
+             patch("core.cli._config_ops.confirm", return_value=True):
             result = run_probe_and_maybe_accept(self._supply())
         self.assertEqual(result, {"effort_enum": ["low", "high"]})
 
     def test_a_branch_user_declines_returns_none(self):
-        with patch("_config_ops.probe_effort",
+        with patch("core.cli._config_ops.probe_effort",
                    return_value=(400, '{"error":{"message":"expected one of `low`, `high`"}}',
                                  ["low", "high"], True, None)), \
              patch("builtins.input", return_value=""), \
-             patch("_config_ops.confirm", return_value=False):
+             patch("core.cli._config_ops.confirm", return_value=False):
             result = run_probe_and_maybe_accept(self._supply())
         self.assertIsNone(result)
 
@@ -283,7 +283,7 @@ class TestRunProbeAndMaybeAcceptFlow(unittest.TestCase):
         # is_complete=False（截断）→ 截断不采纳→直接人工输入 → candidates=None
         # → 仍进入人工输入环节（不能因为探测不出就直接放弃，人工可能依据外部信息判断）；
         # 本用例模拟用户留空 = 跳过，不写入。
-        with patch("_config_ops.probe_effort",
+        with patch("core.cli._config_ops.probe_effort",
                    return_value=(400, '{"error":{"message":"可选值为：none、low',
                                  ["none", "low"], False, None)), \
              patch("builtins.input", return_value=""):
@@ -292,7 +292,7 @@ class TestRunProbeAndMaybeAcceptFlow(unittest.TestCase):
 
     def test_no_regex_hit_falls_to_manual_edit(self):
         # 正则未命中 → candidates=None 仍进入人工输入环节；本用例模拟用户留空 = 跳过，不写入。
-        with patch("_config_ops.probe_effort",
+        with patch("core.cli._config_ops.probe_effort",
                    return_value=(400, '{"error":{"message":"Extra inputs are not permitted"}}',
                                  None, True, None)), \
              patch("builtins.input", return_value=""):
@@ -303,40 +303,40 @@ class TestRunProbeAndMaybeAcceptFlow(unittest.TestCase):
         # candidates=None（探测无结论），但人工依据外部信息（如已知官方文档结论）
         # 判断该 supply 确认不支持任何档位，输入 "-" 应能写入空列表——这是本次修复的
         # 核心场景：探测拿不出候选时，人工仍必须有输入空集的入口。
-        with patch("_config_ops.probe_effort",
+        with patch("core.cli._config_ops.probe_effort",
                    return_value=(400, '{"error":{"message":"Extra inputs are not permitted"}}',
                                  None, True, None)), \
              patch("builtins.input", return_value="-"), \
-             patch("_config_ops.confirm", return_value=True):
+             patch("core.cli._config_ops.confirm", return_value=True):
             result = run_probe_and_maybe_accept(self._supply())
         self.assertEqual(result, {"effort_enum": []})
 
     def test_no_candidates_user_can_manually_input_explicit_list(self):
         # candidates=None 时人工也可以直接敲入一组已知档位（比如凭官方文档结论），
         # 不局限于"-"表示空集这一种输入。
-        with patch("_config_ops.probe_effort",
+        with patch("core.cli._config_ops.probe_effort",
                    return_value=(400, '{"error":{"message":"Extra inputs are not permitted"}}',
                                  None, True, None)), \
              patch("builtins.input", return_value="high,max"), \
-             patch("_config_ops.confirm", return_value=True):
+             patch("core.cli._config_ops.confirm", return_value=True):
             result = run_probe_and_maybe_accept(self._supply())
         self.assertEqual(result, {"effort_enum": ["high", "max"]})
 
     def test_user_can_edit_candidates_before_writing(self):
-        with patch("_config_ops.probe_effort",
+        with patch("core.cli._config_ops.probe_effort",
                    return_value=(400, '{"error":{"message":"expected one of `low`, `Unhandled`"}}',
                                  ["low", "Unhandled"], True, None)), \
              patch("builtins.input", return_value="low,high"), \
-             patch("_config_ops.confirm", return_value=True):
+             patch("core.cli._config_ops.confirm", return_value=True):
             result = run_probe_and_maybe_accept(self._supply())
         self.assertEqual(result, {"effort_enum": ["low", "high"]})
 
     def test_user_can_edit_to_empty_list_via_dash(self):
-        with patch("_config_ops.probe_effort",
+        with patch("core.cli._config_ops.probe_effort",
                    return_value=(400, '{"error":{"message":"expected one of `low`"}}',
                                  ["low"], True, None)), \
              patch("builtins.input", return_value="-"), \
-             patch("_config_ops.confirm", return_value=True):
+             patch("core.cli._config_ops.confirm", return_value=True):
             result = run_probe_and_maybe_accept(self._supply())
         self.assertEqual(result, {"effort_enum": []})
 
@@ -345,9 +345,9 @@ class TestRunProbeAndMaybeAcceptFlow(unittest.TestCase):
         # 二次真实请求的核心机制，必须验证 probe_effort 完全不被调用。
         prefetched = (400, '{"error":{"message":"expected one of `low`, `high`"}}',
                       ["low", "high"], True, None)
-        with patch("_config_ops.probe_effort") as mock_probe, \
+        with patch("core.cli._config_ops.probe_effort") as mock_probe, \
              patch("builtins.input", return_value=""), \
-             patch("_config_ops.confirm", return_value=True):
+             patch("core.cli._config_ops.confirm", return_value=True):
             result = run_probe_and_maybe_accept(self._supply(), prefetched=prefetched)
         mock_probe.assert_not_called()
         self.assertEqual(result, {"effort_enum": ["low", "high"]})
@@ -355,10 +355,10 @@ class TestRunProbeAndMaybeAcceptFlow(unittest.TestCase):
     def test_non_reachable_category_prints_attribution_but_still_allows_manual_input(self):
         # 分类为 AUTH_ERROR（非 REACHABLE）时，仍应打印明确归因，且不因为分类是
         # 错误就直接 return——继续进入人工输入环节（保持现有设计原则不变）。
-        with patch("_config_ops.probe_effort",
+        with patch("core.cli._config_ops.probe_effort",
                    return_value=(401, "unauthorized", None, True, None)), \
              patch("builtins.input", return_value="-"), \
-             patch("_config_ops.confirm", return_value=True):
+             patch("core.cli._config_ops.confirm", return_value=True):
             result = run_probe_and_maybe_accept(self._supply())
         self.assertEqual(result, {"effort_enum": []})
 
@@ -376,9 +376,9 @@ class TestConnectivityTestRequestReuse(unittest.TestCase):
     def test_reachable_flow_calls_probe_effort_exactly_once(self):
         reachable_result = (400, '{"error":{"message":"expected one of `low`, `high`"}}',
                              ["low", "high"], True, None)
-        with patch("_config_ops.probe_effort", return_value=reachable_result) as mock_probe, \
+        with patch("core.cli._config_ops.probe_effort", return_value=reachable_result) as mock_probe, \
              patch("builtins.input", return_value=""), \
-             patch("_config_ops.confirm", return_value=True):
+             patch("core.cli._config_ops.confirm", return_value=True):
             result = run_connectivity_test(self._supply())
             status, text_fixed, _, _, exc = result
             category, _ = classify_supply_reachability(status, text_fixed, exc)
@@ -392,7 +392,7 @@ class TestConnectivityTestRequestReuse(unittest.TestCase):
         # run_probe_and_maybe_accept，这里验证 run_connectivity_test 本身
         # 也只发一次请求。
         auth_error_result = (401, "unauthorized", None, True, None)
-        with patch("_config_ops.probe_effort", return_value=auth_error_result) as mock_probe:
+        with patch("core.cli._config_ops.probe_effort", return_value=auth_error_result) as mock_probe:
             result = run_connectivity_test(self._supply())
         mock_probe.assert_called_once()
         status, text_fixed, _, _, exc = result
@@ -410,9 +410,9 @@ class TestConnectivityTestThenProbe(unittest.TestCase):
     def test_connectivity_test_then_probe_reachable_reuses_response(self):
         reachable_result = (400, '{"error":{"message":"expected one of `low`, `high`"}}',
                              ["low", "high"], True, None)
-        with patch("_config_ops.probe_effort", return_value=reachable_result) as mock_probe, \
+        with patch("core.cli._config_ops.probe_effort", return_value=reachable_result) as mock_probe, \
              patch("builtins.input", return_value=""), \
-             patch("_config_ops.confirm", return_value=True):
+             patch("core.cli._config_ops.confirm", return_value=True):
             category, desc, rcap = connectivity_test_then_probe(self._supply())
         mock_probe.assert_called_once()
         self.assertEqual(category, ReachabilityCategory.REACHABLE)
@@ -420,7 +420,7 @@ class TestConnectivityTestThenProbe(unittest.TestCase):
 
     def test_connectivity_test_then_probe_non_reachable_returns_none_rcap(self):
         auth_error_result = (401, "unauthorized", None, True, None)
-        with patch("_config_ops.probe_effort", return_value=auth_error_result) as mock_probe:
+        with patch("core.cli._config_ops.probe_effort", return_value=auth_error_result) as mock_probe:
             category, desc, rcap = connectivity_test_then_probe(self._supply())
         mock_probe.assert_called_once()
         self.assertEqual(category, ReachabilityCategory.AUTH_ERROR)
@@ -431,6 +431,18 @@ class TestSupplyCheck(unittest.TestCase):
     """supply_check：整合原 supply_test/supply_probe 为单一入口后的顶层子命令单测。
     覆盖核心正确性要求：全流程 probe_effort 只被调用一次。
     """
+
+    def setUp(self):
+        # done() may write the reload marker inherited from the caller's environment.
+        tmpdir = tempfile.TemporaryDirectory()
+        self.addCleanup(tmpdir.cleanup)
+        marker = os.path.join(tmpdir.name, "reload-marker")
+        env_patcher = patch.dict(os.environ, {"CONFIG_OPS_RELOAD_MARKER": marker})
+        env_patcher.start()
+        self.addCleanup(env_patcher.stop)
+        marker_patcher = patch("core.cli._config_ops.done")
+        marker_patcher.start()
+        self.addCleanup(marker_patcher.stop)
 
     def _cfg_with_supply(self):
         return {
@@ -444,11 +456,11 @@ class TestSupplyCheck(unittest.TestCase):
         cfg = self._cfg_with_supply()
         reachable_result = (400, '{"error":{"message":"expected one of `low`, `high`"}}',
                              ["low", "high"], True, None)
-        with patch("_config_ops.load_config", return_value=cfg), \
-             patch("_config_ops.atomic_write") as mock_write, \
-             patch("_config_ops.probe_effort", return_value=reachable_result) as mock_probe, \
+        with patch("core.cli._config_ops.load_config", return_value=cfg), \
+             patch("core.cli._config_ops.atomic_write") as mock_write, \
+             patch("core.cli._config_ops.probe_effort", return_value=reachable_result) as mock_probe, \
              patch("builtins.input", return_value=""), \
-             patch("_config_ops.confirm", return_value=True):
+             patch("core.cli._config_ops.confirm", return_value=True):
             supply_check("dummy_path", "s1")
         mock_probe.assert_called_once()
         mock_write.assert_called_once()
@@ -458,10 +470,10 @@ class TestSupplyCheck(unittest.TestCase):
     def test_supply_check_non_reachable_ends_without_probe_or_write(self):
         cfg = self._cfg_with_supply()
         auth_error_result = (401, "unauthorized", None, True, None)
-        with patch("_config_ops.load_config", return_value=cfg), \
-             patch("_config_ops.atomic_write") as mock_write, \
-             patch("_config_ops.probe_effort", return_value=auth_error_result) as mock_probe, \
-             patch("_config_ops.run_probe_and_maybe_accept") as mock_run_probe:
+        with patch("core.cli._config_ops.load_config", return_value=cfg), \
+             patch("core.cli._config_ops.atomic_write") as mock_write, \
+             patch("core.cli._config_ops.probe_effort", return_value=auth_error_result) as mock_probe, \
+             patch("core.cli._config_ops.run_probe_and_maybe_accept") as mock_run_probe:
             supply_check("dummy_path", "s1")
         mock_probe.assert_called_once()
         mock_run_probe.assert_not_called()
@@ -535,7 +547,7 @@ class TestBodyErrorDowngrade(unittest.TestCase):
 
     def test_run_connectivity_test_200_downgrades_and_prints_summary(self):
         buf = io.StringIO()
-        with patch("_config_ops.probe_effort",
+        with patch("core.cli._config_ops.probe_effort",
                    return_value=self._body_error_result()), \
              contextlib.redirect_stdout(buf):
             result = run_connectivity_test(self._supply(), body_rules=self.RULES)
@@ -550,7 +562,7 @@ class TestBodyErrorDowngrade(unittest.TestCase):
         # REACHABLE 的 400 形态（探测非法值被拒）同样叠加正文识别
         result_400 = (400, '{"error":{"message":"请求过于频繁，请稍后再试"}}', None, True, None)
         buf = io.StringIO()
-        with patch("_config_ops.probe_effort", return_value=result_400), \
+        with patch("core.cli._config_ops.probe_effort", return_value=result_400), \
              contextlib.redirect_stdout(buf):
             run_connectivity_test(self._supply(), body_rules=self.RULES)
         self.assertIn("body_error", buf.getvalue())
@@ -558,9 +570,9 @@ class TestBodyErrorDowngrade(unittest.TestCase):
 
     def test_then_probe_body_error_skips_effort_probe_and_rcap(self):
         # 联动：BODY_ERROR != REACHABLE → 跳过 effort 探测与 rcap 写入
-        with patch("_config_ops.probe_effort",
+        with patch("core.cli._config_ops.probe_effort",
                    return_value=self._body_error_result()) as mock_probe, \
-             patch("_config_ops.run_probe_and_maybe_accept") as mock_run_probe:
+             patch("core.cli._config_ops.run_probe_and_maybe_accept") as mock_run_probe:
             category, desc, rcap = connectivity_test_then_probe(
                 self._supply(), body_rules=self.RULES)
         mock_probe.assert_called_once()
@@ -573,9 +585,9 @@ class TestBodyErrorDowngrade(unittest.TestCase):
         # 无 rules 零行为回归：REACHABLE 流程照旧进入探测并写入
         reachable_result = (400, '{"error":{"message":"expected one of `low`, `high`"}}',
                             ["low", "high"], True, None)
-        with patch("_config_ops.probe_effort", return_value=reachable_result) as mock_probe, \
+        with patch("core.cli._config_ops.probe_effort", return_value=reachable_result) as mock_probe, \
              patch("builtins.input", return_value=""), \
-             patch("_config_ops.confirm", return_value=True):
+             patch("core.cli._config_ops.confirm", return_value=True):
             category, desc, rcap = connectivity_test_then_probe(self._supply())
         mock_probe.assert_called_once()
         self.assertEqual(category, ReachabilityCategory.REACHABLE)
@@ -584,7 +596,7 @@ class TestBodyErrorDowngrade(unittest.TestCase):
     def test_run_connectivity_test_no_rules_reachable_no_summary_line(self):
         # 无 rules 时 REACHABLE 输出与现状一致：无"正文摘要"行
         buf = io.StringIO()
-        with patch("_config_ops.probe_effort",
+        with patch("core.cli._config_ops.probe_effort",
                    return_value=(200, '{"ok":true}', None, True, None)), \
              contextlib.redirect_stdout(buf):
             run_connectivity_test(self._supply())
@@ -600,8 +612,8 @@ class TestValidateStrategyRouteFields(unittest.TestCase):
     def test_both_fields_present_raises_and_reports_error(self):
         entry = {"client_token": "tok1", "route_id": "claude",
                   "route_pool": ["claude", "nation"]}
-        with patch("_config_ops.err") as mock_err, \
-             patch("_config_ops.done") as mock_done:
+        with patch("core.cli._config_ops.err") as mock_err, \
+             patch("core.cli._config_ops.done") as mock_done:
             with self.assertRaises(SystemExit) as ctx:
                 _validate_strategy_route_fields(entry)
         self.assertEqual(ctx.exception.code, 1)
@@ -612,14 +624,14 @@ class TestValidateStrategyRouteFields(unittest.TestCase):
 
     def test_only_route_id_does_not_raise(self):
         entry = {"client_token": "tok2", "route_id": "claude"}
-        with patch("_config_ops.err") as mock_err:
+        with patch("core.cli._config_ops.err") as mock_err:
             result = _validate_strategy_route_fields(entry)
         self.assertIsNone(result)
         mock_err.assert_not_called()
 
     def test_only_route_pool_does_not_raise(self):
         entry = {"client_token": "tok3", "route_pool": ["claude", "nation"]}
-        with patch("_config_ops.err") as mock_err:
+        with patch("core.cli._config_ops.err") as mock_err:
             result = _validate_strategy_route_fields(entry)
         self.assertIsNone(result)
         mock_err.assert_not_called()
@@ -627,7 +639,7 @@ class TestValidateStrategyRouteFields(unittest.TestCase):
     def test_neither_field_present_does_not_raise(self):
         # 脏配置（既无 route_id 也无 route_pool）不属于本函数职责，交由其他校验处理。
         entry = {"client_token": "tok4"}
-        with patch("_config_ops.err") as mock_err:
+        with patch("core.cli._config_ops.err") as mock_err:
             result = _validate_strategy_route_fields(entry)
         self.assertIsNone(result)
         mock_err.assert_not_called()
@@ -637,7 +649,7 @@ class TestValidateStrategyRouteFields(unittest.TestCase):
         # 不会与 route_id 冲突判定为互斥违规。此为当前实现的既有行为，用测试明确固化，
         # 而非遗漏；若未来需要区分"字段存在但为空"与"字段不存在"，需先修改函数逻辑。
         entry = {"client_token": "tok5", "route_id": "claude", "route_pool": []}
-        with patch("_config_ops.err") as mock_err:
+        with patch("core.cli._config_ops.err") as mock_err:
             result = _validate_strategy_route_fields(entry)
         self.assertIsNone(result)
         mock_err.assert_not_called()
@@ -660,7 +672,7 @@ class TestProbeEffortExtFields(unittest.TestCase):
                 req.full_url, 400, "Bad Request",
                 email.message.Message(), io.BytesIO(b'{"error":{"message":"bad"}}'))
 
-        with patch("_config_ops.urllib.request.urlopen", side_effect=fake_urlopen):
+        with patch("core.cli._config_ops.urllib.request.urlopen", side_effect=fake_urlopen):
             result = probe_effort(supply)
         return captured["req"], result
 
@@ -722,7 +734,7 @@ class TestProbeEffortExtFields(unittest.TestCase):
         try:
             supply = {"id": "s5", "protocol": "anthropic", "url": "http://x",
                       "target_model": "m", "appkey_file": path}
-            with patch("_config_ops.urllib.request.urlopen") as mock_urlopen:
+            with patch("core.cli._config_ops.urllib.request.urlopen") as mock_urlopen:
                 status, text, cands, is_complete, exc = probe_effort(supply)
             mock_urlopen.assert_not_called()
             self.assertIsNone(status)
@@ -750,6 +762,41 @@ class TestProbeEffortExtFields(unittest.TestCase):
         self.assertNotIn("system", body)
 
 
+@contextlib.contextmanager
+def _test_authorized_write(path, operation='route-edit'):
+    """Test-only approval of a synthetic target inside a synthetic project.
+
+    The production writer now stages and backs up in the project `.runtime/`.
+    This builds that private layout under a temp project so real preflight,
+    location capture and the commit path all run against fake files only.
+    """
+    from core.cli import _config_ops, dispatch
+    from core.mac_config_path import open_target_parent
+    from core.mac_config_writer import WriteAuthorization
+    project = os.path.dirname(os.path.abspath(path))
+    project = os.path.dirname(os.path.abspath(path))
+    os.makedirs(os.path.join(project, 'config'), exist_ok=True)
+    os.makedirs(os.path.join(project, '.runtime'), mode=0o700, exist_ok=True)
+    paths = {key: os.path.join(project, '.runtime', key)
+             for key in ('log', 'totals', 'lock', 'pid', 'ensure_log', 'start_lock')}
+    with open(os.path.join(project, 'config', 'runtime_paths.json'), 'w', encoding='utf-8') as stream:
+        json.dump(paths, stream)
+
+    def prepare(_root, snapshot, *, operation):
+        with open_target_parent(snapshot) as (fd, _name):
+            info = os.fstat(fd)
+        grant = WriteAuthorization(snapshot.target_path, (info.st_dev, info.st_ino),
+                                   tuple(snapshot.final_identity[:2]), True)
+        return grant, lambda actual: actual == snapshot
+    with patch.multiple(_config_ops, _WRITE_BASELINE=None, _WRITE_STARTED=False,
+                        _WRITE_OPERATION=operation, _WRITE_AUTHORIZATION=None,
+                        _WRITE_PREFLIGHT=None, _WRITE_INPUT_PATH=None, _WRITE_COMMITTED=None), \
+         patch.object(dispatch, 'ROOT', project), \
+         patch.object(dispatch, 'prepare_config_write', prepare, create=True):
+        _config_ops._prepare_write(path, operation)
+        yield
+
+
 class TestConfigAtomicAndCsvContracts(unittest.TestCase):
     def test_atomic_write_current_object_roundtrip_and_permissions(self):
         previous = {"old": "synthetic previous value"}
@@ -761,40 +808,36 @@ class TestConfigAtomicAndCsvContracts(unittest.TestCase):
             path = os.path.join(directory, 'synthetic.json')
             with open(path, 'w', encoding='utf-8') as f:
                 json.dump(previous, f)
-            os.chmod(path, 0o644)
-            real_replace = os.replace
-            seen = []
-            def inspect_replace(source, destination):
-                self.assertEqual(os.path.dirname(source), directory)
-                self.assertEqual(destination, path)
-                self.assertTrue(source.endswith('.tmp'))
-                self.assertEqual(load_config(source), current)
-                seen.append(source)
-                real_replace(source, destination)
-            with patch('_config_ops.os.replace', side_effect=inspect_replace) as replace:
+            os.chmod(path, 0o600)
+            with _test_authorized_write(path):
                 atomic_write(path, current)
-            replace.assert_called_once()
-            self.assertEqual(load_config(path), current)
+                self.assertEqual(load_config(path), current)
             self.assertEqual(current, before)
             self.assertEqual(stat.S_IMODE(os.stat(path).st_mode), 0o600)
             with open(path, encoding='utf-8') as f:
-                text = f.read()
-            self.assertEqual(text, compact_config_json(current) + '\n')
-            self.assertFalse(text.endswith('\n\n'))
-            self.assertFalse(os.path.exists(seen[0]))
-            self.assertEqual(os.listdir(directory), ['synthetic.json'])
+                self.assertEqual(f.read(), compact_config_json(current) + '\n')
+            backup_dir = os.path.join(directory, '.runtime', 'backups')
+            backups = [n for n in os.listdir(backup_dir) if n.startswith('synthetic.json.bak.')]
+            self.assertEqual(len(backups), 1)
+            with open(os.path.join(backup_dir, backups[0]), encoding='utf-8') as f:
+                self.assertEqual(json.load(f), previous)
+            self.assertFalse([n for n in os.listdir(directory) if n.startswith('synthetic.json.bak.')])
 
     def test_atomic_write_failure_cleans_temp_and_preserves_previous(self):
+        from core.mac_config_writer import MacWriteError
         with tempfile.TemporaryDirectory() as directory:
             path = os.path.join(directory, 'synthetic.json')
             previous = {"old": "synthetic"}
             with open(path, 'w', encoding='utf-8') as f:
                 json.dump(previous, f)
-            with patch('_config_ops.os.replace', side_effect=OSError('synthetic failure')):
-                with self.assertRaises(OSError):
+            os.chmod(path, 0o600)
+            with _test_authorized_write(path), \
+                 patch('core.mac_config_writer.os.replace', side_effect=OSError('synthetic failure')):
+                with self.assertRaises(MacWriteError) as caught:
                     atomic_write(path, {"new": "current"})
+                self.assertEqual(caught.exception.state, 'UNKNOWN')
             self.assertEqual(load_config(path), previous)
-            self.assertEqual(os.listdir(directory), ['synthetic.json'])
+            self.assertFalse(any(n.startswith('.model-proxy-config-') for n in os.listdir(directory)))
 
     def test_supply_id_csv_contract_unchanged(self):
         for raw, expected in [('s1, s2', ['s1', 's2']),
@@ -818,9 +861,12 @@ class TestConfigAtomicAndCsvContracts(unittest.TestCase):
                           "sonnet": ["s,1"], "haiku": []}, "failover": "on"}]}
         with tempfile.TemporaryDirectory() as directory:
             path = os.path.join(directory, 'synthetic.json')
-            atomic_write(path, cfg)
-            with patch('builtins.input', side_effect=['', '', '', '']), \
-                 patch('_config_ops.done') as done, \
+            with open(path, 'w', encoding='utf-8') as f:
+                json.dump(cfg, f)
+            os.chmod(path, 0o600)
+            with _test_authorized_write(path), \
+                 patch('builtins.input', side_effect=['', '', '', '']), \
+                 patch('core.cli._config_ops.done') as done, \
                  contextlib.redirect_stdout(io.StringIO()):
                 route_edit(path, 'r,1')
             done.assert_called_once_with(True)

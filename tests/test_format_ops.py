@@ -1,4 +1,4 @@
-"""_format_ops.py 单测：P0 status 重设计后的覆盖。
+"""core/cli/_format_ops.py 单测：P0 status 重设计后的覆盖。
 
 运行：cd tools/model_proxy && python3 -m unittest tests.test_format_ops -v
 """
@@ -16,7 +16,7 @@ from unittest.mock import patch
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from _format_ops import (
+from core.cli._format_ops import (
     DEGRADED_FAIL_PCT,
     DEGRADED_MIN_REQUESTS,
     _format_active_sessions,
@@ -70,7 +70,8 @@ class TestLoadSupplyHealth(unittest.TestCase):
 
     def test_file_missing_returns_empty(self):
         """文件缺失 → 返回 {}。"""
-        health = load_supply_health("/nonexistent/path/totals.json")
+        with tempfile.TemporaryDirectory() as td:
+            health = load_supply_health(os.path.join(td, "missing", "totals.json"))
         self.assertEqual(health, {})
 
     def test_json_corrupt_returns_empty(self):
@@ -438,7 +439,7 @@ class TestMenuSmoke(unittest.TestCase):
 
     def _run_list(self, func_name, cfg):
         """redirect_stdout 调 _config_ops 的 list 函数，返回输出字符串。"""
-        import _config_ops
+        from core.cli import _config_ops
         with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False, encoding="utf-8") as f:
             json.dump(cfg, f)
             cfg_path = f.name
@@ -729,7 +730,8 @@ class TestLoadActiveSessions(unittest.TestCase):
 
     def test_file_missing_returns_log_missing(self):
         """文件缺失 → log_missing=True。"""
-        result = load_active_sessions("/nonexistent/path/test.log")
+        with tempfile.TemporaryDirectory() as td:
+            result = load_active_sessions(os.path.join(td, "missing", "test.log"))
         self.assertTrue(result["log_missing"])
         self.assertEqual(result["sessions"], {})
 
@@ -1040,9 +1042,11 @@ class TestStatusFormatWithSessions(unittest.TestCase):
     def setUp(self):
         # 隔离真实 HOME：默认注册表指向不存在路径（未命中 → 纯 uuid8，
         # 输出确定性）；需要 name 标注的用例显式传 sessions_dir 注入临时注册表。
+        tmpdir = tempfile.TemporaryDirectory()
+        self.addCleanup(tmpdir.cleanup)
         self._patcher = patch(
             "core.session_identity.DEFAULT_SESSIONS_DIR",
-            Path("/nonexistent/sessions-registry"))
+            Path(tmpdir.name) / "missing-sessions-registry")
         self._patcher.start()
         self.addCleanup(self._patcher.stop)
 
@@ -1141,7 +1145,7 @@ class TestStatusFormatWithSessions(unittest.TestCase):
                 "cooldown": {}, "default_cooldown_seconds": 60,
             }
             lines = _format_status_from_json(
-                data, cfg_path, totals_path, "/nonexistent/log.log")
+                data, cfg_path, totals_path, os.path.join(td, "missing.log"))
         joined = "\n".join(lines)
         self.assertIn("日志文件缺失", joined)
 

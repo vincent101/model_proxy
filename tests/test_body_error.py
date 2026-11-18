@@ -753,6 +753,7 @@ class TestBodyErrorConfigValidation(unittest.TestCase):
         with tempfile.TemporaryDirectory() as d:
             path = Path(d) / "config.json"
             path.write_text(json.dumps(cfg), encoding="utf-8")
+            path.chmod(0o600)
             return ConfigStore(path)
 
     def test_valid_rules_loaded_and_returned(self):

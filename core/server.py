@@ -5,19 +5,23 @@ tools/model_proxy/core/server.py — 本地多协议路由代理主体
 入口为 tools/model_proxy/model_proxy.py（thin wrapper 调用本模块 main()）。
 监听地址默认 127.0.0.1:18889，可经 config listen 段配置（回退矩阵与 allow_hosts
 Host 白名单见 core/listen_config.py）、配置 tools/model_proxy/config/model_proxy_config.json
-（可用 MODEL_PROXY_CONFIG 环境变量覆盖）、进程锁 /tmp/model_proxy.lock、
-日志 tools/model_proxy/.model_proxy.log。
+（可用 MODEL_PROXY_CONFIG 环境变量覆盖），默认运行数据位于项目 .runtime/。
 （v1 proxy.py 于 2026-07-24 下线删除，本模块为唯一代理实现。）
 
 仅使用 Python 标准库，不引入第三方依赖。
 """
 
+import copy
+import errno
 import hashlib
 import hmac
+import ipaddress
 import json
 import logging
 import os
 import re
+import socket
+import stat
 import sys
 import tempfile
 import threading
@@ -25,8 +29,11 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+import unicodedata
 import uuid
 from datetime import datetime, timedelta, timezone
+from dataclasses import dataclass
+from contextlib import ExitStack, contextmanager
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any, Callable
@@ -45,6 +52,18 @@ from .thinking_guard import (
     strip_empty_signature_thinking,
 )
 from .listen_config import ListenConfigError, parse_host_authority, resolve_listen
+from .config_snapshot import (ConfigSnapshot, ConfigSnapshotError, FileMarker,
+                              current_file_marker, read_stable_config,
+                              read_mac_business_config, mac_business_marker,
+                              verify_mac_business_config, mac_config_error_code)
+from .runtime_paths import PATH_KEYS, read_runtime_paths, RuntimePathsError
+from .discovery import (inspect_runtime_identities, PreflightError, INSTANCE_SCHEMA,
+                        process_start_identity, process_executable, write_instance_record,
+                        read_instance_record, read_instance_set, initialize_installation,
+                        verify_record_directory, verify_held_instance_locks,
+                        delete_instance_record_if_matches, _verify_directory,
+                        verify_no_extended_acl, verify_local_filesystem_fd)
+from .platform_lock import acquire_lock, LockError, verify_local_access
 from .commands import (
     CMD_PREFIX,
     COMMAND_HANDLERS,
@@ -85,17 +104,17 @@ _VERSION = "unknown"  # main() 启动时读 VERSION 文件覆盖
 _VERSION_FILE = _PACKAGE_DIR / "VERSION"
 
 # 模块级默认值（供 _DEFAULT_PATHS 引用 + 测试 import 时不触碰文件）
-_LOG_FILE_DEFAULT = _PACKAGE_DIR / ".model_proxy.log"
-_TOTALS_FILE_DEFAULT = _PACKAGE_DIR / ".model_proxy_totals.json"
-_LOCK_FILE_DEFAULT = Path("/tmp/model_proxy.lock")
+_LOG_FILE_DEFAULT = _PACKAGE_DIR / ".runtime" / "model_proxy.log"
+_TOTALS_FILE_DEFAULT = _PACKAGE_DIR / ".runtime" / "model_proxy_totals.json"
+_LOCK_FILE_DEFAULT = _PACKAGE_DIR / ".runtime" / "model_proxy.lock"
 
 _DEFAULT_PATHS = {
     "log": str(_LOG_FILE_DEFAULT),
     "totals": str(_TOTALS_FILE_DEFAULT),
     "lock": str(_LOCK_FILE_DEFAULT),
-    "pid": "/tmp/model_proxy.pid",
-    "ensure_log": "/tmp/model_proxy_ensure.log",
-    "start_lock": "/tmp/model_proxy_start.lock",
+    "pid": str(_PACKAGE_DIR / ".runtime" / "model_proxy.pid"),
+    "ensure_log": str(_PACKAGE_DIR / ".runtime" / "model_proxy_ensure.log"),
+    "start_lock": str(_PACKAGE_DIR / ".runtime" / "model_proxy_start.lock"),
 }
 
 # 运行时实际路径（main() 启动路径赋值，测试 import 时为 None）
@@ -103,25 +122,11 @@ _runtime_paths: dict[str, Path] | None = None
 
 
 def resolve_runtime_paths(paths_file: Path = _RUNTIME_PATHS_FILE) -> dict[str, Path]:
-    """启动时一次性解析所有运行时路径。不参与热重载。
-
-    runtime_paths.json 缺失/corrupt → 全部回退默认值。
-    相对路径以 paths_file.parent.parent（即 model_proxy/）为基准。
-    """
-    paths = {}
-    base = paths_file.parent.parent  # model_proxy/
-    try:
-        with open(paths_file, "r", encoding="utf-8") as f:
-            raw_paths = json.load(f)
-    except (json.JSONDecodeError, OSError):
-        raw_paths = {}
-    for key, default in _DEFAULT_PATHS.items():
-        val = raw_paths.get(key, default)
-        p = Path(val)
-        if not p.is_absolute():
-            p = base / p
-        paths[key] = p
-    return paths
+    """Resolve once at startup; invalid or missing path files fail closed."""
+    base = paths_file.parent.parent.resolve()
+    parsed = read_runtime_paths(paths_file, project_root=base,
+                                local_appdata=os.environ.get("LOCALAPPDATA"))
+    return parsed.map_values(Path)
 
 
 def _trim_log(path: Path, *, now: datetime | None = None,
@@ -193,7 +198,7 @@ access_log.setLevel(logging.INFO)
 access_log.propagate = False
 
 
-def init_logging(log_path: Path) -> None:
+def init_logging(log_path: Path, *, trim: bool = True) -> None:
     """生产启动路径调用：截断日志 + 装配 root/access handler 到 log_path。
 
     仅在 main() 里调用一次。测试 import 本模块时不执行，root logger 无 FileHandler，
@@ -202,7 +207,8 @@ def init_logging(log_path: Path) -> None:
     """
     if access_log.handlers:
         return
-    _trim_log(log_path)
+    if trim:
+        _trim_log(log_path)
     root_handler = logging.FileHandler(log_path)
     root_handler.setFormatter(logging.Formatter(
         "%(asctime)s %(levelname)s req_id=%(req_id)s %(message)s"))
@@ -240,22 +246,46 @@ def _cst_now() -> datetime:
 KEEP_DAYS = 400  # 明细天桶保留窗口，超窗归档进 months_archive
 
 
-def _atomic_write_json(path: Path, obj: dict) -> None:
-    """mkstemp + os.replace 原子写盘，模式与 _config_ops.atomic_write 一致，
-    但不跨包 import（依赖方向/形参语义不同，本函数在 server.py 内自持一份）。
+@dataclass(frozen=True)
+class LedgerUnavailable:
+    """Content invalid after security checks; never equivalent to proven absence."""
+    marker: FileMarker
+
+
+@dataclass(frozen=True, repr=False)
+class LedgerObservation:
+    """Adapter-verified full content and opaque identity/protection evidence.
+
+    ``data=None`` means independently verified absence. Evidence must bind the
+    direct parent, target identity (or absence), protection and stable content.
     """
-    _dir = str(path.parent)
-    fd, tmp = tempfile.mkstemp(dir=_dir, suffix=".tmp")
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8") as f:
-            json.dump(obj, f, indent=2, ensure_ascii=False)
-        os.replace(tmp, str(path))
-    except Exception:
-        try:
-            os.unlink(tmp)
-        except OSError:
-            pass
-        raise
+    data: dict | None
+    evidence: Any
+
+
+@dataclass(frozen=True, repr=False)
+class LedgerCommitResult:
+    """Adapter outcome: CONFIRMED, NOT_APPLIED or UNKNOWN.
+
+    candidate is the protected staging object's identity/content evidence,
+    retained even on UNKNOWN when available. confirmed is a postchecked target.
+    """
+    outcome: str
+    candidate: LedgerObservation | None = None
+    confirmed: LedgerObservation | None = None
+
+
+# Runtime integration contract: guarded platform adapters are selected below.
+# Windows has fake-backend coverage only; native deployment is not validated.
+# bind_startup(path, snapshot) -> LedgerObservation; observe(path) -> observation;
+# matches(observed, prior) -> bool; commit(path, prior, candidate_dict) ->
+# LedgerCommitResult. bind_startup must revalidate startup identity/protection,
+# including verified absence; matches must compare content AND identity, parent
+# and protection (not content alone). commit must independently revalidate prior,
+# roles, locks, staging/volume and target before atomic submission, then verify
+# target and resource release. It must return UNKNOWN whenever submission,
+# postcheck, cleanup or release is uncertain. No fake adapter is installed here.
+# The injection seam is not itself authority; production must pass the real guard.
 
 
 def _zero_bucket() -> dict:
@@ -272,6 +302,88 @@ def _zero_combo() -> dict:
             "attempts": 0, "attempt_fail": 0}
 
 
+def validate_migration_ledger_snapshot(snapshot: ConfigSnapshot | None) -> None:
+    """Pure semantic preflight for a previously captured stable ledger.
+
+    None means the caller has independently proved absence. A present snapshot
+    must come from a stable read with reject_duplicate_keys=True: a parsed dict
+    cannot reveal keys already discarded by a permissive JSON parser.
+    This function does not read files, authenticate paths or mutate/upgrade
+    the snapshot. Existing v2 and v3 ledgers are accepted only when every
+    bucket and combo can be incremented or archived by UsageTotalsStore.
+    Historical optional extension fields remain optional, but must be valid
+    when present.
+    """
+    def invalid():
+        raise PreflightError("ledger_unverified", "Ledger schema is invalid or unsupported")
+
+    if snapshot is None:
+        return
+    if not isinstance(snapshot, ConfigSnapshot) or type(snapshot.config) is not dict:
+        invalid()
+    data = snapshot.config
+    # The original loader treats an absent version as the legacy v2 format.
+    # An explicitly present null or other non-integer is still invalid.
+    version = data.get("version", 2)
+    if type(version) is not int or version not in (2, 3):
+        invalid()
+
+    def date_key(value, *, month=False):
+        pattern = r"[0-9]{4}-[0-9]{2}" if month else r"[0-9]{4}-[0-9]{2}-[0-9]{2}"
+        if type(value) is not str or re.fullmatch(pattern, value) is None:
+            invalid()
+        try:
+            datetime.fromisoformat(value + "-01" if month else value)
+        except ValueError:
+            invalid()
+
+    if "since" in data:
+        date_key(data["since"])
+    if "keep_days" in data and (type(data["keep_days"]) is not int or data["keep_days"] <= 0):
+        invalid()
+
+    def numbers(mapping, required, optional):
+        for field in required:
+            if field not in mapping or type(mapping[field]) is not int or mapping[field] < 0:
+                invalid()
+        for field in optional:
+            if field in mapping and (type(mapping[field]) is not int or mapping[field] < 0):
+                invalid()
+
+    def bucket(value):
+        if type(value) is not dict:
+            invalid()
+        numbers(value, ("requests", "ok", "fail", "sum_ms"), ("client_disconnect", "max_ms"))
+        if (value["ok"] + value["fail"] > value["requests"] or
+                value.get("client_disconnect", 0) > value["requests"] or
+                value.get("max_ms", 0) > value["sum_ms"]):
+            invalid()
+        combos = value.get("combos")
+        if type(combos) is not dict:
+            invalid()
+        for key, combo in combos.items():
+            if type(key) is not str or not key or type(combo) is not dict:
+                invalid()
+            numbers(combo, ("requests", "ok", "fail", "usage_in", "usage_out"),
+                    ("client_disconnect", "attempts", "attempt_fail", "usage_reasoning"))
+            if (combo["ok"] + combo["fail"] > combo["requests"] or
+                    combo.get("client_disconnect", 0) > combo["requests"]):
+                invalid()
+
+    if "total" not in data:
+        invalid()
+    for name in ("days", "months_archive"):
+        if name in data and type(data[name]) is not dict:
+            invalid()
+    bucket(data["total"])
+    for key, value in data.get("days", {}).items():
+        date_key(key)
+        bucket(value)
+    for key, value in data.get("months_archive", {}).items():
+        date_key(key, month=True)
+        bucket(value)
+
+
 class UsageTotalsStore:
     """独立账本：按天分桶，桶内 supply×route×strategy 组合键累加。
 
@@ -282,37 +394,183 @@ class UsageTotalsStore:
         self._path = path
         self._lock = threading.Lock()
         self._data: dict = self._load()
+        # Direct construction has no verified startup evidence and cannot write.
+        self._init_persistence(None, None, initial_verified=False)
+
+    @staticmethod
+    def _empty_data() -> dict:
+        return {
+            "version": 3,
+            "since": _cst_now().strftime("%Y-%m-%d"),
+            "keep_days": KEEP_DAYS,
+            "total": _zero_bucket(),
+            "months_archive": {},
+            "days": {},
+        }
+
+    @classmethod
+    def from_verified_snapshot(cls, path: Path, snapshot, *, adapter=None):
+        """Use the security-gated startup snapshot; never reset an unknown file.
+
+        The caller injects the real guarded adapter on supported runtime paths;
+        no adapter means persistence remains disabled, never an unsafe fallback.
+        """
+        if not isinstance(snapshot, LedgerUnavailable):
+            validate_migration_ledger_snapshot(snapshot)
+        store = cls.__new__(cls)
+        store._path = path
+        store._lock = threading.Lock()
+        if snapshot is None or isinstance(snapshot, LedgerUnavailable):
+            store._data = cls._empty_data()
+        else:
+            data = copy.deepcopy(snapshot.config)
+            validate_migration_ledger_snapshot(ConfigSnapshot(data, snapshot.marker))
+            store._data = cls._prepare_loaded(data)
+        store._init_persistence(adapter, snapshot, initial_verified=True)
+        return store
+
+    def _init_persistence(self, adapter, snapshot, *, initial_verified):
+        self._adapter = adapter
+        self._startup_snapshot = copy.deepcopy(snapshot)
+        self._startup_verified = initial_verified
+        self._baseline = None
+        self._candidate = None
+        self._state = "UNAVAILABLE" if isinstance(snapshot, LedgerUnavailable) else "CLEAN"
+        self._last_warning = None
+        if self._state == "UNAVAILABLE":
+            self._warn_persistence(force=True)
+        elif adapter is None:
+            log.warning("usage_totals.persistence protected adapter unavailable; new statistics will not be persisted")
+
+    @property
+    def persistence_state(self):
+        with self._lock:
+            return self._state
+
+    def _warn_persistence(self, *, force=False):
+        now = time.monotonic()
+        if force or self._last_warning is None or now - self._last_warning >= 60:
+            log.warning("usage_totals.persistence state=%s; statistics not confirmed on disk", self._state)
+            self._last_warning = now
+
+    def _set_persistence_state(self, state):
+        if state != self._state:
+            self._state = state
+            if state == "CLEAN":
+                log.info("usage_totals.persistence recovered; statistics confirmed on disk")
+                self._last_warning = None
+            else:
+                # Rate-limit across transitions too, not just repeated states.
+                self._warn_persistence()
+        elif state != "CLEAN":
+            self._warn_persistence()
+
+    @staticmethod
+    def _valid_observation(value):
+        return (isinstance(value, LedgerObservation) and value.evidence is not None
+                and (value.data is None or type(value.data) is dict))
+
+    def _matches(self, observed, expected):
+        # Content equality is necessary but NOT sufficient; adapter supplies
+        # independent object/parent/protection identity evidence.
+        return (self._valid_observation(observed) and self._valid_observation(expected)
+                and observed.data == expected.data
+                and self._adapter.matches(observed, expected) is True)
+
+    def _flush_locked(self):
+        """Accumulate once, then safely reconcile B/C before any new commit."""
+        if self._state == "UNAVAILABLE":
+            # Unknown starting contents cannot be merged safely with this
+            # process's increments. Recovery needs a future proven merge path.
+            self._warn_persistence()
+            return
+        if self._adapter is None or not self._startup_verified:
+            self._set_persistence_state("PENDING")
+            return
+        try:
+            if self._baseline is None:
+                expected = (None if self._startup_snapshot is None
+                            else self._startup_snapshot.config)
+                bound = self._adapter.bind_startup(self._path, copy.deepcopy(self._startup_snapshot))
+                if not self._valid_observation(bound) or bound.data != expected:
+                    self._set_persistence_state("UNKNOWN")
+                    return
+                self._baseline = copy.deepcopy(bound)
+            observed = self._adapter.observe(self._path)
+            if self._state == "UNKNOWN" and self._candidate is not None and self._matches(observed, self._candidate):
+                self._baseline = copy.deepcopy(observed)
+                self._candidate = None
+            elif self._matches(observed, self._baseline):
+                self._candidate = None
+            else:
+                self._set_persistence_state("UNKNOWN")
+                return
+        except Exception:
+            # Revalidation failures cannot establish current disk identity.
+            self._set_persistence_state("UNKNOWN")
+            return
+
+        try:
+            candidate_data = copy.deepcopy(self._data)
+        except Exception:
+            # No commit has been called; the in-memory increment is pending.
+            self._set_persistence_state("PENDING")
+            return
+        try:
+            result = self._adapter.commit(self._path, copy.deepcopy(self._baseline),
+                                          copy.deepcopy(candidate_data))
+        except Exception:
+            # An unclassified exception may have happened after submission.
+            self._candidate = None
+            self._set_persistence_state("UNKNOWN")
+            return
+        if not isinstance(result, LedgerCommitResult):
+            self._candidate = None
+            self._set_persistence_state("UNKNOWN")
+            return
+        if result.outcome == "NOT_APPLIED":
+            self._candidate = None
+            self._set_persistence_state("PENDING")
+            return
+        try:
+            candidate = result.candidate
+            self._candidate = (copy.deepcopy(candidate) if self._valid_observation(candidate)
+                               and candidate.data == candidate_data else None)
+        except Exception:
+            # Submission may have happened before the adapter returned.
+            self._candidate = None
+            self._set_persistence_state("UNKNOWN")
+            return
+        if result.outcome == "CONFIRMED" and self._candidate is not None:
+            try:
+                if self._matches(result.confirmed, self._candidate):
+                    self._baseline = copy.deepcopy(result.confirmed)
+                    self._candidate = None
+                    self._set_persistence_state("CLEAN")
+                    return
+            except Exception:
+                pass
+        self._set_persistence_state("UNKNOWN")
 
     def _load(self) -> dict:
-        if not self._path.exists():
-            return {
-                "version": 3,
-                "since": _cst_now().strftime("%Y-%m-%d"),
-                "keep_days": KEEP_DAYS,
-                "total": _zero_bucket(),
-                "months_archive": {},
-                "days": {},
-            }
+        """Load a stable ledger; never move/reset an unreadable existing file."""
         try:
-            with open(self._path, "r", encoding="utf-8") as f:
-                data = json.load(f)
-        except (json.JSONDecodeError, OSError) as e:
-            log.warning("usage totals ledger corrupt, resetting: %s", e)
-            try:
-                ts = int(time.time())
-                corrupt_path = self._path.with_name(self._path.name + f".corrupt.{ts}")
-                os.replace(str(self._path), str(corrupt_path))
-            except OSError:
-                pass
-            return {
-                "version": 3,
-                "since": _cst_now().strftime("%Y-%m-%d"),
-                "keep_days": KEEP_DAYS,
-                "total": _zero_bucket(),
-                "months_archive": {},
-                "days": {},
-            }
-        # OPT-10: v2→v3 迁移（补 0，断档但保真）
+            snapshot = read_stable_config(self._path, reject_duplicate_keys=True)
+        except ConfigSnapshotError as exc:
+            if exc.code == "config_read_error":
+                try:
+                    self._path.lstat()
+                except FileNotFoundError:
+                    return self._empty_data()
+                except OSError:
+                    pass
+            raise PreflightError("ledger_unverified", "Ledger cannot be verified") from None
+        validate_migration_ledger_snapshot(snapshot)
+        return self._prepare_loaded(copy.deepcopy(snapshot.config))
+
+    @staticmethod
+    def _prepare_loaded(data: dict) -> dict:
+        # OPT-10: v2→v3 migration remains in memory until normal recording.
         if data.get("version", 2) < 3:
             data["version"] = 3
             for bucket in [data.get("total"), *(data.get("months_archive") or {}).values(),
@@ -381,7 +639,7 @@ class UsageTotalsStore:
                 combo["attempt_fail"] = combo.get("attempt_fail", 0) + attempt_fail
 
             self._archive_if_needed()
-            _atomic_write_json(self._path, self._data)
+            self._flush_locked()
 
     def _archive_if_needed(self) -> None:
         """days 超过 KEEP_DAYS 时，把最旧的天桶按组合键汇总进 months_archive 后删除。
@@ -415,6 +673,10 @@ class UsageTotalsStore:
                                              + combo_val.get("client_disconnect", 0))
                 dest["usage_in"] += combo_val.get("usage_in", 0)
                 dest["usage_out"] += combo_val.get("usage_out", 0)
+                # Preserve the legacy reasoning count only where it existed.
+                if "usage_reasoning" in combo_val:
+                    dest["usage_reasoning"] = (dest.get("usage_reasoning", 0)
+                                               + combo_val["usage_reasoning"])
                 # OPT-10: attempts/attempt_fail 归档累加
                 dest["attempts"] = dest.get("attempts", 0) + combo_val.get("attempts", 0)
                 dest["attempt_fail"] = dest.get("attempt_fail", 0) + combo_val.get("attempt_fail", 0)
@@ -438,10 +700,13 @@ if os.environ.get("MODEL_PROXY_REASONING_DEBUG", "").strip().lower() in ("1", "t
 
 # 默认路径（全部 v2 命名）：锚定包目录 tools/model_proxy/config/model_proxy_config.json，
 # 可用环境变量 MODEL_PROXY_CONFIG 覆盖（与 model_proxy_cli.sh 的 CONFIG_FILE 逻辑一致）。
-_DEFAULT_CONFIG_PATH = Path(
-    os.environ.get("MODEL_PROXY_CONFIG")
-    or (Path(__file__).resolve().parent.parent / "config" / "model_proxy_config.json")
-)
+_default_config_source = (os.environ.get("MODEL_PROXY_CONFIG")
+                          or (Path(__file__).resolve().parent.parent / "config" / "model_proxy_config.json"))
+# pathlib discards a trailing slash and '/.'; retain the original Mac business
+# path until its filesystem semantics have been checked by the snapshot code.
+_DEFAULT_CONFIG_PATH = (os.fspath(_default_config_source)
+                        if sys.platform == "darwin" and os.name == "posix"
+                        else Path(_default_config_source))
 # _LOCK_FILE 旧硬编码已移除，运行时路径由 resolve_runtime_paths() 解析，
 # 默认值见 _DEFAULT_PATHS["lock"]（即 _LOCK_FILE_DEFAULT）。
 
@@ -487,12 +752,53 @@ class SyntaxPreferenceStore:
 # L1 配置：ConfigStore（拷贝 proxy.py 骨架 + 换 getter 适配新 schema）
 # ---------------------------------------------------------------------------
 
+@dataclass(frozen=True)
+class ConfigReloadOutcome:
+    """One attempt only; error values are fixed, non-sensitive enums."""
+
+    loaded: bool
+    error: str | None = None
+
+
+class ConfigReloadCallbackError(RuntimeError):
+    """Configuration was committed but its reload callback failed."""
+
+    def __init__(self):
+        super().__init__("config_callback_error")
+        self.loaded = True
+
+
+def _mac_business_enabled():
+    return sys.platform == "darwin" and os.name == "posix"
+
+
+def _business_path(path):
+    """Anchor relative Mac paths without erasing symlink/.. or trailing slash."""
+    if not _mac_business_enabled():
+        return Path(path)
+    raw = os.fspath(path)
+    return raw if os.path.isabs(raw) else os.path.join(os.getcwd(), raw)
+
+
+def _read_business_config(path):
+    return read_mac_business_config(path) if _mac_business_enabled() else read_stable_config(path)
+
+
+def _business_marker(path):
+    return mac_business_marker(path) if _mac_business_enabled() else current_file_marker(path)
+
+
+def _verify_business_snapshot(snapshot):
+    if _mac_business_enabled():
+        verify_mac_business_config(snapshot)
+
+
 class ConfigStore:
     """从 model_proxy_config.json 加载并热重载配置。
 
-    热重载机制（mtime 比对、maybe_reload 双重检查、_reload_locked
-    失败保留旧配置、reload 强制重载）拷贝自 proxy.py，getter 换成
-    新 schema（supplies/routes/admin_token/cooldown_rules）。
+    文件身份、时间及大小标记不等时触发双重检查；本次稳定读取失败
+    不替换快照、不推进标记。初始化保留 supply 扩展校验 fail-fast，
+    热重载保留校验异常仅告警的既有行为。
     """
 
     def __init__(
@@ -500,9 +806,11 @@ class ConfigStore:
         config_path: str | os.PathLike | None = None,
         on_reload: Callable[[], None] | None = None,
     ):
-        self._path = Path(config_path) if config_path else _DEFAULT_CONFIG_PATH
+        self._path = _business_path(config_path if config_path is not None else _DEFAULT_CONFIG_PATH)
         self._config: dict[str, Any] = {}
         self._mtime: float = 0.0
+        self._probe_marker = None
+        self._business_snapshot = None
         self._lock = threading.Lock()
         self._on_reload = on_reload
         self._reload()
@@ -600,67 +908,99 @@ class ConfigStore:
     # ------------------------------------------------------------------
 
     def maybe_reload(self) -> bool:
-        """比对 mtime，有变化则重载，返回是否触发了重载。"""
+        """Reload on marker inequality; failures do not advance the marker."""
         try:
-            mtime = self._path.stat().st_mtime
-        except FileNotFoundError:
+            marker = _business_marker(self._path)
+        except ConfigSnapshotError:
             return False
-        if mtime <= self._mtime:
+        if marker == self._probe_marker:
             return False
         with self._lock:
-            # 双重检查
             try:
-                mtime = self._path.stat().st_mtime
-            except FileNotFoundError:
+                marker = _business_marker(self._path)
+            except ConfigSnapshotError:
                 return False
-            if mtime <= self._mtime:
+            if marker == self._probe_marker:
                 return False
-            reloaded = self._reload_locked()
-        # 锁外调用回调，避免锁嵌套；加载失败则不触发回调
-        if reloaded and self._on_reload is not None:
+            outcome = self._reload_locked()
+        if outcome.loaded and self._on_reload is not None:
             self._on_reload()
-        return reloaded
+        return outcome.loaded
 
-    def reload(self) -> None:
-        """强制重载配置文件，并触发 on_reload 回调。"""
+    def reload_detailed(self) -> ConfigReloadOutcome:
+        """One manual attempt, including a possible post-commit callback error."""
         with self._lock:
-            reloaded = self._reload_locked()
-        if reloaded and self._on_reload is not None:
-            self._on_reload()
+            outcome = self._reload_locked()
+        if outcome.loaded and self._on_reload is not None:
+            try:
+                self._on_reload()
+            except Exception:
+                return ConfigReloadOutcome(True, "config_callback_error")
+        return outcome
+
+    def reload(self) -> bool:
+        """Return this attempt's loading result; callback failure is post-commit."""
+        outcome = self.reload_detailed()
+        if outcome.error == "config_callback_error":
+            raise ConfigReloadCallbackError() from None
+        return outcome.loaded
 
     # ------------------------------------------------------------------
     # Internal
     # ------------------------------------------------------------------
 
     def _reload(self) -> None:
-        """初始化加载，失败直接上抛（不容错）。"""
+        """Initial stable read; retain the existing startup validation failure."""
         with self._lock:
-            with open(self._path, "r", encoding="utf-8") as f:
-                new_config: dict[str, Any] = json.load(f)
-            self._mtime = self._path.stat().st_mtime
-            self._config = new_config
+            snapshot = _read_business_config(self._path)
+            self._config = snapshot.config
+            self._business_snapshot = snapshot
+            self._probe_marker = snapshot.marker
+            self._mtime = snapshot.marker.mtime_ns / 1_000_000_000
+            # Startup remains fail-fast for invalid supply extension fields.
             self._validate_config()
 
-    def _reload_locked(self) -> bool:
-        """持锁加载文件，替换 config 引用。解析失败时保留旧配置，返回 False。"""
+    def _reload_locked(self) -> ConfigReloadOutcome:
+        """Commit the read descriptor's snapshot and marker under one lock."""
         try:
-            with open(self._path, "r", encoding="utf-8") as f:
-                new_config: dict[str, Any] = json.load(f)
-            self._mtime = self._path.stat().st_mtime
-            self._config = new_config
-            log.info("config.reload.ok mtime=%s supplies=%d routes=%d strategies=%d",
-                     self._mtime,
-                     len(new_config.get("supplies", [])),
-                     len(new_config.get("routes", [])),
-                     len(new_config.get("strategies", [])))
+            snapshot = _read_business_config(self._path)
+        except ConfigSnapshotError as exc:
+            allowed = {"config_parse_error", "config_read_error", "config_unstable",
+                       "file_identity_unavailable", "filesystem_unverified"}
+            code = exc.code if exc.code in allowed else "config_reload_error"
             try:
-                self._validate_config()
-            except Exception as e:
-                log.warning("config.validate raised (ignored, load still ok): %s", e)
-            return True
-        except (json.JSONDecodeError, OSError) as e:
-            log.warning("config reload failed, keeping old config: %s", e)
-            return False
+                log.warning("config.reload.failed reason=%s", code)
+            except Exception:
+                pass
+            return ConfigReloadOutcome(False, code)
+
+        # A later path change is detected against the marker of the bytes read.
+        self._config = snapshot.config
+        self._business_snapshot = snapshot
+        self._probe_marker = snapshot.marker
+        self._mtime = snapshot.marker.mtime_ns / 1_000_000_000
+        try:
+            self._validate_config()
+        except Exception as exc:
+            # Existing hot-reload behavior: validation warns, not rejection.
+            try:
+                log.warning("config.validate raised (ignored, load still ok): %s", exc)
+            except Exception:
+                pass
+        try:
+            def safe_count(value):
+                try:
+                    return len(value)
+                except (TypeError, AttributeError):
+                    return 0
+            log.info("config.reload.ok mtime=%s supplies=%d routes=%d strategies=%d",
+                     self._mtime, safe_count(snapshot.config.get("supplies", [])),
+                     safe_count(snapshot.config.get("routes", [])),
+                     safe_count(snapshot.config.get("strategies", [])))
+        except Exception:
+            # Logging failure cannot make an already committed snapshot old.
+            pass
+        return ConfigReloadOutcome(True)
 
     def _validate_config(self) -> None:
         """OPT-06：配置校验（告警 ≠ 拒绝加载）。
@@ -670,7 +1010,7 @@ class ConfigStore:
         - route_id 与 route_pool 互斥：每个 strategy 最多告警一次
         - route_pool 非法项：每个 strategy 最多告警一次（聚合非法 route_id 列表）
         - cooldown_rules 策略组格式校验（容错：非法策略组跳过 + log warning）
-        容错语义：校验只告警，不影响加载成功（_reload_locked 仍返回 True）。
+        容错语义：热重载校验只告警，不影响本次加载成功结果。
         """
         routes_map = {r["id"]: r for r in self._config.get("routes", [])
                       if isinstance(r, dict) and "id" in r}
@@ -1775,6 +2115,17 @@ class ModelProxyHandler(BaseHTTPRequestHandler):
     # dispatch
     # ------------------------------------------------------------------
 
+    def _close_if_body_unconsumed(self) -> None:
+        """Do not reuse a connection when this route leaves a possible body unread."""
+        lengths = self.headers.get_all("Content-Length") or []
+        encodings = self.headers.get_all("Transfer-Encoding") or []
+        # Only no framing, or one strictly decimal zero, proves there is no body.
+        # Do not read/discard it: a client may not send the declared bytes.
+        if (encodings or len(lengths) > 1
+                or (lengths and re.fullmatch(r"0+", lengths[0].strip()) is None)):
+            self.close_connection = True
+            self._unconsumed_body_close = True
+
     def _host_check(self) -> bool:
         """Host 头校验守卫：通过返回 True；不通过已回 403 并返回 False。
 
@@ -1790,6 +2141,7 @@ class ModelProxyHandler(BaseHTTPRequestHandler):
             return True
         log.warning("host_check.reject req_id=%s host=%r path=%s",
                     _req_local.req_id, values, self.path)
+        self._close_if_body_unconsumed()
         self._send_json(403, {"error": "host not allowed"})
         return False
 
@@ -1799,6 +2151,7 @@ class ModelProxyHandler(BaseHTTPRequestHandler):
             if not self._host_check():
                 return
             if self.path.startswith(_CONTROL_PATH_PREFIX):
+                self._close_if_body_unconsumed()
                 self._dispatch_control("GET")
             else:
                 self._forward_logged("GET")
@@ -1811,6 +2164,7 @@ class ModelProxyHandler(BaseHTTPRequestHandler):
             if not self._host_check():
                 return
             if self.path.startswith(_CONTROL_PATH_PREFIX):
+                self._close_if_body_unconsumed()
                 self._dispatch_control("POST")
             else:
                 self._forward_logged("POST")
@@ -1938,7 +2292,8 @@ class ModelProxyHandler(BaseHTTPRequestHandler):
                 try:
                     usage_totals.record(a, ms)
                 except Exception:
-                    log.warning("usage_totals.record failed", exc_info=True)
+                    # Do not expose ledger data or adapter exception details.
+                    log.warning("usage_totals.record failed; statistics not confirmed on disk")
 
     # ------------------------------------------------------------------
     # 转发编排（阶段1：纯透传路由 + cooldown + failover）
@@ -3282,17 +3637,55 @@ class ModelProxyHandler(BaseHTTPRequestHandler):
         })
 
     def _handle_reload(self, cs: "ConfigStore", cd: "CooldownStore"):
-        """手动 reload：强制重载配置 + 无条件清空所有 supply 的冷却。
+        """Authenticated manual reload: report the actual attempt and clear cooldown."""
+        loaded: bool | None = None
+        load_error: str | None = None
+        allowed = {"config_parse_error", "config_read_error", "config_unstable",
+                   "file_identity_unavailable", "filesystem_unverified", "config_reload_error",
+                   "config_callback_error", "config_reload_unknown"}
+        try:
+            outcome = cs.reload_detailed()
+            if not isinstance(outcome, ConfigReloadOutcome) or not isinstance(outcome.loaded, bool):
+                load_error = "config_reload_unknown"
+            else:
+                loaded = outcome.loaded
+                load_error = outcome.error if outcome.error in allowed else (
+                    "config_reload_unknown" if outcome.error is not None else None)
+        except Exception:
+            # An unexpected failure may have happened before or after commit.
+            loaded = None
+            load_error = "config_reload_unknown"
 
-        与 mtime 驱动的自动 maybe_reload()（每请求经 _forward 调用）的关键区别：
-        手动 reload 是运维显式动作（改配置后确认生效），清空 cooldown 是合理的用户预期；
-        自动 reload 只是发现文件变了顺手换配置，不应该悄悄影响运行中的冷却状态。
-        """
-        cs.reload()
-        cleared = len(cd.snapshot())
-        cd.clear_all()
-        log.info("admin.reload cleared_cooldowns=%d", cleared)
-        self._send_json(200, {"ok": True})
+        try:
+            count = len(cd.snapshot())
+        except Exception:
+            count = None
+        try:
+            cd.clear_all()
+            cooldown_cleared: bool | None = True
+        except Exception:
+            # A partial clear cannot be distinguished from an unperformed one.
+            cooldown_cleared = None
+        try:
+            if cooldown_cleared is True:
+                log.info("admin.reload cleared_cooldowns=%s", count if count is not None else "unknown")
+            else:
+                log.warning("admin.reload cooldown_clear_failed")
+        except Exception:
+            pass
+
+        if loaded is True and load_error is None and cooldown_cleared is True:
+            self._send_json(200, {"ok": True})
+            return
+        if cooldown_cleared is None:
+            error = "cooldown_clear_failed"
+        else:
+            error = load_error or "config_reload_unknown"
+        body = {"ok": False, "error": error, "loaded": loaded,
+                "cooldown_cleared": cooldown_cleared}
+        if cooldown_cleared is None and load_error is not None:
+            body["load_error"] = load_error
+        self._send_json(422 if error == "config_parse_error" else 500, body)
 
     # ------------------------------------------------------------------
     # 写回（拷贝 proxy.py：流式 chunked 透传 / 缓冲响应）
@@ -3710,6 +4103,8 @@ class ModelProxyHandler(BaseHTTPRequestHandler):
         self.send_response(status)
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", str(len(data)))
+        if getattr(self, "_unconsumed_body_close", False):
+            self.send_header("Connection", "close")
         self.end_headers()
         self.wfile.write(data)
 
@@ -3718,56 +4113,1314 @@ class ModelProxyHandler(BaseHTTPRequestHandler):
 # main
 # ---------------------------------------------------------------------------
 
-def main():
-    config_path = _DEFAULT_CONFIG_PATH
-
-    # 0. 解析 listen/allow_hosts（回退矩阵见 core/listen_config.py；与 cli.sh/
-    #    ensure_model_proxy.sh 共用同一实现）。fail-fast：非法配置在任何副作用
-    #    （锁/账本/日志截断）之前退出，stderr 信息随 nohup 落入日志文件。
+def _windows_check_config_targets(runtime_paths, config_path, *, project_root=None,
+                                  initial_missing_parents=()):
+    """Use held Windows path evidence for configs, sidecar, and all roles."""
+    import ntpath
+    from pathlib import PureWindowsPath
+    from core import windows_paths
+    from core.discovery import (_windows_open_preflight, _windows_close_leases,
+                                _windows_trusted_boundary)
+    scope = None
+    inputs = []
     try:
-        listen_cfg = resolve_listen(config_path,
-                                    os.environ.get("MODEL_PROXY_PORT"))
-    except ListenConfigError as e:
-        print(f"model_proxy: listen/allow_hosts 配置非法，启动失败：{e}",
-              file=sys.stderr)
-        raise SystemExit(1)
+        project = ntpath.abspath(os.fspath(_PACKAGE_DIR if project_root is None else project_root))
+        business = PureWindowsPath(ntpath.abspath(os.fspath(config_path)))
+        path_config = PureWindowsPath(ntpath.join(project, "config", "runtime_paths.json"))
+        sidecar = business.parent / "session_overrides.json"
+        _, scope = _windows_open_preflight(project, runtime_paths, light=True,
+                                           initial_missing_parents=initial_missing_parents)
+        backend = scope["__root__"]._backend
+        for path in (business, path_config, sidecar):
+            lease = windows_paths.inspect(
+                str(path), backend=backend, kind="file", private=True,
+                trusted_boundary=_windows_trusted_boundary(project, path))
+            inputs.append(lease)
+            if not lease.evidence.direct_parent_observed:
+                raise LockError("config_path_unknown")
+        state = scope["state_dir"]
+        for item in inputs:
+            if windows_paths.may_contain(item, state):
+                raise LockError("config_state_conflict")
+        for index, item in enumerate(inputs):
+            for other in inputs[index + 1:]:
+                if windows_paths.may_alias(item, other):
+                    raise LockError("config_path_conflict")
+            for role, other in scope.items():
+                if role in ("__root__", "state_dir"):
+                    continue
+                if windows_paths.may_contain(item, other) or windows_paths.may_contain(other, item):
+                    raise LockError("config_path_conflict")
+        for lease in (*scope.values(), *inputs):
+            lease.revalidate()
+    except LockError:
+        raise
+    except Exception as exc:
+        # The opening preflight may fail while closing an internal HANDLE,
+        # before it hands us any leases. Preserve that unknown outcome rather
+        # than downgrading it to an ordinary path-verification failure.
+        if (getattr(exc, "release_unknown", False) is True or
+                getattr(exc, "close_unknown", False) is True or
+                getattr(exc, "code", None) in
+                ("release_unknown", "lock_release_unknown", "close_failed",
+                 "handle_close_failed", "resource_release_failed")):
+            raise LockError("lock_release_unknown") from None
+        raise LockError("config_path_unknown") from None
+    finally:
+        all_leases = list(inputs)
+        if scope is not None:
+            all_leases.extend(scope.values())
+        try:
+            _windows_close_leases(all_leases)
+        except PreflightError:
+            raise LockError("lock_release_unknown") from None
 
-    # 0. 解析运行时路径（bootstrap，不依赖 ConfigStore；文件缺失/corrupt 回退默认值）
+
+def _check_config_targets(runtime_paths, config_path):
+    """Reject overlaps among runtime targets, both configs and the sidecar."""
+    if os.name == "nt":
+        return _windows_check_config_targets(runtime_paths, config_path)
+    config = Path(config_path)
+    protected = (config, _RUNTIME_PATHS_FILE, config.parent / "session_overrides.json")
+    try:
+        inputs = tuple(path if path.is_absolute() else Path.cwd() / path for path in protected)
+        # Reuse the same identity and unresolved-name rules as the runtime
+        # preflight. Probe both roles so no original runtime role is omitted.
+        # lock/pid preserve the already-supported configuration symlink path.
+        for source in inputs:
+            for role in ("lock", "pid"):
+                probe = dict(runtime_paths)
+                probe[role] = source
+                inspect_runtime_identities(_PACKAGE_DIR, probe)
+        for index, source in enumerate(inputs):
+            for other in inputs[index + 1:]:
+                probe = dict(runtime_paths)
+                probe["lock"], probe["pid"] = source, other
+                inspect_runtime_identities(_PACKAGE_DIR, probe)
+    except LockError:
+        raise
+    except PreflightError as exc:
+        raise LockError("config_path_conflict" if exc.code in
+                        ("same_identity", "nested_targets", "state_conflict")
+                        else "config_path_unknown") from None
+    except (OSError, RuntimeError, ValueError):
+        raise LockError("config_path_unknown") from None
+
+
+def _check_legacy_presence(snapshot):
+    """Old PID or starter-lock artifacts are UNKNOWN, never auto-cleared."""
+    identities = snapshot.as_dict()
+    if identities["pid"].exists or identities["start_lock"].exists:
+        raise PreflightError("legacy_state_unknown", "Legacy startup state is unknown")
+
+
+def _check_windows_legacy_observations(snapshot):
+    """Read-only Windows role/metadata preflight; never sends a signal."""
+    from .discovery import WindowsPathPreflight
+    if not isinstance(snapshot, WindowsPathPreflight):
+        raise PreflightError("legacy_state_unknown", "Runtime path identity unavailable")
+    identities = snapshot.as_dict()
+    try:
+        paths = {key: identities[key].requested for key in PATH_KEYS}
+        light = "install.json" not in identities
+        current = (inspect_runtime_identities(snapshot.project_root, paths, windows_light=True)
+                   if light else inspect_runtime_identities(snapshot.project_root, paths))
+        _check_legacy_presence(current)
+        if current != snapshot:
+            raise PreflightError("legacy_state_unknown", "Runtime path identity changed")
+        observations = []
+        for key in PATH_KEYS:
+            evidence = identities[key]
+            marker = current_file_marker(evidence.canonical) if evidence.exists else None
+            observations.append((key, marker))
+        # Bracket the observation by a second held-chain/path preflight and
+        # re-probe existing file IDs/ChangeTime without reading their contents.
+        current = (inspect_runtime_identities(snapshot.project_root, paths, windows_light=True)
+                   if light else inspect_runtime_identities(snapshot.project_root, paths))
+        if current != snapshot:
+            raise PreflightError("legacy_state_unknown", "Runtime path identity changed")
+        for key, marker in observations:
+            if marker is not None and current_file_marker(identities[key].canonical) != marker:
+                raise PreflightError("legacy_state_unknown", "Runtime target changed")
+        return tuple(observations)
+    except PreflightError:
+        raise
+    except (ConfigSnapshotError, OSError, ValueError, AttributeError, KeyError):
+        raise PreflightError("legacy_state_unknown", "Runtime protection unavailable") from None
+
+
+def _check_legacy_observations(snapshot):
+    """Read-only equivalent of CLI legacy preflight; no ownership inference."""
+    if os.name == "nt":
+        return _check_windows_legacy_observations(snapshot)
+    from .secure_files import SecureSnapshotError, mac_private_protection
+    identities = snapshot.as_dict()
+    try:
+        paths = {key: identities[key].requested for key in PATH_KEYS}
+        current = inspect_runtime_identities(snapshot.project_root, paths)
+        _check_legacy_presence(current)
+        if current != snapshot:
+            raise PreflightError("legacy_state_unknown", "Runtime path identity changed")
+        observations = []
+        verified_parents = set()
+        for key in PATH_KEYS:
+            identity = identities[key]
+            target = Path(identity.canonical)
+            parent = target.parent
+            if parent.resolve(strict=True) != parent:
+                raise PreflightError("legacy_state_unknown", "Runtime parent is unknown")
+            for part in (parent,):
+                if part not in verified_parents:
+                    # Match the CLI's bounded retries for transient snapshots.
+                    for attempt in range(4):
+                        try:
+                            _verify_directory(part, private=False)
+                            break
+                        except PreflightError as exc:
+                            if exc.code not in ("protection_changed", "record_changed", "records_changed") or attempt == 3:
+                                raise
+                            time.sleep(0.01)
+                    verified_parents.add(part)
+            if not identity.exists:
+                observations.append((key, None))
+                continue
+            before = target.lstat()
+            if stat.S_ISDIR(before.st_mode):
+                mac_private_protection(str(target), before)
+            else:
+                fd = os.open(target, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
+                try:
+                    opened = os.fstat(fd)
+                    if (not stat.S_ISREG(opened.st_mode) or opened.st_nlink != 1
+                            or opened.st_uid not in (os.geteuid(), 0) or opened.st_mode & 0o022
+                            or (opened.st_dev, opened.st_ino, opened.st_mode, opened.st_uid, opened.st_gid)
+                            != (before.st_dev, before.st_ino, before.st_mode, before.st_uid, before.st_gid)):
+                        raise PreflightError("legacy_state_unknown", "Runtime protection unavailable")
+                    verify_no_extended_acl(fd)
+                    verify_local_filesystem_fd(fd)
+                finally:
+                    os.close(fd)
+            after = target.lstat()
+            def marker(info):
+                return (info.st_dev, info.st_ino, info.st_mode, info.st_uid, info.st_gid,
+                        info.st_nlink, info.st_size, info.st_mtime_ns, info.st_ctime_ns)
+            if marker(before) != marker(after):
+                raise PreflightError("legacy_state_unknown", "Runtime target changed")
+            observations.append((key, marker(after)))
+        final = inspect_runtime_identities(snapshot.project_root, paths)
+        _check_legacy_presence(final)
+        if final != snapshot:
+            raise PreflightError("legacy_state_unknown", "Runtime path identity changed")
+        return tuple(observations)
+    except PreflightError:
+        raise
+    except (OSError, ValueError, RuntimeError, SecureSnapshotError, AttributeError):
+        raise PreflightError("legacy_state_unknown", "Runtime protection unavailable") from None
+
+
+def _listen_address_family(host, port):
+    """Select IPv4 for localhost/dual-stack names, otherwise the IP family."""
+    if host.lower() == "localhost":
+        return socket.AF_INET  # Preserve the previous IPv4-only localhost behavior.
+    try:
+        address = ipaddress.ip_address(host)
+    except ValueError:
+        candidates = socket.getaddrinfo(host, port, socket.AF_UNSPEC, socket.SOCK_STREAM,
+                                        socket.IPPROTO_TCP)
+        families = {item[0] for item in candidates if item[1] == socket.SOCK_STREAM}
+        if socket.AF_INET in families:
+            return socket.AF_INET
+        if socket.AF_INET6 in families:
+            return socket.AF_INET6
+        raise OSError("listen address family unavailable")
+    return socket.AF_INET6 if address.version == 6 else socket.AF_INET
+
+
+class ProxyHTTPServer(ThreadingHTTPServer):
+    """Preserve the baseline outside Windows; use Windows candidate binding."""
+
+    allow_reuse_address = os.name != "nt"
+
+    def __init__(self, server_address, handler_class, bind_and_activate=True):
+        if os.name == "nt":
+            host, port = server_address[:2]
+            self.address_family = _listen_address_family(host, port)
+            if self.address_family == socket.AF_INET6:
+                server_address = (host, port, 0, 0)
+        super().__init__(server_address, handler_class, bind_and_activate)
+
+    def server_bind(self):
+        if os.name == "nt":
+            if self.address_family == socket.AF_INET6:
+                self.socket.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY,
+                                       0 if self.server_address[0] == "::" else 1)
+            self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
+        super().server_bind()
+
+
+def main():
+    config_path = _business_path(_DEFAULT_CONFIG_PATH)
+    try:
+        if sys.platform == "win32" and os.name == "nt":
+            _windows_main(config_path)
+            return
+        # Match the Mac control authority before records, locks or listeners.
+        # Windows retains its separate native startup contract.
+        initial_private = _mac_private_config_snapshot(config_path)
+        listen_cfg = resolve_listen(config_path, os.environ.get("MODEL_PROXY_PORT"))
+        if initial_private is not None:
+            _verify_mac_private_config(initial_private)
+        global _runtime_paths
+        _runtime_paths = resolve_runtime_paths()
+        _check_config_targets(_runtime_paths, config_path)
+        # Detect invalid/conflicting targets before creating the state directory.
+        snapshot = inspect_runtime_identities(_PACKAGE_DIR, _runtime_paths)
+        # Only the two platforms with native protection adapters may proceed.
+        if not ((sys.platform == "darwin" and os.name == "posix") or
+                (sys.platform == "win32" and os.name == "nt")):
+            raise PreflightError("protection_unavailable", "ACL verification unavailable")
+        state = Path(snapshot.as_dict()["state_dir"].canonical)
+        if os.name == "nt":
+            # mkdir(mode=0o700) does not establish a verified Windows DACL.
+            # Do not create an unprotected state directory and hope to fix it.
+            if not snapshot.as_dict()["state_dir"].exists:
+                raise PreflightError("windows_state_directory_unverified",
+                                     "A verified fixed state directory is required")
+        elif not snapshot.as_dict()["state_dir"].exists:
+            _verify_directory(state.parent, private=False)
+            state.mkdir(mode=0o700)
+        verify_record_directory(state)
+        snapshot = inspect_runtime_identities(_PACKAGE_DIR, _runtime_paths)
+        _check_config_targets(_runtime_paths, config_path)
+        initial_records = (read_instance_set(state)
+                           if snapshot.as_dict()["install.json"].exists else None)
+        first_start = initial_records is None or initial_records["active"] is None
+        initial_legacy = _check_legacy_observations(snapshot) if first_start else None
+        initial_snapshot = snapshot
+        with ExitStack() as locks:
+            anchor = locks.enter_context(acquire_lock(
+                snapshot, "anchor.lock", create=True, access_verifier=verify_local_access))
+            if resolve_runtime_paths() != _runtime_paths:
+                raise LockError("runtime_paths_changed")
+            legacy = locks.enter_context(acquire_lock(
+                anchor.snapshot, "lock", create=True, access_verifier=verify_local_access,
+                anchor=anchor))
+            # Check once more while both locks are held, before any log or ledger.
+            if (resolve_runtime_paths() != _runtime_paths or
+                    inspect_runtime_identities(_PACKAGE_DIR, _runtime_paths) != legacy.snapshot):
+                raise LockError("preflight_changed")
+            _check_config_targets(_runtime_paths, config_path)
+            verify_held_instance_locks(anchor, legacy)
+            if first_start:
+                if read_instance_set(state) != initial_records:
+                    raise PreflightError("legacy_state_unknown", "Initialization state changed")
+                checked = _check_legacy_observations(legacy.snapshot)
+                before = dict(initial_legacy)
+                after = dict(checked)
+                old_ids, new_ids = initial_snapshot.as_dict(), legacy.snapshot.as_dict()
+                if any(before[key] != after[key] or old_ids[key] != new_ids[key]
+                       for key in PATH_KEYS if key != "lock"):
+                    raise PreflightError("legacy_state_unknown", "Legacy runtime observations changed")
+            if sys.platform == "darwin" and os.name == "posix":
+                _run_server(config_path, listen_cfg, anchor, legacy,
+                            initial_private=initial_private)
+            else:
+                _run_server(config_path, listen_cfg, anchor, legacy)
+    except (ListenConfigError, RuntimePathsError, PreflightError, LockError, OSError) as exc:
+        # Do not disclose configuration values or raw paths.
+        code = getattr(exc, "code", type(exc).__name__)
+        detail = ": runtime paths changed; migration required" if code == "runtime_drift" else ""
+        if code == "config_unverified" and sys.platform == "darwin" and os.name == "posix":
+            detail = ": private local configuration could not be verified"
+        if os.name == "nt":
+            from core.discovery import WindowsRecordCommitError
+            if isinstance(exc, WindowsRecordCommitError):
+                detail = _windows_record_error_detail(exc)
+            elif isinstance(exc, WindowsStartupRecoveryError):
+                detail = _windows_startup_recovery_detail(exc)
+        print(f"model_proxy: startup failed ({code}){detail}", file=sys.stderr)
+        raise SystemExit(1) from None
+    except Exception:
+        print("model_proxy: startup failed (unexpected_error)", file=sys.stderr)
+        raise SystemExit(1) from None
+
+
+def _windows_record_error_detail(exc):
+    """Fixed enumerations only; never print paths, ACLs or raw OS messages."""
+    stages = {"precommit", "api_failed", "reported_success", "unknown"}
+    states = {"original", "replacement", "original_changed", "replacement_changed", "missing", "other", "unknown"}
+    stage = exc.stage if exc.stage in stages else "unknown"
+    number = exc.winerror if type(exc.winerror) is int and 0 <= exc.winerror <= 0xFFFFFFFF else "unknown"
+    recovery = exc.recovery
+    target = recovery.target if recovery is not None and recovery.target in states else "unknown"
+    source = recovery.source if recovery is not None and recovery.source in states else "unknown"
+    old = recovery.old_other_name if recovery is not None and recovery.old_other_name in ("unknown", "not_assumed") else "unknown"
+    temp_data = exc.temporary_may_contain_data if type(exc.temporary_may_contain_data) is bool else "unknown"
+    temp_created = exc.temporary_created if type(exc.temporary_created) is bool else "unknown"
+    return (f": stage={stage} winerror={number} target={target} source={source} "
+            f"old_other_name={old} temp_created={temp_created} temp_data={temp_data}")
+
+
+_WINDOWS_STARTUP_CAUSES = frozenset({
+    "startup_config_changed", "runtime_drift", "preflight_changed",
+    "ledger_changed", "ledger_unverified", "records_changed",
+    "records_inconsistent", "locks_unverified", "lock_identity_changed",
+    "security_changed", "protection_unavailable", "process_unverified",
+    "process_still_active", "identity_changed", "identity_unknown",
+    "protection_changed", "release_unknown", "lock_release_unknown",
+})
+
+
+def _windows_startup_cause(exc):
+    """Expose only a fixed code from known startup errors, never raw details."""
+    if not isinstance(exc, (PreflightError, LockError, RuntimePathsError, ListenConfigError)):
+        return "unknown"
+    code = getattr(exc, "code", None)
+    return code if type(code) is str and code in _WINDOWS_STARTUP_CAUSES else "unknown"
+
+
+class WindowsStartupRecoveryError(PreflightError):
+    """Records may have changed; no Windows rollback was attempted."""
+
+    def __init__(self, original):
+        super().__init__("record_cleanup_failed", "Startup records require manual review")
+        self.cause_code = _windows_startup_cause(original)
+
+
+def _windows_startup_recovery_detail(exc):
+    cause = exc.cause_code
+    if type(cause) is not str or cause not in _WINDOWS_STARTUP_CAUSES:
+        cause = "unknown"
+    return f": cause={cause} records=unverified rollback=not_attempted"
+
+
+def _instance_observation(server, anchor, legacy, install):
+    """Protected record data, not proof of current process or peer ownership."""
+    pid = os.getpid()
+    nonce = os.environ.get("MODEL_PROXY_START_NONCE")
+    if nonce is None:
+        nonce = uuid.uuid4().hex
+    elif not re.fullmatch(r"[0-9a-f]{32}", nonce):
+        raise PreflightError("invalid_start_nonce", "Invalid startup nonce")
+    identities = legacy.snapshot.as_dict()
+    if os.name == "nt":
+        locks = _lock_identities(anchor, legacy)
+    else:
+        locks = {}
+        for name, held in (("anchor", anchor), ("legacy", legacy)):
+            info = os.fstat(held.fileno())
+            locks[name] = {"device": info.st_dev, "inode": info.st_ino}
+    host, port = server.server_address[:2]
+    return {
+        "schema": INSTANCE_SCHEMA, "record": "active", "state": "STARTING",
+        "instance_nonce": nonce, "pid": pid,
+        "process_start": process_start_identity(pid),
+        "executable": process_executable(pid),
+        "project_root": legacy.snapshot.project_root,
+        "listen": {"host": host, "port": port},
+        "runtime_paths": {key: identities[key].canonical for key in _runtime_paths},
+        "locks": locks,
+        "install_id": install["install_id"],
+    }
+
+
+def _capture_confirmation_snapshot(config_path, config_store, listen_cfg, legacy):
+    """Capture exactly the inputs to be confirmed, while instance locks are held."""
+    try:
+        business = _read_business_config(config_path)
+        paths = read_stable_config(_RUNTIME_PATHS_FILE)
+        with config_store._lock:
+            if (config_store._probe_marker != business.marker or config_store._config != business.config
+                    or (_mac_business_enabled() and config_store._business_snapshot != business)):
+                raise PreflightError("startup_config_changed", "Startup configuration changed")
+        legacy_observations = _check_legacy_observations(legacy.snapshot)
+        snapshot = (business, paths, os.environ.get("MODEL_PROXY_PORT"), legacy_observations)
+        _verify_confirmation_snapshot(snapshot, config_path, config_store, listen_cfg, legacy)
+        return snapshot
+    except ConfigSnapshotError:
+        raise PreflightError("startup_config_changed", "Startup configuration unavailable") from None
+
+
+def _verify_confirmation_snapshot(snapshot, config_path, config_store, listen_cfg, legacy):
+    """Recheck input bytes, identities, parsed paths and listen before committing."""
+    try:
+        business, paths, port, legacy_observations = snapshot
+        _verify_business_snapshot(business)
+        if (os.environ.get("MODEL_PROXY_PORT") != port or
+                _read_business_config(config_path) != business or
+                read_stable_config(_RUNTIME_PATHS_FILE) != paths):
+            raise PreflightError("startup_config_changed", "Startup configuration changed")
+        with config_store._lock:
+            if (config_store._probe_marker != business.marker or config_store._config != business.config
+                    or (_mac_business_enabled() and config_store._business_snapshot != business)):
+                raise PreflightError("startup_config_changed", "Startup configuration changed")
+        if (resolve_listen(config_path, port) != listen_cfg or
+                resolve_runtime_paths() != _runtime_paths):
+            raise PreflightError("startup_config_changed", "Startup configuration changed")
+        _check_config_targets(_runtime_paths, config_path)
+        if _check_legacy_observations(legacy.snapshot) != legacy_observations:
+            raise PreflightError("legacy_state_unknown", "Legacy runtime observations changed")
+        if (_business_marker(config_path) != business.marker or
+                current_file_marker(_RUNTIME_PATHS_FILE) != paths.marker):
+            raise PreflightError("startup_config_changed", "Startup configuration changed")
+        _verify_business_snapshot(business)
+    except ConfigSnapshotError:
+        raise PreflightError("startup_config_changed", "Startup configuration unavailable") from None
+
+
+def _confirm_initialization():
+    """Explicit operator attestation; absence never implies a new install."""
+    if not sys.stdin.isatty():
+        raise PreflightError("initialization_required", "Interactive initialization required")
+    try:
+        source = input("Installation/recovery source: ").strip()
+        confirm = input("Confirm no old instance, shared/synchronized files or enabled legacy autostart (type YES): ").strip()
+    except (EOFError, KeyboardInterrupt):
+        raise PreflightError("initialization_unconfirmed", "Initialization not confirmed") from None
+    if not source or confirm != "YES":
+        raise PreflightError("initialization_unconfirmed", "Initialization not confirmed")
+    return source
+
+
+def _lock_identities(anchor, legacy):
+    if os.name == "nt":
+        from core import platform_lock
+        from core import platform_windows
+        result = {}
+        try:
+            for name, held in (("anchor", anchor), ("legacy", legacy)):
+                platform_lock._windows_verify_guard(held._windows_guard, held._windows_lease)
+                handle = platform_windows._NativeFDAPI().handle(held.fileno())
+                identity = platform_windows.file_identity(handle)
+                if identity != held._windows_guard.object_evidence.identity:
+                    raise PreflightError("locks_unverified", "Lock identity changed")
+                result[name] = {"device": identity.volume_serial, "inode": identity.file_index}
+            return result
+        except PreflightError:
+            raise
+        except Exception:
+            raise PreflightError("locks_unverified", "Lock identity unavailable") from None
+    result = {}
+    for name, held in (("anchor", anchor), ("legacy", legacy)):
+        info = os.fstat(held.fileno())
+        result[name] = {"device": info.st_dev, "inode": info.st_ino}
+    return result
+
+
+def _ensure_stale_instance(records, current_paths, current_listen, lock_ids):
+    """Reject path/lock drift and require the previous PID to have exited or changed."""
+    active = records["active"]
+    if active is None:
+        return
+    if active["runtime_paths"] != current_paths:
+        raise PreflightError("runtime_drift", "Runtime paths changed; migration required")
+    if active["locks"] != lock_ids:
+        raise PreflightError("lock_identity_changed", "Previous lock identities changed")
+    pid = active["pid"]
+    if os.name == "nt":
+        # Windows os.kill is not a safe existence probe. A stale record
+        # cannot authorize a signal or a new instance without native proof.
+        raise PreflightError("process_unverified", "Previous process identity unavailable")
+    try:
+        os.kill(pid, 0)  # Existence/permission probe only; never stop the process.
+    except ProcessLookupError:
+        return
+    except OSError:
+        raise PreflightError("process_unverified", "Previous process identity unavailable") from None
+    current = process_start_identity(pid)
+    if sys.platform == "darwin" and (current is None or current == active["process_start"]):
+        # proc_pidinfo may return ESRCH for an unreaped zombie even though
+        # kill(pid, 0) still succeeds. Require the same stable PID/start and
+        # kernel status evidence used by CLI recovery; never reap here.
+        from .platform_process import darwin_recorded_state, ProcessEvidenceError
+        try:
+            state = darwin_recorded_state(pid, active["process_start"])
+        except ProcessEvidenceError:
+            raise PreflightError("process_unverified", "Previous process identity unavailable") from None
+        if state == 'ZOMBIE':
+            return
+    if current is None:
+        raise PreflightError("process_unverified", "Previous process identity unavailable")
+    if current == active["process_start"]:
+        raise PreflightError("process_still_active", "Previous process is still active")
+
+
+def _same_configured_listener(configured, previous):
+    host = configured["host"]
+    return (configured["port"] == previous["port"] and
+            (host == previous["host"] or host.lower() == "localhost" and previous["host"] == "127.0.0.1"))
+
+
+@contextmanager
+def _reserve_previous_listener(listen):
+    """Temporarily bind the recorded numeric endpoint; never connect or signal."""
+    try:
+        host, port = listen["host"], listen["port"]
+        ip = ipaddress.ip_address(host)
+        if type(port) is not int or not 1 <= port <= 65535:
+            raise ValueError("invalid port")
+        if ip.version == 6 and (ip.is_link_local or getattr(ip, "scope_id", None)):
+            raise ValueError("record lacks verifiable IPv6 scope")
+        family = socket.AF_INET6 if ip.version == 6 else socket.AF_INET
+        address = (host, port, 0, 0) if family == socket.AF_INET6 else (host, port)
+        listener = socket.socket(family, socket.SOCK_STREAM)
+    except (OSError, ValueError, TypeError, KeyError):
+        raise PreflightError("old_listener_unverified", "Previous listener cannot be verified") from None
+    try:
+        try:
+            if os.name == "nt":
+                listener.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
+            else:
+                listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            if family == socket.AF_INET6:
+                listener.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 0 if host == "::" else 1)
+            listener.bind(address)
+            listener.listen(5)
+        except OSError as exc:
+            code = "old_listener_busy" if exc.errno == errno.EADDRINUSE else "old_listener_unverified"
+            raise PreflightError(code, "Previous listener cannot be verified free") from None
+        yield listener
+    finally:
+        listener.close()
+
+
+def _capture_migration_ledger(snapshot):
+    """Capture a security-checked ledger, or explicit content UNAVAILABLE.
+
+    Only stable JSON/schema failure is degradable. Identity, protection, I/O,
+    close and race failures remain startup errors, not a missing/empty ledger.
+    """
+    identity = snapshot.as_dict()["totals"]
+    target = Path(identity.canonical)
+
+    def validated_or_unavailable(data, marker):
+        if data is None:
+            return LedgerUnavailable(marker)
+        try:
+            validate_migration_ledger_snapshot(data)
+        except PreflightError as exc:
+            if exc.code != "ledger_unverified":
+                raise
+            return LedgerUnavailable(marker)
+        return data
+
+    try:
+        if not identity.exists:
+            try:
+                target.lstat()
+            except FileNotFoundError:
+                return None
+            raise PreflightError("ledger_changed", "Ledger appeared during startup")
+        if os.name == "nt":
+            # Both marker reads use the existing guarded Windows adapter. A
+            # parse failure alone must not waive target/parent protection.
+            before = current_file_marker(target)
+            if (identity.link_count != 1 or
+                    (before.device, before.inode) != (identity.device, identity.inode)):
+                raise PreflightError("ledger_changed", "Ledger identity changed")
+            try:
+                data = read_stable_config(target, reject_duplicate_keys=True)
+            except ConfigSnapshotError as exc:
+                if exc.code != "config_parse_error":
+                    raise
+                data = None
+            after = current_file_marker(target)
+            if before != after or (data is not None and data.marker != before):
+                raise PreflightError("ledger_changed", "Ledger changed during startup")
+            return validated_or_unavailable(data, before)
+        before = target.lstat()
+        if (not stat.S_ISREG(before.st_mode) or before.st_nlink != 1
+                or before.st_uid not in (os.geteuid(), 0) or before.st_mode & 0o022
+                or (before.st_dev, before.st_ino) != (identity.device, identity.inode)):
+            raise PreflightError("ledger_unverified", "Ledger identity unavailable")
+        fd = os.open(target, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
+        try:
+            opened = os.fstat(fd)
+            def marker(value):
+                return (value.st_dev, value.st_ino, value.st_mode, value.st_uid, value.st_gid,
+                        value.st_nlink, value.st_size, value.st_mtime_ns, value.st_ctime_ns)
+            if marker(before) != marker(opened):
+                raise PreflightError("ledger_changed", "Ledger changed during startup")
+            verify_no_extended_acl(fd)
+            verify_local_filesystem_fd(fd)
+            try:
+                data = read_stable_config(target, reject_duplicate_keys=True)
+            except ConfigSnapshotError as exc:
+                if exc.code != "config_parse_error":
+                    raise
+                data = None
+            after = os.fstat(fd)
+            current = target.lstat()
+            file_marker = FileMarker(opened.st_dev, opened.st_ino, opened.st_mtime_ns,
+                                     opened.st_ctime_ns, opened.st_size)
+            if (marker(opened) != marker(after) or marker(after) != marker(current)
+                    or (data is not None and data.marker != file_marker)):
+                raise PreflightError("ledger_changed", "Ledger changed during startup")
+            return validated_or_unavailable(data, file_marker)
+        finally:
+            os.close(fd)
+    except PreflightError:
+        raise
+    except (OSError, ConfigSnapshotError, ValueError, AttributeError):
+        raise PreflightError("ledger_unverified", "Ledger cannot be verified") from None
+
+
+def _mac_private_config_snapshot(config_path):
+    """Capture the protected Mac business path, never CLI authority internals."""
+    if not _mac_business_enabled():
+        return None
+    from .mac_config_path import MacConfigError, capture_config
+    try:
+        return capture_config(config_path)
+    except MacConfigError as exc:
+        raise PreflightError(mac_config_error_code(exc), "Private configuration unavailable") from None
+
+
+def _verify_mac_private_config(snapshot):
+    from .mac_config_path import MacConfigError, verify_config
+    try:
+        verify_config(snapshot)
+    except MacConfigError:
+        raise PreflightError("startup_config_changed", "Configuration protection changed") from None
+
+
+def _check_mac_private_business(private, business):
+    """Bind exact chain, identity, bytes, parsed content and probe marker."""
+    if (business.evidence is None or private != business.evidence
+            or business.marker != private.marker):
+        raise PreflightError("startup_config_changed", "Configuration identity changed")
+    _verify_mac_private_config(private)
+
+
+def _capture_migration_guard(config_path, config_store, listen_cfg, legacy, initial_private=None):
+    try:
+        private = _mac_private_config_snapshot(config_path)
+        if sys.platform == "darwin" and os.name == "posix":
+            if initial_private is None or private != initial_private:
+                raise PreflightError("startup_config_changed", "Configuration changed before guard")
+        business = _read_business_config(config_path)
+        paths = read_stable_config(_RUNTIME_PATHS_FILE)
+        with config_store._lock:
+            if (config_store._probe_marker != business.marker or config_store._config != business.config
+                    or (_mac_business_enabled() and config_store._business_snapshot != business)):
+                raise PreflightError("startup_config_changed", "Startup configuration changed")
+        if private is not None:
+            _check_mac_private_business(private, business)
+            if _mac_private_config_snapshot(config_path) != private:
+                raise PreflightError("startup_config_changed", "Configuration protection changed")
+        guard = (business, paths, os.environ.get("MODEL_PROXY_PORT"), _capture_migration_ledger(legacy.snapshot))
+        return (*guard, private) if private is not None else guard
+    except ConfigSnapshotError:
+        raise PreflightError("startup_config_changed", "Startup configuration unavailable") from None
+
+
+def _verify_migration_guard(guard, config_path, config_store, listen_cfg, anchor, legacy,
+                            expected_records, *, allow_log_change=False):
+    """Validate the same config, paths, held locks, records and current ledger."""
+    try:
+        business, paths, port, ledger = guard[:4]
+        if sys.platform == "darwin" and os.name == "posix":
+            if len(guard) != 5 or guard[4] is None:
+                raise PreflightError("config_unverified", "Private configuration unavailable")
+            private = guard[4]
+            if _mac_private_config_snapshot(config_path) != private:
+                raise PreflightError("startup_config_changed", "Configuration protection changed")
+            _check_mac_private_business(private, business)
+        else:
+            private = None
+        if (os.environ.get("MODEL_PROXY_PORT") != port or
+                _read_business_config(config_path) != business or
+                read_stable_config(_RUNTIME_PATHS_FILE) != paths):
+            raise PreflightError("startup_config_changed", "Startup configuration changed")
+        with config_store._lock:
+            if (config_store._probe_marker != business.marker or config_store._config != business.config
+                    or (_mac_business_enabled() and config_store._business_snapshot != business)):
+                raise PreflightError("startup_config_changed", "Startup configuration changed")
+        if resolve_listen(config_path, port) != listen_cfg:
+            raise PreflightError("startup_config_changed", "Listen configuration changed")
+        if resolve_runtime_paths() != _runtime_paths:
+            raise PreflightError("runtime_drift", "Runtime paths changed; migration required")
+        verify_held_instance_locks(anchor, legacy)
+        windows_light = (os.name == "nt" and isinstance(expected_records, dict)
+                         and set(expected_records) == {"windows_active"})
+        fresh = (inspect_runtime_identities(_PACKAGE_DIR, _runtime_paths, windows_light=True)
+                 if windows_light else inspect_runtime_identities(_PACKAGE_DIR, _runtime_paths)).as_dict()
+        previous = legacy.snapshot.as_dict()
+        for key in (*PATH_KEYS, "state_dir", "anchor.lock"):
+            if key == "log" and allow_log_change:
+                # init_logging may create or atomically trim this same path.
+                if (fresh[key].canonical != previous[key].canonical or
+                        fresh[key].requested != previous[key].requested or fresh[key].final_was_link):
+                    raise PreflightError("preflight_changed", "Runtime log path changed")
+            elif fresh[key] != previous[key]:
+                raise PreflightError("preflight_changed", "Runtime path identity changed")
+        _check_config_targets(_runtime_paths, config_path)
+        state = Path(legacy.snapshot.as_dict()["state_dir"].canonical)
+        if (os.name == "nt" and isinstance(expected_records, dict)
+                and set(expected_records) == {"windows_active"}):
+            from .discovery import read_windows_active
+            current_records = {"windows_active": read_windows_active(state)}
+        else:
+            current_records = read_instance_set(state)
+        if current_records != expected_records:
+            raise PreflightError("records_changed", "Instance records changed")
+        if _capture_migration_ledger(legacy.snapshot) != ledger:
+            raise PreflightError("ledger_changed", "Ledger changed during startup")
+        if (_business_marker(config_path) != business.marker or
+                current_file_marker(_RUNTIME_PATHS_FILE) != paths.marker):
+            raise PreflightError("startup_config_changed", "Startup configuration changed")
+        if private is not None and _mac_private_config_snapshot(config_path) != private:
+            raise PreflightError("startup_config_changed", "Configuration protection changed")
+    except ConfigSnapshotError:
+        raise PreflightError("startup_config_changed", "Startup configuration unavailable") from None
+
+
+def _restore_prestart_records(state_dir, before, attempted, anchor, legacy):
+    """Restore only our own intended changes; uncertain rollback stays UNKNOWN."""
+    if os.name == "nt" and attempted:
+        # No approved Windows delete/restore contract: never guess which
+        # partially committed record still belongs to this startup.
+        raise PreflightError("record_cleanup_failed", "Startup records require manual review")
+    for name in ("install.json", "active.json", "last_good_paths.json"):
+        if name not in attempted:
+            continue
+        old, new_values = before[name], attempted[name]
+        current = read_instance_record(state_dir, name)
+        if current == old:
+            continue
+        if current not in new_values:
+            raise PreflightError("record_cleanup_failed", "Record cleanup could not be verified")
+        if old is None:
+            delete_instance_record_if_matches(state_dir, name, current, anchor=anchor, legacy=legacy)
+        else:
+            write_instance_record(state_dir, name, old, anchor=anchor, legacy=legacy)
+            if read_instance_record(state_dir, name) != old:
+                raise PreflightError("record_cleanup_failed", "Record cleanup could not be verified")
+
+
+def _require_windows_listener_validation():
+    """Require the actual exclusive-bind primitive; server_bind applies it."""
+    if os.name == "nt" and not isinstance(getattr(socket, "SO_EXCLUSIVEADDRUSE", None), int):
+        raise PreflightError("windows_listener_exclusivity_unavailable",
+                             "Windows exclusive listener option is unavailable")
+
+
+def _require_windows_service_launch(config_path, listen_cfg):
+    """Do not start an instance the controller cannot identify from argv."""
+    from .cli.windows_command_line import verify_shared_launch_argv
+    try:
+        verify_shared_launch_argv(
+            getattr(sys, "orig_argv", ()),
+            entry=str(_PACKAGE_DIR / "core" / "cli" / "model_proxy.py"),
+            config=str(config_path), port=listen_cfg["port"])
+    except Exception:
+        raise PreflightError("windows_launch_unverified", "Service launch entry cannot be verified") from None
+
+
+def _windows_main(config_path):
+    """Windows startup using the two OS locks and one non-authoritative locator."""
+    import ntpath
+    from .discovery import (read_windows_active, prepare_windows_runtime_directories,
+                            prepare_windows_log, windows_initial_missing_parents)
+    from . import windows_process
     global _runtime_paths
+    config_path = Path(ntpath.abspath(os.fspath(config_path)))
+    listen_cfg = resolve_listen(config_path, os.environ.get("MODEL_PROXY_PORT"))
+    _require_windows_service_launch(config_path, listen_cfg)
     _runtime_paths = resolve_runtime_paths()
+    _windows_check_config_targets(
+        _runtime_paths, config_path,
+        initial_missing_parents=windows_initial_missing_parents(
+            _runtime_paths, os.environ.get("LOCALAPPDATA")))
+    prepare_windows_runtime_directories(_PACKAGE_DIR, _runtime_paths, os.environ.get("LOCALAPPDATA"))
+    _check_config_targets(_runtime_paths, config_path)
+    snapshot = inspect_runtime_identities(_PACKAGE_DIR, _runtime_paths, windows_light=True)
+    state = Path(snapshot.as_dict()["state_dir"].canonical)
+    if not snapshot.as_dict()["state_dir"].exists:
+        raise PreflightError("windows_state_directory_unverified",
+                             "A privately created state directory is required")
+    verify_record_directory(state)
+    with ExitStack() as locks:
+        anchor = locks.enter_context(acquire_lock(
+            snapshot, "anchor.lock", create=True, access_verifier=verify_local_access))
+        legacy = locks.enter_context(acquire_lock(
+            anchor.snapshot, "lock", create=True, access_verifier=verify_local_access,
+            anchor=anchor))
+        verify_held_instance_locks(anchor, legacy)
+        if resolve_runtime_paths() != _runtime_paths:
+            raise LockError("runtime_paths_changed")
+        _check_config_targets(_runtime_paths, config_path)
+        previous = read_windows_active(state)
+        if previous is not None:
+            try:
+                status = windows_process.recorded_process_state(
+                    previous["pid"], previous["process_start"], previous["executable"])
+            except windows_process.ProcessEvidenceError as exc:
+                raise PreflightError("previous_process_unknown", "Previous process is unknown") from exc
+            if status == "running":
+                raise PreflightError("previous_process_alive", "Previous process is still running")
+            # A path change is not silently taken over, even if the old PID exited.
+            current = {key: legacy.snapshot.as_dict()[key].canonical for key in PATH_KEYS}
+            if current != previous["runtime_paths"]:
+                raise PreflightError("runtime_drift", "Runtime paths changed")
+        else:
+            _check_legacy_observations(legacy.snapshot)
+        # Ordinary log creation is a service-side effect: neither contender may
+        # create it until *both* instance locks are held.  The new path evidence
+        # must differ only by this one created file, never by another role.
+        before_log = legacy.snapshot
+        after_log = prepare_windows_log(_PACKAGE_DIR, _runtime_paths, before_log)
+        if after_log != before_log:
+            from .platform_lock import _windows_compare_post
+            _windows_compare_post(before_log, after_log, "log")
+        # The fresh snapshot is admissible only after the single-log delta
+        # check.  Held-lock validation itself compares against the snapshot,
+        # so publish it to both held locks *before* that validation.
+        anchor.snapshot = legacy.snapshot = after_log
+        verify_held_instance_locks(anchor, legacy)
+        _check_config_targets(_runtime_paths, config_path)
+        config_store = ConfigStore(config_path, on_reload=None)
+        guard = _capture_migration_guard(config_path, config_store, listen_cfg, legacy)
+        expected = {"windows_active": previous}
+        _verify_migration_guard(guard, config_path, config_store, listen_cfg, anchor, legacy, expected)
+        _require_windows_listener_validation()
+        with ProxyHTTPServer((listen_cfg["host"], listen_cfg["port"]), ModelProxyHandler) as server:
+            _verify_migration_guard(guard, config_path, config_store, listen_cfg, anchor, legacy, expected)
+            pid = os.getpid()
+            record = {
+                "schema": 3, "record": "active", "state": "STARTING",
+                "instance_nonce": os.environ.get("MODEL_PROXY_START_NONCE") or uuid.uuid4().hex,
+                "project_root": legacy.snapshot.project_root, "pid": pid,
+                "process_start": process_start_identity(pid), "executable": process_executable(pid),
+                "entry": str(_PACKAGE_DIR / "core" / "cli" / "model_proxy.py"),
+                "config": str(config_path),
+                "listen": {"host": server.server_address[0], "port": server.server_address[1]},
+                "runtime_paths": {key: legacy.snapshot.as_dict()[key].canonical for key in PATH_KEYS},
+            }
+            from .discovery import _valid_windows_active
+            if not _valid_windows_active(record, state):
+                raise PreflightError("process_unverified", "Current process identity unavailable")
+            write_instance_record(state, "active.json", record, anchor=anchor, legacy=legacy)
+            expected = {"windows_active": record}
+            _verify_migration_guard(guard, config_path, config_store, listen_cfg, anchor, legacy, expected)
+            ready, attempted = {"serving_started": False}, {"active.json": [record]}
+            _run_bound_server(server, config_path, listen_cfg, config_store, state, record,
+                              ready, attempted, anchor, legacy, guard, expected, None)
 
-    # 0.1 读 VERSION 文件覆盖模块级默认值（文件不存在保持 "unknown"，不阻断启动）
+
+def _run_server(config_path, listen_cfg, anchor, legacy, *, initial_private=None):
+    config_store = ConfigStore(config_path, on_reload=None)
+    if resolve_listen(config_path, os.environ.get("MODEL_PROXY_PORT")) != listen_cfg:
+        raise PreflightError("listen_changed", "Listen configuration changed")
+    if (resolve_runtime_paths() != _runtime_paths or
+            inspect_runtime_identities(_PACKAGE_DIR, _runtime_paths) != legacy.snapshot):
+        raise LockError("preflight_changed")
+    _check_config_targets(_runtime_paths, config_path)
+    state_dir = Path(legacy.snapshot.as_dict()["state_dir"].canonical)
+    records = read_instance_set(state_dir)
+    active = None if records is None else records["active"]
+    current_paths = {key: legacy.snapshot.as_dict()[key].canonical for key in PATH_KEYS}
+    lock_ids = _lock_identities(anchor, legacy)
+    if active is not None:
+        _ensure_stale_instance(records, current_paths, listen_cfg, lock_ids)
+    migration = (active is not None and not _same_configured_listener(listen_cfg, active["listen"]))
+    # Every startup must revalidate the stopped/current ledger, even if the
+    # listen endpoint did not change or no earlier instance exists.
+    if sys.platform == "darwin" and os.name == "posix":
+        guard = _capture_migration_guard(config_path, config_store, listen_cfg, legacy, initial_private)
+    else:
+        guard = _capture_migration_guard(config_path, config_store, listen_cfg, legacy)
+
+    # Old port is reserved while checking and, for different ports, through
+    # the new bind. Same-port address changes require releasing it first.
+    with ExitStack() as listeners:
+        old_listener = None
+        _verify_migration_guard(guard, config_path, config_store, listen_cfg, anchor, legacy, records)
+        _require_windows_listener_validation()
+        if migration:
+            old_listener = listeners.enter_context(_reserve_previous_listener(active["listen"]))
+            _ensure_stale_instance(records, current_paths, listen_cfg, lock_ids)
+            if active["listen"]["port"] == listen_cfg["port"]:
+                old_listener.close()
+        server = ProxyHTTPServer((listen_cfg["host"], listen_cfg["port"]), ModelProxyHandler)
+        listeners.callback(server.server_close)
+        _verify_migration_guard(guard, config_path, config_store, listen_cfg, anchor, legacy, records)
+        if migration:
+            _ensure_stale_instance(records, current_paths, listen_cfg, lock_ids)
+            old_listener.close()
+        if (resolve_runtime_paths() != _runtime_paths or
+                inspect_runtime_identities(_PACKAGE_DIR, _runtime_paths) != legacy.snapshot):
+            raise LockError("preflight_changed")
+        _check_config_targets(_runtime_paths, config_path)
+        if read_instance_set(state_dir) != records:
+            raise PreflightError("records_changed", "Instance records changed")
+        if records is None or records["active"] is None:
+            _check_legacy_observations(legacy.snapshot)
+        if records is None:
+            confirmation = _capture_confirmation_snapshot(config_path, config_store, listen_cfg, legacy)
+            source = _confirm_initialization()
+            def recheck_confirmed_inputs():
+                _verify_confirmation_snapshot(confirmation, config_path, config_store, listen_cfg, legacy)
+            recheck_confirmed_inputs()
+            initialize_installation(anchor, legacy, server.socket, listen=listen_cfg,
+                                    source=source, confirmed=True, precommit_check=recheck_confirmed_inputs)
+            records = read_instance_set(state_dir)
+            if records is None:
+                raise PreflightError("initialization_unverified", "Initialization did not verify")
+        install = records["install"]
+        record = _instance_observation(server, anchor, legacy, install)
+        if record["process_start"] is None or record["executable"] is None:
+            raise PreflightError("process_unverified", "Current process identity unavailable")
+        _ensure_stale_instance(records, record["runtime_paths"], record["listen"], record["locks"])
+        if active is not None and record["listen"] != active["listen"] and not migration:
+            raise PreflightError("listen_changed", "Resolved listener changed during startup")
+        _verify_migration_guard(guard, config_path, config_store, listen_cfg, anchor, legacy, records)
+        last_good = {key: record[key] for key in ("schema", "project_root", "instance_nonce",
+                                                    "listen", "runtime_paths", "install_id")}
+        last_good["record"] = "last_good_paths"
+        updated_install = dict(install, ever_started=True, last_instance_nonce=record["instance_nonce"])
+        before = {"install.json": install, "active.json": records["active"],
+                  "last_good_paths.json": records["last_good_paths"]}
+        writes = (("last_good_paths.json", last_good), ("active.json", record),
+                  ("install.json", updated_install))
+        attempted = {}
+        ready = {"serving_started": False}
+        expected = {"install": updated_install, "active": record, "last_good_paths": last_good}
+        try:
+            for name, value in writes:
+                attempted[name] = [value]  # Include post-replace failures in rollback.
+                write_instance_record(state_dir, name, value, anchor=anchor, legacy=legacy)
+            if read_instance_set(state_dir) is None:
+                raise PreflightError("records_inconsistent", "Instance records did not verify")
+            _verify_migration_guard(guard, config_path, config_store, listen_cfg, anchor, legacy, expected)
+            _run_bound_server(server, config_path, listen_cfg, config_store, state_dir, record,
+                              ready, attempted, anchor, legacy, guard, expected, records)
+        except BaseException as exc:
+            if os.name == "nt":
+                from core.discovery import WindowsRecordCommitError
+                if isinstance(exc, WindowsRecordCommitError):
+                    # A failed ReplaceFileW may already have changed names or
+                    # ACLs; preserve recovery evidence and never blind-rollback.
+                    raise
+            if not ready["serving_started"]:
+                if os.name == "nt" and attempted:
+                    # Replacement may have committed despite a reported error.
+                    # Preserve the original fixed failure category without
+                    # claiming that any record has been restored.
+                    raise WindowsStartupRecoveryError(exc) from None
+                try:
+                    _restore_prestart_records(state_dir, before, attempted, anchor, legacy)
+                except Exception:
+                    raise PreflightError("record_cleanup_failed", "Startup record cleanup failed") from None
+            raise
+
+
+def _close_windows_startup_diagnostic_pipe():
+    """Return a controller-launched service's stderr to NUL before serving.
+
+    The marker only controls diagnostic plumbing; it conveys no authority.
+    Direct launches and all non-Windows behavior are unchanged.
+    """
+    if os.name != "nt" or os.environ.pop("MODEL_PROXY_STARTUP_DIAGNOSTIC_PIPE", None) != "1":
+        return
+    try:
+        sys.stderr.flush()
+        with open(os.devnull, "w") as sink:
+            os.dup2(sink.fileno(), sys.stderr.fileno())
+    except Exception:
+        raise PreflightError("startup_diagnostics_unavailable", "Startup diagnostic pipe unavailable") from None
+
+
+class _LedgerGuardUnverified(PreflightError):
+    """The shared guard failed without a complete release-result contract."""
+    def __init__(self):
+        super().__init__("ledger_guard_unverified", "Ledger guard unavailable")
+        # Existing guard helpers may collapse a close failure into a generic
+        # protection error. Conservatively quarantine until process restart.
+        self.close_unknown = True
+        self.release_unknown = True
+
+
+class _LedgerRuntimeGuard:
+    """Revalidate actual held locks, selected path and all protected roles.
+
+    The configured totals path is the authorization source; the existing
+    role preflight and the platform writer separately verify identities.
+    """
+    def __init__(self, config_path, anchor, legacy, runtime_paths):
+        if not ((sys.platform == "darwin" and os.name == "posix") or
+                (sys.platform == "win32" and os.name == "nt")):
+            raise PreflightError("ledger_unverified", "Ledger runtime adapter unavailable")
+        self.root = _PACKAGE_DIR
+        self.config_path = Path(config_path)
+        self.anchor, self.legacy = anchor, legacy
+        self.paths = {key: Path(runtime_paths[key]) for key in PATH_KEYS}
+        self.target = self.paths["totals"]
+        self.state = self.root / ".runtime"
+        self.staging = self.state / "tmp"
+        initial = legacy.snapshot.as_dict()["totals"]
+        if (not self.root.is_absolute() or not self.target.is_absolute()
+                or ".." in self.target.parts or str(self.target) != initial.canonical
+                or str(self.target) != initial.requested or initial.final_was_link):
+            raise PreflightError("ledger_unverified", "Ledger target not supported")
+        if os.name == "nt":
+            from .discovery import _windows_trusted_boundary
+            self.boundary = Path(_windows_trusted_boundary(self.root, self.target))
+            self.external = self.boundary != self.root
+        else:
+            self.external = os.path.commonpath((str(self.root), str(self.target))) != str(self.root)
+            self.boundary = self.target.parent if self.external else self.root
+
+    def _check_mac_external_boundary(self):
+        if not self.external or os.name != "posix":
+            return
+        try:
+            root_info = self.root.stat()
+            current = self.target.parent
+            while True:
+                info = current.stat()
+                if (info.st_dev, info.st_ino) == (root_info.st_dev, root_info.st_ino):
+                    raise PreflightError("ledger_unverified", "External boundary ambiguous")
+                if current == current.parent:
+                    break
+                current = current.parent
+        except PreflightError:
+            raise
+        except (OSError, ValueError, AttributeError):
+            raise PreflightError("ledger_unverified", "External boundary unavailable") from None
+
+    def _check_mac_external_namespace(self, roles):
+        """Prove hidden random target-parent names do not overlap any role."""
+        if not self.external or os.name != "posix":
+            return
+        from .discovery import _identity_contains, _path_identity
+        parent = self.target.parent
+        try:
+            parent_id = _path_identity(parent, fixed=False, kind="directory")
+            protected = list(roles.values())
+            for source in (self.config_path, _RUNTIME_PATHS_FILE,
+                           self.config_path.parent / "session_overrides.json"):
+                path = source if source.is_absolute() else Path.cwd() / source
+                protected.append(_path_identity(path, fixed=False, kind="file"))
+            for item in protected:
+                component = None
+                for i, entry in enumerate(item.trace):
+                    if (entry[1], entry[2]) == (parent_id.device, parent_id.inode):
+                        if i + 1 < len(item.trace):
+                            component = Path(item.trace[i + 1][0]).name
+                        elif item.unresolved:
+                            component = item.unresolved[0]
+                        else:
+                            raise PreflightError("ledger_unverified", "Staging namespace overlaps a role")
+                        break
+                if component is None and _identity_contains(parent_id, item):
+                    # Alias/containment without a physically bound first child.
+                    raise PreflightError("ledger_unverified", "Staging namespace ambiguous")
+                if component is not None and (not component.isascii() or re.fullmatch(
+                        r"\.model-proxy-runtime-[0-9a-f]{24}", component, flags=re.IGNORECASE)):
+                    raise PreflightError("ledger_unverified", "Staging namespace overlaps a role")
+        except PreflightError:
+            raise
+        except (OSError, ValueError, AttributeError):
+            raise PreflightError("ledger_unverified", "Staging namespace unavailable") from None
+
+    def _verify_locks(self):
+        try:
+            verify_held_instance_locks(self.anchor, self.legacy)
+        except Exception:
+            # The shared lock helper can collapse a close failure into a
+            # generic protection error, so release cannot be inferred here.
+            raise _LedgerGuardUnverified() from None
+
+    def __call__(self):
+        self._verify_locks()
+        try:
+            configured = resolve_runtime_paths(_RUNTIME_PATHS_FILE)
+        except Exception:
+            # The shared snapshot reader can similarly hide a close failure.
+            raise _LedgerGuardUnverified() from None
+        if configured != self.paths:
+            raise PreflightError("runtime_drift", "Runtime paths changed")
+        fresh = (inspect_runtime_identities(self.root, self.paths, windows_light=True)
+                 if os.name == "nt" else inspect_runtime_identities(self.root, self.paths)).as_dict()
+        target = fresh["totals"]
+        if (target.canonical != str(self.target) or target.requested != str(self.target)
+                or target.final_was_link or fresh["state_dir"].canonical != str(self.state)):
+            raise PreflightError("ledger_changed", "Ledger target changed")
+        # The shared preflight checks all runtime/fixed roles, tmp/backups,
+        # config, path-config and sidecar, including missing-name alias rules.
+        _check_config_targets(self.paths, self.config_path)
+        self._check_mac_external_boundary()
+        self._verify_locks()
+        return True
+
+    def check_mac_target_staging(self):
+        """Authorize hidden target-parent names only for the cross-volume case."""
+        if os.name != "posix" or not self.external:
+            raise PreflightError("ledger_unverified", "External staging not authorized")
+        self()
+        fresh = inspect_runtime_identities(self.root, self.paths).as_dict()
+        self._check_mac_external_namespace(fresh)
+        self._verify_locks()
+        return True
+
+    def check_windows_artifact(self, stage, artifact, *, require_absent=False):
+        """Bind the exact native staging name to live role/input leases."""
+        if os.name != "nt":
+            raise PreflightError("ledger_unverified", "Windows guard unavailable")
+        import ntpath
+        from . import windows_paths
+        from .discovery import _windows_open_preflight, _windows_close_leases, _windows_trusted_boundary
+        stage, artifact = os.fspath(stage), os.fspath(artifact)
+        if (stage not in (str(self.staging), str(self.target.parent))
+                or (stage == str(self.target.parent) and not self.external)
+                or ntpath.dirname(artifact) != stage
+                or re.fullmatch(r"\.model-proxy-stage-[0-9a-f]{24}", ntpath.basename(artifact)) is None):
+            raise PreflightError("ledger_unverified", "Staging artifact is not authorized")
+        self()
+        scope = None
+        extras = []
+        try:
+            _, scope = _windows_open_preflight(str(self.root), self.paths, light=True)
+            backend = scope["__root__"]._backend
+            candidate = windows_paths.inspect(
+                artifact, backend=backend, kind="file", private=True, single_link=True,
+                trusted_boundary=_windows_trusted_boundary(self.root, artifact))
+            extras.append(candidate)
+            absent = not candidate.evidence.exists and candidate.evidence.direct_parent_observed
+            for source in (self.config_path, _RUNTIME_PATHS_FILE,
+                           self.config_path.parent / "session_overrides.json"):
+                lease = windows_paths.inspect(str(source), backend=backend, kind="file", private=True,
+                                              trusted_boundary=_windows_trusted_boundary(self.root, source))
+                extras.append(lease)
+            for name, lease in scope.items():
+                if name in ("__root__", "state_dir") or (name == "tmp_dir" and stage == str(self.staging)):
+                    continue
+                if windows_paths.may_contain(candidate, lease) or windows_paths.may_contain(lease, candidate):
+                    raise PreflightError("ledger_unverified", "Staging artifact overlaps a role")
+            for lease in extras[1:]:
+                if windows_paths.may_contain(candidate, lease) or windows_paths.may_contain(lease, candidate):
+                    raise PreflightError("ledger_unverified", "Staging artifact overlaps an input")
+            for lease in (*scope.values(), *extras):
+                lease.revalidate()
+        finally:
+            try:
+                _windows_close_leases([*extras, *(scope.values() if scope is not None else ())])
+            except Exception:
+                raise _LedgerGuardUnverified() from None
+        self()
+        return absent if require_absent else True
+
+    def prepare_staging(self):
+        """Create only the fixed private tmp directory, under held locks."""
+        self()
+        if os.name == "nt":
+            from .platform_windows import ensure_private_directory, WindowsPrivateCreationError
+            try:
+                ensure_private_directory(str(self.staging), trusted_boundary=str(self.root))
+            except WindowsPrivateCreationError as exc:
+                if exc.created is not False or exc.release_unknown:
+                    unknown = PreflightError("ledger_staging_unknown", "Staging creation unverified")
+                    unknown.cleanup_unknown = True
+                    unknown.release_unknown = bool(exc.release_unknown)
+                    raise unknown from None
+                raise PreflightError("ledger_unverified", "Staging unavailable") from None
+            self()
+            return self.staging
+        from .secure_files import capture_private_directory
+        expected = self.legacy.snapshot.as_dict()["state_dir"]
+        try:
+            verify_record_directory(self.state)
+        except Exception:
+            raise _LedgerGuardUnverified() from None
+        fd = os.open(self.state, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
+        try:
+            info = os.fstat(fd)
+            if (info.st_dev, info.st_ino) != (expected.device, expected.inode):
+                raise PreflightError("ledger_changed", "Runtime directory changed")
+            try:
+                os.stat("tmp", dir_fd=fd, follow_symlinks=False)
+            except FileNotFoundError:
+                try:
+                    # A competing creation is not silently adopted.
+                    os.mkdir("tmp", 0o700, dir_fd=fd)
+                except FileExistsError:
+                    raise PreflightError("ledger_changed", "Staging directory appeared") from None
+                except OSError:
+                    # The creation outcome and any residual are not established.
+                    exc = PreflightError("ledger_staging_unknown", "Staging creation unverified")
+                    exc.cleanup_unknown = True
+                    raise exc from None
+        finally:
+            try:
+                os.close(fd)
+            except OSError:
+                raise PreflightError("release_unknown", "Staging directory release unknown") from None
+        self()
+        return capture_private_directory(self.staging, purpose="staging")
+
+
+def _ledger_runtime_adapter(config_path, anchor, legacy):
+    """Install only a real platform adapter with its real runtime guard."""
+    try:
+        from .ledger_secure_io import MacLedgerSecureIO, WindowsLedgerSecureIO
+        guard = _LedgerRuntimeGuard(config_path, anchor, legacy, _runtime_paths)
+        adapter = WindowsLedgerSecureIO if os.name == "nt" else MacLedgerSecureIO
+        return adapter(root=guard.root, target=guard.target, guard=guard)
+    except Exception:
+        # Lack of a supported secure platform/path is a persistence downgrade,
+        # never permission to fall back to an unchecked replace.
+        return None
+
+
+def _sidecar_runtime_store(config_path, anchor, legacy):
+    """Build the protected sidecar; failure never falls back to legacy writes."""
+    from .sidecar_runtime_guard import SidecarRuntimeGuard, UnavailableSidecarIO
+    path = Path(config_path).parent / "session_overrides.json"
+    try:
+        from .sidecar_secure_io import SidecarSecureIO, _source
+        selected = os.environ.get("MODEL_PROXY_CONFIG")
+        explicit = bool(selected) and _source(selected) == _source(config_path)
+        guard = SidecarRuntimeGuard(root=_PACKAGE_DIR, config_path=config_path,
+                                    anchor=anchor, legacy=legacy, runtime_paths=_runtime_paths,
+                                    explicit_external_config=explicit)
+        adapter = SidecarSecureIO(project_root=_PACKAGE_DIR, target=path, guard=guard,
+                                   allow_external_target_staging=guard.allow_external_target_staging)
+        try:
+            guard.prepare_staging()
+        except Exception:
+            # Guard retains any resource uncertainty. An ordinary unavailable
+            # staging directory need not prevent protected reads/conversation.
+            log.warning("sidecar: staging unavailable; protected writes may be blocked")
+    except Exception as exc:
+        log.warning("sidecar: protected adapter unavailable; overrides remain unavailable")
+        adapter = UnavailableSidecarIO(exc)
+    return SessionOverridesSidecar(path, secure_io=adapter)
+
+
+def _run_bound_server(server, config_path, listen_cfg, config_store, state_dir, record, ready, attempted,
+                      anchor, legacy, migration_guard=None, expected_records=None, previous_records=None):
     global _VERSION
     try:
         _VERSION = _VERSION_FILE.read_text(encoding="utf-8").strip()
     except OSError:
-        pass  # 保持 "unknown"
-
-    # 1. 装配日志 handler + 截断日志（S1：从模块级挪到启动路径，
-    # 避免测试 import 时触碰生产日志文件）
-    init_logging(_runtime_paths["log"])
-
-    # 2. 进程级互斥锁：同一时刻只允许一个 model_proxy.py 实例运行
-    # （flock 提前到 UsageTotalsStore 之前，B10 确认是改善）
-    import fcntl
-    lock_path = _runtime_paths["lock"]
-    lock_fd = open(lock_path, "w")
-    try:
-        fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-    except OSError:
-        existing_pid = lock_path.read_text().strip() if lock_path.exists() else "unknown"
-        log.warning("startup.lock_conflict existing_pid=%s", existing_pid)
-        lock_fd.close()
-        raise SystemExit(1)
-    lock_fd.write(str(os.getpid()))
-    lock_fd.flush()
-
-    # 3. 实例化账本（S1：从模块级挪到启动路径，避免测试 import 时触碰账本文件）
+        pass
     global usage_totals
-    usage_totals = UsageTotalsStore(_runtime_paths["totals"])
-
-    # 4. 实例化 ConfigStore
-    config_store = ConfigStore(config_path, on_reload=None)
+    if migration_guard is None:
+        raise PreflightError("ledger_unverified", "Validated ledger snapshot required")
+    _verify_migration_guard(migration_guard, config_path, config_store, listen_cfg,
+                            anchor, legacy, expected_records)
+    windows_light = (os.name == "nt" and isinstance(expected_records, dict)
+                     and set(expected_records) == {"windows_active"})
+    if windows_light:
+        init_logging(_runtime_paths["log"], trim=False)
+    else:
+        init_logging(_runtime_paths["log"])
+    _verify_migration_guard(migration_guard, config_path, config_store, listen_cfg,
+                            anchor, legacy, expected_records, allow_log_change=True)
+    ledger_adapter = _ledger_runtime_adapter(config_path, anchor, legacy)
+    usage_totals = UsageTotalsStore.from_verified_snapshot(
+        _runtime_paths["totals"], migration_guard[3], adapter=ledger_adapter)
 
     # 2. 实例化 CooldownStore
     cooldown_store = CooldownStore()
@@ -3780,22 +5433,15 @@ def main():
     # 见 core/thinking_guard.py 与 docs/designs/2026-10-28-thinking空签名剥离与supply级自适应.md）
     thinking_strip_store = ThinkingStripStore()
 
-    # 2.5b 实例化 ThinkingStripStore（thinking 空签名剥离的 supply 级学习，
-    # 见 core/thinking_guard.py 与 docs/designs/2026-10-28-thinking空签名剥离与supply级自适应.md）
-    thinking_strip_store = ThinkingStripStore()
-
     # 2.6 实例化 SessionOverridesSidecar（$route in-band 指令的 override 落盘，
     # 与主 config 同目录，代理独占写，见 docs/designs/2026-08-04-in-band-route-command-design.md §4.5）
-    sidecar_store = SessionOverridesSidecar(config_path.parent / "session_overrides.json")
+    sidecar_store = _sidecar_runtime_store(config_path, anchor, legacy)
 
-    # 3. 启动 ThreadingHTTPServer（监听地址来自 listen 段/回退矩阵，见 listen_config）
-    server = ThreadingHTTPServer(
-        (listen_cfg["host"], listen_cfg["port"]), ModelProxyHandler)
+    # Socket is already exclusively bound; publish handlers only after stores exist.
     server.config_store = config_store    # type: ignore[attr-defined]
     server.cooldown_store = cooldown_store  # type: ignore[attr-defined]
     server.stream_health_store = stream_health_store  # type: ignore[attr-defined]
     server.pref_store = pref_store        # type: ignore[attr-defined]
-    server.thinking_strip_store = thinking_strip_store  # type: ignore[attr-defined]
     server.thinking_strip_store = thinking_strip_store  # type: ignore[attr-defined]
     tool_strict_store = ToolStrictStore()
     server.tool_strict_store = tool_strict_store  # type: ignore[attr-defined]
@@ -3807,19 +5453,56 @@ def main():
         HostHeaderValidator(listen_cfg["port"], listen_cfg["allow_hosts"])
         if listen_cfg["host_check_enabled"] else None)
 
+    if migration_guard is not None:
+        _verify_migration_guard(migration_guard, config_path, config_store, listen_cfg,
+                                anchor, legacy, expected_records, allow_log_change=True)
+        if previous_records is not None:
+            _ensure_stale_instance(previous_records, record["runtime_paths"], record["listen"], record["locks"])
+    record = dict(record, state="READY")
+    # A post-replace failure may have committed READY. Include both our
+    # STARTING and READY values in pre-serve cleanup's allowed identities.
+    attempted["active.json"].append(record)
+    write_instance_record(state_dir, "active.json", record, anchor=anchor, legacy=legacy)
+    windows_light = (os.name == "nt" and isinstance(expected_records, dict)
+                     and set(expected_records) == {"windows_active"})
+    if windows_light:
+        from .discovery import read_windows_active
+        ready_records = {"windows_active": read_windows_active(state_dir)}
+    else:
+        ready_records = read_instance_set(state_dir)
+    if ready_records is None:
+        raise PreflightError("records_inconsistent", "Ready record did not verify")
+    if os.name == "nt" or _mac_business_enabled():
+        # A self-consistent record set is not necessarily the one just written.
+        # Recheck after publication and before serving. Mac cleanup attempts
+        # only the existing identity-checked pre-start rollback; failure is UNKNOWN.
+        if not isinstance(expected_records, dict):
+            raise PreflightError("records_inconsistent", "Ready record did not verify")
+        expected_ready = ({"windows_active": record} if windows_light
+                          else dict(expected_records, active=record))
+        if ready_records != expected_ready:
+            raise PreflightError("records_changed", "Ready records changed")
+        _verify_migration_guard(migration_guard, config_path, config_store, listen_cfg,
+                                anchor, legacy, expected_ready, allow_log_change=True)
+        if previous_records is not None:
+            _ensure_stale_instance(previous_records, record["runtime_paths"],
+                                   record["listen"], record["locks"])
+
     log.info("startup.listening host=%s port=%d pid=%d config_path=%s "
              "host_check=%s allow_hosts=%d",
              listen_cfg["host"], listen_cfg["port"], os.getpid(),
              str(config_path),
              "on" if listen_cfg["host_check_enabled"] else "off",
              len(listen_cfg["allow_hosts"]))
+    if windows_light:
+        _close_windows_startup_diagnostic_pipe()
     try:
+        ready["serving_started"] = True
         server.serve_forever()
     except KeyboardInterrupt:
         log.info("shutdown.signal KeyboardInterrupt")
     finally:
         server.shutdown()
-        server.server_close()
         log.info("shutdown.complete")
 
 

@@ -8,15 +8,23 @@ select_supply（列表签名 + cooling/tried 跳过）、tier 内 failover、以
 运行：cd tools/model_proxy && python3 -m unittest tests.test_route
 """
 
+import contextlib
+import io
+import json
 import os
+from pathlib import Path
 import sys
 import tempfile
 import unittest
+from unittest.mock import patch
 
 # tests/ 与 core/ 同级，sys.path 指向 tools/model_proxy/ 以便 from core.server import
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from _config_ops import atomic_write, load_config  # noqa: E402
+from core.cli import _config_ops, dispatch  # noqa: E402
+from core.cli._config_ops import atomic_write, load_config, WritePreflightFailed  # noqa: E402
+from core.mac_config_path import MacConfigError  # noqa: E402
+from core import mac_config_writer  # noqa: E402
 
 from core.server import (  # noqa: E402
     resolve_strategy,
@@ -92,25 +100,181 @@ class TestSelectSupplyList(unittest.TestCase):
 
 class TestSelectSupply(unittest.TestCase):
 
+    @staticmethod
+    def _isolated_config_fixture(directory):
+        base = Path(directory).resolve()
+        root, home = base / 'project', base / 'home'
+        (root / 'config').mkdir(parents=True, mode=0o700)
+        (root / 'runtime').mkdir(mode=0o700)
+        home.mkdir(mode=0o700)
+        path = root / 'config' / 'synthetic.json'
+        path.write_text('{}\n', encoding='utf-8')
+        path.chmod(0o600)
+        keys = ('log', 'totals', 'lock', 'pid', 'ensure_log', 'start_lock')
+        runtime_file = root / 'config' / 'runtime_paths.json'
+        runtime_file.write_text(
+            json.dumps({key: str(root / 'runtime' / key) for key in keys}),
+            encoding='utf-8')
+        runtime_file.chmod(0o600)
+        env = {'HOME': str(home), 'USERPROFILE': str(home),
+               'LOCALAPPDATA': str(home / 'Local'), 'MODEL_PROXY_CONFIG': str(path),
+               'TMPDIR': str(base), 'TMP': str(base), 'TEMP': str(base)}
+        return root, path, env
+
+    @staticmethod
+    @contextlib.contextmanager
+    def _isolated_write_state(root, env):
+        with patch.object(dispatch, 'ROOT', root), patch.dict(os.environ, env, clear=True), \
+             patch.multiple(_config_ops, _WRITE_BASELINE=None, _WRITE_STARTED=False,
+                            _WRITE_OPERATION='route-edit', _WRITE_AUTHORIZATION=None,
+                            _WRITE_PREFLIGHT=None, _WRITE_INPUT_PATH=None, _WRITE_COMMITTED=None,
+                            _WRITE_LOCATIONS=None, _WRITE_BACKUP_BASELINE=None,
+                            _MARKER_BASELINE=None, _MARKER_CONTENT=None, _MARKER_REQUIRED=False):
+            yield
+
     def test_first_available(self):
         supply_map = {"k0": {"id": "k0"}, "k1": {"id": "k1"}}
         cd = _FakeCooldown()
         supply = select_supply(["k0", "k1"], supply_map, cd, set())
         self.assertEqual(supply["id"], "k0")
 
+    @unittest.skipUnless(sys.platform == 'darwin', 'requires native macOS config writer')
     def test_roundtrip_comma_supply_id_matches_exactly(self):
         cfg = {"supplies": [{"id": "s,1"}, {"id": "s"}, {"id": "1"}],
                "routes": [{"id": "r,1", "tiers": {"opus": ["s,1", "s"]},
                            "failover": "on"}]}
         with tempfile.TemporaryDirectory() as directory:
-            path = os.path.join(directory, 'synthetic.json')
-            atomic_write(path, cfg)
-            loaded = load_config(path)
+            root, path, env = self._isolated_config_fixture(directory)
+            with self._isolated_write_state(root, env):
+                _config_ops._prepare_write(str(path), 'route-edit')
+                self.assertEqual(_config_ops._WRITE_INPUT_PATH, str(path))
+                self.assertEqual(_config_ops._WRITE_AUTHORIZATION.target_path, str(path))
+                self.assertIs(_config_ops._WRITE_AUTHORIZATION.allow_backup_and_staging, True)
+                self.assertTrue(_config_ops._WRITE_PREFLIGHT(_config_ops._WRITE_BASELINE))
+                atomic_write(str(path), cfg)
+                loaded = load_config(str(path))
+        self.assertEqual(loaded, cfg)
         ids = select_supply_list(loaded['routes'][0], 'opus')
         self.assertEqual(ids, ['s,1', 's'])
         supply_map = {s['id']: s for s in loaded['supplies']}
         self.assertEqual(select_supply(ids, supply_map, _FakeCooldown(), set())['id'], 's,1')
         self.assertEqual(select_supply(ids, supply_map, _FakeCooldown(), {'s,1'})['id'], 's')
+
+    @unittest.skipUnless(sys.platform == 'darwin', 'requires native macOS config capture')
+    def test_prepare_write_missing_config_fails_without_creating(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root, path, env = self._isolated_config_fixture(directory)
+            missing = root / 'config' / 'absent.json'
+            before = sorted(p.name for p in path.parent.iterdir())
+            with self._isolated_write_state(root, env):
+                with self.assertRaises(MacConfigError) as caught:
+                    _config_ops._prepare_write(str(missing), 'route-edit')
+                self.assertEqual(caught.exception.code, 'file_not_found')
+                with self.assertRaisesRegex(WritePreflightFailed, '缺少编辑前快照'):
+                    atomic_write(str(missing), {'supplies': []})
+            self.assertFalse(missing.exists())
+            self.assertEqual(sorted(p.name for p in path.parent.iterdir()), before)
+
+    def test_windows_config_write_is_rejected_before_staging(self):
+        # Runs on native Windows and simulates the platform guard elsewhere.
+        with tempfile.TemporaryDirectory() as directory:
+            root, path, env = self._isolated_config_fixture(directory)
+            path_arg = str(path)
+            before = path.read_bytes()
+            base = root.parent
+            entries = sorted(str(p.relative_to(base)) for p in base.rglob('*'))
+            with self._isolated_write_state(root, env), \
+                 patch.object(mac_config_writer, 'replace_config') as write, \
+                 patch.object(_config_ops.os, 'name', 'nt'):
+                # Windows writes are now implemented; without a captured
+                # pre-write authorization they must still fail closed before
+                # any staging or replacement happens.
+                with self.assertRaises(WritePreflightFailed):
+                    atomic_write(path_arg, {'supplies': [{'id': 's,1'}]})
+                write.assert_not_called()
+            self.assertEqual(path.read_bytes(), before)
+            self.assertEqual(sorted(str(p.relative_to(base)) for p in base.rglob('*')), entries)
+
+    def test_simulated_windows_helper_rejects_marker_before_writer(self):
+        for transport in ('untrusted_path', 'pipe'):
+            with self.subTest(transport=transport), tempfile.TemporaryDirectory() as directory, \
+                 contextlib.ExitStack() as stack:
+                root, path, env = self._isolated_config_fixture(directory)
+                if transport == 'untrusted_path':
+                    marker = root / 'config' / 'untrusted-marker'
+                    marker.write_bytes(b'fake-marker')
+                    env['CONFIG_OPS_RELOAD_MARKER'] = str(marker)
+                else:
+                    read_fd, write_fd = os.pipe()
+                    stack.callback(os.close, read_fd)
+                    stack.callback(os.close, write_fd)
+                    os.set_inheritable(write_fd, True)
+                    env['CONFIG_OPS_RELOAD_MARKER_FD'] = str(write_fd)
+                before = path.read_bytes()
+                base = root.parent
+                entries = sorted(str(p.relative_to(base)) for p in base.rglob('*'))
+                error = io.StringIO()
+                argv = ['helper', 'switch', str(path), 'fake-token', 'fake-route']
+                with self._isolated_write_state(root, env), \
+                     patch.object(_config_ops, '_precheck_inherited_marker',
+                                  wraps=_config_ops._precheck_inherited_marker) as precheck, \
+                     patch.object(_config_ops, 'atomic_write',
+                                  wraps=_config_ops.atomic_write) as atomic, \
+                     patch.object(mac_config_writer, '_open_private') as stage, \
+                     patch.object(mac_config_writer, 'replace_config') as writer, \
+                     patch('core.mac_config_path.capture_config') as capture, \
+                     patch.object(_config_ops.os, 'name', 'nt'), \
+                     patch.object(_config_ops.sys, 'argv', argv), \
+                     contextlib.redirect_stderr(error):
+                    with self.assertRaises(SystemExit) as caught:
+                        _config_ops.main()
+                    self.assertNotEqual(caught.exception.code, 0)
+                    precheck.assert_called_once()
+                    # Refusal happens before any config work. The untrusted
+                    # path is rejected by the path check, so only require that
+                    # generic fail-closed message for that transport.
+                    message = error.getvalue()
+                    self.assertTrue('marker' in message or '路径校验失败' in message, message)
+                    self.assertIn('未触发 reload', message)
+                    capture.assert_not_called()
+                    atomic.assert_not_called()
+                    stage.assert_not_called()
+                    writer.assert_not_called()
+                self.assertEqual(path.read_bytes(), before)
+                self.assertEqual(sorted(str(p.relative_to(base)) for p in base.rglob('*')), entries)
+                if transport == 'untrusted_path':
+                    self.assertEqual(marker.read_bytes(), b'fake-marker')
+
+    @unittest.skipUnless(sys.platform == 'darwin', 'requires native macOS fake config writer')
+    def test_helper_and_roundtrip_restore_state_in_both_orders(self):
+        from tests.test_cli_write_preflight import WritePreflightTests
+
+        fields = ('_WRITE_BASELINE', '_WRITE_STARTED', '_WRITE_OPERATION',
+                  '_WRITE_AUTHORIZATION', '_WRITE_PREFLIGHT', '_WRITE_INPUT_PATH',
+                  '_WRITE_COMMITTED', '_WRITE_LOCATIONS', '_WRITE_BACKUP_BASELINE',
+                  '_MARKER_BASELINE', '_MARKER_CONTENT', '_MARKER_REQUIRED')
+        self.assertEqual({name for name in vars(_config_ops)
+                          if name.startswith(('_WRITE_', '_MARKER_'))}, set(fields))
+        original = {name: getattr(_config_ops, name) for name in fields}
+        sentinels = {name: object() for name in fields}
+        sentinels['_WRITE_STARTED'] = sentinels['_MARKER_REQUIRED'] = True
+        factories = {
+            'route': lambda: TestSelectSupply('test_roundtrip_comma_supply_id_matches_exactly'),
+            'helper': lambda: WritePreflightTests('test_windows_direct_helper_fails_before_config_staging'),
+        }
+        with patch.multiple(_config_ops, **sentinels):
+            for order in (('route', 'helper'), ('helper', 'route')):
+                for name in order:
+                    with self.subTest(order=order, test=name):
+                        result = unittest.TestResult()
+                        factories[name]().run(result)
+                        self.assertEqual(result.testsRun, 1)
+                        self.assertFalse(result.skipped)
+                        self.assertTrue(result.wasSuccessful(), (result.failures, result.errors))
+                        for field in fields:
+                            self.assertIs(getattr(_config_ops, field), sentinels[field], field)
+        for field in fields:
+            self.assertIs(getattr(_config_ops, field), original[field], field)
 
     def test_skip_tried(self):
         supply_map = {"k0": {"id": "k0"}, "k1": {"id": "k1"}}

@@ -13,7 +13,7 @@ import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from _config_ops import compact_config_json
+from core.cli._config_ops import compact_config_json
 
 
 def _make_full_cfg():

@@ -10,7 +10,13 @@
 样例，纳入跟踪。
 
 session override 存放在独立 sidecar 文件 `config/session_overrides.json`（与主 config 同目录，
-600 权限，已加入 `.gitignore`），代理独占写。
+600 权限，已加入 `.gitignore`），代理独占写，同样走受保护提交（私有暂存 + 原子替换 + 后验）。
+
+运行数据（日志、账本、锁、PID、CLI 暂存与备份）默认集中在项目根 `.runtime/`，见
+`config/runtime_paths.json`。该目录由 CLI 独占创建并校验私有权限，已加入 `.gitignore`；
+不再使用 `/tmp` 或盘根。配置写入的安全备份也放在 `.runtime/backups/`（文件名带
+`.bak.<随机后缀>`），不在被编辑文件的旁边生成。唯一例外：用户显式选择的外部配置目标，
+若其派生的 sidecar 与项目暂存跨卷，才在该目标父目录做一次经确认的私有短期暂存。
 
 ## 2. supplies 字段
 
@@ -206,7 +212,7 @@ route），按 Claude Code 会话 session_id 做一致性哈希分配——同�
 ```
 
 - **`route_pool`**（数组，`{route_id, weight}`）：与 `route_id` 二选一、互斥。同时配置两者会被
-  `_config_ops.py` 的 `strategy add`/`edit` 拒绝写入；若绕过 CLI 直接改配置文件导致两者同时
+  `core/cli/_config_ops.py` 的 `strategy add`/`edit` 拒绝写入；若绕过 CLI 直接改配置文件导致两者同时
   存在，运行时（`extract_route_candidates`）会忽略 `route_id`、按 `route_pool` 处理并打
   warning 日志，不会中断请求。
   - `weight`（可选，默认 1）：参与一致性哈希的权重。非正整数会被静默视为 1（不报错、不把该
@@ -306,8 +312,8 @@ text 截 100 字符），并跳过 effort 探测与 `reasoning_capability` 写�
 
 累计用量账本（schema v3）：ACCESS 日志会在进程启动时被 `_trim_log` 截断到最后 5000 行，早期行
 永久丢失，无法回答「本月/某天累计用了多少 token」这类长期问题。为此另建一个独立账本文件
-`.model_proxy_totals.json`（与日志文件同目录），每请求在 `_forward_logged` 收口处同步累加、
-原子写盘：按天分桶，桶内以 `supply×route×strategy` 组合键（形如
+`.runtime/model_proxy_totals.json`（默认与日志同目录，路径以 `config/runtime_paths.json`
+为准），每请求在 `_forward_logged` 收口处同步累加、经私有暂存原子替换并做后验复核：按天分桶，桶内以 `supply×route×strategy` 组合键（形如
 `supply=<s>|route=<r>|strategy=<t>`，strategy 段是 client_token 明文如 `cc`/`codex`）累加
 `requests`/`ok`/`fail`/`usage_in`/`usage_out`/`max_ms`/`attempts`/`attempt_fail`，另存 `total`
 全历史汇总。`max_ms`（OPT-10）入账本，CLI stats 的 max_ms 从账本取，不再依赖日志窗口；

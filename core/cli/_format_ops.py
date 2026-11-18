@@ -12,11 +12,11 @@ CLI 入口：
 import json
 import os
 import sys
+import time
 import unicodedata
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from core.protocol_hints import PROTOCOL_HINT_WINDOW_DAYS
 from core.session_identity import (
     load_session_names,
@@ -168,10 +168,12 @@ def load_supply_health(totals_path: str) -> dict[str, dict]:
     return health
 
 
-def _route_tokens(cfg: dict) -> dict[str, list[str]]:
+def _route_tokens(cfg: dict, *, explicit_only: bool = False) -> dict[str, list[str]]:
     """route_id → 引用它的 strategy token 列表（route_id 单值 + route_pool 两种写法）。"""
     route_tokens: dict[str, list[str]] = {}
     for st in cfg.get("strategies", []):
+        if explicit_only and "client_token" not in st:
+            continue
         tok = st.get("client_token", "?")
         if st.get("route_id"):
             route_tokens.setdefault(st["route_id"], []).append(tok)
@@ -181,12 +183,19 @@ def _route_tokens(cfg: dict) -> dict[str, list[str]]:
     return route_tokens
 
 
-def _supply_refs(cfg: dict) -> dict[str, list[str]]:
+class StatusReferenceConflict(ValueError):
+    """A visible status identity or error path conflicts with the admin token."""
+
+
+def _supply_refs(cfg: dict, *, forbidden_reference_token=None,
+                 visible_supply_ids=None) -> dict[str, list[str]]:
     """supply_id → 引用它的 `route(token,...) tier` 列表。
 
     用于在 degraded/cooldown 行尾标注该 supply 被哪个 route 的哪档、哪个 strategy 引用。
     """
     route_tokens = _route_tokens(cfg)
+    explicit_tokens = (_route_tokens(cfg, explicit_only=True)
+                       if forbidden_reference_token is not None else None)
     refs: dict[str, list[str]] = {}
     for r in cfg.get("routes", []):
         rid = r.get("id", "?")
@@ -194,6 +203,11 @@ def _supply_refs(cfg: dict) -> dict[str, list[str]]:
         toks_str = f"({','.join(toks)})" if toks else ""
         for tn in TIER_NAMES:
             for sid in r.get("tiers", {}).get(tn, []):
+                if (forbidden_reference_token is not None and visible_supply_ids is not None
+                        and sid in visible_supply_ids and
+                        (("id" in r and str(rid) == forbidden_reference_token) or
+                         forbidden_reference_token in explicit_tokens.get(rid, []))):
+                    raise StatusReferenceConflict("status reference conflicts with admin token")
                 refs.setdefault(sid, []).append(f"{rid}{toks_str} {tn}")
     return refs
 
@@ -375,7 +389,8 @@ def load_active_sessions(log_path: str, *, now: datetime | None = None,
 
 
 def _format_active_sessions(result: dict, cfg: dict | None = None,
-                            session_names: dict[str, str] | None = None) -> list[str]:
+                            session_names: dict[str, str] | None = None, *,
+                            forbidden_reference_token: str | None = None) -> list[str]:
     """渲染活跃 session 段（header + 每 session 一行 + FAIL err 续行）。
 
     行格式：`[name · ]sid8  state n=N fail=F [fo=K] [client]  HH:MM status  route tier/supply(pct%) ...`
@@ -463,9 +478,24 @@ def _format_active_sessions(result: dict, cfg: dict | None = None,
 
         # client 标注：窗口内主 token（cc=ClaudeCode / codex=Codex），多 token 并列
         toks_part = ""
+        toks_sorted = []
         if agg.get("tokens"):
             toks_sorted = sorted(agg.get("tokens", {}).items(), key=lambda kv: -kv[1])
             toks_part = "  [" + ",".join(t for t, _ in toks_sorted) + "]"
+
+        if forbidden_reference_token is not None:
+            display_sid = (sid or "")[:8]
+            display_name = match_session_name(names, sid)
+            visible_tokens = (t for t, _ in toks_sorted)
+            if (display_sid == forbidden_reference_token or
+                    display_name == forbidden_reference_token or
+                    str(route_part) == forbidden_reference_token or
+                    forbidden_reference_token in visible_tokens):
+                raise StatusReferenceConflict("visible session identity conflicts with admin token")
+            if not agg["builtin_only"] and any(
+                    _short_supply(supply) == forbidden_reference_token
+                    for (_, supply) in agg["chains"]):
+                raise StatusReferenceConflict("visible session identity conflicts with admin token")
 
         if agg["builtin_only"]:
             line = (f"  {_pad(id_str, id_w)}  {_pad(state, 4)} n=0 fail=0"
@@ -635,10 +665,27 @@ def _compute_degraded(health: dict[str, dict]) -> list[dict]:
     return degraded
 
 
+def _format_status_header(port: int, pid: int, started: int | None = None) -> str:
+    """Common process header; started is an independently verified Unix time."""
+    header = f"service running on port {port}  pid {pid}"
+    if type(started) is int:
+        elapsed = int(time.time()) - started
+        if elapsed >= 0:
+            days, seconds = divmod(elapsed, 86400)
+            hours, seconds = divmod(seconds, 3600)
+            minutes, seconds = divmod(seconds, 60)
+            uptime = (f"{days}-{hours:02d}:{minutes:02d}:{seconds:02d}" if days else
+                      f"{hours:02d}:{minutes:02d}:{seconds:02d}" if hours else
+                      f"{minutes:02d}:{seconds:02d}")
+            header += f"  up {uptime}  (started {time.strftime('%b %d %H:%M', time.localtime(started))})"
+    return header
+
+
 def _format_status_from_json(data: dict, config_path: str, totals_path: str,
                              log_path: str | None = None,
                              cooldown_unknown: bool = False,
-                             sessions_dir=None) -> list[str]:
+                             sessions_dir=None,
+                             forbidden_reference_token: str | None = None) -> list[str]:
     """从 server status JSON + config + 账本 格式化 status 输出。
 
     布局：health 行 → degraded supplies 段 → active sessions 段（在线时恒展示）
@@ -650,6 +697,9 @@ def _format_status_from_json(data: dict, config_path: str, totals_path: str,
 
     sessions_dir：session 身份注册表目录（默认 ~/.claude/sessions）。显式参数
     供测试注入临时目录（不读真实 HOME）；仅在有 log_path 时扫描一次。
+
+    forbidden_reference_token：可选的本次管理 token。若实际显示的身份或
+    读取失败时展示的路径组件与其相同，抛 StatusReferenceConflict；缺省不改变原展示。
     """
     cooldown = data.get("cooldown", {})
     n_supplies = len(data.get("supplies", []))
@@ -673,6 +723,15 @@ def _format_status_from_json(data: dict, config_path: str, totals_path: str,
 
     # config 读取（_supply_refs 需要；损坏时容错为空，refs 显示"未被引用"）
     cfg, cfg_err = _load_config_tolerant(config_path)
+    if cfg_err and forbidden_reference_token is not None:
+        # OSError text may include the config filename. Compare only actual
+        # path components, and only when that path is rendered in the error;
+        # ordinary error numbers and unrelated text are not identity values.
+        rendered_path = os.fsdecode(os.fspath(config_path))
+        components = rendered_path.replace("\\", "/").split("/")
+        if (forbidden_reference_token in components and
+                (rendered_path in cfg_err or repr(rendered_path) in cfg_err)):
+            raise StatusReferenceConflict("status config error conflicts with admin token")
 
     # supply health
     health = load_supply_health(totals_path)
@@ -705,13 +764,22 @@ def _format_status_from_json(data: dict, config_path: str, totals_path: str,
     lines.append("health: " + " · ".join(parts))
 
     # supply 引用标注（degraded/cooldown 行尾标出被哪个 route.tier(strategy) 引用）
-    refs = _supply_refs(cfg)
+    if forbidden_reference_token is None:
+        refs = _supply_refs(cfg)
+    else:
+        visible_supply_ids = {item["id"] for item in degraded}
+        if not cooldown_unknown:
+            visible_supply_ids.update(cooldown)
+        refs = _supply_refs(cfg, forbidden_reference_token=forbidden_reference_token,
+                            visible_supply_ids=visible_supply_ids)
 
     # degraded supplies 段（只列问题）
     if degraded:
         lines.append("")
         lines.append(f"degraded supplies (today fail%>{DEGRADED_FAIL_PCT:.0f}%, n>={DEGRADED_MIN_REQUESTS}):")
         for d in degraded:
+            if forbidden_reference_token is not None and str(d["id"]) == forbidden_reference_token:
+                raise StatusReferenceConflict("visible supply identity conflicts with admin token")
             ref = ",".join(refs.get(d["id"], [])) or "未被引用"
             lines.append(f"  {_pad(d['id'], 24)} fail {d['fail_pct']:.1f}% ({d['fail']}/{d['requests']})  ← {ref}")
 
@@ -719,8 +787,12 @@ def _format_status_from_json(data: dict, config_path: str, totals_path: str,
     if log_path:
         lines.append("")
         session_names = load_session_names(sessions_dir)
-        lines.extend(_format_active_sessions(load_active_sessions(log_path), cfg,
-                                             session_names))
+        sessions = load_active_sessions(log_path)
+        if forbidden_reference_token is None:
+            lines.extend(_format_active_sessions(sessions, cfg, session_names))
+        else:
+            lines.extend(_format_active_sessions(sessions, cfg, session_names,
+                                                forbidden_reference_token=forbidden_reference_token))
 
     # 2026-11-06：跨协议转换链路已系统性补齐（system/strict/encrypted
     # reasoning/工具/终态全实测），protocol conversions 专属展示段整体移除，
@@ -736,6 +808,11 @@ def _format_status_from_json(data: dict, config_path: str, totals_path: str,
             else:
                 remain = info
                 reason = ""
+            if (forbidden_reference_token is not None and str(sid) == forbidden_reference_token):
+                raise StatusReferenceConflict("visible supply identity conflicts with admin token")
+            if (forbidden_reference_token is not None and not forbidden_reference_token.isdecimal()
+                    and reason and str(reason) == forbidden_reference_token):
+                raise StatusReferenceConflict("visible cooldown reason conflicts with admin token")
             ref = ",".join(refs.get(sid, [])) or "未被引用"
             suffix = f" ({reason})" if reason else ""
             lines.append(f"  {_pad(sid, 24)} {int(remain)}s  ← {ref}{suffix}")

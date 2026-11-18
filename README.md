@@ -1,10 +1,24 @@
 ---
 created: 2026-07-17 18:52:18
-version: 0.10
+version: 0.14
 ---
 # model_proxy
 
-**Version: 0.10**
+**Version: 0.14**（与 `VERSION` 一致；本次重构尚未发布）
+
+> **当前工作树状态**：Mac 统一 CLI 已在隔离副本通过假数据端到端回归，尚未部署。
+> Windows `.bat` 入口与同一套 Python CLI、锁、ACL 及控制链路已实现，但**只经过
+> 虚拟 Win32 后端测试，尚无原生 Windows 验收**，因此暂不作为可用的 Windows 服务
+> 发布。下述操作不要直接用于线上切换；部署节奏需另行确认。
+>
+> 运行数据统一在项目根 `.runtime/`（日志、账本、锁、PID、CLI 私有的暂存与备份），
+> 不再写 `/tmp` 或系统临时目录。该目录由 CLI 独占创建并做私有权限校验，已加入
+> `.gitignore`。
+
+CLI 入口目前要求 Python 3.10 以上；Codex 安装的 TOML 安全校验优先使用标准库
+`tomllib`，也可使用已安装的 `tomli`。Python 3.10 没有标准库 `tomllib`；
+若也没有 `tomli`，安全编辑将在写入前失败，应用不会自动安装依赖。
+这不是对所有 Python 版本和平台的兼容性声明。
 
 ## 1. 这是什么
 
@@ -24,35 +38,37 @@ cp tools/model_proxy/config/model_proxy_config.example.json \
 chmod 600 tools/model_proxy/config/model_proxy_config.json
 ```
 
-编辑 `config/model_proxy_config.json`，把所有 `"appkey": "xxx"` 替换为真实 appkey（每个 supply 一条），`admin_token` 替换为自定义控制 API 鉴权 token（Quick Start 不涉及控制 API，可暂时填任意值）。example.json 已含一条可用 strategy（`client_token: "cc"` 绑 `nation1` route）与四条示例 supply——其中三条为 aigc 系（配 appkey 即用），`glm-53-mcli-example` 展示自定义网关接入（`appkey_file` 从本地登录态读 token + `extra_headers`/`system_inject` 注入网关要求的客户端特征，无需 appkey）。配置字段完整说明见 [CONFIG.md](docs/CONFIG.md)。
+编辑 `config/model_proxy_config.json`，把所有 `"appkey": "xxx"` 替换为真实 appkey（每个 supply 一条），并设置控制 API 的 `admin_token`；`status` 和 `reload` 需要该 token。example.json 已含一条可用 strategy（`client_token: "cc"` 绑 `nation1` route）与四条示例 supply——其中三条为 aigc 系（配 appkey 即用），`glm-53-mcli-example` 展示自定义网关接入（`appkey_file` 从本地登录态读 token + `extra_headers`/`system_inject` 注入网关要求的客户端特征，无需 appkey）。配置字段完整说明见 [CONFIG.md](docs/CONFIG.md)。
 
 **② 启动代理**
 ```bash
 tools/model_proxy/model_proxy_cli.sh on
 ```
-预期输出：
+首次初始化需在交互终端确认安装来源、旧启动者及账本等安全前提；非交互环境
+不能代替首次确认。成功时输出：
 ```
-Starting model_proxy.py on port 18889...
-model_proxy started (pid <PID>), ready (N * 0.5s)
+model_proxy started and verified.
 ```
-（已在监听则输出 `model_proxy already running on port 18889`。）
+已核验是本安装的实例时，输出 `model_proxy already running and verified.`；其他
+进程占用端口或身份无法核验时返回失败，不视为启动成功。
 
 **③ 接入 Claude Code**
 ```bash
 tools/model_proxy/model_proxy_cli.sh install
 ```
 交互式列出四个 SDK 与本机检测状态，选 `claude` 对应序号（如 `0`），
-再从协议匹配的候选 client_token 里选一个。确认 diff 后写入
+再从协议匹配的候选 client_token 里选一个。确认隐藏敏感内容的更新摘要后写入
 `~/.claude/settings.json` 的 `env`：
 ```
 ANTHROPIC_BASE_URL=http://localhost:18889/
 ANTHROPIC_AUTH_TOKEN=<你选的 client_token>
-ANTHROPIC_DEFAULT_FABLE_MODEL=claude-fable
 ANTHROPIC_DEFAULT_OPUS_MODEL=claude-opus
 ANTHROPIC_DEFAULT_SONNET_MODEL=claude-sonnet
 ANTHROPIC_DEFAULT_HAIKU_MODEL=claude-haiku
 ```
-（写入前会先备份原文件到 `settings.json.bak.<时间戳>`。）
+需要 Fable 档位时，可手动添加 `ANTHROPIC_DEFAULT_FABLE_MODEL=claude-fable`。
+写入前会先备份原文件到项目根 `.runtime/backups/`（文件名带 `.bak.<随机后缀>`），
+不再在 `~/.claude/` 旁生成备份。
 
 **④ 重启 Claude Code 生效并验证**
 重启 Claude Code 后，用 `logs` 看是否有转发记录：
@@ -62,11 +78,9 @@ tools/model_proxy/model_proxy_cli.sh logs
 出现形如 `ACCESS ms=... status=200 source=anthropic route=claude tier=... supply=... token=...`
 的行即接入成功。想看运行状态用 `model_proxy_cli.sh status`。
 
-日常挂载：`tools/model_proxy/hooker/ensure_model_proxy.sh` 已注册到 SessionStart hook，
-每次开 Claude Code 会话自动拉起，一般无需手动 `on`（详见「启动与停止」）。
-
-（注：`install` 会先跑 `ensure_session_hook` 确保 SessionStart 里存在正确 hook 条目，此点在
-「启动与停止」「接入各 SDK（install）」说明，Quick Start 不展开。）
+日常挂载：`hooker/ensure_model_proxy.sh` 委托同一 CLI 执行 `on`。`install` 仅在
+识别到标准 vault 布局且用户确认时维护 SessionStart hook；独立目录和 worktree
+不会向上猜测 vault。首次初始化仍须交互完成。
 
 ## 3. 配置结构概述
 
@@ -167,35 +181,45 @@ HTTP 200 后不再切换 supply：PASSTHROUGH 立即提交并逐块原样转发�
 
 | 命令 | 说明 |
 |------|------|
-| `status` | 运行态健康总览：health 计数 / degraded supplies / active sessions / cooldown 明细 / config 计数；离线只报进程态 + config mtime |
-| `reload` | 触发配置热重载（无条件清空所有 cooldown） |
+| `status` | 核验实例和连接对端后显示 health / active sessions / cooldown 等；无法核验或离线返回非零 |
+| `reload` | 强制重载并报告实际结果；进入认证 handler 后即使加载失败也尝试清 cooldown |
 | `supply` | 打印 list 后进入交互菜单 [a]dd/[e]dit/[d]el/[t]est/[q]uit |
 | `route` | 打印 list 后进入交互菜单 [a]dd/[e]dit/[d]el/[q]uit |
 | `strategy` | 打印 list 后进入交互菜单 [a]dd/[e]dit/[d]el/[q]uit |
 | `switch <token> <route_id>` | 改 strategy.route_id 后 reload；仅支持单值写法，route_pool 会被拒绝 |
 | `install` | 交互式列出四个 SDK + 本机检测状态，选择安装 |
-| `on` | 启动 model_proxy.py（已在监听则跳过） |
-| `off` | 停止 model_proxy.py（严格按脚本绝对路径匹配进程） |
+| `on` | 启动并核验本安装实例；无关进程占用端口时失败 |
+| `off` | 核验安装路径、进程入口、PID 和启动身份后停止；不按端口或进程名宽泛杀进程 |
 | `restart` | 停止后重启进程（代码更新后用；reload 只换配置不换代码） |
 | `logs [N]` | 显示最近 N 条 ACCESS 访问日志（默认 30 条）；支持 `req=<id>` / `level=ERROR` / `event=cooldown` 过滤 |
 | `stats [时间]` | 读独立累计账本，按 supply/route/strategy 三维度各投影一段；支持 today/month/YYYY-MM-DD/YYYY-MM/全历史 |
 | `--help` / `-h` | 显示帮助 |
 
 - **菜单规则**：`supply`/`route`/`strategy` 只能通过一级入口进入交互菜单（先打印 list，再选操作，可回菜单
-  继续或 `q`/回车退出）；不再支持子命令直达（如 `supply add`）。所有写操作原子写盘
-  （tempfile + os.replace）后自动触发 reload。
+  继续或 `q`/回车退出）；不再支持子命令直达（如 `supply add`）。所有写操作走受保护提交
+  （私有暂存 → 原子替换 → 后验复核）后自动触发 reload。
+- **平台差异**：Windows 把上表入口换成 `tools\model_proxy\model_proxy_cli.bat`，子命令和参数
+  完全相同；`on/off/restart/status/reload/supply/route/strategy/switch` 走同一套 Python CLI。
+  `install` 在 Windows 上也已接线，但原生 Windows 未验收，详见「已知限制」。
 - **switch 限制**：仅适用于单值 `route_id` 写法的 strategy；对已配置
   `route_pool` 的 strategy 会拒绝执行（`route_id` 与 `route_pool` 互斥），需直接编辑配置文件
   调整。
 - **非交互（stdin 非 TTY）环境**：调用 `supply`/`route`/`strategy` 时，先打印一次 list，然后
   检测到非 TTY 即直接退出，不进交互菜单，不会阻塞在 `read` 上等待永远不会到来的输入。
 - **strategy 录入**：`tiers_source_capability` 逐 tier 人工问答录入（source 侧无可探测真实上游，详见 [CONFIG.md](docs/CONFIG.md)「strategy 录入流程」）。
-- **热重载**：`ConfigStore` 按 mtime 比对，每次转发请求都 `maybe_reload()`，改配置落盘即在下一个
-  请求生效；也可用 `reload` 主动强制重载（无条件清空所有冷却）。配置文件解析失败时保留旧配置并记 warning 日志，不崩溃。
+- **热重载**：`ConfigStore` 比较文件身份和修改标记，在后续请求中尝试自动重载；
+  自动路径不清 cooldown。手动 `reload` 进入认证 handler 后，无论加载成功还是失败都
+  尝试清 cooldown，并返回实际结果；未进入 handler 或发送后断线时不能假定清理成功。
+- **管理 token 轮换**：磁盘中的 `admin_token` 改变后，在服务加载新配置之前，
+  CLI 可能因新旧 token 不一致收到 401；控制 API 是否主动预加载配置仍待决定。
+- **日志过滤兼容**：`logs` 支持常用 grep 基础正则，但部分 locale 相关字符类、
+  反向引用和非 ASCII 范围目前会明确报错，不能认为覆盖所有旧 grep 表达式。
 - **reload 与 restart 边界**：`reload`=换配置不断流（cooldown 也清）；`restart`=换代码全量重启
+- **停止风险**：`off` / `restart` 沿用 SIGTERM 停止，不做请求排空；在途流可能中断，
+  已发生但尚未落盘的调用也可能漏记账。生产停服和重启由用户自行决定。
   （pref/thinking_strip 48h 学习记忆、cooldown、流健康计数全清，在途请求切断，停机窗口约 1-2s）。
 - supply test 归因+探测、stats 账本 schema 见 [CONFIG.md](docs/CONFIG.md)。
-- 日志写 `.model_proxy.log`（启动时截断保留末 5000 行），累计用量账本写 `.model_proxy_totals.json`（路径配置见 `config/runtime_paths.json`）。日志级别、ACCESS 字段、translate 限流、token 统计等运维内容见
+- 日志写 `.runtime/model_proxy.log`（启动时截断保留末 5000 行），累计用量账本写 `.runtime/model_proxy_totals.json`；全部运行路径见 `config/runtime_paths.json`，默认都在项目根 `.runtime/` 下。日志级别、ACCESS 字段、translate 限流、token 统计等运维内容见
   `docs/designs/2026-07-22-access-log-and-latency.md`、
   `docs/designs/2026-07-23-usage-totals-ledger.md`、
   `docs/designs/2026-08-08-log-optimization-plan.md`。
@@ -240,9 +264,8 @@ token→route 绑定。
 支持四个 SDK：
 
 - **claude**（Claude Code，Anthropic 协议）：写 `~/.claude/settings.json` 的
-  `env.ANTHROPIC_BASE_URL`/`ANTHROPIC_AUTH_TOKEN`，并补齐四个档位环境变量
-  （`ANTHROPIC_DEFAULT_FABLE_MODEL`/`_OPUS_MODEL`/`_SONNET_MODEL`/`_HAIKU_MODEL` 固定填
-  `claude-fable`/`claude-opus`/`claude-sonnet`/`claude-haiku`）；同时确保 `~/.claude.json` 含
+  `env.ANTHROPIC_BASE_URL`/`ANTHROPIC_AUTH_TOKEN`，并在缺失时补齐 OPUS、SONNET、HAIKU
+  三个档位环境变量；FABLE 档位需要时手动添加。同时确保 `~/.claude.json` 含
   `hasCompletedOnboarding=true`（新机器跳过官方登录引导）。
 - **codex**（codex-cli，Responses 协议）：写 `~/.codex/config.toml` 的
   `[model_providers.model_proxy]` 段（`base_url`/`wire_api="responses"`/`experimental_bearer_token`
@@ -294,7 +317,8 @@ token 里选定）过滤候选 client_token；无匹配协议的 token 时提示
 }
 ```
 
-与本地 `install` 的唯一区别是 base_url 从 `localhost` 换成 `<主机名>.local`；也可先在本机跑 `install` 生成配置，再到远程机器上改 base_url 一行。token 只用 client_token，绝不把上游 appkey 复制到客户端。配置后完全退出并重启 Claude Code 生效。
+可先在本机跑 `install` 生成配置，再到远程机器上改 base_url；上例的 FABLE 档位需
+按需手动添加。token 只用 client_token，绝不把上游 appkey 复制到客户端。配置后完全退出并重启 Claude Code 生效。
 
 **同机一并开放的两个 MCP 服务**（与本代理同一套开放方案，客户端 `.mcp.json` 示例）：
 
@@ -311,7 +335,7 @@ token 里选定）过滤候选 client_token；无匹配协议的 token 时提示
 
 ```bash
 nc -vz <主机名>.local 18889   # 三端口各测一次；通则 TCP 可达
-# model_proxy 冒烟：用 Claude Code 发一条最小消息，服务端 .model_proxy.log 出现 ACCESS 行即接入成功
+# model_proxy 冒烟：用 Claude Code 发一条最小消息，服务端 .runtime/model_proxy.log 出现 ACCESS 行即接入成功
 ```
 
 **可用性边界**：服务端 Mac 关机/睡眠/离开家庭网络时三服务不可达，且远端请求无法触发本机的懒启动 hook——恢复方式是在 Mac 上开一次 Claude Code 会话或手动跑两个 ensure 脚本（详见上述设计文档第 3 节）。
@@ -388,8 +412,16 @@ nc -vz <主机名>.local 18889   # 三端口各测一次；通则 TCP 可达
   多轮推理连续性保持（上游实测 `include:["reasoning.encrypted_content"]` 通道）；
   passthrough 出站前剥离 `resp:` 伪签名块防跨协议泄漏。真 Anthropic 签名（非 resp: 前缀）
   跨协议时仍丢弃（上游无对应验签语义，属协议不对等的结构性限制）。
-- 未接入自动化测试覆盖真实上游网络调用（转换器单测均为脱网络单测，转发编排本身未做端到端自动化
-  测试，依赖手动 curl 验证）。
+- 未接入自动化测试覆盖真实上游网络调用（转换器单测均为脱网络单测；本仓库新增了本地 mock 的
+  隔离端到端回归，覆盖 on/status/reload/off 与 A2A/A2R/R2A 的 JSON 和增量 SSE，但不连真实上游）。
+- **Windows 适配现状（2026-11-18）**：业务与 CLI 全部复用同一份 Python 实现，`.bat` 只负责找
+  Python 3.10+ 后转调 `core\cli\main.py`。路径/ACL、实例锁、同 HANDLE 停止、配置与 sidecar
+  受保护写入、账本持久化均已实现并在**虚拟 Win32 后端**上回归通过；**尚无原生 Windows 验收**，
+  因此暂不支持在生产 Windows 上启用。原生验证计划见
+  [统一运行目录与外部权限边界修订](docs/designs/2026-11-16-model-proxy统一运行目录与外部权限边界修订.md)。
+- **运行数据位置收敛**：所有运行文件（日志/账本/锁/PID/暂存/备份）默认在项目根 `.runtime/`，
+  不再回落到 `/tmp` 或盘根；只有显式选择的外部配置目标在其派生 sidecar 需要跨卷暂存时，才在
+  该目标父目录做一次私有短期暂存。
 - effort 探测（`supply test`）解析结果不保证准确，仅供人工审阅参考。
 - **astra 加密块间歇解密失败**（2026-11-07~09 观测）：`openai-astra-sankuai-2023` 偶发
   400 `invalid_encrypted_content`（3 天 32 次 / 约 5 万笔 a2r 的 0.06%），因 fable 档无
@@ -407,16 +439,21 @@ nc -vz <主机名>.local 18889   # 三端口各测一次；通则 TCP 可达
 
 ```
 tools/model_proxy/
-├── model_proxy.py                     # 入口（thin wrapper，转发到 core.server.main）
 ├── config/
 │   ├── model_proxy_config.json        # 实际配置（600 权限，不纳入 git 跟踪）
 │   ├── model_proxy_config.example.json # 配置样例（不含真实凭证，纳入 git 跟踪）
-│   ├── runtime_paths.json             # 运行时路径常量（log/totals/lock/pid 等）
+│   ├── runtime_paths.json             # 运行时路径常量（默认均指向项目根 .runtime/）
 │   └── session_overrides.json         # session override sidecar（$route 写入，600 权限）
-├── model_proxy_cli.sh                 # 控制脚本
-├── _config_ops.py                     # supply/route/strategy 的增删改实现（被 cli 调用）
-├── _install_ops.py                    # install 子命令实现（四个 SDK 接入）
+├── .runtime/                          # 运行数据（独占创建、私有权限、不入库）
+│   ├── model_proxy.log                # ACCESS/运维日志
+│   ├── model_proxy_totals.json        # 累计用量账本（schema v3）
+│   ├── model_proxy.lock               # 实例锁
+│   ├── tmp/                           # CLI 私有暂存（原子替换用）
+│   └── backups/                       # 配置/客户端配置写入前的安全备份
+├── model_proxy_cli.sh                 # Mac/POSIX 薄入口（仅调用 core/cli/main.py）
+├── model_proxy_cli.bat                # Windows 薄入口（同一 Python CLI；原生 Windows 未验收）
 ├── core/                              # 核心实现包
+│   ├── cli/                           # 共同命令分发、服务入口和配置/安装/格式化 helper
 │   ├── server.py                      # 主体：HTTP server、路由决策、转发编排、控制 API、Host 头校验
 │   ├── listen_config.py               # listen/allow_hosts 配置解析（server 与 cli/ensure 共用的单一实现）
 │   ├── translate.py                   # 多协议结构转换器（Anthropic⇄Chat / Responses⇄Anthropic / Anthropic⇄Responses）
