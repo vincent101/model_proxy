@@ -42,8 +42,8 @@ model_proxy_translate_reverse.py（§2 反向）合并而来，§3 为后续新�
       本状态机将 thinking/redacted_thinking 块映射为 Responses reasoning item
       （cur_item_kind="reasoning"），占用一个 output_index，故 output_index 与
       Anthropic index 解耦但顺序一致（thinking 在前则 reasoning 占 index 0）。
-  修正3 usage 落点：message_start.usage 为空 {}，完整 usage（input+output_tokens）在 message_delta。
-      故 usage_in / usage_out 均从 message_delta 取，不依赖 message_start。
+  修正3 usage 落点：message_start.message.usage 和 message_delta.usage 均可能带计数。
+      R2A 流先取 start 中的有效 input/output，delta 中的有效字段覆盖已有值，不做累加。
 """
 
 import hashlib
@@ -2036,6 +2036,8 @@ class AnthropicToResponsesStreamAdapter:
         self.usage_in = 0
         self.usage_out = 0
         self.usage_reasoning = 0
+        # A duplicate or late start must not roll back a delta's usage.
+        self._usage_started = False
         self.final_stop_reason = None
         self.completed_items = []                # 已完成的 output item，供 response.completed
         self.cur_reasoning_summary_buf = ""       # reasoning item 正文累积（thinking_delta）
@@ -2093,6 +2095,15 @@ class AnthropicToResponsesStreamAdapter:
         }))
         self.sent_created = True
 
+    def _absorb_token_counts(self, usage: dict) -> None:
+        # Anthropic counts are snapshots; malformed values never replace a
+        # previously trusted count. bool is not a token count despite int inheritance.
+        for key, attr in (("input_tokens", "usage_in"),
+                          ("output_tokens", "usage_out")):
+            value = usage.get(key)
+            if type(value) is int and value >= 0:
+                setattr(self, attr, value)
+
     # ---- 主入口 ----
 
     def feed(self, event_type: str, data: dict) -> list:
@@ -2106,8 +2117,14 @@ class AnthropicToResponsesStreamAdapter:
         self._ensure_created(events)
 
         if event_type == "message_start":
-            # 修正3：message_start.usage 为空 {}，不在此取 usage。
-            pass
+            # Anthropic may put input_tokens in start and only output_tokens
+            # in the final delta. Start is a snapshot, not an increment.
+            if not self._usage_started:
+                self._usage_started = True
+                message = data.get("message")
+                usage = message.get("usage") if isinstance(message, dict) else None
+                if isinstance(usage, dict):
+                    self._absorb_token_counts(usage)
 
         elif event_type == "content_block_start":
             cb = data.get("content_block") or {}
@@ -2166,12 +2183,13 @@ class AnthropicToResponsesStreamAdapter:
             self.cur_item_kind = None
 
         elif event_type == "message_delta":
-            # 修正3：完整 usage 在 message_delta。
-            usage = data.get("usage") or {}
-            if "output_tokens" in usage and usage.get("output_tokens") is not None:
-                self.usage_out = usage.get("output_tokens")
-            if "input_tokens" in usage and usage.get("input_tokens") is not None:
-                self.usage_in = usage.get("input_tokens")
+            self._usage_started = True
+            # Delta fields are snapshots: valid values replace, never add;
+            # missing, null and invalid values retain the last trusted counts.
+            usage = data.get("usage")
+            if not isinstance(usage, dict):
+                usage = {}
+            self._absorb_token_counts(usage)
             # 流式场景 message_delta.usage 目前观察到的结构不含 thinking 明细，
             # 防御性读取：真实有值时自然带出，无值维持 0（不臆造）。
             self.usage_reasoning = _extract_reasoning_tokens(usage) or self.usage_reasoning

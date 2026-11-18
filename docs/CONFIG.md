@@ -318,11 +318,16 @@ text 截 100 字符），并跳过 effort 探测与 `reasoning_capability` 写�
 `requests`/`ok`/`fail`/`usage_in`/`usage_out`/`max_ms`/`attempts`/`attempt_fail`，另存 `total`
 全历史汇总。`max_ms`（OPT-10）入账本，CLI stats 的 max_ms 从账本取，不再依赖日志窗口；
 `attempts`/`attempt_fail`（OPT-10）为 attempt 级计数——failover 中间失败计入对应 supply（仅盖
-3 处 failover continue，budget 重试按 §5a 决策不记账）。该字段只落账本 JSON，CLI stats 暂不投影。账本 **只增不截**，
-不受进程重启与日志截断影响。天分桶只保留最近 `KEEP_DAYS=400` 天，超窗旧天桶汇总进 `months_archive`
+3 处 failover continue，budget 重试按 §5a 决策不记账）。该字段只落账本 JSON，CLI stats 暂不投影。
+持续选用同一账本且文件未丢失时，已持久化的累计数据不会因正常重启或日志截断而清零。
+天分桶只保留最近 `KEEP_DAYS=400` 天，超窗旧天桶汇总进 `months_archive`
 月归档节点（永久保留）。天/月边界固定按 UTC+8 划分（`timezone(timedelta(hours=8))`，不依赖系统时区）。
-schema 升级（v2→v3）在 `_load` 启动时自动迁移：旧桶 combo 补 `attempts=0`/`attempt_fail=0`、
+schema 升级（v2→v3）在 `_load` 启动时自动迁移**已选路径上的账本**：旧桶 combo 补 `attempts=0`/`attempt_fail=0`、
 bucket 补 `max_ms=0`（断档但保真，不虚高），既有值保留，记 `usage_totals.migrated` INFO 日志。
-**迁移与重启顺序**：先停旧进程→起新进程（启动时迁移），避免旧进程写旧 schema 覆盖新进程已迁移的文件。
+这只是 schema 迁移，不会自动把项目根旧账本 `.model_proxy_totals.json` 迁移到新默认路径
+`.runtime/model_proxy_totals.json`；使用新默认路径不会自动承接旧路径上的历史。
+**迁移与重启顺序**：先停旧进程；如需迁移旧路径账本，须使用经过验收的手动切换脚本完成迁移，
+再启动新进程加载已选账本。脚本是否完成及通过验收需另行确认；不能以启动时 schema 迁移替代路径迁移。
+即使无需路径迁移，也须先停旧进程再启动新进程，避免旧进程用旧 schema 覆盖已升级的文件。
 账本供 `stats` 命令查询（见 README「CLI 命令速查」），与 ACCESS 日志完全独立。账本结构细节见设计记录
 `docs/designs/2026-07-23-usage-totals-ledger.md` + `docs/designs/2026-08-08-log-optimization-plan.md`。

@@ -9,7 +9,8 @@ from unittest.mock import patch
 
 from core.mac_config_path import MacConfigError, capture_config, open_target_parent, verify_config
 from core.mac_config_writer import (
-    MacWriteError, WriteAuthorization, _check_created, replace_config, validate_write_authorization,
+    MacWriteError, WriteAuthorization, _check_created, _open_private, replace_config,
+    validate_write_authorization,
 )
 from core.secure_files import (
     RuntimeWriteLocations, SecureSnapshotError, SecureWriteError,
@@ -42,14 +43,24 @@ class MacRuntimeStagingTests(unittest.TestCase):
             target_staging,
         )
 
-    def config_snapshot(self, path=None):
+    def config_snapshot(self, path=None, *, external_confirmed=False):
         snapshot = capture_config(str(path or self.alias))
         with open_target_parent(snapshot) as (fd, _):
             info = os.fstat(fd)
             authorization = WriteAuthorization(
                 snapshot.target_path, (info.st_dev, info.st_ino),
-                snapshot.final_identity[:2])
+                snapshot.final_identity[:2], external_confirmed=external_confirmed)
         return snapshot, authorization
+
+    def fake_external_config(self):
+        external = self.root / 'external'
+        external.mkdir(mode=0o700)
+        target = external / 'business.json'
+        target.write_bytes(b'fake external original')
+        target.chmod(0o600)
+        link = self.root / 'external-config-link'
+        link.symlink_to(target)
+        return external, target, link
 
     def config_write(self, snapshot, authorization, locations, before=lambda: None):
         return replace_config(snapshot, b'{"new":true}\n', authorization,
@@ -107,28 +118,99 @@ class MacRuntimeStagingTests(unittest.TestCase):
         self.assertEqual(list(self.backups.iterdir()), [])
 
     def test_cross_volume_requires_explicit_exception_and_stages_by_target(self):
-        snapshot, auth = self.config_snapshot()
+        # Only the volume check is mocked; all targets and writes are disposable.
+        external, target, link = self.fake_external_config()
+        snapshot, no_confirmation = self.config_snapshot(link)
+        _, confirmed = self.config_snapshot(link, external_confirmed=True)
         calls = []
         real_replace = os.replace
 
         def replace(src, dst, *, src_dir_fd, dst_dir_fd):
-            calls.append((os.fstat(src_dir_fd).st_ino, os.fstat(dst_dir_fd).st_ino))
+            calls.append((os.fstat(src_dir_fd).st_ino, os.fstat(dst_dir_fd).st_ino,
+                          external.stat().st_ino))
             return real_replace(src, dst, src_dir_fd=src_dir_fd, dst_dir_fd=dst_dir_fd)
 
         with patch('core.mac_config_writer._same_volume', return_value=False):
-            with self.assertRaises(MacWriteError) as caught:
-                self.config_write(snapshot, auth, self.locations())
-            self.assertEqual(caught.exception.code, 'cross_volume_staging_not_authorized')
+            for auth, locations in (
+                    (no_confirmation, self.locations(target_staging=True)),
+                    (confirmed, self.locations(target_staging=False))):
+                with self.subTest(external_confirmed=auth.external_confirmed,
+                                  target_staging=locations.allow_target_staging):
+                    with self.assertRaises(MacWriteError) as caught:
+                        validate_write_authorization(snapshot, auth, locations=locations)
+                    self.assertEqual(caught.exception.code, 'cross_volume_staging_not_authorized')
+                    with self.assertRaises(MacWriteError) as caught:
+                        self.config_write(snapshot, auth, locations)
+                    self.assertEqual(caught.exception.code, 'cross_volume_staging_not_authorized')
+                    self.assertEqual(caught.exception.state, 'NOT_REPLACED')
+                    self.assertEqual(target.read_bytes(), snapshot.data)
+                    self.assertEqual(list(self.backups.iterdir()), [])
+                    self.assertEqual(list(external.glob('.model-proxy-*')), [])
+            locations = self.locations(target_staging=True)
+            validate_write_authorization(snapshot, confirmed, locations=locations)
             with patch('core.mac_config_writer.os.replace', side_effect=replace):
-                result = self.config_write(snapshot, auth, self.locations(target_staging=True))
-        self.assertEqual(calls[0][0], calls[0][1])
-        self.assertEqual(Path(result.backup_name).parent, self.backups)
+                result = self.config_write(snapshot, confirmed, locations)
+                self.assertEqual(result.state, 'VERIFIED')
+                backup = Path(result.backup_name)
+                self.assertEqual(backup.parent, self.backups)
+                self.assertEqual(backup.read_bytes(), snapshot.data)
+                self.assertEqual(stat.S_IMODE(backup.stat().st_mode), 0o600)
+                self.assertEqual(target.read_bytes(), b'{"new":true}\n')
+                after, restore_auth = self.config_snapshot(link, external_confirmed=True)
+                restored = replace_config(after, backup.read_bytes(), restore_auth,
+                                          preflight=lambda _: True, before_replace=lambda: None,
+                                          locations=locations)
+        self.assertEqual(restored.state, 'VERIFIED')
+        self.assertEqual(target.read_bytes(), snapshot.data)
+        self.assertEqual(backup.read_bytes(), snapshot.data)
+        self.assertTrue(link.is_symlink())
+        self.assertEqual(len(calls), 2)
+        self.assertTrue(all(src == dst == parent for src, dst, parent in calls))
+        self.assertEqual(list(external.glob('.model-proxy-*')), [])
+        self.assert_no_stage()
+
+    def test_mock_cross_volume_failures_reach_injection_without_commit(self):
+        external, target, link = self.fake_external_config()
+        snapshot, auth = self.config_snapshot(link, external_confirmed=True)
+        locations = self.locations(target_staging=True)
+        with patch('core.mac_config_writer._same_volume', return_value=False):
+            with patch('core.secure_files.os.write',
+                       side_effect=OSError(errno.ENOSPC, 'fake full')) as failing_write:
+                with self.assertRaises(MacWriteError) as caught:
+                    self.config_write(snapshot, auth, locations)
+            self.assertGreater(failing_write.call_count, 0)
+            self.assertEqual(caught.exception.code, 'filesystem_or_backend_error')
+            self.assertEqual(caught.exception.state, 'NOT_REPLACED')
+            self.assertIsNone(caught.exception.backup_name)
+            self.assertEqual(target.read_bytes(), snapshot.data)
+            self.assertEqual(list(self.backups.iterdir()), [])
+
+            def fail_staging(fd, name, *args):
+                if name.startswith('.model-proxy-config-'):
+                    raise OSError(errno.ENOSPC, 'fake staging full')
+                return _open_private(fd, name, *args)
+
+            with patch('core.mac_config_writer._open_private',
+                       side_effect=fail_staging) as failing_stage:
+                with self.assertRaises(MacWriteError) as caught:
+                    self.config_write(snapshot, auth, locations)
+            self.assertEqual(failing_stage.call_count, 2)
+            self.assertTrue(failing_stage.call_args.args[1].startswith('.model-proxy-config-'))
+            self.assertEqual(caught.exception.code, 'filesystem_or_backend_error')
+            self.assertEqual(caught.exception.state, 'NOT_REPLACED')
+            self.assertEqual(Path(caught.exception.backup_name).read_bytes(), snapshot.data)
+            self.assertEqual(target.read_bytes(), snapshot.data)
+        self.assertEqual(list(external.glob('.model-proxy-*')), [])
         self.assert_no_stage()
 
     def test_real_cross_volume_backup_and_restore(self):
         volume = os.environ.get('MP_TEST_CROSS_VOLUME_ROOT')
         if not volume:
             self.skipTest('requires a caller-created disposable APFS volume')
+        if not os.path.isdir(volume) or not os.access(volume, os.W_OK):
+            self.skipTest('disposable cross-volume root is not an available writable directory')
+        if os.stat(volume).st_dev == self.runtime.stat().st_dev:
+            self.skipTest('provided disposable root is not on a second volume')
         with tempfile.TemporaryDirectory(dir=volume, prefix='fake-config-') as external:
             external = Path(external)
             self.assertNotEqual(external.stat().st_dev, self.runtime.stat().st_dev)
@@ -137,13 +219,16 @@ class MacRuntimeStagingTests(unittest.TestCase):
             target.chmod(0o600)
             link = self.root / 'external-config-link'
             link.symlink_to(target)
-            snapshot, auth = self.config_snapshot(link)
+            snapshot, auth = self.config_snapshot(link, external_confirmed=True)
             with self.assertRaises(MacWriteError) as caught:
                 self.config_write(snapshot, auth, self.locations())
             self.assertEqual(caught.exception.code, 'cross_volume_staging_not_authorized')
-            with patch('core.secure_files.os.write', side_effect=OSError(errno.ENOSPC, 'fake full')):
+            with patch('core.secure_files.os.write',
+                       side_effect=OSError(errno.ENOSPC, 'fake full')) as failing_write:
                 with self.assertRaises(MacWriteError) as caught:
                     self.config_write(snapshot, auth, self.locations(target_staging=True))
+            self.assertGreater(failing_write.call_count, 0)
+            self.assertEqual(caught.exception.code, 'filesystem_or_backend_error')
             self.assertEqual(caught.exception.state, 'NOT_REPLACED')
             self.assertIsNone(caught.exception.backup_name)
             self.assertEqual(target.read_bytes(), snapshot.data)
@@ -155,7 +240,7 @@ class MacRuntimeStagingTests(unittest.TestCase):
             self.assertEqual(backup.read_bytes(), b'fake external original')
             self.assertEqual(stat.S_IMODE(backup.stat().st_mode), 0o600)
             self.assertEqual(target.read_bytes(), b'{"new":true}\n')
-            after, restore_auth = self.config_snapshot(link)
+            after, restore_auth = self.config_snapshot(link, external_confirmed=True)
             restored = replace_config(after, backup.read_bytes(), restore_auth,
                                       preflight=lambda _: True, before_replace=lambda: None,
                                       locations=self.locations(target_staging=True))

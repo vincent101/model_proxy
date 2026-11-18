@@ -218,11 +218,15 @@ HTTP 200 后不再切换 supply：PASSTHROUGH 立即提交并逐块原样转发�
 - **停止风险**：`off` / `restart` 沿用 SIGTERM 停止，不做请求排空；在途流可能中断，
   已发生但尚未落盘的调用也可能漏记账。生产停服和重启由用户自行决定。
   （pref/thinking_strip 48h 学习记忆、cooldown、流健康计数全清，在途请求切断，停机窗口约 1-2s）。
+- **macOS 手动切换/回滚**：[操作指南](docs/MACOS_SWITCH_GUIDE.md)（已做新端口 mock 与脚本假数据测试；尚未实际生产切换，须由用户手动停服和启动）。
 - supply test 归因+探测、stats 账本 schema 见 [CONFIG.md](docs/CONFIG.md)。
 - 日志写 `.runtime/model_proxy.log`（启动时截断保留末 5000 行），累计用量账本写 `.runtime/model_proxy_totals.json`；全部运行路径见 `config/runtime_paths.json`，默认都在项目根 `.runtime/` 下。日志级别、ACCESS 字段、translate 限流、token 统计等运维内容见
   `docs/designs/2026-07-22-access-log-and-latency.md`、
   `docs/designs/2026-07-23-usage-totals-ledger.md`、
   `docs/designs/2026-08-08-log-optimization-plan.md`。
+- **旧账本切换**：启动时的 v2→v3 迁移只升级**已选路径上的账本 schema**，不会自动把项目根
+  `.model_proxy_totals.json` 搬到新默认路径 `.runtime/model_proxy_totals.json`。需要承接旧路径
+  数据时，须先停服，并在手动切换脚本经过验收后按其流程迁移；这里不代表脚本现已完成或通过验收。
 - 本次局部修订：[工具参数关联、配置序列化保真与新增 guard 撤除](docs/designs/2026-11-04-tool-config-fix-and-guard-revert.md)，见配套回归
   [工具参数关联](tests/test_tool_stream_association.py)与[guard 撤除](tests/test_responses_guard_removal.py)。
 - 本批局部修订：[协议终态与流质量](docs/designs/2026-11-05-modelproxy-protocol-and-stream-quality.md)，覆盖 A/B/C 协议终态与 SSE 分帧；配套回归见 [SSE 分帧](tests/test_sse_framing.py)。
