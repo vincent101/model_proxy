@@ -5,6 +5,7 @@ Native Darwin tests use only a new disposable private fixture directory.
 """
 import json
 import os
+import subprocess
 import sys
 import tempfile
 import traceback
@@ -31,6 +32,26 @@ class DarwinSidecarTests(unittest.TestCase):
             self.calls.append((target, actual, stage, artifact))
             return True
         self.io = SidecarSecureIO(project_root=self.root, target=self.path, guard=test_only_guard)
+
+    def test_existing_xattr_sidecar_set_read_reset(self):
+        self.path.write_text('{"fake-client":{}}')
+        self.path.chmod(0o600)
+        for path in (self.root / 'config', self.root / '.runtime' / 'tmp', self.path):
+            subprocess.run(['/usr/bin/xattr', '-w', 'com.example.fake-attribute',
+                            'fake', str(path)], check=True, capture_output=True)
+        store = SessionOverridesSidecar(self.path, secure_io=self.io)
+        store.apply_command('fake-client', 'fake-session', 'set', 'route-B')
+        self.assertEqual(store.get_overrides_for('fake-client'), {'fake-session': 'route-B'})
+        self.assertEqual(json.loads(self.path.read_text())['fake-client']['fake-session']['route_id'], 'route-B')
+        self.assertEqual(subprocess.run(['/usr/bin/xattr', '-p', 'com.example.fake-attribute',
+                                         str(self.path)], capture_output=True).returncode, 0)
+        with patch('core.secure_files._copy_extended_attributes',
+                   side_effect=secure_files.SecureSnapshotError('extended_attributes_copy_failed')), \
+             self.assertLogs('core.secure_files', level='WARNING') as logged:
+            store.apply_command('fake-client', 'fake-session', 'reset')
+        self.assertTrue(any('extended attributes could not be copied' in line
+                            for line in logged.output))
+        self.assertEqual(store.get_overrides_for('fake-client'), {})
 
     def test_real_absence_create_and_replace(self):
         absent = self.io.capture(self.path)

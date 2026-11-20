@@ -10,6 +10,7 @@ import stat
 import hashlib
 import errno
 import inspect
+import logging
 import sys
 from contextlib import contextmanager, ExitStack
 from dataclasses import dataclass, field
@@ -17,6 +18,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 from core.darwin_acl import ACLVerificationError, read_acl_snapshot
+
 
 
 # Only these fixed diagnostic tokens may cross a writer's error boundary.
@@ -27,10 +29,11 @@ _WRITE_ERROR_CODES = frozenset((
     'acl_invalid', 'acl_not_deny_only', 'acl_permissions_unknown',
     'acl_size_invalid', 'acl_unavailable', 'authorization_identity_changed',
     'backup_staging_not_distinct', 'boundary_guard_unavailable', 'commit_marker_unavailable',
+    'config_attributes_preservation_unverified', 'config_attributes_changed',
     'config_changed', 'config_read_error', 'config_too_large',
     'cross_volume_staging_not_authorized', 'directory_attributes_unsupported',
     'directory_attributes_unverified', 'directory_changed', 'directory_identity_unknown',
-    'extended_attributes_unverified', 'fd_close_unknown', 'file_acl_present',
+    'extended_attributes_unverified', 'extended_attributes_copy_failed', 'fd_close_unknown', 'file_acl_present',
     'file_flags_unverified', 'file_not_found', 'file_permissions_unsafe',
     'filesystem_error', 'filesystem_or_backend_error', 'filesystem_unverified',
     'hardlinks_not_preserved', 'identity_changed', 'identity_unknown', 'identity_unverified',
@@ -375,9 +378,10 @@ class PrivateDirectorySnapshot:
     path: str
     purpose: str
     protection: tuple = field(repr=False)
+    business_xattr_compat: bool = False
 
 
-def _directory_proof(fd: int) -> tuple:
+def _directory_proof(fd: int, *, business_xattr_compat=False) -> tuple:
     # The config walker also binds relevant directory xattrs; use the same
     # narrow policy rather than accepting unknown access-related attributes.
     from core.mac_config_path import _directory_attributes
@@ -386,9 +390,9 @@ def _directory_proof(fd: int) -> tuple:
             or stat.S_IMODE(info.st_mode) & 0o7077
             or stat.S_IMODE(info.st_mode) & 0o700 != 0o700):
         raise SecureSnapshotError('private_directory_permissions_unsafe')
-    attributes = _directory_attributes(fd)
+    attributes = None if business_xattr_compat else _directory_attributes(fd)
     proof = _mac_fd_protection(fd, directory=True)
-    if _directory_attributes(fd) != attributes:
+    if not business_xattr_compat and _directory_attributes(fd) != attributes:
         raise SecureSnapshotError('private_directory_changed')
     # A directory's link count can change when an unrelated child is made.
     return proof[:5] + proof[6:] + (getattr(info, 'st_flags', 0), attributes)
@@ -397,7 +401,7 @@ def _directory_proof(fd: int) -> tuple:
 def verify_private_directory(snapshot: PrivateDirectorySnapshot, fd: int) -> None:
     if not isinstance(snapshot, PrivateDirectorySnapshot):
         raise SecureSnapshotError('private_directory_authorization_missing')
-    before = _directory_proof(fd)
+    before = _directory_proof(fd, business_xattr_compat=snapshot.business_xattr_compat)
     try:
         entry = os.stat(snapshot.path, follow_symlinks=False)
     except OSError:
@@ -405,7 +409,7 @@ def verify_private_directory(snapshot: PrivateDirectorySnapshot, fd: int) -> Non
     if (not stat.S_ISDIR(entry.st_mode)
             or (entry.st_dev, entry.st_ino, entry.st_mode, entry.st_uid, entry.st_gid)
             != before[:5] or before != snapshot.protection
-            or _directory_proof(fd) != before):
+            or _directory_proof(fd, business_xattr_compat=snapshot.business_xattr_compat) != before):
         raise SecureSnapshotError('private_directory_changed')
 
 
@@ -422,18 +426,21 @@ def open_private_directory(snapshot: PrivateDirectorySnapshot, *, purpose: str):
         _close_private_fd(fd)
 
 
-def capture_private_directory(path: str | os.PathLike[str], *, purpose: str) -> PrivateDirectorySnapshot:
+def capture_private_directory(path: str | os.PathLike[str], *, purpose: str,
+                              business_xattr_compat: bool = False) -> PrivateDirectorySnapshot:
     """Capture an independently authorized staging or backup directory.
 
     Call only for a location approved for this purpose. This function checks
     the directory, but cannot infer or grant the caller's authorization.
     """
-    if purpose not in ('staging', 'backup'):
+    if purpose not in ('staging', 'backup') or type(business_xattr_compat) is not bool:
         raise SecureSnapshotError('private_directory_purpose_invalid')
     path = _normalize(path)
     fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
     try:
-        result = PrivateDirectorySnapshot(path, purpose, _directory_proof(fd))
+        result = PrivateDirectorySnapshot(
+            path, purpose, _directory_proof(fd, business_xattr_compat=business_xattr_compat),
+            business_xattr_compat)
         verify_private_directory(result, fd)
         return result
     finally:
@@ -506,8 +513,13 @@ def _mac_local_apfs(fd: int, lib) -> tuple:
         raise SecureSnapshotError('filesystem_unverified') from None
 
 
-def _mac_fd_protection(fd: int, *, directory: bool) -> tuple:
-    """Accept only stable deny-only directory ACLs; files require no ACL."""
+def _mac_fd_protection(fd: int, *, directory: bool,
+                       business_config_xattrs: bool = False) -> tuple:
+    """Accept only stable deny-only directory ACLs; files require no ACL.
+
+    Business-config reads may omit xattr inspection. None explicitly means
+    unobserved, not an empty attribute set; all other callers remain strict.
+    """
     import ctypes
     lib = _mac_native()
     st = os.fstat(fd)
@@ -520,8 +532,8 @@ def _mac_fd_protection(fd: int, *, directory: bool) -> tuple:
         acl_evidence = read_acl_snapshot(fd)
     except ACLVerificationError as exc:
         raise SecureSnapshotError(exc.code) from None
-    attrs = ()
-    if not directory:
+    attrs = None if business_config_xattrs and not directory else ()
+    if not directory and not business_config_xattrs:
         ctypes.set_errno(0)
         count = lib.flistxattr(fd, None, 0, 0)
         if count < 0 or count > 4096:
@@ -551,12 +563,13 @@ def _mac_fd_protection(fd: int, *, directory: bool) -> tuple:
             raise SecureSnapshotError('parent_owner_unverified')
         if mode & 0o022 and not (mode & stat.S_ISVTX and st.st_uid in (0, os.geteuid())):
             raise SecureSnapshotError('parent_writable')
-    elif st.st_uid != os.geteuid() or mode & 0o7077 or not mode & 0o400:
+    elif not business_config_xattrs and (st.st_uid != os.geteuid() or mode & 0o7077 or not mode & 0o400):
         raise SecureSnapshotError('file_permissions_unsafe')
     return (st.st_dev, st.st_ino, st.st_mode, st.st_uid, st.st_gid, st.st_nlink, acl_evidence, fs_info, attrs)
 
 
-def mac_private_protection(path: str, info: os.stat_result) -> ProtectionEvidence:
+def mac_private_protection(path: str, info: os.stat_result, *,
+                           business_config_xattrs: bool = False) -> ProtectionEvidence:
     """Check an opened object rather than relying on chmod or path alone."""
     flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC
     if stat.S_ISDIR(info.st_mode):
@@ -570,7 +583,10 @@ def mac_private_protection(path: str, info: os.stat_result) -> ProtectionEvidenc
                 raise SecureSnapshotError('identity_changed')
             if stat.S_ISDIR(actual.st_mode) and _meta(info) != _meta(actual):
                 raise SecureSnapshotError('identity_changed')
-            checked = _mac_fd_protection(fd, directory=stat.S_ISDIR(actual.st_mode))
+            if business_config_xattrs and not stat.S_ISDIR(actual.st_mode):
+                checked = _mac_fd_protection(fd, directory=False, business_config_xattrs=True)
+            else:
+                checked = _mac_fd_protection(fd, directory=stat.S_ISDIR(actual.st_mode))
             if stat.S_ISDIR(actual.st_mode):
                 rechecked = _mac_fd_protection(fd, directory=True)
                 # Directory nlink may change when unrelated children change;
@@ -594,7 +610,22 @@ def mac_private_protection(path: str, info: os.stat_result) -> ProtectionEvidenc
         raise SecureSnapshotError('protection_unknown') from None
 
 
-def _open_private(parent_fd: int, name: str, contents: bytes, mode: int, uid: int, gid: int, expected_attrs=None) -> tuple[int, int]:
+def _copy_extended_attributes(source_fd, destination_fd):
+    """Copy visible xattrs on already-open FDs, without bytewise comparison."""
+    import ctypes
+    try:
+        copy_xattrs = _mac_native().fcopyfile
+        copy_xattrs.argtypes = [ctypes.c_int, ctypes.c_int, ctypes.c_void_p, ctypes.c_uint32]
+        copy_xattrs.restype = ctypes.c_int
+        if copy_xattrs(source_fd, destination_fd, None, 1 << 2) != 0:
+            raise SecureSnapshotError('extended_attributes_copy_failed')
+    except (AttributeError, OSError):
+        raise SecureSnapshotError('extended_attributes_copy_failed') from None
+
+
+def _open_private(parent_fd: int, name: str, contents: bytes, mode: int, uid: int, gid: int,
+                  expected_attrs=None, *, business_config_xattrs=False,
+                  copy_xattrs_from_fd=None) -> tuple[int, int]:
     flags = os.O_RDWR | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC
     try:
         before = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
@@ -642,13 +673,30 @@ def _open_private(parent_fd: int, name: str, contents: bytes, mode: int, uid: in
         os.fchmod(fd, mode)
         info = os.fstat(fd)
         if (info.st_uid, info.st_gid) != (uid, gid):
-            os.fchown(fd, uid, gid)
+            if business_config_xattrs:
+                try:
+                    os.fchown(fd, uid, gid)
+                except OSError:
+                    logging.getLogger(__name__).warning(
+                        'business file ownership could not be preserved on the new file')
+            else:
+                os.fchown(fd, uid, gid)
         info = os.fstat(fd)
-        if (stat.S_IMODE(info.st_mode), info.st_uid, info.st_gid, info.st_nlink) != (mode, uid, gid, 1):
+        if ((stat.S_IMODE(info.st_mode), info.st_nlink) != (mode, 1)
+                or (not business_config_xattrs and (info.st_uid, info.st_gid) != (uid, gid))):
             raise SecureSnapshotError('new_file_permissions_unverified')
-        checked = _mac_fd_protection(fd, directory=False)  # Before writing any secret.
+        checked = (_mac_fd_protection(fd, directory=False, business_config_xattrs=True)
+                   if business_config_xattrs else _mac_fd_protection(fd, directory=False))
         if expected_attrs is not None and checked[-1] != expected_attrs:
             raise SecureSnapshotError('extended_attributes_unverified')
+        if copy_xattrs_from_fd is not None:
+            try:
+                _copy_extended_attributes(copy_xattrs_from_fd, fd)
+            except (SecureSnapshotError, OSError, AttributeError, TypeError):
+                logging.getLogger(__name__).warning(
+                    'extended attributes could not be copied; new file or backup may lack attributes')
+            if _mac_fd_protection(fd, directory=False, business_config_xattrs=True) != checked:
+                raise SecureSnapshotError('new_file_permissions_unverified')
         view = memoryview(contents)
         while view:
             written = os.write(fd, view)
@@ -666,9 +714,12 @@ def _open_private(parent_fd: int, name: str, contents: bytes, mode: int, uid: in
         if bytes(restored) != contents:
             raise SecureSnapshotError('staging_content_unverified')
         after = os.fstat(fd)
-        if (stat.S_IMODE(after.st_mode), after.st_uid, after.st_gid, after.st_nlink) != (mode, uid, gid, 1):
+        if ((stat.S_IMODE(after.st_mode), after.st_nlink) != (mode, 1)
+                or (not business_config_xattrs and (after.st_uid, after.st_gid) != (uid, gid))):
             raise SecureSnapshotError('new_file_permissions_unverified')
-        if _mac_fd_protection(fd, directory=False)[-1] != checked[-1]:
+        after_proof = (_mac_fd_protection(fd, directory=False, business_config_xattrs=True)
+                       if business_config_xattrs else _mac_fd_protection(fd, directory=False))
+        if after_proof[-1] != checked[-1]:
             raise SecureSnapshotError('extended_attributes_unverified')
         identity = (after.st_dev, after.st_ino)
     except BaseException as exc:
@@ -702,7 +753,7 @@ def _open_private(parent_fd: int, name: str, contents: bytes, mode: int, uid: in
     return identity
 
 
-def _verify_private_entry(fd, name, identity, contents, expected):
+def _verify_private_entry(fd, name, identity, contents, expected, *, business_config_xattrs=False):
     """Reopen one exclusively created file and verify identity, bytes and ACL."""
     file_fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC | os.O_NONBLOCK,
                       dir_fd=fd)
@@ -711,7 +762,11 @@ def _verify_private_entry(fd, name, identity, contents, expected):
         if (not stat.S_ISREG(info.st_mode) or info.st_nlink != 1
                 or (info.st_dev, info.st_ino) != identity):
             raise SecureSnapshotError('staging_identity_changed')
-        proof = _mac_fd_protection(file_fd, directory=False)
+        def protection():
+            if business_config_xattrs:
+                return _mac_fd_protection(file_fd, directory=False, business_config_xattrs=True)
+            return _mac_fd_protection(file_fd, directory=False)
+        proof = protection()
         if ((stat.S_IMODE(proof[2]), proof[3], proof[4], proof[6], proof[8])
                 != expected):
             raise SecureSnapshotError('staging_protection_mismatch')
@@ -722,7 +777,7 @@ def _verify_private_entry(fd, name, identity, contents, expected):
                 break
             data.extend(part)
         current = os.stat(name, dir_fd=fd, follow_symlinks=False)
-        if (bytes(data) != contents or _mac_fd_protection(file_fd, directory=False) != proof
+        if (bytes(data) != contents or protection() != proof
                 or _meta(info) != _meta(os.fstat(file_fd)) or _meta(info) != _meta(current)):
             raise SecureSnapshotError('staging_changed')
         return info, proof
@@ -733,7 +788,8 @@ def _verify_private_entry(fd, name, identity, contents, expected):
 def secure_replace_runtime(snapshot: TargetSnapshot, new_bytes: bytes, *, max_bytes: int,
                            locations: RuntimeWriteLocations,
                            make_backup: bool = True,
-                           boundary_guard: Callable | None = None) -> WriteOutcome:
+                           boundary_guard: Callable | None = None,
+                           sidecar_xattr_compat: bool = False) -> WriteOutcome:
     """Opt-in protected runtime staging; caller separately authorizes target.
 
     ``capture_target``'s target and parent constraints still apply. A None
@@ -757,7 +813,7 @@ def secure_replace_runtime(snapshot: TargetSnapshot, new_bytes: bytes, *, max_by
     import secrets
     if (not isinstance(snapshot, TargetSnapshot) or not isinstance(new_bytes, bytes)
             or type(max_bytes) is not int or max_bytes < 0 or len(new_bytes) > max_bytes
-            or type(make_backup) is not bool
+            or type(make_backup) is not bool or type(sidecar_xattr_compat) is not bool
             or (boundary_guard is not None and not callable(boundary_guard))
             or not isinstance(locations, RuntimeWriteLocations)
             or type(locations.allow_target_staging) is not bool
@@ -766,10 +822,27 @@ def secure_replace_runtime(snapshot: TargetSnapshot, new_bytes: bytes, *, max_by
         raise SecureWriteError('write_locations_invalid')
     parent, name = os.path.dirname(snapshot.path), os.path.basename(snapshot.path)
     temp = temp_identity = temp_fd = runtime_fd = None
+    source_fd = None
     backup = backup_id = backup_fd = backup_entry = None
     state = 'NOT_REPLACED'
     candidate = None
     cleanup_unknown = close_unknown = False
+
+    def protection_reader(path, info):
+        if sidecar_xattr_compat:
+            return mac_private_protection(path, info, business_config_xattrs=True)
+        return mac_private_protection(path, info)
+
+    def open_entry(*args):
+        if sidecar_xattr_compat:
+            return _open_private(*args, business_config_xattrs=True,
+                                 copy_xattrs_from_fd=source_fd)
+        return _open_private(*args)
+
+    def verify_entry(*args):
+        if sidecar_xattr_compat:
+            return _verify_private_entry(*args, business_config_xattrs=True)
+        return _verify_private_entry(*args)
 
     def guard():
         if boundary_guard is not None:
@@ -786,7 +859,7 @@ def secure_replace_runtime(snapshot: TargetSnapshot, new_bytes: bytes, *, max_by
     try:
         with ExitStack() as stack:
             guard()
-            if not target_unchanged(snapshot, protection_reader=mac_private_protection,
+            if not target_unchanged(snapshot, protection_reader=protection_reader,
                                     max_bytes=max_bytes):
                 raise SecureSnapshotError('target_changed')
             parent_fd = os.open(parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
@@ -794,6 +867,12 @@ def secure_replace_runtime(snapshot: TargetSnapshot, new_bytes: bytes, *, max_by
             info = os.fstat(parent_fd)
             if (info.st_dev, info.st_ino, info.st_mode, info.st_uid, info.st_gid) != snapshot.parents[-1][1]:
                 raise SecureSnapshotError('parent_changed')
+            if sidecar_xattr_compat and snapshot.exists:
+                source_fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC | os.O_NONBLOCK,
+                                    dir_fd=parent_fd)
+                stack.callback(close_checked, source_fd)
+                if _meta(os.fstat(source_fd)) != snapshot.identity:
+                    raise SecureSnapshotError('target_changed')
             runtime_fd = stack.enter_context(open_private_directory(locations.staging, purpose='staging'))
             if make_backup:
                 backup_fd = stack.enter_context(open_private_directory(locations.backup, purpose='backup'))
@@ -824,13 +903,13 @@ def secure_replace_runtime(snapshot: TargetSnapshot, new_bytes: bytes, *, max_by
                         guard()
                         verify_dirs()
                         try:
-                            backup_id = _open_private(backup_fd, backup_entry, snapshot.contents,
+                            backup_id = open_entry(backup_fd, backup_entry, snapshot.contents,
                                                       mode, uid, gid, token[-1])
                         except BaseException as exc:
                             if not _safe_error_flag(exc, 'cleanup_unknown'):
                                 backup = None
                             raise
-                        _verify_private_entry(backup_fd, backup_entry, backup_id,
+                        verify_entry(backup_fd, backup_entry, backup_id,
                                               snapshot.contents, expected)
                 else:
                     mode, uid, gid = 0o600, os.geteuid(), info.st_gid
@@ -838,32 +917,33 @@ def secure_replace_runtime(snapshot: TargetSnapshot, new_bytes: bytes, *, max_by
                 temp = '.model-proxy-runtime-' + secrets.token_hex(12)
                 guard()
                 verify_dirs()
-                temp_identity = _open_private(temp_fd, temp, new_bytes, mode, uid, gid,
+                temp_identity = open_entry(temp_fd, temp, new_bytes, mode, uid, gid,
                                               snapshot.protection.token[-1] if snapshot.exists else None)
                 if not snapshot.exists:
                     # A platform provenance attribute may be attached at
                     # creation; use the exact verified evidence, not a guess.
                     test_fd = os.open(temp, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=temp_fd)
                     try:
-                        p = _mac_fd_protection(test_fd, directory=False)
+                        p = (_mac_fd_protection(test_fd, directory=False, business_config_xattrs=True)
+                             if sidecar_xattr_compat else _mac_fd_protection(test_fd, directory=False))
                         expected = (mode, uid, gid, p[6], p[8])
                     finally:
                         close_checked(test_fd)
-                _verify_private_entry(temp_fd, temp, temp_identity, new_bytes, expected)
-                if not target_unchanged(snapshot, protection_reader=mac_private_protection,
+                verify_entry(temp_fd, temp, temp_identity, new_bytes, expected)
+                if not target_unchanged(snapshot, protection_reader=protection_reader,
                                         max_bytes=max_bytes):
                     raise SecureSnapshotError('target_changed')
                 verify_dirs()
                 if backup_id:
-                    _verify_private_entry(backup_fd, backup_entry, backup_id, snapshot.contents, expected)
-                _verify_private_entry(temp_fd, temp, temp_identity, new_bytes, expected)
+                    verify_entry(backup_fd, backup_entry, backup_id, snapshot.contents, expected)
+                verify_entry(temp_fd, temp, temp_identity, new_bytes, expected)
                 # Immediately before the syscall, rebind both target and source.
                 guard()
-                if not target_unchanged(snapshot, protection_reader=mac_private_protection,
+                if not target_unchanged(snapshot, protection_reader=protection_reader,
                                         max_bytes=max_bytes):
                     raise SecureSnapshotError('target_changed')
                 verify_dirs()
-                staged, staged_proof = _verify_private_entry(
+                staged, staged_proof = verify_entry(
                     temp_fd, temp, temp_identity, new_bytes, expected)
                 staged_token = (stat.S_IMODE(staged.st_mode), staged.st_uid, staged.st_gid,
                                 staged_proof[6], getattr(staged, 'st_flags', 0),
@@ -884,7 +964,7 @@ def secure_replace_runtime(snapshot: TargetSnapshot, new_bytes: bytes, *, max_by
                     temp = None
                 guard()
                 final = capture_target(snapshot.path, authorized_root=snapshot.authorized_root,
-                                       protection_reader=mac_private_protection, max_bytes=max_bytes,
+                                       protection_reader=protection_reader, max_bytes=max_bytes,
                                        trusted_boundary=snapshot.trusted_boundary)
                 if (not final.exists or final.contents != new_bytes
                         or tuple(final.identity[:2]) != temp_identity or final.identity[5] != 1
@@ -895,7 +975,7 @@ def secure_replace_runtime(snapshot: TargetSnapshot, new_bytes: bytes, *, max_by
                     raise SecureSnapshotError('postcheck_failed')
                 verify_dirs()
                 if backup_id:
-                    _verify_private_entry(backup_fd, backup_entry, backup_id, snapshot.contents, expected)
+                    verify_entry(backup_fd, backup_entry, backup_id, snapshot.contents, expected)
                 if not candidate.matches(final):
                     raise SecureSnapshotError('postcheck_failed')
                 state = 'VERIFIED'

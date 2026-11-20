@@ -16,7 +16,7 @@ from contextlib import ExitStack
 from dataclasses import dataclass, field
 from typing import Callable
 
-from core.mac_config_path import capture_config, verify_config, open_target_parent, _entry_meta
+from core.mac_config_path import capture_config, verify_config, open_target_parent, _entry_meta, _close_fd
 from core.secure_files import (_open_private, _mac_fd_protection, _same_volume,
                                RuntimeWriteLocations, open_private_directory,
                                verify_private_directory, _safe_write_error_code,
@@ -121,7 +121,7 @@ def _check_preflight(preflight, snapshot):
         raise MacWriteError('write_preflight_unverified')
 
 
-def _check_created(fd, name, identity, contents, proof, *, cross_volume=False):
+def _check_created(fd, name, identity, contents, proof, *, cross_volume=False, business_config_xattrs=False):
     flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC | os.O_NONBLOCK
     file_fd = os.open(name, flags, dir_fd=fd)
     try:
@@ -130,7 +130,7 @@ def _check_created(fd, name, identity, contents, proof, *, cross_volume=False):
                 or (info.st_dev, info.st_ino) != identity):
             raise MacWriteError('staging_identity_changed')
         metadata = _entry_meta(info)
-        actual = _mac_fd_protection(file_fd, directory=False)
+        actual = _mac_fd_protection(file_fd, directory=False, business_config_xattrs=business_config_xattrs)
         # Backups may be on a different filesystem; compare security metadata,
         # not filesystem identity. The backend separately verifies each FS.
         if ((actual[2:7] != proof[2:7] or actual[8:] != proof[8:])
@@ -142,7 +142,7 @@ def _check_created(fd, name, identity, contents, proof, *, cross_volume=False):
             if not piece:
                 break
             data.extend(piece)
-        if bytes(data) != contents or _mac_fd_protection(file_fd, directory=False) != actual:
+        if bytes(data) != contents or _mac_fd_protection(file_fd, directory=False, business_config_xattrs=business_config_xattrs) != actual:
             raise MacWriteError('staging_changed')
         current = os.stat(name, dir_fd=fd, follow_symlinks=False)
         if _entry_meta(os.fstat(file_fd)) != metadata or _entry_meta(current) != metadata:
@@ -201,6 +201,11 @@ def replace_config(snapshot, new_bytes: bytes, authorization: WriteAuthorization
                 _authorize(snapshot, authorization, parent_fd, name, legacy=locations is None)
                 verify_config(snapshot)
                 _check_preflight(preflight, snapshot)
+                source_fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC | os.O_NONBLOCK,
+                                    dir_fd=parent_fd)
+                dirs.callback(_close_fd, source_fd)
+                if _entry_meta(os.fstat(source_fd)) != snapshot.final_identity:
+                    raise MacWriteError('target_changed')
                 temp_fd = backup_fd = parent_fd
                 runtime_temp_fd = None
                 if locations is not None:
@@ -233,26 +238,28 @@ def replace_config(snapshot, new_bytes: bytes, authorization: WriteAuthorization
                     guard()
                     verify_locations()
                     backup_id = _open_private(backup_fd, backup_entry, snapshot.data,
-                                              mode, uid, gid, proof[-1])
+                                              mode, uid, gid, proof[-1],
+                                              business_config_xattrs=True, copy_xattrs_from_fd=source_fd)
                 except BaseException as exc:
                     if not _safe_error_flag(exc, 'cleanup_unknown'):
                         backup = None
                     raise
                 _check_created(backup_fd, backup_entry, backup_id, snapshot.data, proof,
-                               cross_volume=locations is not None)
+                               cross_volume=locations is not None, business_config_xattrs=True)
                 temp = '.model-proxy-config-' + secrets.token_hex(12)
                 guard()
                 verify_locations()
                 temp_identity = _open_private(temp_fd, temp, new_bytes,
-                                               mode, uid, gid, proof[-1])
-                _check_created(temp_fd, temp, temp_identity, new_bytes, proof)
+                                               mode, uid, gid, proof[-1],
+                                               business_config_xattrs=True, copy_xattrs_from_fd=source_fd)
+                _check_created(temp_fd, temp, temp_identity, new_bytes, proof, business_config_xattrs=True)
                 verify_config(snapshot)
                 _authorize(snapshot, authorization, parent_fd, name, legacy=locations is None)
                 _check_preflight(preflight, snapshot)
                 verify_locations()
                 _check_created(backup_fd, backup_entry, backup_id, snapshot.data, proof,
-                               cross_volume=locations is not None)
-                _check_created(temp_fd, temp, temp_identity, new_bytes, proof)
+                               cross_volume=locations is not None, business_config_xattrs=True)
+                _check_created(temp_fd, temp, temp_identity, new_bytes, proof, business_config_xattrs=True)
                 before_replace()
                 # Marker callbacks and preflight can themselves take time.
                 verify_config(snapshot)
@@ -260,8 +267,8 @@ def replace_config(snapshot, new_bytes: bytes, authorization: WriteAuthorization
                 _check_preflight(preflight, snapshot)
                 verify_locations()
                 _check_created(backup_fd, backup_entry, backup_id, snapshot.data, proof,
-                               cross_volume=locations is not None)
-                _check_created(temp_fd, temp, temp_identity, new_bytes, proof)
+                               cross_volume=locations is not None, business_config_xattrs=True)
+                _check_created(temp_fd, temp, temp_identity, new_bytes, proof, business_config_xattrs=True)
                 verify_config(snapshot)
                 _authorize(snapshot, authorization, parent_fd, name, legacy=locations is None)
                 verify_locations()
@@ -271,8 +278,8 @@ def replace_config(snapshot, new_bytes: bytes, authorization: WriteAuthorization
                 _authorize(snapshot, authorization, parent_fd, name, legacy=locations is None)
                 verify_locations()
                 _check_created(backup_fd, backup_entry, backup_id, snapshot.data, proof,
-                               cross_volume=locations is not None)
-                _check_created(temp_fd, temp, temp_identity, new_bytes, proof)
+                               cross_volume=locations is not None, business_config_xattrs=True)
+                _check_created(temp_fd, temp, temp_identity, new_bytes, proof, business_config_xattrs=True)
                 state = 'UNKNOWN'  # syscall may have happened if it fails/interrupted
                 os.replace(temp, name, src_dir_fd=temp_fd, dst_dir_fd=parent_fd)
                 state = 'REPLACED'
@@ -285,10 +292,10 @@ def replace_config(snapshot, new_bytes: bytes, authorization: WriteAuthorization
                         or final.target_parent_protection != snapshot.target_parent_protection
                         or final.protection[1][2:] != proof[2:]):
                     raise MacWriteError('postcheck_failed')
-                _check_created(parent_fd, name, temp_identity, new_bytes, proof)
+                _check_created(parent_fd, name, temp_identity, new_bytes, proof, business_config_xattrs=True)
                 verify_locations()
                 _check_created(backup_fd, backup_entry, backup_id, snapshot.data, proof,
-                               cross_volume=locations is not None)
+                               cross_volume=locations is not None, business_config_xattrs=True)
                 state = 'VERIFIED'
                 return WriteOutcome('VERIFIED', backup, final.marker, final)
             except BaseException as exc:

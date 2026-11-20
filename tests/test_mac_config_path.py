@@ -131,7 +131,9 @@ class MacConfigPaths(unittest.TestCase):
         self.config.write_bytes(b'different fake data')
         self.assert_error(lambda: m.verify_config(before), 'config_changed')
         self.inner.chmod(0o777)
-        self.assert_error(lambda: self.capture(str(self.inner) + '/../config.json'))
+        self.assertEqual(self.capture(str(self.inner) + '/../config.json').target_path, str(self.config))
+        self.config_dir.chmod(0o777)
+        self.assert_error(lambda: self.capture())
 
     def test_default_unlimited_and_explicit_size_boundaries(self):
         data = b'fake-data-' * (m.MAX_CONFIG_BYTES // 10 + 100) + b'end'
@@ -379,85 +381,66 @@ class MacConfigPaths(unittest.TestCase):
         self.assertNotEqual(second.marker, third.marker)
         self.config_dir.chmod(0o700)
 
-    def test_directory_xattr_add_modify_remove_changes_evidence(self):
-        name = 'com.apple.metadata:_kMDItemUserTags'
+    def test_config_ancestor_and_parent_xattrs_do_not_drive_marker(self):
+        name = 'com.example.config-read-test'
         before = self.capture()
-        secret = 'fake-xattr-secret-value'
-        subprocess.run(['/usr/bin/xattr', '-w', name, secret, str(self.config_dir)],
-                       check=True, capture_output=True)
-        after_add = self.capture()
-        self.assertNotEqual(before.marker, after_add.marker)
-        self.assertEqual(before.marker.mtime_ns, after_add.marker.mtime_ns)
-        self.assert_error(lambda: m.verify_config(before), 'config_changed')
-        for obj in (after_add, after_add.chain, after_add.target_parent_protection,
-                    after_add.marker):
-            self.assertNotIn(secret, repr(obj))
-        subprocess.run(['/usr/bin/xattr', '-w', name, 'fake-different-value',
-                        str(self.config_dir)], check=True, capture_output=True)
-        after_modify = self.capture()
-        self.assertNotEqual(after_add.marker, after_modify.marker)
-        self.assert_error(lambda: m.verify_config(after_add), 'config_changed')
-        subprocess.run(['/usr/bin/xattr', '-d', name, str(self.config_dir)],
-                       check=True, capture_output=True)
-        after_remove = self.capture()
-        self.assertNotEqual(after_modify.marker, after_remove.marker)
-        self.assert_error(lambda: m.verify_config(after_modify), 'config_changed')
-        self.assertEqual(before.marker, after_remove.marker)
+        for directory in (self.root, self.config_dir):
+            subprocess.run(['/usr/bin/xattr', '-w', name, 'fake-value', str(directory)],
+                           check=True, capture_output=True)
+        after = self.capture()
+        self.assertEqual(before.marker, after.marker)
+        self.assertEqual(m.verify_config(before), before)
+        self.assertIsNone(after.target_parent_protection[1][-1])
+        self.assertNotIn('fake-value', repr(after.chain))
 
-    def test_existing_finderinfo_and_provenance_are_tracked(self):
-        finderinfo = '01' + '00' * 31
-        subprocess.run(['/usr/bin/xattr', '-wx', 'com.apple.FinderInfo',
-                        finderinfo, str(self.config_dir)], check=True, capture_output=True)
+    def test_file_unknown_xattr_read_allowed_shared_policy_stays_strict(self):
+        subprocess.run(['/usr/bin/xattr', '-w', 'com.example.config-read-test',
+                        'fake-value', str(self.config)], check=True, capture_output=True)
         snapshot = self.capture()
-        attrs = snapshot.target_parent_protection[1][-1]
-        names = [item[0] for item in attrs]
-        self.assertIn(b'com.apple.FinderInfo', names)
-        listed = subprocess.run(['/usr/bin/xattr', str(self.config_dir)],
-                                check=True, capture_output=True).stdout.splitlines()
-        if b'com.apple.provenance' in listed:
-            self.assertIn(b'com.apple.provenance', names)
-        self.assertEqual(m.verify_config(snapshot).marker, snapshot.marker)
-        # New fake directories carry platform provenance in this environment;
-        # if present it must be recorded rather than rejected or discarded.
-        subprocess.run(['/usr/bin/xattr', '-d', 'com.apple.FinderInfo',
-                        str(self.config_dir)], check=True, capture_output=True)
-        self.assertNotEqual(snapshot.marker, self.capture().marker)
+        self.assertIsNone(snapshot.protection[1][-1])
+        self.assertEqual(m.verify_config(snapshot), snapshot)
+        fd = os.open(self.config, os.O_RDONLY)
+        try:
+            with self.assertRaises(m.SecureSnapshotError) as caught:
+                m._mac_fd_protection(fd, directory=False)
+            self.assertEqual(caught.exception.code, 'extended_attributes_unverified')
+        finally:
+            os.close(fd)
 
-    def test_unknown_directory_attribute_fails_closed_without_value(self):
+    def test_target_xattr_only_change_does_not_trigger_reload_marker(self):
         before = self.capture()
-        secret = 'fake-unknown-secret-value'
-        subprocess.run(['/usr/bin/xattr', '-w', 'com.example.unknown',
-                        secret, str(self.config_dir)], check=True, capture_output=True)
-        with self.assertRaises(m.MacConfigError) as caught:
-            m.verify_config(before)
-        self.assertEqual(caught.exception.code, 'directory_attributes_unsupported')
-        self.assertNotIn(secret, str(caught.exception))
-        self.assertNotIn(str(self.config_dir), str(caught.exception))
-        self.assert_error(lambda: self.capture(), 'directory_attributes_unsupported')
+        subprocess.run(['/usr/bin/xattr', '-w', 'com.example.fake-attribute',
+                        'fake', str(self.config)], check=True, capture_output=True)
+        after = self.capture()
+        self.assertEqual(before.marker, after.marker)
+        self.config.write_bytes(b'{"fake":"different"}')
+        self.assertNotEqual(after.marker, self.capture().marker)
 
-    def test_directory_attribute_change_during_sampling_is_rejected(self):
-        real = m._directory_attributes
-        target_ino = self.config_dir.stat().st_ino
-        changed = False
-        def mutate(fd):
-            nonlocal changed
-            proof = real(fd)
-            if os.fstat(fd).st_ino == target_ino and not changed:
-                changed = True
-                subprocess.run(['/usr/bin/xattr', '-w', 'com.apple.metadata:_kMDItemUserTags',
-                                'fake-value', str(self.config_dir)], check=True,
-                               capture_output=True)
-            return proof
-        with mock.patch.object(m, '_directory_attributes', side_effect=mutate):
-            self.assert_error(lambda: self.capture(), 'protection_changed')
-        self.assertTrue(changed)
+    def test_synthetic_lastuseddate_repeated_read_keeps_stable_marker(self):
+        # This is a manually created fixture, not a system-produced attribute.
+        created = subprocess.run(['/usr/bin/xattr', '-wx', 'com.apple.lastuseddate#PS',
+                                  '00' * 16, str(self.config)], capture_output=True)
+        if created.returncode:
+            self.skipTest('cannot create synthetic lastuseddate')
+        first = self.capture()
+        first_ctime = self.config.stat().st_ctime_ns
+        for _ in range(5):
+            self.assertEqual(self.capture().marker, first.marker)
+            self.assertEqual(self.config.stat().st_ctime_ns, first_ctime)
 
-    def test_directory_attribute_enumeration_failure_is_unverified(self):
-        native = m._mac_native()
-        fake = mock.Mock(wraps=native)
-        fake.flistxattr = mock.Mock(return_value=-1)
-        with mock.patch.object(m, '_mac_native', return_value=fake):
-            self.assert_error(lambda: self.capture(), 'directory_attributes_unverified')
+    def test_business_config_does_not_enumerate_directory_xattrs(self):
+        with mock.patch.object(m, '_directory_attributes', side_effect=AssertionError('unexpected')):
+            self.assertEqual(self.capture().data, self.config.read_bytes())
+
+    def test_directory_attributes_retains_strict_shared_policy(self):
+        subprocess.run(['/usr/bin/xattr', '-w', 'com.example.config-read-test',
+                        'fake-value', str(self.config_dir)], check=True, capture_output=True)
+        fd = os.open(self.config_dir, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            self.assert_error(lambda: m._directory_attributes(fd), 'directory_attributes_unsupported')
+            self.assert_error(lambda: m._protection(fd, True), 'directory_attributes_unsupported')
+        finally:
+            os.close(fd)
 
     def test_unrelated_directory_entries_do_not_change_marker(self):
         before = self.capture()
@@ -494,12 +477,18 @@ class MacConfigPaths(unittest.TestCase):
         with mock.patch.object(m.os, 'stat', side_effect=stat_untrusted):
             self.assert_error(lambda: self.capture(link), 'sticky_entry_owner_unverified')
 
-    def test_unknown_symlink_xattr_is_rejected(self):
+    def test_unknown_symlink_xattr_is_readable_but_identity_changes_are_detected(self):
         link = self.other / 'link'; link.symlink_to('../config/config.json')
         snapshot = self.capture(link)
         subprocess.run(['/usr/bin/xattr', '-w', '-s', 'com.example.fake-test', 'fake', str(link)],
                        check=True, capture_output=True)
-        self.assert_error(lambda: m.verify_config(snapshot), 'link_attributes_unverified')
+        self.assert_error(lambda: m.verify_config(snapshot), 'config_changed')
+        self.assertEqual(self.capture(link).data, self.config.read_bytes())
+        fd = os.open(link, os.O_SYMLINK | os.O_CLOEXEC)
+        try:
+            self.assert_error(lambda: m._link_protection(fd), 'link_attributes_unverified')
+        finally:
+            os.close(fd)
 
     def test_real_acl_rejected_on_file_and_directory(self):
         before = self.capture()
@@ -511,7 +500,10 @@ class MacConfigPaths(unittest.TestCase):
         before = self.capture(path)
         subprocess.run(['/bin/chmod', '+a', 'everyone allow list', str(self.inner)],
                        check=True, capture_output=True)
-        self.assert_error(lambda: m.verify_config(before))
+        self.assertEqual(self.capture(path).data, self.config.read_bytes())
+        subprocess.run(['/bin/chmod', '+a', 'everyone allow list', str(self.config_dir)],
+                       check=True, capture_output=True)
+        self.assert_error(lambda: self.capture(path))
 
     def test_link_acl_is_checked_on_link_itself(self):
         link = self.other / 'link'; link.symlink_to('../config/config.json')

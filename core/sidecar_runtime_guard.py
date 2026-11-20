@@ -371,7 +371,8 @@ class SidecarRuntimeGuard:
                 raise self._resource from None
         self._base()
         try:
-            capture_private_directory(self.staging, purpose='staging')
+            capture_private_directory(self.staging, purpose='staging',
+                                      business_xattr_compat=True)
         except Exception as exc:
             if self._latch(exc):
                 raise self._resource from None

@@ -137,7 +137,7 @@ def _mac_walk(source, project_root):
 
         def directory_proof(fd, path):
             if path == project_root or path.startswith(project_root.rstrip('/') + '/'):
-                return ('protected', mac._protection(fd, True))
+                return ('protected', mac._protection(fd, True, business_config=True))
             before = mac._dir_meta(os.fstat(fd))
             volume = secure._mac_local_apfs(fd, secure._mac_native())
             if mac._dir_meta(os.fstat(fd)) != before:
@@ -183,7 +183,7 @@ def _mac_walk(source, project_root):
             except FileNotFoundError:
                 if pending or final_link:
                     raise mac.MacConfigError('file_not_found') from None
-                parent_protected = mac._protection(fd, True)
+                parent_protected = mac._protection(fd, True, business_config=True)
                 events.append(('target-parent', parent_protected))
                 try:
                     os.stat(part, dir_fd=fd, follow_symlinks=False)
@@ -195,20 +195,20 @@ def _mac_walk(source, project_root):
             if stat.S_ISLNK(info.st_mode):
                 if not pending:
                     final_link = True
-                parent_protected = mac._protection(fd, True)
+                parent_protected = mac._protection(fd, True, business_config=True)
                 before = mac._entry_meta(info)
                 link = own(mac._path_operation(os.open, part, os.O_SYMLINK | os.O_CLOEXEC,
                                                 dir_fd=fd, changed='link_changed'))
                 if mac._entry_meta(os.fstat(link.fd)) != before:
                     raise mac.MacConfigError('link_changed')
-                link_proof = mac._link_protection(link.fd)
+                link_proof = mac._link_protection(link.fd, business_config=True)
                 text = mac._path_operation(os.readlink, part, dir_fd=fd,
                                            changed='link_changed', invalid_means_changed=True)
                 after = mac._path_operation(os.stat, part, dir_fd=fd, follow_symlinks=False,
                                             changed='link_changed')
                 if (not text or mac._entry_meta(after) != before or link_proof[0] != before
-                        or mac._link_protection(link.fd) != link_proof
-                        or mac._protection(fd, True) != parent_protected):
+                        or mac._link_protection(link.fd, business_config=True) != link_proof
+                        or mac._protection(fd, True, business_config=True) != parent_protected):
                     raise mac.MacConfigError('link_changed')
                 link.close()
                 links += 1
@@ -241,7 +241,7 @@ def _mac_walk(source, project_root):
             if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
                 raise mac.MacConfigError('not_regular_file')
             entry = mac._entry_meta(info)
-            parent_protected = mac._protection(fd, True)
+            parent_protected = mac._protection(fd, True, business_config=True)
             again = mac._path_operation(os.stat, part, dir_fd=fd, follow_symlinks=False,
                                          changed='target_changed')
             if mac._entry_meta(again) != entry:
@@ -390,7 +390,8 @@ class SidecarSecureIO:
         boundary, external = self._mac_boundary(binding.target)
         self._guard(actual=binding.target, external=external)
         target = secure.capture_target(binding.target, authorized_root=os.path.dirname(binding.target),
-                                       protection_reader=secure.mac_private_protection,
+                                       protection_reader=lambda path, info: secure.mac_private_protection(
+                                           path, info, business_config_xattrs=True),
                                        max_bytes=self.max_bytes, trusted_boundary=boundary)
         if ((binding.entry is None) != (not target.exists)
                 or (target.exists and binding.entry[:9] != target.identity)):
@@ -481,7 +482,8 @@ class SidecarSecureIO:
             current = self._mac_capture()
             if not _same(_mac_snapshot(current), baseline):
                 raise SidecarIOError('baseline_changed')
-            staging = secure.capture_private_directory(self.staging, purpose='staging')
+            staging = secure.capture_private_directory(
+                self.staging, purpose='staging', business_xattr_compat=True)
             locations = secure.RuntimeWriteLocations(
                 staging, None, self.allow_external_target_staging and current.external)
             def boundary_guard():
@@ -489,8 +491,11 @@ class SidecarSecureIO:
             entered = True
             outcome = secure.secure_replace_runtime(
                 current.target, payload, max_bytes=self.max_bytes, locations=locations,
-                make_backup=False, boundary_guard=boundary_guard)
+                make_backup=False, boundary_guard=boundary_guard,
+                sidecar_xattr_compat=True)
         except secure.SecureWriteError as exc:
+            if exc.code == 'extended_attributes_copy_failed':
+                log.warning('sidecar: xattr copy failed; write not submitted')
             resource_unknown = exc.close_unknown or exc.cleanup_unknown
             state = 'NOT_REPLACED' if exc.state == 'NOT_REPLACED' and not resource_unknown else 'UNKNOWN'
             candidate = _mac_candidate(exc.candidate, payload, current.binding if current else None) if exc.state != 'NOT_REPLACED' else None

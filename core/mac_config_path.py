@@ -64,6 +64,23 @@ def _entry_meta(st):
             st.st_nlink, st.st_size, st.st_mtime_ns, st.st_ctime_ns, st.st_flags)
 
 
+def _reload_chain(chain):
+    """Exclude ctime from reload evidence; it can change for xattrs alone."""
+    def without_ctime(meta):
+        return meta[:8] + meta[9:]
+    events = []
+    for event in chain:
+        if event[0] == 'target':
+            events.append((event[0], event[1], without_ctime(event[2])))
+        elif event[0] == 'link':
+            proof = event[5]
+            events.append((event[0], event[1], without_ctime(event[2]), event[3],
+                           event[4], (without_ctime(proof[0]), proof[1])))
+        else:
+            events.append(event)
+    return tuple(events)
+
+
 _DIRECTORY_ATTRS = frozenset((
     # Finder presentation and user tags do not grant filesystem access.
     b'com.apple.FinderInfo',
@@ -111,13 +128,16 @@ def _directory_attributes(fd):
     return tuple(attributes)
 
 
-def _protection(fd, directory):
+def _protection(fd, directory, *, business_config=False):
     before = os.fstat(fd)
     meta = _dir_meta if directory else _entry_meta
     initial = meta(before)
-    attributes = _directory_attributes(fd) if directory else None
-    proof = _mac_fd_protection(fd, directory=directory)
-    if directory and _directory_attributes(fd) != attributes:
+    attributes = _directory_attributes(fd) if directory and not business_config else None
+    if business_config and not directory:
+        proof = _mac_fd_protection(fd, directory=False, business_config_xattrs=True)
+    else:
+        proof = _mac_fd_protection(fd, directory=directory)
+    if directory and not business_config and _directory_attributes(fd) != attributes:
         raise MacConfigError('protection_changed')
     after = os.fstat(fd)
     if meta(after) != initial:
@@ -128,7 +148,12 @@ def _protection(fd, directory):
     return (initial, proof)
 
 
-def _link_protection(fd):
+def _ancestor_protection(fd):
+    """Record path identity without applying the direct-parent ACL policy."""
+    return (_dir_meta(os.fstat(fd)), None)
+
+
+def _link_protection(fd, *, business_config=False):
     """Inspect the link itself using Darwin O_SYMLINK, never its target.
 
     APFS + ENOENT means no extended ACL under the same narrow assumption used
@@ -150,28 +175,29 @@ def _link_protection(fd):
             raise MacConfigError('link_acl_present')
         if ctypes.get_errno() != errno.ENOENT:
             raise MacConfigError('link_acl_unavailable')
-        count = lib.flistxattr(fd, None, 0, 0)
-        if count < 0 or count > 4096:
-            raise MacConfigError('link_attributes_unverified')
         attrs = []
-        if count:
-            names_buf = ctypes.create_string_buffer(count)
-            if lib.flistxattr(fd, names_buf, count, 0) != count:
+        if not business_config:
+            count = lib.flistxattr(fd, None, 0, 0)
+            if count < 0 or count > 4096:
                 raise MacConfigError('link_attributes_unverified')
-            names = sorted(name for name in names_buf.raw.split(b'\0') if name)
-            if any(name != b'com.apple.provenance' for name in names):
-                raise MacConfigError('link_attributes_unverified')
-            for name in names:
-                size = lib.fgetxattr(fd, name, None, 0, 0, 0)
-                if size < 0 or size > 4096:
+            if count:
+                names_buf = ctypes.create_string_buffer(count)
+                if lib.flistxattr(fd, names_buf, count, 0) != count:
                     raise MacConfigError('link_attributes_unverified')
-                value = ctypes.create_string_buffer(max(size, 1))
-                if lib.fgetxattr(fd, name, value, size, 0, 0) != size:
+                names = sorted(name for name in names_buf.raw.split(b'\0') if name)
+                if any(name != b'com.apple.provenance' for name in names):
                     raise MacConfigError('link_attributes_unverified')
-                attrs.append((name, value.raw[:size]))
+                for name in names:
+                    size = lib.fgetxattr(fd, name, None, 0, 0, 0)
+                    if size < 0 or size > 4096:
+                        raise MacConfigError('link_attributes_unverified')
+                    value = ctypes.create_string_buffer(max(size, 1))
+                    if lib.fgetxattr(fd, name, value, size, 0, 0) != size:
+                        raise MacConfigError('link_attributes_unverified')
+                    attrs.append((name, value.raw[:size]))
         if _entry_meta(os.fstat(fd)) != identity:
             raise MacConfigError('link_changed')
-        results.append((fs, tuple(attrs)))
+        results.append((fs, None if business_config else tuple(attrs)))
     if results[0] != results[1]:
         raise MacConfigError('link_protection_changed')
     return (identity, results[0])
@@ -272,7 +298,7 @@ def _walk_inner(source, max_bytes, *, hold_parent, duplicate_sink):
 
         def root():
             fd = own(os.open('/', dflags))
-            proof = _protection(fd.fd, True)
+            proof = _ancestor_protection(fd.fd)
             events.append(('root', proof))
             return [(fd, '', proof)]
 
@@ -293,7 +319,7 @@ def _walk_inner(source, max_bytes, *, hold_parent, duplicate_sink):
                 expected = stack[-2][2] if len(stack) > 1 else stack[0][2]
                 if _dir_meta(os.fstat(up.fd)) != expected[0]:
                     raise MacConfigError('parent_changed')
-                proof = _protection(up.fd, True)
+                proof = _ancestor_protection(up.fd)
                 if proof != expected:
                     raise MacConfigError('parent_changed')
                 events.append(('dotdot', proof))
@@ -316,14 +342,14 @@ def _walk_inner(source, max_bytes, *, hold_parent, duplicate_sink):
                     changed='link_changed'))
                 if _entry_meta(os.fstat(link_fd.fd)) != before:
                     raise MacConfigError('link_changed')
-                link_proof = _link_protection(link_fd.fd)
+                link_proof = _link_protection(link_fd.fd, business_config=True)
                 if link_proof[0] != before:
                     raise MacConfigError('link_changed')
                 text = _path_operation(os.readlink, part, dir_fd=fd,
                                        changed='link_changed', invalid_means_changed=True)
                 after = _path_operation(os.stat, part, dir_fd=fd, follow_symlinks=False,
                                         changed='link_changed')
-                if before != _entry_meta(after) or _link_protection(link_fd.fd) != link_proof:
+                if before != _entry_meta(after) or _link_protection(link_fd.fd, business_config=True) != link_proof:
                     raise MacConfigError('link_changed')
                 link_fd.close()
                 if not text:
@@ -346,7 +372,7 @@ def _walk_inner(source, max_bytes, *, hold_parent, duplicate_sink):
                                             changed='directory_changed'))
                 if _dir_meta(os.fstat(child.fd)) != _dir_meta(info):
                     raise MacConfigError('directory_changed')
-                proof = _protection(child.fd, True)
+                proof = _ancestor_protection(child.fd)
                 if _dir_meta(info) != proof[0]:
                     raise MacConfigError('directory_changed')
                 # A second pathname check binds the observation to the fd.
@@ -359,6 +385,11 @@ def _walk_inner(source, max_bytes, *, hold_parent, duplicate_sink):
                 continue
             if not stat.S_ISREG(info.st_mode):
                 raise MacConfigError('not_regular_file')
+            # Only the actual target parent is a protection boundary. Ancestor
+            # identities remain in the path chain and are independently rewalked.
+            parent_proof = _protection(fd, True, business_config=True)
+            if parent_proof[0] != stack[-1][2][0]:
+                raise MacConfigError('parent_changed')
             initial = _entry_meta(info)
             if info.st_size < 0:
                 raise MacConfigError('identity_unknown')
@@ -368,7 +399,7 @@ def _walk_inner(source, max_bytes, *, hold_parent, duplicate_sink):
                                            changed='target_changed'))
             if _entry_meta(os.fstat(target_fd.fd)) != initial:
                 raise MacConfigError('target_changed')
-            before_proof = _protection(target_fd.fd, False)
+            before_proof = _protection(target_fd.fd, False, business_config=True)
             if before_proof[0] != initial:
                 raise MacConfigError('target_changed')
             chunks = []
@@ -386,7 +417,7 @@ def _walk_inner(source, max_bytes, *, hold_parent, duplicate_sink):
                 raise MacConfigError('target_changed')
             if _entry_meta(os.fstat(target_fd.fd)) != initial:
                 raise MacConfigError('target_changed')
-            after_proof = _protection(target_fd.fd, False)
+            after_proof = _protection(target_fd.fd, False, business_config=True)
             current = _path_operation(os.stat, part, dir_fd=fd, follow_symlinks=False,
                                       changed='target_changed')
             if (before_proof != after_proof or _entry_meta(current) != initial
@@ -395,12 +426,14 @@ def _walk_inner(source, max_bytes, *, hold_parent, duplicate_sink):
             # Re-prove held parent after reading, including ACL/filesystem.
             if _dir_meta(os.fstat(fd)) != parent_proof[0]:
                 raise MacConfigError('parent_changed')
-            if _protection(fd, True) != parent_proof:
+            if _protection(fd, True, business_config=True) != parent_proof:
                 raise MacConfigError('parent_changed')
             target_fd.close()
             target = '/' + '/'.join([item[1] for item in stack[1:]] + [part])
             chain = tuple(events) + (('target', part, initial),)
-            fingerprint = hashlib.sha256(repr((chain, after_proof, hashlib.sha256(data).digest())).encode('utf-8', 'surrogatepass')).digest()
+            stable_file_meta = initial[:8] + initial[9:]
+            reload_proof = (stable_file_meta, after_proof[1])
+            fingerprint = hashlib.sha256(repr((_reload_chain(chain), parent_proof, reload_proof, hashlib.sha256(data).digest())).encode('utf-8', 'surrogatepass')).digest()
             marker = MacConfigMarker(initial[7], fingerprint)
             snapshot = MacConfigSnapshot(source, target, data, initial, chain,
                                          after_proof, parent_proof, marker, max_bytes)
@@ -493,7 +526,7 @@ def open_target_parent(snapshot):
         verify_config(snapshot)
         if _dir_meta(os.fstat(fd)) != snapshot.target_parent_protection[0]:
             raise MacConfigError('parent_changed')
-        parent_proof = _protection(fd, True)
+        parent_proof = _protection(fd, True, business_config=True)
         if parent_proof != snapshot.target_parent_protection:
             raise MacConfigError('parent_changed')
         info = _path_operation(os.stat, name, dir_fd=fd, follow_symlinks=False,
@@ -501,7 +534,7 @@ def open_target_parent(snapshot):
         if _entry_meta(info) != snapshot.final_identity:
             raise MacConfigError('target_changed')
         # Ensure the descriptor itself remained stable throughout the last checks.
-        if _protection(fd, True) != parent_proof:
+        if _protection(fd, True, business_config=True) != parent_proof:
             raise MacConfigError('parent_changed')
     except SecureSnapshotError as exc:
         _close_fd(fd)

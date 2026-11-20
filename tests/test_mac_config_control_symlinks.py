@@ -74,7 +74,7 @@ class MacConfigControlLinks(unittest.TestCase):
             self.assertEqual(self.lease.admin_token(), 'fake-token')
         self.assertTrue(self.lease.verify_admin_token())
 
-    def test_service_chain_untrusted_or_different_target_fails(self):
+    def test_service_chain_different_target_fails_but_ancestor_is_not_parent_gate(self):
         other = self.root / 'service/other.json'
         other.write_bytes(self.target.read_bytes()); other.chmod(0o600)
         self.service.unlink(); self.service.symlink_to(other)
@@ -82,7 +82,7 @@ class MacConfigControlLinks(unittest.TestCase):
         self.service.unlink(); self.service.symlink_to(self.target)
         (self.root / 'service').chmod(0o777)
         try:
-            with self.assertRaises((control.ControlError, authority.PreflightError)): self.launch()
+            self.assertEqual(self.launch(), self.env)
         finally:
             (self.root / 'service').chmod(0o700)
 
@@ -156,7 +156,7 @@ class MacConfigControlLinks(unittest.TestCase):
         finally:
             self.target.parent.chmod(0o700)
 
-    def test_parent_xattr_change_invalidates_grant_and_recheck(self):
+    def test_parent_xattr_change_does_not_itself_invalidate_grant(self):
         from core.mac_config_writer import validate_write_authorization
         snapshot = capture_config(self.cli)
         grant, recheck = dispatch.prepare_config_write(self.root, snapshot, operation='switch')
@@ -166,10 +166,9 @@ class MacConfigControlLinks(unittest.TestCase):
                        check=True, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         try:
             changed = capture_config(self.cli)
-            self.assertNotEqual(snapshot.target_parent_protection, changed.target_parent_protection)
-            self.assertFalse(recheck(snapshot))
-            with self.assertRaises(RuntimeError):
-                validate_write_authorization(snapshot, grant)
+            self.assertEqual(snapshot.target_parent_protection, changed.target_parent_protection)
+            self.assertTrue(recheck(snapshot))
+            validate_write_authorization(snapshot, grant)
         finally:
             subprocess.run(['/usr/bin/xattr', '-d', name, str(self.target.parent)],
                            check=True, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE)

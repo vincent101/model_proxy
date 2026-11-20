@@ -3,6 +3,7 @@ import json
 import io
 from contextlib import redirect_stderr
 import os
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -87,6 +88,20 @@ class ServerMacSnapshots(unittest.TestCase):
         self.assertNotEqual(store._probe_marker, marker)
         self.assertEqual(calls, ['reload'])
         self.assertEqual(store._config['generation'], 'A')
+
+    def test_config_xattrs_do_not_block_load_or_parent_attribute_trigger_reload(self):
+        subprocess.run(['/usr/bin/xattr', '-w', 'com.example.fake-config-test',
+                        'fake', str(self.target)], check=True, capture_output=True)
+        store = server.ConfigStore(self.link)
+        original, marker = store._config, store._probe_marker
+        subprocess.run(['/usr/bin/xattr', '-w', 'com.example.fake-parent-test',
+                        'fake', str(self.target.parent)], check=True, capture_output=True)
+        self.assertFalse(store.maybe_reload())
+        self.assertIs(store._config, original)
+        self.assertEqual(store._probe_marker, marker)
+        self.write(config('B'))
+        self.assertTrue(store.maybe_reload())
+        self.assertEqual(store._config['generation'], 'B')
 
     def test_unsafe_or_bad_json_preserves_and_retry_after_repair(self):
         store = server.ConfigStore(self.link)
@@ -222,7 +237,9 @@ class ServerMacSnapshots(unittest.TestCase):
                                          ready, attempted, None, legacy, guard, expected, None)
         self.assertFalse(ready['serving_started'])
         self.assertEqual(checks[-1], ready_records)
-        sidecar.assert_called_once_with(self.link.parent / 'session_overrides.json')
+        sidecar.assert_called_once()
+        self.assertEqual(sidecar.call_args.args, (self.link.parent / 'session_overrides.json',))
+        self.assertIn('secure_io', sidecar.call_args.kwargs)
         self.assertNotEqual(self.link.parent, self.target.parent)
 
     def test_server_and_snapshot_use_backend_default_and_accept_none_evidence(self):

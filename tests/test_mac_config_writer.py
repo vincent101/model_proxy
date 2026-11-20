@@ -2,6 +2,7 @@
 import contextlib
 import os
 import stat
+import subprocess
 import tempfile
 import unittest
 from unittest.mock import patch
@@ -38,6 +39,45 @@ class WriterTests(unittest.TestCase):
         return replace_config(snap, b'{"new":true}\n', auth,
                               preflight=kwargs.get('preflight', lambda _: True),
                               before_replace=kwargs.get('before_replace', lambda: None))
+
+    def test_read_only_source_with_xattrs_is_replaced_and_backed_up(self):
+        subprocess.run(['/usr/bin/xattr', '-w', 'com.example.fake-attribute',
+                        'fake', str(self.target)], check=True, capture_output=True)
+        self.target.chmod(0o400)
+        snap, auth = self.prepare()
+        result = self.write(snap, auth)
+        self.assertEqual(result.state, 'VERIFIED')
+        self.assertEqual(self.target.read_bytes(), b'{"new":true}\n')
+        self.assertEqual((self.folder / result.backup_name).read_bytes(), snap.data)
+        self.assertEqual(stat.S_IMODE(self.target.stat().st_mode), 0o400)
+        self.assertEqual(stat.S_IMODE((self.folder / result.backup_name).stat().st_mode), 0o400)
+        for path in (self.target, self.folder / result.backup_name):
+            self.assertEqual(subprocess.run(['/usr/bin/xattr', '-p', 'com.example.fake-attribute',
+                                             str(path)], capture_output=True).returncode, 0)
+        self.assertTrue(self.alias.is_symlink())
+
+    def test_copy_error_warns_and_writes_with_staging_xattr(self):
+        from core.cli._config_ops import _mac_runtime_locations
+        from core.secure_files import SecureSnapshotError
+        snap, auth = self.prepare()
+        state = self.root / '.runtime'
+        state.mkdir(mode=0o700)
+        stage = state / 'tmp'
+        stage.mkdir(mode=0o700)
+        subprocess.run(['/usr/bin/xattr', '-w', 'com.example.fake-attribute',
+                        'fake', str(stage)], check=True, capture_output=True)
+        locations = _mac_runtime_locations(self.root, snap, lambda _: True)
+        with patch('core.secure_files._copy_extended_attributes',
+                   side_effect=SecureSnapshotError('extended_attributes_copy_failed')), \
+             self.assertLogs('core.secure_files', level='WARNING') as logged:
+            result = replace_config(snap, b'{"new":true}\n', auth,
+                                    preflight=lambda _: True,
+                                    before_replace=lambda: None, locations=locations)
+        self.assertEqual(result.state, 'VERIFIED')
+        self.assertEqual(self.target.read_bytes(), b'{"new":true}\n')
+        self.assertEqual(Path(result.backup_name).read_bytes(), snap.data)
+        self.assertTrue(any('extended attributes could not be copied' in line
+                            for line in logged.output))
 
     def test_actual_backend_parent_descriptor_matches_snapshot_protection(self):
         snap, _auth = self.prepare()
@@ -213,7 +253,7 @@ class WriterTests(unittest.TestCase):
         self.assertEqual(self.target.read_bytes(), snap.data)
         self.assertTrue(self.alias.is_symlink())
 
-    def test_parent_directory_xattr_change_before_replace_is_rejected(self):
+    def test_parent_directory_xattr_change_before_replace_does_not_change_proof(self):
         import ctypes
         lib = ctypes.CDLL('/usr/lib/libSystem.B.dylib', use_errno=True)
         lib.fsetxattr.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_void_p,
@@ -230,14 +270,12 @@ class WriterTests(unittest.TestCase):
                 raise OSError(ctypes.get_errno(), 'fake xattr setup failed')
             changed.append(True)
         try:
-            with self.assertRaises(MacWriteError) as caught:
-                self.write(snap, auth, before_replace=mutate)
+            result = self.write(snap, auth, before_replace=mutate)
             self.assertEqual(changed, [True])
-            self.assertEqual(caught.exception.state, 'NOT_REPLACED')
-            self.assertEqual(self.target.read_bytes(), snap.data)
+            self.assertEqual(result.state, 'VERIFIED')
+            self.assertEqual(self.target.read_bytes(), b'{"new":true}\n')
             after = capture_config(str(self.alias))
-            self.assertNotEqual(after.target_parent_protection, snap.target_parent_protection)
-            self.assertNotEqual(after.marker, snap.marker)
+            self.assertEqual(after.target_parent_protection, snap.target_parent_protection)
         finally:
             os.close(fd)
 

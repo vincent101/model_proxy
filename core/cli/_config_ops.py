@@ -127,7 +127,8 @@ def _mac_runtime_locations(root, snapshot, preflight, *, allow_target_staging=Fa
     if preflight(snapshot) is not True:
         raise WritePreflightFailed('运行目录创建前角色核验失败')
     verify_record_directory(state)
-    stage = capture_private_directory(state / 'tmp', purpose='staging')
+    stage = capture_private_directory(state / 'tmp', purpose='staging',
+                                      business_xattr_compat=True)
     fd = os.open(state, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
     try:
         info = os.fstat(fd)
@@ -143,7 +144,8 @@ def _mac_runtime_locations(root, snapshot, preflight, *, allow_target_staging=Fa
         verify_record_directory(state)
     finally:
         _close_private_fd(fd)
-    backup = capture_private_directory(state / 'backups', purpose='backup')
+    backup = capture_private_directory(state / 'backups', purpose='backup',
+                                       business_xattr_compat=True)
     if stage.protection[:2] == backup.protection[:2]:
         raise WritePreflightFailed('备份和暂存目录不独立')
     if preflight(snapshot) is not True:
@@ -576,9 +578,11 @@ def atomic_write(path: str, cfg: dict) -> None:
             _verify_marker_binding()
         from core.secure_files import capture_private_directory
         if (_WRITE_LOCATIONS is None or _WRITE_PREFLIGHT(_WRITE_BASELINE) is not True
-                or capture_private_directory(_WRITE_LOCATIONS.staging.path, purpose='staging')
+                or capture_private_directory(_WRITE_LOCATIONS.staging.path, purpose='staging',
+                                             business_xattr_compat=True)
                 != _WRITE_LOCATIONS.staging
-                or capture_private_directory(_WRITE_LOCATIONS.backup.path, purpose='backup')
+                or capture_private_directory(_WRITE_LOCATIONS.backup.path, purpose='backup',
+                                             business_xattr_compat=True)
                 != _WRITE_LOCATIONS.backup):
             raise WritePreflightFailed('写入角色或私有目录已改变')
     try:
@@ -586,6 +590,8 @@ def atomic_write(path: str, cfg: dict) -> None:
                                  preflight=_WRITE_PREFLIGHT, before_replace=before_replace,
                                  boundary_guard=boundary_guard, locations=_WRITE_LOCATIONS)
     except MacWriteError as exc:
+        if exc.code == 'extended_attributes_copy_failed':
+            err("扩展属性复制失败；配置未提交，请检查文件系统能力和权限。")
         if exc.state == 'NOT_REPLACED' and marker_started:
             try:
                 _set_marker("no")
