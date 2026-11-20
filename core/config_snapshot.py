@@ -88,13 +88,14 @@ def _decode_json_object(data: bytes, *, reject_duplicate_keys: bool) -> dict[str
     return value
 
 
-def _windows_snapshot(path, *, with_data: bool, reject_duplicate_keys: bool = False):
+def _windows_snapshot(path, *, with_data: bool, reject_duplicate_keys: bool = False,
+                      trusted_boundary=None):
     """Windows same-handle identity/ChangeTime and guarded parent evidence."""
     import ntpath
     from core.platform_windows import read_guarded_file, WindowsReadError
     try:
         target = ntpath.abspath(os.fspath(path))
-        value = read_guarded_file(target, with_data=with_data)
+        value = read_guarded_file(target, with_data=with_data, trusted_boundary=trusted_boundary)
         marker = FileMarker(*value.marker)
         if not with_data:
             return marker
@@ -110,11 +111,11 @@ def _windows_snapshot(path, *, with_data: bool, reject_duplicate_keys: bool = Fa
         raise ConfigSnapshotError("config_read_error") from None
 
 
-def current_file_marker(path: str | os.PathLike[str]) -> FileMarker:
+def current_file_marker(path: str | os.PathLike[str], *, trusted_boundary=None) -> FileMarker:
     """Read a descriptor-bound current marker on a verified local filesystem."""
     _platform_gate()
     if os.name == "nt":
-        return _windows_snapshot(path, with_data=False)
+        return _windows_snapshot(path, with_data=False, trusted_boundary=trusted_boundary)
     _require_reliable_filesystem()
     try:
         with open(path, "rb") as stream:
@@ -129,7 +130,8 @@ def current_file_marker(path: str | os.PathLike[str]) -> FileMarker:
         raise ConfigSnapshotError("config_read_error") from None
 
 
-def read_stable_config(path: str | os.PathLike[str], *, reject_duplicate_keys: bool = False) -> ConfigSnapshot:
+def read_stable_config(path: str | os.PathLike[str], *, reject_duplicate_keys: bool = False,
+                       trusted_boundary=None) -> ConfigSnapshot:
     """Read one JSON object, rejecting observable changes before return.
 
     The same open descriptor is used for the pre/post-read identity.  The path
@@ -142,7 +144,8 @@ def read_stable_config(path: str | os.PathLike[str], *, reject_duplicate_keys: b
         raise TypeError("reject_duplicate_keys must be bool")
     _platform_gate()
     if os.name == "nt":
-        return _windows_snapshot(path, with_data=True, reject_duplicate_keys=reject_duplicate_keys)
+        return _windows_snapshot(path, with_data=True, reject_duplicate_keys=reject_duplicate_keys,
+                                 trusted_boundary=trusted_boundary)
     _require_reliable_filesystem()
     try:
         with open(path, "rb") as stream:

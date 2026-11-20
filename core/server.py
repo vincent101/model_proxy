@@ -780,12 +780,47 @@ def _business_path(path):
     return raw if os.path.isabs(raw) else os.path.join(os.getcwd(), raw)
 
 
+def _windows_config_boundary(path, *, project_root=None):
+    """Use the existing Windows preflight boundary for an established role."""
+    import ntpath
+    from .discovery import _windows_trusted_boundary
+    try:
+        project = ntpath.abspath(os.fspath(_PACKAGE_DIR if project_root is None else project_root))
+        target = ntpath.abspath(os.fspath(path))
+        return _windows_trusted_boundary(project, target)
+    except PreflightError:
+        # Ambiguous project aliases must remain fail-closed during hot reload.
+        raise ConfigSnapshotError("config_read_error") from None
+
+
 def _read_business_config(path):
-    return read_mac_business_config(path) if _mac_business_enabled() else read_stable_config(path)
+    if _mac_business_enabled():
+        return read_mac_business_config(path)
+    if os.name == "nt":
+        return read_stable_config(path, trusted_boundary=_windows_config_boundary(path))
+    return read_stable_config(path)
 
 
 def _business_marker(path):
-    return mac_business_marker(path) if _mac_business_enabled() else current_file_marker(path)
+    if _mac_business_enabled():
+        return mac_business_marker(path)
+    if os.name == "nt":
+        return current_file_marker(path, trusted_boundary=_windows_config_boundary(path))
+    return current_file_marker(path)
+
+
+def _read_runtime_paths_config():
+    if os.name == "nt":
+        return read_stable_config(_RUNTIME_PATHS_FILE,
+                                  trusted_boundary=_windows_config_boundary(_RUNTIME_PATHS_FILE))
+    return read_stable_config(_RUNTIME_PATHS_FILE)
+
+
+def _runtime_paths_marker():
+    if os.name == "nt":
+        return current_file_marker(_RUNTIME_PATHS_FILE,
+                                   trusted_boundary=_windows_config_boundary(_RUNTIME_PATHS_FILE))
+    return current_file_marker(_RUNTIME_PATHS_FILE)
 
 
 def _verify_business_snapshot(snapshot):
@@ -4231,7 +4266,10 @@ def _check_windows_legacy_observations(snapshot):
         observations = []
         for key in PATH_KEYS:
             evidence = identities[key]
-            marker = current_file_marker(evidence.canonical) if evidence.exists else None
+            marker = (current_file_marker(
+                evidence.canonical,
+                trusted_boundary=_windows_config_boundary(evidence.canonical, project_root=snapshot.project_root))
+                if evidence.exists else None)
             observations.append((key, marker))
         # Bracket the observation by a second held-chain/path preflight and
         # re-probe existing file IDs/ChangeTime without reading their contents.
@@ -4240,7 +4278,10 @@ def _check_windows_legacy_observations(snapshot):
         if current != snapshot:
             raise PreflightError("legacy_state_unknown", "Runtime path identity changed")
         for key, marker in observations:
-            if marker is not None and current_file_marker(identities[key].canonical) != marker:
+            target = identities[key].canonical
+            if (marker is not None and current_file_marker(
+                    target, trusted_boundary=_windows_config_boundary(target, project_root=snapshot.project_root))
+                    != marker):
                 raise PreflightError("legacy_state_unknown", "Runtime target changed")
         return tuple(observations)
     except PreflightError:
@@ -4528,7 +4569,7 @@ def _capture_confirmation_snapshot(config_path, config_store, listen_cfg, legacy
     """Capture exactly the inputs to be confirmed, while instance locks are held."""
     try:
         business = _read_business_config(config_path)
-        paths = read_stable_config(_RUNTIME_PATHS_FILE)
+        paths = _read_runtime_paths_config()
         with config_store._lock:
             if (config_store._probe_marker != business.marker or config_store._config != business.config
                     or (_mac_business_enabled() and config_store._business_snapshot != business)):
@@ -4548,7 +4589,7 @@ def _verify_confirmation_snapshot(snapshot, config_path, config_store, listen_cf
         _verify_business_snapshot(business)
         if (os.environ.get("MODEL_PROXY_PORT") != port or
                 _read_business_config(config_path) != business or
-                read_stable_config(_RUNTIME_PATHS_FILE) != paths):
+                _read_runtime_paths_config() != paths):
             raise PreflightError("startup_config_changed", "Startup configuration changed")
         with config_store._lock:
             if (config_store._probe_marker != business.marker or config_store._config != business.config
@@ -4561,7 +4602,7 @@ def _verify_confirmation_snapshot(snapshot, config_path, config_store, listen_cf
         if _check_legacy_observations(legacy.snapshot) != legacy_observations:
             raise PreflightError("legacy_state_unknown", "Legacy runtime observations changed")
         if (_business_marker(config_path) != business.marker or
-                current_file_marker(_RUNTIME_PATHS_FILE) != paths.marker):
+                _runtime_paths_marker() != paths.marker):
             raise PreflightError("startup_config_changed", "Startup configuration changed")
         _verify_business_snapshot(business)
     except ConfigSnapshotError:
@@ -4712,19 +4753,24 @@ def _capture_migration_ledger(snapshot):
                 return None
             raise PreflightError("ledger_changed", "Ledger appeared during startup")
         if os.name == "nt":
-            # Both marker reads use the existing guarded Windows adapter. A
-            # parse failure alone must not waive target/parent protection.
-            before = current_file_marker(target)
+            # The startup ledger is the already-preflighted totals role. Other
+            # ledger callers and unproven snapshots retain the strict default.
+            from .discovery import WindowsPathPreflight
+            boundary = (_windows_config_boundary(target, project_root=snapshot.project_root)
+                        if isinstance(snapshot, WindowsPathPreflight) else None)
+            # A parse failure alone must not waive target/parent protection.
+            before = current_file_marker(target, trusted_boundary=boundary)
             if (identity.link_count != 1 or
                     (before.device, before.inode) != (identity.device, identity.inode)):
                 raise PreflightError("ledger_changed", "Ledger identity changed")
             try:
-                data = read_stable_config(target, reject_duplicate_keys=True)
+                data = read_stable_config(target, reject_duplicate_keys=True,
+                                          trusted_boundary=boundary)
             except ConfigSnapshotError as exc:
                 if exc.code != "config_parse_error":
                     raise
                 data = None
-            after = current_file_marker(target)
+            after = current_file_marker(target, trusted_boundary=boundary)
             if before != after or (data is not None and data.marker != before):
                 raise PreflightError("ledger_changed", "Ledger changed during startup")
             return validated_or_unavailable(data, before)
@@ -4799,7 +4845,7 @@ def _capture_migration_guard(config_path, config_store, listen_cfg, legacy, init
             if initial_private is None or private != initial_private:
                 raise PreflightError("startup_config_changed", "Configuration changed before guard")
         business = _read_business_config(config_path)
-        paths = read_stable_config(_RUNTIME_PATHS_FILE)
+        paths = _read_runtime_paths_config()
         with config_store._lock:
             if (config_store._probe_marker != business.marker or config_store._config != business.config
                     or (_mac_business_enabled() and config_store._business_snapshot != business)):
@@ -4830,7 +4876,7 @@ def _verify_migration_guard(guard, config_path, config_store, listen_cfg, anchor
             private = None
         if (os.environ.get("MODEL_PROXY_PORT") != port or
                 _read_business_config(config_path) != business or
-                read_stable_config(_RUNTIME_PATHS_FILE) != paths):
+                _read_runtime_paths_config() != paths):
             raise PreflightError("startup_config_changed", "Startup configuration changed")
         with config_store._lock:
             if (config_store._probe_marker != business.marker or config_store._config != business.config
@@ -4867,7 +4913,7 @@ def _verify_migration_guard(guard, config_path, config_store, listen_cfg, anchor
         if _capture_migration_ledger(legacy.snapshot) != ledger:
             raise PreflightError("ledger_changed", "Ledger changed during startup")
         if (_business_marker(config_path) != business.marker or
-                current_file_marker(_RUNTIME_PATHS_FILE) != paths.marker):
+                _runtime_paths_marker() != paths.marker):
             raise PreflightError("startup_config_changed", "Startup configuration changed")
         if private is not None and _mac_private_config_snapshot(config_path) != private:
             raise PreflightError("startup_config_changed", "Configuration protection changed")

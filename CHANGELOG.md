@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.14 (2026-11-20)
+
+- macOS 和 Windows 入口统一到 Python CLI；日志、账本、锁、PID 及私有暂存/备份归入项目根 `.runtime/`。
+- 兼容 macOS 配置文件 xattr；2026-11-20 本机 master 首次切换至 `2450c38` 并启动成功。
+- Windows 配置读取 root boundary 已接入，经过 fake 验证；目前仅有虚拟 Win32 测试，尚未原生验收，不视为生产可用。
+
 ## 0.13 (2026-11-09)
 
 ### 跨协议链路语义保真与观测补齐（2026-11-06，a2r/r2a 全向）
@@ -26,7 +32,7 @@
 - **r2a item ID 前缀**：生成的 function_call item id 从 `item_` 改为 `fc_`
   （Responses 上游校验 fc 前缀，旧前缀导致跨上游历史回放 400）
 - **CLI status**：active sessions 行增加 `[token]` client 标注（区分 ClaudeCode/Codex）；
-  移除 protocol conversions 专属段与跨协议风险 hint（链路已无损，不再特别展示）；
+  移除 protocol conversions 专属段与跨协议风险 hint；
   route 后 strategy token 括注移除（与 client 标注重复）
 
 - **count_tokens 404 本地短接**：mcli 系网关不支持 `/v1/messages/count_tokens`（实测直接

@@ -4,12 +4,13 @@ version: 0.14
 ---
 # model_proxy
 
-**Version: 0.14**（与 `VERSION` 一致；本次重构尚未发布）
+**Version: 0.14**（2026-11-20，与 `VERSION` 一致）
 
-> **当前工作树状态**：Mac 统一 CLI 已在隔离副本通过假数据端到端回归，尚未部署。
-> Windows `.bat` 入口与同一套 Python CLI、锁、ACL 及控制链路已实现，但**只经过
-> 虚拟 Win32 后端测试，尚无原生 Windows 验收**，因此暂不作为可用的 Windows 服务
-> 发布。下述操作不要直接用于线上切换；部署节奏需另行确认。
+> **当前状态**：2026-11-20 本机 master 首次切换至 `2450c38` 并启动成功；真实日志已出现
+> A2R/R2A 成功，也有个别上游超时和 fable 路由 503，不能据此认定全部链路无异常或无损。
+> 本次正式切换使用外部临时一次性脚本；原仓 `macos_switch.sh` 仅做过假数据演练。
+> Windows `.bat` 与统一 Python CLI 等功能只经过**虚拟 Win32 后端测试，尚无原生
+> Windows 验收**；配置读取 root boundary 已接入，经过 fake 验证，不视为生产可用。
 >
 > 运行数据统一在项目根 `.runtime/`（日志、账本、锁、PID、CLI 私有的暂存与备份），
 > 不再写 `/tmp` 或系统临时目录。该目录由 CLI 独占创建并做私有权限校验，已加入
@@ -218,7 +219,7 @@ HTTP 200 后不再切换 supply：PASSTHROUGH 立即提交并逐块原样转发�
 - **停止风险**：`off` / `restart` 沿用 SIGTERM 停止，不做请求排空；在途流可能中断，
   已发生但尚未落盘的调用也可能漏记账。生产停服和重启由用户自行决定。
   （pref/thinking_strip 48h 学习记忆、cooldown、流健康计数全清，在途请求切断，停机窗口约 1-2s）。
-- **macOS 手动切换/回滚**：[操作指南](docs/MACOS_SWITCH_GUIDE.md)（已做新端口 mock 与脚本假数据测试；尚未实际生产切换，须由用户手动停服和启动）。
+- **macOS 手动切换/回滚**：[操作指南](docs/MACOS_SWITCH_GUIDE.md)；原仓 `macos_switch.sh` 仅做过假数据演练，本次正式切换使用外部临时一次性脚本。
 - supply test 归因+探测、stats 账本 schema 见 [CONFIG.md](docs/CONFIG.md)。
 - 日志写 `.runtime/model_proxy.log`（启动时截断保留末 5000 行），累计用量账本写 `.runtime/model_proxy_totals.json`；全部运行路径见 `config/runtime_paths.json`，默认都在项目根 `.runtime/` 下。日志级别、ACCESS 字段、translate 限流、token 统计等运维内容见
   `docs/designs/2026-07-22-access-log-and-latency.md`、
@@ -354,8 +355,8 @@ nc -vz <主机名>.local 18889   # 三端口各测一次；通则 TCP 可达
   按位置透传（原先静默丢弃）；工具 strict 语义 supply 级保真（Responses 上游缺省 strict:false +
   学习升级）；r2a 生成 function_call item id 用 `fc_` 前缀（跨上游历史回放兼容）。
 - **转换链路观测**：a2r/r2a 的 ACCESS 行补齐 `stop_reason` / `first_event_ms` /
-  `terminal_status`；builtin（`$route`）回执正确记录终态。跨协议链路已系统性实测无损
-  （system/strict/encrypted reasoning/工具/终态），2026-11-06 起 CLI status 不再对
+  `terminal_status`；builtin（`$route`）回执正确记录终态。system/strict/encrypted reasoning/
+  工具/终态等曾做专项验证，但不代表全部链路无损；2026-11-06 起 CLI status 不再对
   跨协议路径做特别风险提示。
 - **流式首事件及时性（Phase D）**：`HTTPResponse.read(amt)` 在 chunked 流上会跨块累积，
   导致转换链路首事件延迟到流近结束；四个流式 writer 已改用 `read1` 单次读取
