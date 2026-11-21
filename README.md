@@ -112,6 +112,23 @@ session override 的唯一来源是独立 sidecar 文件 `config/session_overrid
   （如 mcli/CatPaw：注入 `X-Working-Dir` 头与计费 system 块、鉴权值从本地登录态文件读取），
   完整语义与配置样例见 [docs/CONFIG.md](docs/CONFIG.md) 速查表与
   [docs/designs/2026-09-20-model_proxy接入mcli的supply层扩展.md](../docs/designs/2026-09-20-model_proxy接入mcli的supply层扩展.md)。
+
+  **CatPaw IDE 通道**（`provider: catpaw-ide`）走另一条路径：不用 appkey，改用本地动态库直连：
+
+  ```json
+  {
+    "id": "catpaw-ide-1",
+    "provider": "catpaw-ide",
+    "protocol": "anthropic",
+    "target_model": "<IDE 模型名>",
+    "credential_file": "~/.mtsso_keeper/catpaw_ide_session.json",
+    "bridge_lib": "~/.local/lib/libcatpaw_bridge.dylib"
+  }
+  ```
+
+  凭据由 `mtsso_keeper` 独占管理（登录 + 刷新），本代理**只读、不刷新**；凭据缺失/过期时
+  返回 500 且**不进 cooldown**（凭据问题不是上游故障，写冷却会误伤 failover）。
+  设计记录见 [docs/designs/2026-11-21-CatPaw-IDE凭据单点管理方案.md](../../docs/designs/2026-11-21-CatPaw-IDE凭据单点管理方案.md)。
 - **routes**：家族模板，固定 opus/sonnet/haiku 三档，每档一个按优先级排列的 supply id 列表，
   取第一个未冷却的；route 本身不含 token，可被多条 strategy 复用。
 - **strategies**：把某个 client_token 绑定到某个 route——可以绑单个 route（`route_id`），也可以

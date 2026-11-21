@@ -60,7 +60,8 @@ session override 存放在独立 sidecar 文件 `config/session_overrides.json`�
 | 字段 | 类型 | 必填 | 语义 | 默认值 |
 |---|---|---|---|---|
 | `id` | string | 必填 | 唯一标识，routes 里按 id 引用 | — |
-| `url` | string | 必填 | 完整终态请求端点，代理不做拼接，只在其后拼接净化后的原始 query | — |
+| `url` | string | 必填（`provider: catpaw-ide` 时不需要） | 完整终态请求端点，代理不做拼接，只在其后拼接净化后的原始 query | — |
+| `provider` | string | 可选 | 留空 = 原有 HTTP 路径；`catpaw-ide` = 走本地动态库直连 CatPaw IDE。其他值（含拼错）一律拒绝，不静默降级 | 留空 |
 | `protocol` | string | 可选 | `anthropic`/`chat`/`responses`，缺省从 url 尾缀推断，推断不出报 500 | 从 url 推断 |
 | `appkey` | string | 与 appkey_file 二选一 | 鉴权用 Bearer token（静态），注入转发请求 | — |
 | `appkey_file` | string | 与 appkey 二选一 | 鉴权值的文件来源：每请求读取（~ 展开），逐行匹配 `AUTHORIZATION:` 前缀取值（mcopilot-cli 登录态）。读取失败该请求 500 且不冷却 | — |
@@ -70,6 +71,11 @@ session override 存放在独立 sidecar 文件 `config/session_overrides.json`�
 | `system_inject` | string | 可选 | 注入计费标识等 system 块（前置合并进客户端 system，幂等）；仅 `protocol: anthropic` 的 supply 可配 | — |
 | `reasoning_capability.effort_enum` | string[] | 可选 | target 侧真实支持的 effort 档位有序列表 | 默认 5 档 `off/low/medium/high/xhigh` |
 | `reasoning_capability.off_alias` | string | 可选 | 关闭动作具体落到哪个档位 | 含 off 则落 off，否则不设（走 STRIP） |
+| `credential_file` | string | `catpaw-ide` 必填 | 凭据文件路径（`~` 展开），由 `mtsso_keeper` 产出与刷新；含 `accessToken`/`refreshToken`/`attestation`/`mis`/`expire`。每请求读取；缺失或 `expire` 已过则 500 且不冷却 | — |
+| `bridge_lib` | string | `catpaw-ide` 必填 | 桥动态库路径（`~` 展开）；惰性加载并校验 ABI 版本，仅配置了 IDE supply 时才加载 | — |
+
+`provider: catpaw-ide` 的 `credential_file`/`bridge_lib` 语义与部署方式见
+[docs/designs/2026-11-21-CatPaw-IDE凭据单点管理方案.md](../../docs/designs/2026-11-21-CatPaw-IDE凭据单点管理方案.md)。
 
 三个扩展字段的完整语义（合并矩阵/校验规则/失败语义）见
 [docs/designs/2026-09-20-model_proxy接入mcli的supply层扩展.md](../../docs/designs/2026-09-20-model_proxy接入mcli的supply层扩展.md)；
