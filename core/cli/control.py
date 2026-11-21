@@ -320,7 +320,8 @@ class MacControl:
                             'process exited; locks released; port release unknown'})
             code = exc.code if isinstance(exc.code, str) and exc.code in codes else 'control_failed'
             detail = exc.detail if (isinstance(exc.detail, str) and (exc.detail in details
-                or re.fullmatch(r'loaded=(yes|no|unknown), cooldown_cleared=(yes|no|unknown)', exc.detail))) else ''
+                or re.fullmatch(r'loaded=(yes|no|unknown), cooldown_cleared=(yes|no|unknown)'
+                                r'(, error=[a-z_]{1,40})?', exc.detail))) else ''
             print(f'Error: {command}: {code}' + (f'; {detail}' if detail else '') + '.', file=self.err)
         except platform_process.ProcessEvidenceError as exc:
             codes = {'invalid_process_identity', 'process_identity_unavailable', 'process_identity_changed',
@@ -696,7 +697,13 @@ class MacControl:
                 loaded, cleared = data.get('loaded'), data.get('cooldown_cleared')
                 def state(value):
                     return 'yes' if value is True else 'no' if value is False else 'unknown'
-                raise ControlError('reload_failed', f'loaded={state(loaded)}, cooldown_cleared={state(cleared)}')
+                # 只回显固定枚举错误码，绝不回显服务端原始文本（可能含路径/凭据）。
+                error = data.get('error') or data.get('load_error')
+                code = error if isinstance(error, str) and re.fullmatch(r'[a-z_]{1,40}', error) else ''
+                detail = f'loaded={state(loaded)}, cooldown_cleared={state(cleared)}'
+                if code:
+                    detail += f', error={code}'
+                raise ControlError('reload_failed', detail)
             if response.status != 200:
                 raise ControlError('status_failed')
             # Redact before JSON escaping, including token-bearing keys.

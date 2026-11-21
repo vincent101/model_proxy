@@ -604,18 +604,22 @@ class TestConfigValidationDualTrack(unittest.TestCase):
                 with self.assertRaises(ValueError):
                     ConfigStore(p)
 
-    def test_hot_reload_swallows_and_loads(self):
-        """热重载路径（_reload_locked 吞校验异常）：不崩，非法配置仍生效（已知降级）。"""
+    def test_hot_reload_rejects_and_keeps_old(self):
+        """热重载校验失败即拒绝（2026-11-22 语义变更：不再「吞异常照常生效」）。
+
+        旧行为允许一份启动期会被拒的配置热加载生效，实测造成 catpaw-ide 全量
+        500；现在必须拒绝并保留旧快照。
+        """
         with tempfile.TemporaryDirectory() as d:
             p = Path(d) / "cfg.json"
             p.write_text(json.dumps(self._cfg(_supply())), encoding="utf-8")
             p.chmod(0o600)
             cs = ConfigStore(p)
-            # 改写为非法配置（互斥）后强制热重载：不抛异常，新配置生效
             p.write_text(json.dumps(self._cfg(_supply(appkey_file=str(Path(tempfile.gettempdir()) / "fake-kf.yaml")))),
                          encoding="utf-8")
-            cs.reload()
-            self.assertEqual(cs.get_supply_map()["s1"].get("appkey_file"), str(Path(tempfile.gettempdir()) / "fake-kf.yaml"))
+            with self.assertLogs("core.server", level="WARNING"):
+                self.assertIs(cs.reload(), False)
+            self.assertIsNone(cs.get_supply_map()["s1"].get("appkey_file"))
 
     def test_legal_new_fields_load(self):
         """三新字段齐配的合法配置正常加载（mcli 形态）。"""

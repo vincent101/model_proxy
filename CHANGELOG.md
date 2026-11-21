@@ -1,5 +1,26 @@
 # Changelog
 
+## 0.16 (2026-11-22)
+
+### reload 校验失败即拒绝；provider 路径收敛；桥跨平台构建
+
+- **热重载改为「先校验、通过才提交」**：此前 `_reload_locked` 先替换内存快照，
+  校验异常只打 `config.validate raised (ignored, load still ok)` 告警，于是一份
+  启动期会被 fail-fast 拒掉的配置能成功热重载并生效（实测造成 catpaw-ide 全量
+  500 持续 13 分钟）。现在失败即回滚旧快照，返回 `config_rejected`（HTTP 422），
+  CLI 打印 `loaded=no, ..., error=config_rejected`。
+- **被拒文件按标记去重**：新增 `_rejected_marker`，同一份未改动的坏文件不会被
+  每个请求反复重读重告警；`_probe_marker` 始终等于「当前生效配置」的标记。
+- **provider 本机设置层** `config/provider_settings.json`：`credential_file` /
+  `bridge_lib` 从 supply 必填项降为可选覆盖，优先级
+  `supply > provider_settings.json > 模块默认值`；桥库默认值按平台取
+  `.dylib`/`.dll`/`.so`。9 条 provider supply 统一收敛为 4 字段。
+- **`requireCustomFridayAppid` 模型不再被过滤**：该标记只表示「账号需已开通
+  个人 Friday AppID」。此前 `ideModels` 无条件剔除，导致 `gpt-6.2-astra` 被误判
+  为「当前账号目录中没有该模型」；放开后实测正常出文。
+- **桥库跨平台构建**：新增 `build-catpaw-bridge` workflow（windows-latest +
+  MinGW-w64 / macos-14），c-shared 不能交叉编译，Windows 侧必须由 CI 产出。
+
 ## 0.15 (2026-11-21)
 
 ### CatPaw IDE 与 CLI 双 provider 接入；supply 配置减负

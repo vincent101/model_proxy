@@ -851,6 +851,10 @@ class ConfigStore:
         self._config: dict[str, Any] = {}
         self._mtime: float = 0.0
         self._probe_marker = None
+        # 最近一次「已读但被拒绝」的快照标记。与 _probe_marker 分开是为了让
+        # 热路径（maybe_reload）不反复重读同一份坏文件，同时保持
+        # _probe_marker 始终等于「当前生效配置」的标记（多处一致性检查依赖它）。
+        self._rejected_marker = None
         self._business_snapshot = None
         self._lock = threading.Lock()
         self._on_reload = on_reload
@@ -954,14 +958,14 @@ class ConfigStore:
             marker = _business_marker(self._path)
         except ConfigSnapshotError:
             return False
-        if marker == self._probe_marker:
+        if marker == self._probe_marker or marker == self._rejected_marker:
             return False
         with self._lock:
             try:
                 marker = _business_marker(self._path)
             except ConfigSnapshotError:
                 return False
-            if marker == self._probe_marker:
+            if marker == self._probe_marker or marker == self._rejected_marker:
                 return False
             outcome = self._reload_locked()
         if outcome.loaded and self._on_reload is not None:
@@ -1016,18 +1020,30 @@ class ConfigStore:
             return ConfigReloadOutcome(False, code)
 
         # A later path change is detected against the marker of the bytes read.
+        #
+        # 校验候选、通过后才提交（2026-11-22）：此前是先替换内存快照再
+        # 「校验失败只告警」，于是一份启动期会被拒的配置能成功热重载并生效。
+        # 现在失败即回滚到旧快照并返回 config_rejected；客户端的 reload 命令
+        # 因此能看到明确错误码，热路径也不会偷偷换上坏配置。
+        previous_config = self._config
         self._config = snapshot.config
-        self._business_snapshot = snapshot
-        self._probe_marker = snapshot.marker
-        self._mtime = snapshot.marker.mtime_ns / 1_000_000_000
         try:
             self._validate_config()
         except Exception as exc:
-            # Existing hot-reload behavior: validation warns, not rejection.
+            self._config = previous_config
+            # 记住这次被拒的标记：文件没再改就不必每次请求都重读+重告警。
+            # 用户修好文件后标记会变，热路径自然重试；显式 reload 也会重试。
+            self._rejected_marker = snapshot.marker
             try:
-                log.warning("config.validate raised (ignored, load still ok): %s", exc)
+                log.warning("config.reload.rejected reason=config_rejected detail=%s", exc)
             except Exception:
                 pass
+            return ConfigReloadOutcome(False, "config_rejected")
+
+        self._business_snapshot = snapshot
+        self._probe_marker = snapshot.marker
+        self._rejected_marker = None
+        self._mtime = snapshot.marker.mtime_ns / 1_000_000_000
         try:
             def safe_count(value):
                 try:
@@ -3746,7 +3762,7 @@ class ModelProxyHandler(BaseHTTPRequestHandler):
         load_error: str | None = None
         allowed = {"config_parse_error", "config_read_error", "config_unstable",
                    "file_identity_unavailable", "filesystem_unverified", "config_reload_error",
-                   "config_callback_error", "config_reload_unknown"}
+                   "config_callback_error", "config_reload_unknown", "config_rejected"}
         try:
             outcome = cs.reload_detailed()
             if not isinstance(outcome, ConfigReloadOutcome) or not isinstance(outcome.loaded, bool):
@@ -3789,7 +3805,10 @@ class ModelProxyHandler(BaseHTTPRequestHandler):
                 "cooldown_cleared": cooldown_cleared}
         if cooldown_cleared is None and load_error is not None:
             body["load_error"] = load_error
-        self._send_json(422 if error == "config_parse_error" else 500, body)
+        # 422：客户端给的配置本身有问题（解析失败/校验拒绝），重试同样输入无用；
+        # 500：读盘/未知错误，可能瞬时。两者都在 body 里给固定枚举错误码。
+        self._send_json(
+            422 if error in ("config_parse_error", "config_rejected") else 500, body)
 
     # ------------------------------------------------------------------
     # 写回（拷贝 proxy.py：流式 chunked 透传 / 缓冲响应）

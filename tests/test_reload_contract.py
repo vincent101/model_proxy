@@ -73,13 +73,64 @@ class ReloadContractTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             ConfigStore(self.path)
 
-    def test_hot_reload_invalid_supply_warns_and_commits(self):
+    def test_hot_reload_invalid_supply_is_rejected_and_keeps_old(self):
+        """2026-11-22 语义变更：热重载校验失败即拒绝，不再「告警但提交」。
+
+        此前一份启动期会被 fail-fast 拒掉的配置能成功热重载并生效（实测导致
+        catpaw-ide 全量 500）。现在必须保留旧快照并返回 config_rejected。
+        """
         store = ConfigStore(self.path)
+        old_config = store._config
+        marker = store._probe_marker
         self.write(fake_config("B", supplies=[invalid_supply()]))
         with self.assertLogs("core.server", level="WARNING"):
-            self.assertIs(store.reload(), True)
-        self.assertEqual(store._config["generation"], "B")
-        self.assertEqual(store.get_supply_map()["fake"]["appkey"], "FAKE_SECRET")
+            self.assertIs(store.reload(), False)
+        self.assertIs(store._config, old_config)
+        self.assertEqual(store._config["generation"], "A")
+        self.assertEqual(store._probe_marker, marker)
+        self.assertEqual(store.get_supply_map(), {})
+
+    def test_rejected_snapshot_is_not_reparsed_on_every_request(self):
+        """被拒文件未变时热路径不重复读盘，也不推进生效配置标记。"""
+        store = ConfigStore(self.path)
+        old_config, marker = store._config, store._probe_marker
+        self.write(fake_config("B", supplies=[invalid_supply()]))
+        self.assertFalse(store.maybe_reload())
+        self.assertIsNotNone(store._rejected_marker)
+        calls = []
+        import core.server as server_module
+        original = server_module._read_business_config
+        with patch("core.server._read_business_config",
+                   side_effect=lambda path: calls.append(path) or original(path)):
+            self.assertFalse(store.maybe_reload())
+        self.assertEqual(calls, [], "同一份被拒文件不该再读一次")
+        self.assertIs(store._config, old_config)
+        self.assertEqual(store._probe_marker, marker)
+
+    def test_fixing_rejected_file_takes_effect(self):
+        """用户改好文件后（marker 变化）热路径自动重新加载。"""
+        store = ConfigStore(self.path)
+        self.write(fake_config("B", supplies=[invalid_supply()]))
+        self.assertFalse(store.maybe_reload())
+        self.write(fake_config("C"))
+        self.assertTrue(store.maybe_reload())
+        self.assertEqual(store._config["generation"], "C")
+        self.assertIsNone(store._rejected_marker)
+
+    def test_manual_reload_reports_config_rejected(self):
+        store, cooldown = ConfigStore(self.path), FakeCooldown()
+        self.write(fake_config("B", supplies=[invalid_supply()]))
+        handler, sent = self.handler()
+        with self.assertLogs("core.server", level="WARNING"):
+            handler._handle_reload(store, cooldown)
+        status, body = sent[-1]
+        self.assertEqual(status, 422)
+        self.assertIs(body["ok"], False)
+        self.assertEqual(body["error"], "config_rejected")
+        self.assertIs(body["loaded"], False)
+        self.assertEqual(store._config["generation"], "A")
+        # 显式 reload 仍会清 cooldown（进程侧状态，与被拒配置无关）
+        self.assertEqual(cooldown.clear_calls, 1)
 
     def test_reload_returns_bool_and_failure_preserves_this_attempt_snapshot(self):
         store = ConfigStore(self.path)

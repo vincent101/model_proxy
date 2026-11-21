@@ -18,6 +18,29 @@ session override 存放在独立 sidecar 文件 `config/session_overrides.json`�
 `.bak.<随机后缀>`），不在被编辑文件的旁边生成。唯一例外：用户显式选择的外部配置目标，
 若其派生的 sidecar 与项目暂存跨卷，才在该目标父目录做一次经确认的私有短期暂存。
 
+### 1.1 reload 的失败语义（2026-11-22）
+
+热重载**先校验、通过才提交**。配置读得到但校验不过时，内存继续用旧配置，
+返回固定错误码而不是静默生效：
+
+| 结果 | HTTP | `error` | 说明 |
+|---|---|---|---|
+| 成功 | 200 | — | 新配置生效，cooldown 已清 |
+| 校验拒绝 | 422 | `config_rejected` | 旧配置继续跑；按提示修好后重试即可 |
+| 解析失败 | 422 | `config_parse_error` | JSON 不合法 |
+| 读盘/未知 | 500 | `config_reload_error` 等 | 可能瞬时，可重试 |
+
+同一份被拒文件，请求热路径**不会**反复重读（按文件标记去重）；文件一改，下一次
+请求或显式 `reload` 自然重试。CLI 会把这些错误码原样打印：
+
+```
+$ model_proxy_cli.sh reload
+Error: reload: reload_failed; loaded=no, cooldown_cleared=yes, error=config_rejected.
+```
+
+手动 `reload` 进入认证 handler 后即使加载失败也会清 cooldown（那是进程状态，
+与被拒配置无关）；后续请求触发的自动重载不会清。
+
 ## 2. supplies 字段
 
 一个供给单元 = 一个上游端点。
