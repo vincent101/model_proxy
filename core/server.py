@@ -42,6 +42,11 @@ from typing import Any, Callable
 from . import claudian_titles
 from . import session_identity
 from . import translate as pt
+from .providers import (CATPAW_CLI, CATPAW_IDE, LEGACY_HTTP,
+                        is_provider, resolve_handler, wire_protocol)
+from .providers import catpaw_cli as cli_provider
+from .providers import catpaw_ide as ide_provider
+from .providers import http_compat as _http_compat
 from .item_id_normalize import sanitize_responses_input_ids
 from .thinking_guard import (
     CountTokensUnsupportedStore,
@@ -1790,10 +1795,16 @@ def select_supply_for_operation(supplies: list, supply_map: dict, cooldown: "Coo
 
 
 def detect_target(supply: dict) -> str:
-    """target 协议：优先显式 supply["protocol"]，否则从 supply["url"] 尾缀推断
-    （唯一权威实现见 core.reasoning.registry.resolve_protocol，本函数不重复判断逻辑）。
+    """supply → 上游线协议。
+
+    - provider supply（catpaw-cli / catpaw-ide）→ 模块内置的线协议（恒 anthropic）
+    - legacy → 显式 supply["protocol"] 或从 url 尾缀推断
+      （唯一权威实现见 core.reasoning.registry.resolve_protocol，本函数不重复判断）
     推断失败时抛 ValueError，由调用方（_forward）捕获并转为合法错误响应。
     """
+    handler = resolve_handler(supply)
+    if is_provider(handler):
+        return wire_protocol(handler)
     return resolve_protocol(supply)
 
 
@@ -1804,18 +1815,44 @@ def detect_target(supply: dict) -> str:
 
 # extra_headers 禁键（小写比较）：鉴权归 appkey/appkey_file 管，避免双来源
 # 冲突；content-length 由 body 长度决定，不可覆盖。
-_EXTRA_HEADER_FORBIDDEN_KEYS = {"authorization", "x-api-key", "content-length"}
+_EXTRA_HEADER_FORBIDDEN_KEYS = _http_compat.FORBIDDEN_EXTRA_HEADERS
 
 
 def validate_supply_ext(supply: dict) -> None:
-    """supply 层扩展字段校验（extra_headers / system_inject / appkey_file）。
+    """supply 层扩展字段校验，按处理模块分流。
 
     与 _validate_config 既有容错校验（log.warning 不阻断加载）不同，本组
     校验 raise ValueError：启动路径 fail-fast 阻断加载；热重载路径由
     _reload_locked 吞异常降级为 warning（已知接受）。_config_ops.py 的
     supply_add/supply_edit 写盘前调用同款校验拒写盘（单一真相源）。
+
+    provider supply（catpaw-cli / catpaw-ide）的端点、凭据、header、注入全部
+    内置在模块中，因此这些字段出现即视为配置错误——宁可报错也不静默忽略。
     """
     sid = supply.get("id", "")
+    # 未知 protocol 在这里暴露（拼错不得静默降级为 legacy）
+    handler = resolve_handler(supply)
+
+    if is_provider(handler):
+        if handler == CATPAW_CLI:
+            cli_provider.validate_supply(supply)
+            cli_provider.target_model_of(supply)
+            return
+        # catpaw-ide：凭据由 mtsso_keeper 写入 credential_file，本代理只读。
+        if supply.get("url") or supply.get("appkey") or supply.get("appkey_file"):
+            raise ValueError(
+                f"supply {sid}: catpaw-ide 不支持 url/appkey/appkey_file"
+                "（端点内置、凭据由 keeper 管理）")
+        if supply.get("extra_headers") or supply.get("system_inject"):
+            raise ValueError(
+                f"supply {sid}: catpaw-ide 不支持 extra_headers/system_inject")
+        if not supply.get("credential_file"):
+            raise ValueError(f"supply {sid}: catpaw-ide 须配置 credential_file")
+        if not supply.get("bridge_lib"):
+            raise ValueError(f"supply {sid}: catpaw-ide 须配置 bridge_lib")
+        return
+
+    # ---- legacy：原有校验逐字保留 ----
     eh = supply.get("extra_headers")
     if eh is not None:
         if not isinstance(eh, dict):
@@ -1834,6 +1871,7 @@ def validate_supply_ext(supply: dict) -> None:
             raise ValueError(
                 f"supply {sid}: system_inject 仅支持 anthropic 协议 supply"
                 f"（当前 {protocol}）")
+
     has_appkey = bool(supply.get("appkey"))
     has_appkey_file = bool(supply.get("appkey_file"))
     if has_appkey and has_appkey_file:
@@ -1845,65 +1883,19 @@ def validate_supply_ext(supply: dict) -> None:
 def inject_system_block(body_json: dict, text: str) -> bool:
     """system_inject：向 body["system"] 前置合并注入块（幂等，原地修改）。
 
-    合并矩阵（设计记录 §2）：
-    - system 缺省 / 空数组 → [inject_block]
-    - 字符串 → [inject_block, {"type":"text","text":原值}]
-    - 非空数组 → 首块 text == 注入文本 → 跳过（幂等硬约束：budget_retry /
-      failover 重试复用同一 body_json，重复注入会叠加计费标识块）；
-      否则前置插入
-    - 首块畸形（非 dict）→ 视为不匹配 → 前置插入
-    返回是否发生修改（False = 幂等跳过；未知形态不动）。
+    实现已抽到 core.providers.http_compat（legacy 与 catpaw-cli 共用），
+    此处保留同名导出以兼容既有调用方与测试。完整合并矩阵见该模块 docstring。
     """
-    inject_block = {"type": "text", "text": text}
-    system = body_json.get("system")
-    if system is None or (isinstance(system, list) and not system):
-        body_json["system"] = [inject_block]
-        return True
-    if isinstance(system, str):
-        body_json["system"] = [inject_block, {"type": "text", "text": system}]
-        return True
-    if isinstance(system, list):
-        first = system[0]
-        if isinstance(first, dict) and first.get("text") == text:
-            return False
-        body_json["system"] = [inject_block] + system
-        return True
-    return False
+    return _http_compat.inject_system_block(body_json, text)
 
 
 def resolve_appkey(supply: dict) -> str:
     """出站鉴权值：appkey 直取，或 appkey_file 每请求读取解析。
 
-    - appkey_file 支持 ~ 展开（os.path.expanduser）；逐行 strip 后精确匹配
-      "AUTHORIZATION:" 前缀取值（目标文件非标准 YAML，勿用 yaml 库；
-      与 CatpawCLI token store 同款策略，无缓存）。
-    - 失败（文件不存在 / 无 AUTHORIZATION 行 / 值为空）抛 ValueError（消息含
-      supply id 与原因），调用方出站前 500 返回、不进 cooldown（配置问题
-      非上游问题，冷却会误伤 failover）。
-    - appkey 与 appkey_file 均缺 → 返回 ""（维持历史空串照发行为；必填由
-      validate_supply_ext 在加载/写盘层把关，热重载降级路径不额外拦截）。
+    实现已抽到 core.providers.http_compat（legacy 与 catpaw-cli 共用），
+    此处保留同名导出以兼容既有调用方（含 core/cli/_config_ops.py）。
     """
-    appkey = supply.get("appkey")
-    if appkey:
-        return appkey
-    appkey_file = supply.get("appkey_file")
-    if not appkey_file:
-        return ""
-    sid = supply.get("id", "")
-    path = os.path.expanduser(appkey_file)
-    try:
-        with open(path, "r", encoding="utf-8") as f:
-            lines = f.readlines()
-    except OSError as e:
-        raise ValueError(f"supply {sid} appkey_file 读取失败: {e}") from e
-    for line in lines:
-        line = line.strip()
-        if line.startswith("AUTHORIZATION:"):
-            token = line[len("AUTHORIZATION:"):].strip()
-            if token:
-                return token
-            raise ValueError(f"supply {sid} appkey_file 读取失败: AUTHORIZATION 值为空")
-    raise ValueError(f"supply {sid} appkey_file 读取失败: 无 AUTHORIZATION 行")
+    return _http_compat.resolve_appkey(supply)
 
 
 def pick_translator(source: str, target: str) -> str:
@@ -2244,7 +2236,7 @@ class ModelProxyHandler(BaseHTTPRequestHandler):
         """
         self._acc = {
             "status": 0, "source": "", "operation": "", "route": "", "tier": "",
-            "supply": "", "target_protocol": "", "conversion_kind": "",
+            "supply": "", "provider": "", "target_protocol": "", "conversion_kind": "",
             "failover": 0, "attempts": 0, "token": "",
             "usage_in": 0, "usage_out": 0,
             "strategy": "", "session": "", "route_failover": 0,
@@ -2304,7 +2296,7 @@ class ModelProxyHandler(BaseHTTPRequestHandler):
             ms = int((time.monotonic() - t0) * 1000)
             access_log.info(
                 "ACCESS ms=%d status=%s source=%s operation=%s route=%s tier=%s supply=%s "
-                "target_protocol=%s conversion_kind=%s failover=%s attempts=%s "
+                "provider=%s target_protocol=%s conversion_kind=%s failover=%s attempts=%s "
                 "usage_in=%s usage_out=%s token=%s session=%s "
                 "route_failover=%s builtin=%s budget_retried=%s budget_truncated=%s "
                 "stop_reason=%s final_error=%s body_error=%s nudge_rewritten=%s "
@@ -2312,7 +2304,7 @@ class ModelProxyHandler(BaseHTTPRequestHandler):
                 "response_committed=%s "
                 "stream_integrity=%s terminal_status=%s terminal_reason=%s first_event_ms=%s",
                 ms, a["status"], a["source"], a["operation"],
-                a["route"], a["tier"], a["supply"],
+                a["route"], a["tier"], a["supply"], a.get("provider", ""),
                 a["target_protocol"], a["conversion_kind"], a["failover"], a["attempts"],
                 a["usage_in"], a["usage_out"], a["token"], a["session"],
                 a["route_failover"], a["builtin"], a["budget_retried"],
@@ -2370,6 +2362,22 @@ class ModelProxyHandler(BaseHTTPRequestHandler):
             self._acc["conversion_kind"] = protocol_conversion_kind("anthropic", target)
             # 该 supply 已学到不支持 count_tokens → 本地直接 404，不打上游
             # （实测 mcli 返 404；客户端拿不到即本地估算，行为等价，省一次往返）。
+            # catpaw-ide 上游只支持 /messages（Catboss 对非 messages 端点直接 404），
+            # 无需先打一次再学习：本地短接，语义与 learned 404 一致。
+            try:
+                _ct_handler = resolve_handler(supply)
+                if _ct_handler == CATPAW_IDE:
+                    self._acc["final_error"] = "count_tokens_unsupported_local"
+                    self._write_buffered_response(
+                        404, [], error_body_for_source(
+                            "anthropic", 404,
+                            f"count_tokens not supported by supply {sid} (catpaw-ide)"))
+                    return
+            except ValueError as e:
+                self._acc["final_error"] = str(e)
+                self._write_buffered_response(
+                    500, [], error_body_for_source("anthropic", 500, str(e)))
+                return
             _ct_store = getattr(self.server, "count_tokens_store", None)
             if _ct_store is not None and _ct_store.snapshot(sid):
                 self._acc["final_error"] = "count_tokens_unsupported_local"
@@ -2400,15 +2408,10 @@ class ModelProxyHandler(BaseHTTPRequestHandler):
                 self._write_buffered_response(
                     500, [], error_body_for_source("anthropic", 500, str(e)))
                 return
-            headers = {k: v for k, v in self.headers.items()
-                       if k.lower() not in {"host", "content-length", "authorization", "x-api-key"}}
-            headers.update({"Authorization": f"Bearer {appkey}", "x-api-key": appkey,
-                            "Content-Type": "application/json", "Content-Length": str(len(send_body))})
-            # extra_headers：supply 声明的出站 header，最高优先（跳过 content-length）
-            for k, v in (supply.get("extra_headers") or {}).items():
-                if k.lower() == "content-length":
-                    continue
-                headers[k] = v
+            # 与 _forward 共用同一 header 构造（count_tokens body 恒为 JSON）
+            headers = _http_compat.build_standard_headers(
+                self.headers, appkey, len(send_body),
+                converted=True, extra_headers=supply.get("extra_headers"))
             req = urllib.request.Request(target_url, data=send_body, headers=headers, method=method)
             try:
                 resp = urllib.request.urlopen(req, timeout=cs.get_upstream_timeout())
@@ -2762,6 +2765,24 @@ class ModelProxyHandler(BaseHTTPRequestHandler):
                 supply_id = supply.get("id", "")
                 self._acc["supply"] = supply_id
                 self._acc["attempts"] += 1
+                # 处理模块选择：未知 protocol 在加载/写盘层已拒；热重载吞异常后
+                # 这里再校验一次，避免把拼错的 protocol 当 legacy 发出去。
+                try:
+                    _handler = resolve_handler(supply)
+                    if _handler == CATPAW_CLI:
+                        # 把模块内置常量展开成 legacy 可直接消费的形态：
+                        # 之后 resolve_appkey / inject_system_block /
+                        # build_standard_headers / target_url 全部走原路径，
+                        # 无需为 CLI 增加任何分支。
+                        cli_provider.validate_supply(supply)
+                        cli_provider.target_model_of(supply)
+                        supply = cli_provider.materialize(supply)
+                except (ValueError, cli_provider.ConfigError) as e:
+                    log.error("resolve_handler failed: supply=%s err=%s", supply_id, e)
+                    self._write_buffered_response(
+                        500, [], error_body_for_source(source, 500, str(e)))
+                    return
+                self._acc["provider"] = _handler
                 try:
                     target = detect_target(supply)
                 except ValueError as e:
@@ -2953,46 +2974,57 @@ class ModelProxyHandler(BaseHTTPRequestHandler):
                     send_body = json.dumps(anthropic_body, ensure_ascii=False).encode("utf-8")
                     # target_url 已在分支前统一算好（supply.url 现在已是完整 /v1/messages 端点）
 
-                # ---- 注入出站 appkey（Authorization Bearer + x-api-key）----
-                # appkey 直取 / appkey_file 每请求读取；失败出站前 500、不进
-                # cooldown（配置问题非上游问题，同 detect_target 失败先例）
-                try:
-                    appkey = resolve_appkey(supply)
-                except ValueError as e:
-                    log.error("resolve_appkey failed: supply=%s err=%s", supply_id, e)
-                    self._write_buffered_response(
-                        500, [], error_body_for_source(source, 500, str(e)))
-                    return
-                _skip_req_headers = {"host", "content-length", "authorization", "x-api-key"}
-                fwd_headers: dict[str, str] = {}
-                for key, val in self.headers.items():
-                    if key.lower() in _skip_req_headers:
-                        continue
-                    fwd_headers[key] = val
-                fwd_headers["Authorization"] = f"Bearer {appkey}"
-                fwd_headers["x-api-key"] = appkey
-                fwd_headers["Content-Length"] = str(len(send_body))
-                if mode != PASSTHROUGH:
-                    # 转换后 body 一律 JSON
-                    fwd_headers["Content-Type"] = "application/json"
-                # extra_headers：supply 声明的出站 header，最高优先——覆盖透传值
-                # 与内置注入（含转换路径的 Content-Type）；content-length 由 body
-                # 长度决定，跳过不覆盖
-                for k, v in (supply.get("extra_headers") or {}).items():
-                    if k.lower() == "content-length":
-                        continue
-                    fwd_headers[k] = v
-
-                req = urllib.request.Request(
-                    url=target_url,
-                    data=send_body if send_body else None,
-                    headers=fwd_headers,
-                    method=method,
-                )
-
-                try:
-                    resp = urllib.request.urlopen(req, timeout=cs.get_upstream_timeout())  # 缺省30min,对齐 API_TIMEOUT_MS
+                # ---- 出站鉴权与传输：按 provider 静态分流 ----
+                # legacy_http：原有 appkey + urllib 路径，逐字不变。
+                # catpaw_ide：凭据只读 + Go 桥（Anthropic 进 / Anthropic 出）。
+                #   不注入 appkey、不刷新凭据；失败 500 且**不进 cooldown**
+                #   （凭据/配置问题不是上游故障，写 cooldown 会误伤 failover）。
+                req = None
+                if _handler == CATPAW_IDE:
+                    try:
+                        _cred = ide_provider.read_credential(
+                            supply.get("credential_file", ""))
+                        resp = ide_provider.start_request(
+                            supply.get("bridge_lib", ""), _cred, send_body)
+                    except (ide_provider.CredentialError,
+                            ide_provider.BridgeError) as e:
+                        log.error("catpaw-ide failed: supply=%s err=%s", supply_id, e)
+                        self._acc["final_error"] = f"catpaw_ide: {e}"
+                        self._write_buffered_response(
+                            500, [], error_body_for_source(source, 500, str(e)))
+                        return
                     resp_status = resp.status
+                    resp_headers = resp.getheaders()
+                else:
+                    # appkey 直取 / appkey_file 每请求读取；失败出站前 500、不进
+                    # cooldown（配置问题非上游问题，同 detect_target 失败先例）
+                    try:
+                        appkey = resolve_appkey(supply)
+                    except ValueError as e:
+                        log.error("resolve_appkey failed: supply=%s err=%s", supply_id, e)
+                        self._write_buffered_response(
+                            500, [], error_body_for_source(source, 500, str(e)))
+                        return
+                    # header 构造已抽到 http_compat（legacy 与 catpaw-cli 共用）：
+                    # 剔除客户端鉴权/长度 → 双认证注入 → Content-Length →
+                    # 转换时强制 JSON → extra_headers 最后覆盖（跳过 content-length）
+                    fwd_headers = _http_compat.build_standard_headers(
+                        self.headers, appkey, len(send_body),
+                        converted=(mode != PASSTHROUGH),
+                        extra_headers=supply.get("extra_headers"))
+
+                    req = urllib.request.Request(
+                        url=target_url,
+                        data=send_body if send_body else None,
+                        headers=fwd_headers,
+                        method=method,
+                    )
+
+                try:
+                    # IDE 已在上面拿到 resp；legacy 走 urllib（缺省30min,对齐 API_TIMEOUT_MS）
+                    if req is not None:
+                        resp = urllib.request.urlopen(req, timeout=cs.get_upstream_timeout())
+                        resp_status = resp.status
                 except urllib.error.HTTPError as e:
                     resp_status = e.code
                     resp_headers = list(e.headers.items())
