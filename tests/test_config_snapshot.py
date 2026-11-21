@@ -102,8 +102,22 @@ class StableConfigSnapshotTests(unittest.TestCase):
              patch.object(module, "_windows_snapshot", return_value=sentinel) as read:
             self.assertIs(read_stable_config(r"C:\fixture\config.json",
                                              reject_duplicate_keys=True), sentinel)
+            # trusted_boundary 是后加的透传口（默认 None 也要显式传下去，
+            # 否则 Windows 侧无法把配置读取限制在项目目录内）。
             read.assert_called_once_with(r"C:\fixture\config.json", with_data=True,
-                                         reject_duplicate_keys=True)
+                                         reject_duplicate_keys=True, trusted_boundary=None)
+
+    def test_windows_public_reader_forwards_trusted_boundary(self):
+        import core.config_snapshot as module
+        sentinel = object()
+        boundary = r"C:\fixture"
+        with patch.object(module.os, "name", "nt"), \
+             patch.object(module, "_windows_snapshot", return_value=sentinel) as read:
+            self.assertIs(read_stable_config(r"C:\fixture\config.json",
+                                             trusted_boundary=boundary), sentinel)
+            read.assert_called_once_with(r"C:\fixture\config.json", with_data=True,
+                                         reject_duplicate_keys=False,
+                                         trusted_boundary=boundary)
 
     def test_invalid_json_non_object_and_invalid_utf8_are_sanitized(self):
         for contents in (b'{"secret":"FAKE_SECRET",', b'[]', b'null', b'\xff'):

@@ -1,12 +1,30 @@
 ---
 created: 2026-07-17 18:52:18
-version: 0.15
+version: 0.16
 ---
 # model_proxy
 
-本地模型代理：按客户端 token、会话和模型档位选择上游，提供协议转换、故障切换和用量统计。版本见 [VERSION](VERSION)。
+本地模型代理。一句话：**把多个上游模型包装成本地一个端点，由它决定这次请求
+实际打到哪个模型。**
 
-**五种协议组合**（行是客户端入站，列是上游）：
+支持 Anthropic / OpenAI Chat / OpenAI Responses 三种线协议，多客户端
+（Claude Code、Codex、Hermes、OpenClaw…）共用一个端口，互不干扰。
+
+## 核心能力
+
+| 能力 | 说明 |
+|---|---|
+| **多客户端共用** | 每个客户端拿一个 `client_token`，各走自己的 strategy/route，互不影响 |
+| **按会话选路** | `route_pool` 按会话哈希稳定分配；对话里发 `$route <id>` 可临时固定本会话线路 |
+| **档位路由** | 请求模型只认 `claude-{fable,opus,sonnet,haiku}` 四档，实际上游模型由供给决定（可跨厂商） |
+| **协议转换** | Anthropic ↔ Responses ↔ Chat 双向转换，客户端协议与上游协议解耦 |
+| **故障切换** | 供给按顺序尝试；命中冷却规则即标记坏供给并换下一个，坏供给在 `status` 里可见 |
+| **正文错误识别** | 上游 200 但正文是"限流/额度/模型不存在"等语义错误 → 按虚拟错误码冷却，不当作成功 |
+| **effort 映射** | 客户端档位按**相对排名**映射到上游档位，不同供应商档位数量不一致也不会错位 |
+| **用量观测** | 每请求一条 ACCESS 日志 + 独立 token 账本，可按天/月统计；`status` 汇总失败率与活跃会话 |
+| **三类上游接入** | 标准 HTTP（自带 url/appkey）、`catpaw-cli`（mcli 网关）、`catpaw-ide`（CatPaw IDE，凭据由 mtsso_keeper 管） |
+
+上游协议组合矩阵（行是客户端入站，列是上游；每条通路都有流式和非流式实现）：
 
 | 入站 \ 上游 | Anthropic | OpenAI Chat | OpenAI Responses |
 |---|---|---|---|
@@ -14,7 +32,15 @@ version: 0.15
 | OpenAI `/v1/responses` | 转换 | 501 | 同协议 |
 | Chat（不支持入站） | 501 | 501 | 501 |
 
-支持项有流式和非流式实现，但转换不保证语义等价或所有功能组合可用；同协议也会改写模型、推理字段及部分签名或 item ID，并非字节透传。Mac 有实际使用证据，但不是所有上游与功能的验收；**Windows 仅有虚拟 Win32/fake 等测试，未原生验收，只供测试，不用于生产**。
+## 边界与限制
+
+- **转换有损**：跨协议会改写模型名、推理字段、部分签名和 item ID，
+  不保证语义等价；同协议也不是字节透传。
+- **只做模型路由，不做鉴权中心**：`client_token` 是路由查表键，不是密钥校验；
+  上游 `appkey`/`appkey_file` 只供出站，绝不能发给客户端。
+- **流一旦提交就不能换供给**：切换发生在响应开始之前；流内失败只影响后续请求。
+- **Mac 有真实使用证据；Windows 尚未原生验收**，当前只供测试，不用于生产。
+- 支持范围以本文档与 [CONFIG](docs/CONFIG.md) 为准，未列出的功能组合不保证可用。
 
 [首次跑通](#首次跑通一次请求) · [接入客户端](#接入其他客户端或手动配置) · [选路与会话](#换上游模型档位或当前会话) · [运维排错](#查看状态更新配置处理失败) · [远程使用](#从另一台电脑使用) · [深入文档](#深入文档)
 
@@ -60,7 +86,17 @@ if exist config\model_proxy_config.json (echo 配置已存在，未覆盖) else 
 1. 示例是 `listen.host: "0.0.0.0"` 加空 `allow_hosts`，**原样会拒绝启动**。本机使用改成 `127.0.0.1`；远程使用见[下文](#从另一台电脑使用)。
 2. 为要使用的 supply 填入真实上游完整端点、`target_model` 和 `appkey` 或 `appkey_file`；示例不是可用凭据。示例 `nation1` 的 `sonnet` 还引用 mcli：不用 mcli 时先从该 route 的 tier 列表移除引用，再删除其 supply。使用 mcli 时需有效登录态；`appkey_file`、`extra_headers`、`system_inject` 示例在配置样例中，不应假设本机已有登录态。
 
-   mcli 供应也可改写成 `protocol: catpaw-cli`——端点、`appkey_file`、`X-Working-Dir`、计费 system 块全部内置到模块，supply 只留 `id`/`protocol`/`target_model`/`reasoning_capability`。CatPaw IDE 另用 `protocol: catpaw-ide`，supply 同样是这 4 个字段——凭据与桥库路径由模块默认值给出（换机器改 `config/provider_settings.json`，样例见 `config/provider_settings.example.json`；桥动态库由 `build-catpaw-bridge` workflow 按平台产出，见 [CONFIG](docs/CONFIG.md#桥库从哪来)）。两者的凭据都由 `mtsso_keeper` 维护，本代理只读不刷新。字段与内置值见 [CONFIG](docs/CONFIG.md#两个-catpaw-provider)。
+   **内网两条免配置通道**（端点、鉴权、header、计费块都在模块里，supply 只写 4 个字段）：
+
+   | protocol | 用途 | 凭据来源 |
+   |---|---|---|
+   | `catpaw-cli` | mcli 网关（Claude / GLM / Kimi / DeepSeek…） | `~/.config/mcopilot-cli/.config.yaml` |
+   | `catpaw-ide` | CatPaw IDE（GPT / Gemini / LongCat…） | `~/.mtsso_keeper/catpaw_ide_session.json` + 桥库 |
+
+   两者凭据都由 `mtsso_keeper` 维护，本代理只读不刷新；路径默认内置，换机器改
+   `config/provider_settings.json`（样例 `provider_settings.example.json`）。桥库由
+   `build-catpaw-bridge` workflow 按平台产出，见 [CONFIG](docs/CONFIG.md#桥库从哪来)；
+   字段与内置值见 [两个 CatPaw provider](docs/CONFIG.md#两个-catpaw-provider)。
 3. 设置相互独立的随机强 `admin_token` 和 strategy `client_token`，核对 routes、tiers 和 supplies 的引用。示例 strategy 使用 `route_pool`，不是单值 `route_id`。
 4. 密钥和配置不得提交或分享。Mac 保持私有文件权限；Windows 私有 ACL 检查失败时不要绕过或反复重试：记录并脱敏错误，参考 [Windows 路径与 ACL 限制](docs/designs/2026-11-16-model-proxy-Windows路径ACL默认目录兼容方案.md)（草稿，非已验收修复步骤），必要时请管理员协助核对路径和权限。Windows 尚未原生验收。
 

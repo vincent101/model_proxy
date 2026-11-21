@@ -773,8 +773,10 @@ def _test_authorized_write(path, operation='route-edit'):
     from core.cli import _config_ops, dispatch
     from core.mac_config_path import open_target_parent
     from core.mac_config_writer import WriteAuthorization
-    project = os.path.dirname(os.path.abspath(path))
-    project = os.path.dirname(os.path.abspath(path))
+    # 生产不变量是「ROOT 绝对且已解析」；macOS 上 tempfile 给的是
+    # /var/folders/...，其 resolve() 是 /private/var/folders/...，用 abspath
+    # 会构造出一个未解析的伪项目根，被 _config_write_evidence 直接拒掉。
+    project = os.path.dirname(os.path.realpath(path))
     os.makedirs(os.path.join(project, 'config'), exist_ok=True)
     os.makedirs(os.path.join(project, '.runtime'), mode=0o700, exist_ok=True)
     paths = {key: os.path.join(project, '.runtime', key)
