@@ -60,6 +60,29 @@ _WRITE_ERROR_CODES = frozenset((
 ))
 
 
+_PROVENANCE_ATTR = b'com.apple.provenance'
+
+
+def _provenance_stable(attrs):
+    """把 Apple 的 provenance 属性从相等性比较里剔除。
+
+    ``com.apple.provenance`` 由 macOS 按**创建者**（responsible process）附着，
+    其值随创建上下文变化：同一个终端里连续的进程取值相同，换一个启动上下文
+    （launchd / 另一个终端 / IDE 内置终端）就不同。它不是文件内容或权限的属性，
+    也不参与本模块的任何授权判定。
+
+    如果要求新旧文件的 provenance **值**相等，等价于「只有最初创建该文件的
+    那个启动上下文才能再写它」——换上下文后写入永久失败（实测：账本从某次
+    restart 起所有提交都返回 NOT_APPLIED，日志只有一句 PENDING）。
+
+    因此比较时剔除该属性；**其他任何扩展属性仍然必须完全相等**，
+    `_mac_fd_protection` 也继续拒绝 provenance 以外的所有属性。
+    """
+    if attrs is None:
+        return None
+    return tuple((name, value) for name, value in attrs if name != _PROVENANCE_ATTR)
+
+
 def _safe_write_error_code(exc, *, default='filesystem_or_backend_error'):
     try:
         code = getattr(exc, 'code', None)
@@ -687,7 +710,8 @@ def _open_private(parent_fd: int, name: str, contents: bytes, mode: int, uid: in
             raise SecureSnapshotError('new_file_permissions_unverified')
         checked = (_mac_fd_protection(fd, directory=False, business_config_xattrs=True)
                    if business_config_xattrs else _mac_fd_protection(fd, directory=False))
-        if expected_attrs is not None and checked[-1] != expected_attrs:
+        if (expected_attrs is not None
+                and _provenance_stable(checked[-1]) != _provenance_stable(expected_attrs)):
             raise SecureSnapshotError('extended_attributes_unverified')
         if copy_xattrs_from_fd is not None:
             try:
@@ -719,7 +743,7 @@ def _open_private(parent_fd: int, name: str, contents: bytes, mode: int, uid: in
             raise SecureSnapshotError('new_file_permissions_unverified')
         after_proof = (_mac_fd_protection(fd, directory=False, business_config_xattrs=True)
                        if business_config_xattrs else _mac_fd_protection(fd, directory=False))
-        if after_proof[-1] != checked[-1]:
+        if _provenance_stable(after_proof[-1]) != _provenance_stable(checked[-1]):
             raise SecureSnapshotError('extended_attributes_unverified')
         identity = (after.st_dev, after.st_ino)
     except BaseException as exc:
@@ -767,8 +791,10 @@ def _verify_private_entry(fd, name, identity, contents, expected, *, business_co
                 return _mac_fd_protection(file_fd, directory=False, business_config_xattrs=True)
             return _mac_fd_protection(file_fd, directory=False)
         proof = protection()
-        if ((stat.S_IMODE(proof[2]), proof[3], proof[4], proof[6], proof[8])
-                != expected):
+        if ((stat.S_IMODE(proof[2]), proof[3], proof[4], proof[6],
+             _provenance_stable(proof[8]))
+                != (expected[0], expected[1], expected[2], expected[3],
+                    _provenance_stable(expected[4]))):
             raise SecureSnapshotError('staging_protection_mismatch')
         data = bytearray()
         while len(data) <= len(contents):
@@ -971,7 +997,9 @@ def secure_replace_runtime(snapshot: TargetSnapshot, new_bytes: bytes, *, max_by
                         or final.parents != snapshot.parents
                         or (final.protection.token[0], final.protection.token[1],
                             final.protection.token[2], final.protection.token[3],
-                            final.protection.token[-1]) != expected):
+                            _provenance_stable(final.protection.token[-1]))
+                        != (expected[0], expected[1], expected[2], expected[3],
+                            _provenance_stable(expected[4]))):
                     raise SecureSnapshotError('postcheck_failed')
                 verify_dirs()
                 if backup_id:

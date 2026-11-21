@@ -2,6 +2,29 @@
 
 ## 0.16 (2026-11-22)
 
+### 修复统计账本停止落盘（provenance 跨启动上下文）
+
+**现象**：`.runtime/model_proxy_totals.json` 从某次 restart 起不再更新，
+日志只有每分钟一句 `usage_totals.persistence state=PENDING`，`stats` 与
+`status` 的失败率都停在旧数据上。
+
+**根因**：`com.apple.provenance` 由 macOS 按**创建者**（responsible process）
+附着，其值随启动上下文变化——同一个终端里连续进程取值相同，换一个上下文
+（launchd / 另一个终端 / IDE 内置终端）就不同。写入链要求新建的 staging 文件
+扩展属性与目标文件**逐字节相等**，于是「换个终端重启」之后，所有提交恒返回
+`NOT_APPLIED`，账本永久停写。因为失败码没有落日志，只能看到一个 PENDING。
+
+**修复**：
+- 扩展属性比较时剔除 `com.apple.provenance`（`_provenance_stable`）。
+  其余任何扩展属性仍必须完全相等，`_mac_fd_protection` 也继续拒绝
+  provenance 以外的属性——「不许出现意外 xattr」这条不变量不变。
+- 提交失败补可诊断日志：`usage_totals.commit.failed kind= code= stage= outcome=`，
+  只输出 `secure_files._WRITE_ERROR_CODES` 内的固定枚举（复用既有白名单，
+  不新造一套），同码 60s 内不重复；**绝不打路径或异常文本**。
+
+**实测**：修复前 `stats today` 停在 11-21；修复后重启即恢复，`CLEAN` 状态
+正常，`stats today` 有实时数据。
+
 ### status 改为「在用供给健康表」
 
 - **替换 `degraded supplies` 段**：原来只列失败率超阈值的供给，健康项完全不显示。

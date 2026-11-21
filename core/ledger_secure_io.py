@@ -13,6 +13,7 @@ import json
 import logging
 import os
 import sys
+import time
 from pathlib import Path
 
 
@@ -35,6 +36,55 @@ def _resource_unknown(exc):
 
 class LedgerIOError(RuntimeError):
     """Sanitized ledger adapter error; never includes contents or paths."""
+
+
+# 提交失败只有固定枚举可进日志：路径/内容/异常文本都可能含凭据或用户目录。
+# 复用 secure_files 已有的「可安全落日志的错误码」集合，避免两处枚举漂移；
+# 再补上 ledger 适配层与 guard 自己会抛的码。
+_LEDGER_EXTRA_CODES = frozenset({
+    'baseline_changed', 'ledger_invalid', 'ledger_invalid_snapshot',
+    'resource_release_unverified', 'platform_or_guard_unavailable',
+    'target_not_supported', 'cross_volume_not_authorized',
+    'ledger_changed', 'ledger_unverified', 'ledger_guard_unverified',
+    'runtime_drift', 'config_path_conflict', 'config_path_unknown',
+    'locks_unverified', 'lock_identity_changed', 'callback_error', 'unknown',
+})
+
+
+def _safe_codes():
+    try:
+        from core import secure_files
+        base = secure_files._WRITE_ERROR_CODES
+    except Exception:
+        base = frozenset()
+    return base | _LEDGER_EXTRA_CODES
+
+
+def _commit_code(exc):
+    """把提交异常收敛成一个可安全落日志的固定枚举。
+
+    只接受「已知枚举内的 code」——**绝不**取 ``str(exc)``：它可能带路径，
+    而路径里可能有用户名。未知 code 一律折叠成 ``unknown``。
+    """
+    code = getattr(exc, 'code', None)
+    if isinstance(code, str) and code in _safe_codes():
+        return code
+    return 'unknown'
+
+
+_LAST_COMMIT_CODE = {'value': None}
+
+
+def _log_commit_failure(kind, exc, stage, outcome):
+    """只记固定枚举；同一 code 连续失败时不刷屏（每 60s 至多一条）。"""
+    code = _commit_code(exc)
+    now = time.monotonic()
+    previous = _LAST_COMMIT_CODE.get('value')
+    if previous and previous[0] == code and now - previous[1] < 60:
+        return
+    _LAST_COMMIT_CODE['value'] = (code, now)
+    log.warning('usage_totals.commit.failed kind=%s code=%s stage=%s outcome=%s',
+                kind, code, stage, outcome)
 
 
 def _unique(pairs):
@@ -202,6 +252,8 @@ class MacLedgerSecureIO:
                 self._quarantine_resources()
             unknown = exc.state != 'NOT_REPLACED' or resource_unknown
             candidate = self._candidate(exc.candidate, payload, data) if payload is not None and unknown else None
+            _log_commit_failure('secure_write', exc, exc.state,
+                                'UNKNOWN' if unknown else 'NOT_APPLIED')
             return LedgerCommitResult('UNKNOWN' if unknown else 'NOT_APPLIED', candidate)
         except Exception as exc:
             # An unclassified interruption inside the writer also leaves its
@@ -209,6 +261,8 @@ class MacLedgerSecureIO:
             resource_unknown = _resource_unknown(exc) or entered
             if resource_unknown:
                 self._quarantine_resources()
+            _log_commit_failure('unclassified', exc, 'entered' if entered else 'pre_entry',
+                                'UNKNOWN' if resource_unknown else 'NOT_APPLIED')
             return LedgerCommitResult('UNKNOWN' if resource_unknown else 'NOT_APPLIED')
         candidate = self._candidate(outcome.candidate, payload, data)
         try:
