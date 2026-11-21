@@ -1,6 +1,6 @@
 """catpaw-ide 走 ModelProxyHandler._forward 全链路（脱网络）。
 
-上游是 Go 桥 + pocfake 假 transport：验证 supply.provider 分派、凭据只读、
+上游是 Go 桥 + pocfake 假 transport：验证 supply.protocol 分派、凭据只读、
 Anthropic 流式/非流式写回，以及失败不进 cooldown。
 """
 import io
@@ -146,7 +146,7 @@ class TestIdeForward(unittest.TestCase):
         shutil.rmtree(cls.tmp, ignore_errors=True)
 
     def _ide_supply(self):
-        return {"id": "ide1", "provider": "catpaw-ide", "protocol": "anthropic",
+        return {"id": "ide1", "protocol": "catpaw-ide",
                 "credential_file": _cred(self.tmp),
                 "bridge_lib": str(self.lib), "target_model": "gpt-6.2-sol"}
 

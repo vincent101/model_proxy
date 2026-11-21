@@ -16,7 +16,7 @@ HERE = Path(__file__).resolve().parent
 ROOT = HERE.parent
 sys.path.insert(0, str(ROOT))
 
-from core.providers import resolve_provider, LEGACY_HTTP, CATPAW_IDE
+from core.providers import resolve_handler, LEGACY_HTTP, CATPAW_IDE
 from core.providers import catpaw_ide as ide
 
 GO_DIR = ROOT / "core" / "providers" / "catpaw_ide" / "go"
@@ -40,19 +40,27 @@ def _cred(expire_delta=3600 * 24):
     }
 
 
-class TestResolveProvider(unittest.TestCase):
+class TestResolveHandler(unittest.TestCase):
     def test_legacy_when_absent(self):
-        self.assertEqual(resolve_provider({}), LEGACY_HTTP)
-        self.assertEqual(resolve_provider({"provider": ""}), LEGACY_HTTP)
+        self.assertEqual(resolve_handler({}), LEGACY_HTTP)
+        self.assertEqual(resolve_handler({"protocol": ""}), LEGACY_HTTP)
+
+    def test_legacy_protocols_stay_legacy(self):
+        for v in ("anthropic", "chat", "responses"):
+            self.assertEqual(resolve_handler({"protocol": v}), LEGACY_HTTP, v)
 
     def test_ide_variants(self):
         for v in ("catpaw-ide", "catpaw_ide", " CatPaw-IDE "):
-            self.assertEqual(resolve_provider({"provider": v}), CATPAW_IDE, v)
+            self.assertEqual(resolve_handler({"protocol": v}), CATPAW_IDE, v)
+
+    def test_cli_variants(self):
+        for v in ("catpaw-cli", "catpaw_cli", " CatPaw-CLI "):
+            self.assertEqual(resolve_handler({"protocol": v}), "catpaw_cli", v)
 
     def test_unknown_rejected(self):
-        for v in ("catpaw-cli", "CatPaw IDE", "catpawid"):
+        for v in ("CatPaw IDE", "catpawid", "catpaw"):
             with self.assertRaises(ValueError, msg=v):
-                resolve_provider({"provider": v})
+                resolve_handler({"protocol": v})
 
 
 class TestCredential(unittest.TestCase):

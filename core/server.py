@@ -42,7 +42,9 @@ from typing import Any, Callable
 from . import claudian_titles
 from . import session_identity
 from . import translate as pt
-from .providers import CATPAW_IDE, LEGACY_HTTP, resolve_provider
+from .providers import (CATPAW_CLI, CATPAW_IDE, LEGACY_HTTP,
+                        is_provider, resolve_handler, wire_protocol)
+from .providers import catpaw_cli as cli_provider
 from .providers import catpaw_ide as ide_provider
 from .providers import http_compat as _http_compat
 from .item_id_normalize import sanitize_responses_input_ids
@@ -1793,10 +1795,16 @@ def select_supply_for_operation(supplies: list, supply_map: dict, cooldown: "Coo
 
 
 def detect_target(supply: dict) -> str:
-    """target 协议：优先显式 supply["protocol"]，否则从 supply["url"] 尾缀推断
-    （唯一权威实现见 core.reasoning.registry.resolve_protocol，本函数不重复判断逻辑）。
+    """supply → 上游线协议。
+
+    - provider supply（catpaw-cli / catpaw-ide）→ 模块内置的线协议（恒 anthropic）
+    - legacy → 显式 supply["protocol"] 或从 url 尾缀推断
+      （唯一权威实现见 core.reasoning.registry.resolve_protocol，本函数不重复判断）
     推断失败时抛 ValueError，由调用方（_forward）捕获并转为合法错误响应。
     """
+    handler = resolve_handler(supply)
+    if is_provider(handler):
+        return wire_protocol(handler)
     return resolve_protocol(supply)
 
 
@@ -1811,14 +1819,40 @@ _EXTRA_HEADER_FORBIDDEN_KEYS = _http_compat.FORBIDDEN_EXTRA_HEADERS
 
 
 def validate_supply_ext(supply: dict) -> None:
-    """supply 层扩展字段校验（extra_headers / system_inject / appkey_file）。
+    """supply 层扩展字段校验，按处理模块分流。
 
     与 _validate_config 既有容错校验（log.warning 不阻断加载）不同，本组
     校验 raise ValueError：启动路径 fail-fast 阻断加载；热重载路径由
     _reload_locked 吞异常降级为 warning（已知接受）。_config_ops.py 的
     supply_add/supply_edit 写盘前调用同款校验拒写盘（单一真相源）。
+
+    provider supply（catpaw-cli / catpaw-ide）的端点、凭据、header、注入全部
+    内置在模块中，因此这些字段出现即视为配置错误——宁可报错也不静默忽略。
     """
     sid = supply.get("id", "")
+    # 未知 protocol 在这里暴露（拼错不得静默降级为 legacy）
+    handler = resolve_handler(supply)
+
+    if is_provider(handler):
+        if handler == CATPAW_CLI:
+            cli_provider.validate_supply(supply)
+            cli_provider.target_model_of(supply)
+            return
+        # catpaw-ide：凭据由 mtsso_keeper 写入 credential_file，本代理只读。
+        if supply.get("url") or supply.get("appkey") or supply.get("appkey_file"):
+            raise ValueError(
+                f"supply {sid}: catpaw-ide 不支持 url/appkey/appkey_file"
+                "（端点内置、凭据由 keeper 管理）")
+        if supply.get("extra_headers") or supply.get("system_inject"):
+            raise ValueError(
+                f"supply {sid}: catpaw-ide 不支持 extra_headers/system_inject")
+        if not supply.get("credential_file"):
+            raise ValueError(f"supply {sid}: catpaw-ide 须配置 credential_file")
+        if not supply.get("bridge_lib"):
+            raise ValueError(f"supply {sid}: catpaw-ide 须配置 bridge_lib")
+        return
+
+    # ---- legacy：原有校验逐字保留 ----
     eh = supply.get("extra_headers")
     if eh is not None:
         if not isinstance(eh, dict):
@@ -1837,22 +1871,6 @@ def validate_supply_ext(supply: dict) -> None:
             raise ValueError(
                 f"supply {sid}: system_inject 仅支持 anthropic 协议 supply"
                 f"（当前 {protocol}）")
-    # provider 静态选择：未知值必须拒绝（拼错不得静默降级为 HTTP）。
-    kind = resolve_provider(supply)
-    if kind == CATPAW_IDE:
-        # IDE 不走 appkey：凭据由 mtsso_keeper 写入 credential_file，本代理只读。
-        if supply.get("appkey") or supply.get("appkey_file"):
-            raise ValueError(
-                f"supply {sid}: catpaw-ide 不使用 appkey/appkey_file（凭据由 keeper 管理）")
-        if not supply.get("credential_file"):
-            raise ValueError(f"supply {sid}: catpaw-ide 须配置 credential_file")
-        if not supply.get("bridge_lib"):
-            raise ValueError(f"supply {sid}: catpaw-ide 须配置 bridge_lib")
-        # 桥只产出 Anthropic 形态；显式声明避免 url 推断带来的歧义。
-        if resolve_protocol(supply) != "anthropic":
-            raise ValueError(
-                f"supply {sid}: catpaw-ide 的 protocol 必须为 anthropic")
-        return
 
     has_appkey = bool(supply.get("appkey"))
     has_appkey_file = bool(supply.get("appkey_file"))
@@ -2347,7 +2365,8 @@ class ModelProxyHandler(BaseHTTPRequestHandler):
             # catpaw-ide 上游只支持 /messages（Catboss 对非 messages 端点直接 404），
             # 无需先打一次再学习：本地短接，语义与 learned 404 一致。
             try:
-                if resolve_provider(supply) == CATPAW_IDE:
+                _ct_handler = resolve_handler(supply)
+                if _ct_handler == CATPAW_IDE:
                     self._acc["final_error"] = "count_tokens_unsupported_local"
                     self._write_buffered_response(
                         404, [], error_body_for_source(
@@ -2746,15 +2765,24 @@ class ModelProxyHandler(BaseHTTPRequestHandler):
                 supply_id = supply.get("id", "")
                 self._acc["supply"] = supply_id
                 self._acc["attempts"] += 1
-                # provider 静态选择：未知值在加载/写盘层已拒；热重载吞异常后
-                # 这里再校验一次，避免把拼错的 provider 当 legacy 发出去。
+                # 处理模块选择：未知 protocol 在加载/写盘层已拒；热重载吞异常后
+                # 这里再校验一次，避免把拼错的 protocol 当 legacy 发出去。
                 try:
-                    _provider_kind = resolve_provider(supply)
-                except ValueError as e:
-                    log.error("resolve_provider failed: supply=%s err=%s", supply_id, e)
+                    _handler = resolve_handler(supply)
+                    if _handler == CATPAW_CLI:
+                        # 把模块内置常量展开成 legacy 可直接消费的形态：
+                        # 之后 resolve_appkey / inject_system_block /
+                        # build_standard_headers / target_url 全部走原路径，
+                        # 无需为 CLI 增加任何分支。
+                        cli_provider.validate_supply(supply)
+                        cli_provider.target_model_of(supply)
+                        supply = cli_provider.materialize(supply)
+                except (ValueError, cli_provider.ConfigError) as e:
+                    log.error("resolve_handler failed: supply=%s err=%s", supply_id, e)
                     self._write_buffered_response(
                         500, [], error_body_for_source(source, 500, str(e)))
                     return
+                self._acc["provider"] = _handler
                 try:
                     target = detect_target(supply)
                 except ValueError as e:
@@ -2952,7 +2980,7 @@ class ModelProxyHandler(BaseHTTPRequestHandler):
                 #   不注入 appkey、不刷新凭据；失败 500 且**不进 cooldown**
                 #   （凭据/配置问题不是上游故障，写 cooldown 会误伤 failover）。
                 req = None
-                if _provider_kind == CATPAW_IDE:
+                if _handler == CATPAW_IDE:
                     try:
                         _cred = ide_provider.read_credential(
                             supply.get("credential_file", ""))
