@@ -42,6 +42,14 @@ func (c *Client) resolveCatpawResource(ctx context.Context, id string, a Auth, f
 	if !Is(id) || FridayID(id) && a.AppIDOnly() {
 		return a, nil
 	}
+	// [model_proxy 本地改动] 凭据由 mtsso_keeper 维护时不刷新；仍要求四项齐全，残缺即拒绝。
+	// 位置必须早于 Sessions 分支与 force 重试，否则 401 后仍会自动刷新。
+	if c.NoRefresh {
+		if !a.Metadata.OIDC.valid() {
+			return Auth{}, catpawLoginRequired()
+		}
+		return a, nil
+	}
 	if c.Sessions != nil {
 		original := a
 		s, err := c.Sessions.Resolve(ctx, a.Metadata.OIDC, id, force, func(s *CatpawSession, refresh bool) error {

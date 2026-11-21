@@ -187,8 +187,11 @@ type Client struct {
 	AuthorizationStage func(string)
 	Sessions           *SharedSSOStore
 	AuthScope          string
-	AuthUpdated        func(context.Context, Auth, Auth) error
-	owned              *CatpawSession
+	// NoRefresh 表示凭据由外部管理器（如 mtsso_keeper）维护：本客户端只做
+	// 齐全性校验，不发起 SSO 刷新。用于 model_proxy 这类只读消费方。
+	NoRefresh   bool
+	AuthUpdated func(context.Context, Auth, Auth) error
+	owned       *CatpawSession
 }
 
 func (c *Client) authorizationStage(stage string) {
