@@ -2,20 +2,18 @@
 
 package main
 
-// POC_FAKE=1 时把上游换成确定性假服务，仅用于离线回归；正式构建不带此标签。
+// 带 pocfake 标签的构建一律使用确定性假上游，**永不触网**。
+// 构建标签本身就是开关：正式构建不含本文件。去掉环境变量门是刻意的——
+// 若依赖 POC_FAKE 环境变量，误漏该变量会让假 token 打到真实上游。
 import (
 	"io"
 	"net/http"
-	"os"
 	"strings"
 
 	"catboss/bridge"
 )
 
 func init() {
-	if os.Getenv("POC_FAKE") != "1" {
-		return
-	}
 	bridge.TransportFactory = func() *http.Client { return &http.Client{Transport: fakeTransport{}} }
 }
 

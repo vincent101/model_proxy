@@ -42,6 +42,8 @@ from typing import Any, Callable
 from . import claudian_titles
 from . import session_identity
 from . import translate as pt
+from .providers import CATPAW_IDE, LEGACY_HTTP, resolve_provider
+from .providers import catpaw_ide as ide_provider
 from .item_id_normalize import sanitize_responses_input_ids
 from .thinking_guard import (
     CountTokensUnsupportedStore,
@@ -1834,6 +1836,23 @@ def validate_supply_ext(supply: dict) -> None:
             raise ValueError(
                 f"supply {sid}: system_inject 仅支持 anthropic 协议 supply"
                 f"（当前 {protocol}）")
+    # provider 静态选择：未知值必须拒绝（拼错不得静默降级为 HTTP）。
+    kind = resolve_provider(supply)
+    if kind == CATPAW_IDE:
+        # IDE 不走 appkey：凭据由 mtsso_keeper 写入 credential_file，本代理只读。
+        if supply.get("appkey") or supply.get("appkey_file"):
+            raise ValueError(
+                f"supply {sid}: catpaw-ide 不使用 appkey/appkey_file（凭据由 keeper 管理）")
+        if not supply.get("credential_file"):
+            raise ValueError(f"supply {sid}: catpaw-ide 须配置 credential_file")
+        if not supply.get("bridge_lib"):
+            raise ValueError(f"supply {sid}: catpaw-ide 须配置 bridge_lib")
+        # 桥只产出 Anthropic 形态；显式声明避免 url 推断带来的歧义。
+        if resolve_protocol(supply) != "anthropic":
+            raise ValueError(
+                f"supply {sid}: catpaw-ide 的 protocol 必须为 anthropic")
+        return
+
     has_appkey = bool(supply.get("appkey"))
     has_appkey_file = bool(supply.get("appkey_file"))
     if has_appkey and has_appkey_file:
@@ -2370,6 +2389,21 @@ class ModelProxyHandler(BaseHTTPRequestHandler):
             self._acc["conversion_kind"] = protocol_conversion_kind("anthropic", target)
             # 该 supply 已学到不支持 count_tokens → 本地直接 404，不打上游
             # （实测 mcli 返 404；客户端拿不到即本地估算，行为等价，省一次往返）。
+            # catpaw-ide 上游只支持 /messages（Catboss 对非 messages 端点直接 404），
+            # 无需先打一次再学习：本地短接，语义与 learned 404 一致。
+            try:
+                if resolve_provider(supply) == CATPAW_IDE:
+                    self._acc["final_error"] = "count_tokens_unsupported_local"
+                    self._write_buffered_response(
+                        404, [], error_body_for_source(
+                            "anthropic", 404,
+                            f"count_tokens not supported by supply {sid} (catpaw-ide)"))
+                    return
+            except ValueError as e:
+                self._acc["final_error"] = str(e)
+                self._write_buffered_response(
+                    500, [], error_body_for_source("anthropic", 500, str(e)))
+                return
             _ct_store = getattr(self.server, "count_tokens_store", None)
             if _ct_store is not None and _ct_store.snapshot(sid):
                 self._acc["final_error"] = "count_tokens_unsupported_local"
@@ -2762,6 +2796,15 @@ class ModelProxyHandler(BaseHTTPRequestHandler):
                 supply_id = supply.get("id", "")
                 self._acc["supply"] = supply_id
                 self._acc["attempts"] += 1
+                # provider 静态选择：未知值在加载/写盘层已拒；热重载吞异常后
+                # 这里再校验一次，避免把拼错的 provider 当 legacy 发出去。
+                try:
+                    _provider_kind = resolve_provider(supply)
+                except ValueError as e:
+                    log.error("resolve_provider failed: supply=%s err=%s", supply_id, e)
+                    self._write_buffered_response(
+                        500, [], error_body_for_source(source, 500, str(e)))
+                    return
                 try:
                     target = detect_target(supply)
                 except ValueError as e:
@@ -2953,46 +2996,69 @@ class ModelProxyHandler(BaseHTTPRequestHandler):
                     send_body = json.dumps(anthropic_body, ensure_ascii=False).encode("utf-8")
                     # target_url 已在分支前统一算好（supply.url 现在已是完整 /v1/messages 端点）
 
-                # ---- 注入出站 appkey（Authorization Bearer + x-api-key）----
-                # appkey 直取 / appkey_file 每请求读取；失败出站前 500、不进
-                # cooldown（配置问题非上游问题，同 detect_target 失败先例）
-                try:
-                    appkey = resolve_appkey(supply)
-                except ValueError as e:
-                    log.error("resolve_appkey failed: supply=%s err=%s", supply_id, e)
-                    self._write_buffered_response(
-                        500, [], error_body_for_source(source, 500, str(e)))
-                    return
-                _skip_req_headers = {"host", "content-length", "authorization", "x-api-key"}
-                fwd_headers: dict[str, str] = {}
-                for key, val in self.headers.items():
-                    if key.lower() in _skip_req_headers:
-                        continue
-                    fwd_headers[key] = val
-                fwd_headers["Authorization"] = f"Bearer {appkey}"
-                fwd_headers["x-api-key"] = appkey
-                fwd_headers["Content-Length"] = str(len(send_body))
-                if mode != PASSTHROUGH:
-                    # 转换后 body 一律 JSON
-                    fwd_headers["Content-Type"] = "application/json"
-                # extra_headers：supply 声明的出站 header，最高优先——覆盖透传值
-                # 与内置注入（含转换路径的 Content-Type）；content-length 由 body
-                # 长度决定，跳过不覆盖
-                for k, v in (supply.get("extra_headers") or {}).items():
-                    if k.lower() == "content-length":
-                        continue
-                    fwd_headers[k] = v
-
-                req = urllib.request.Request(
-                    url=target_url,
-                    data=send_body if send_body else None,
-                    headers=fwd_headers,
-                    method=method,
-                )
-
-                try:
-                    resp = urllib.request.urlopen(req, timeout=cs.get_upstream_timeout())  # 缺省30min,对齐 API_TIMEOUT_MS
+                # ---- 出站鉴权与传输：按 provider 静态分流 ----
+                # legacy_http：原有 appkey + urllib 路径，逐字不变。
+                # catpaw_ide：凭据只读 + Go 桥（Anthropic 进 / Anthropic 出）。
+                #   不注入 appkey、不刷新凭据；失败 500 且**不进 cooldown**
+                #   （凭据/配置问题不是上游故障，写 cooldown 会误伤 failover）。
+                req = None
+                if _provider_kind == CATPAW_IDE:
+                    try:
+                        _cred = ide_provider.read_credential(
+                            supply.get("credential_file", ""))
+                        resp = ide_provider.start_request(
+                            supply.get("bridge_lib", ""), _cred, send_body)
+                    except (ide_provider.CredentialError,
+                            ide_provider.BridgeError) as e:
+                        log.error("catpaw-ide failed: supply=%s err=%s", supply_id, e)
+                        self._acc["final_error"] = f"catpaw_ide: {e}"
+                        self._write_buffered_response(
+                            500, [], error_body_for_source(source, 500, str(e)))
+                        return
                     resp_status = resp.status
+                    resp_headers = resp.getheaders()
+                else:
+                    # appkey 直取 / appkey_file 每请求读取；失败出站前 500、不进
+                    # cooldown（配置问题非上游问题，同 detect_target 失败先例）
+                    try:
+                        appkey = resolve_appkey(supply)
+                    except ValueError as e:
+                        log.error("resolve_appkey failed: supply=%s err=%s", supply_id, e)
+                        self._write_buffered_response(
+                            500, [], error_body_for_source(source, 500, str(e)))
+                        return
+                    _skip_req_headers = {"host", "content-length", "authorization", "x-api-key"}
+                    fwd_headers: dict[str, str] = {}
+                    for key, val in self.headers.items():
+                        if key.lower() in _skip_req_headers:
+                            continue
+                        fwd_headers[key] = val
+                    fwd_headers["Authorization"] = f"Bearer {appkey}"
+                    fwd_headers["x-api-key"] = appkey
+                    fwd_headers["Content-Length"] = str(len(send_body))
+                    if mode != PASSTHROUGH:
+                        # 转换后 body 一律 JSON
+                        fwd_headers["Content-Type"] = "application/json"
+                    # extra_headers：supply 声明的出站 header，最高优先——覆盖透传值
+                    # 与内置注入（含转换路径的 Content-Type）；content-length 由 body
+                    # 长度决定，跳过不覆盖
+                    for k, v in (supply.get("extra_headers") or {}).items():
+                        if k.lower() == "content-length":
+                            continue
+                        fwd_headers[k] = v
+
+                    req = urllib.request.Request(
+                        url=target_url,
+                        data=send_body if send_body else None,
+                        headers=fwd_headers,
+                        method=method,
+                    )
+
+                try:
+                    # IDE 已在上面拿到 resp；legacy 走 urllib（缺省30min,对齐 API_TIMEOUT_MS）
+                    if req is not None:
+                        resp = urllib.request.urlopen(req, timeout=cs.get_upstream_timeout())
+                        resp_status = resp.status
                 except urllib.error.HTTPError as e:
                     resp_status = e.code
                     resp_headers = list(e.headers.items())

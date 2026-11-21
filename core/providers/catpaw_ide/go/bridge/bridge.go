@@ -22,6 +22,9 @@ type Request struct {
 	Auth         json.RawMessage `json:"auth"`
 	Body         json.RawMessage `json:"body"`
 	Conversation string          `json:"conversation,omitempty"`
+	// NoRefresh 由 Python 侧固定传 true：凭据由 mtsso_keeper 维护，
+	// 桥只做齐全性校验，不发起 SSO 刷新。
+	NoRefresh bool `json:"noRefresh,omitempty"`
 }
 
 type handle struct {
@@ -79,6 +82,7 @@ func Start(req Request) (int64, error) {
 		httpReq.Header.Set("X-Catboss-Conversation", req.Conversation)
 	}
 	c := sankuai.New(TransportFactory())
+	c.NoRefresh = req.NoRefresh
 	res, err := c.RoundTrip(httpReq, "catpaw-ide", auth)
 	if err != nil {
 		cancel()

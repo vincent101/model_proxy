@@ -36,9 +36,11 @@ func copyErr(buf *C.char, n C.int, msg string) {
 
 //export CatpawStart
 func CatpawStart(auth, body, conversation, errBuf *C.char, errLen C.int) C.int64_t {
+	// model_proxy 的固定用法：凭据由 mtsso_keeper 维护，桥不刷新。
 	req := bridge.Request{
-		Auth: json.RawMessage(C.GoString(auth)),
-		Body: json.RawMessage(C.GoString(body)),
+		Auth:      json.RawMessage(C.GoString(auth)),
+		Body:      json.RawMessage(C.GoString(body)),
+		NoRefresh: true,
 	}
 	if conversation != nil {
 		req.Conversation = C.GoString(conversation)
