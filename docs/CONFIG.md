@@ -217,7 +217,7 @@ supply **只声明差异**：
 }
 ```
 
-`errorcode` 为非空数组（HTTP 状态码或非空字符串），`cooldown_seconds` 为正整数；按顺序首条匹配，空数组不是兜底。正文错误须先由 `body_error_rules` 识别，其错误码也须匹配冷却规则才能触发相应冷却和切换。实际切换还取决于 route 的 `failover` 和可用供给。供给级 `cooldown_seconds` 和旧顶层 `default_cooldown_seconds` 不参与当前规则。
+`errorcode` 为非空数组（HTTP 状态码或非空字符串），`cooldown_seconds` 为正整数；按顺序首条匹配，空数组不是兜底。正文错误须先由 `body_error_rules` 识别，其错误码也须匹配冷却规则才能触发相应冷却和切换。**正文识别对 `200` 正常响应与上游非 2xx 错误体同样生效**：非 2xx 命中规则时优先按规则里的虚拟 `errorcode` 取冷却时长，未命中才回落 HTTP 状态码——例如把「模型未在账号目录」这类确定性错误配成 6 小时冷却，避免按 400 的 5 秒冷却反复重试同一坏供给。实际切换还取决于 route 的 `failover` 和可用供给。供给级 `cooldown_seconds` 和旧顶层 `default_cooldown_seconds` 不参与当前规则。
 
 完整样例见 [配置样例](../config/model_proxy_config.example.json)。
 

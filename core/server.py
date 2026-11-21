@@ -15,6 +15,7 @@ import copy
 import errno
 import hashlib
 import hmac
+import io
 import ipaddress
 import json
 import logging
@@ -2980,21 +2981,32 @@ class ModelProxyHandler(BaseHTTPRequestHandler):
                 #   不注入 appkey、不刷新凭据；失败 500 且**不进 cooldown**
                 #   （凭据/配置问题不是上游故障，写 cooldown 会误伤 failover）。
                 req = None
+                resp = None
+                _ide_upstream_error = None
                 if _handler == CATPAW_IDE:
                     try:
                         _cred = ide_provider.read_credential(
                             supply.get("credential_file", ""))
                         resp = ide_provider.start_request(
                             supply.get("bridge_lib", ""), _cred, send_body)
+                    except ide_provider.UpstreamError as e:
+                        # 上游非 2xx：转成 HTTPError，复用它下方的冷却/failover 处理。
+                        # 否则 IDE 供给排在第 2 位时，模型不可用会把客户端卡死在 500。
+                        _ide_upstream_error = urllib.error.HTTPError(
+                            target_url, e.status, "catpaw-ide upstream",
+                            {}, io.BytesIO(e.body.encode("utf-8")))
                     except (ide_provider.CredentialError,
                             ide_provider.BridgeError) as e:
+                        # 凭据/桥问题不是上游故障：快速失败，不冷却也不 failover
+                        # （failover 会静默换模型，掩盖凭据过期这类配置问题）。
                         log.error("catpaw-ide failed: supply=%s err=%s", supply_id, e)
                         self._acc["final_error"] = f"catpaw_ide: {e}"
                         self._write_buffered_response(
                             500, [], error_body_for_source(source, 500, str(e)))
                         return
-                    resp_status = resp.status
-                    resp_headers = resp.getheaders()
+                    if _ide_upstream_error is None:
+                        resp_status = resp.status
+                        resp_headers = resp.getheaders()
                 else:
                     # appkey 直取 / appkey_file 每请求读取；失败出站前 500、不进
                     # cooldown（配置问题非上游问题，同 detect_target 失败先例）
@@ -3021,6 +3033,9 @@ class ModelProxyHandler(BaseHTTPRequestHandler):
                     )
 
                 try:
+                    # IDE 上游非 2xx 已转成 HTTPError，在此抛出以复用下方处理
+                    if _ide_upstream_error is not None:
+                        raise _ide_upstream_error
                     # IDE 已在上面拿到 resp；legacy 走 urllib（缺省30min,对齐 API_TIMEOUT_MS）
                     if req is not None:
                         resp = urllib.request.urlopen(req, timeout=cs.get_upstream_timeout())
@@ -3079,6 +3094,25 @@ class ModelProxyHandler(BaseHTTPRequestHandler):
                             continue  # 重新走 while 循环：select_supply 会再次选中同一 supply，
                                       # 重新算 reasoning_wire 时 select_variant 命中刚学到的偏好，
                                       # 自动改对语法后重发
+
+                    # 上游非 2xx 的正文同样过 body_error_rules：允许把
+                    # "模型不可用/目录无此模型" 这类**确定性**错误映射成虚拟
+                    # errorcode，配更长冷却（如 21600s），避免按 400 的 5s 冷却
+                    # 反复重试同一坏供给。未命中规则或未配冷却 → 回落状态码。
+                    _be_code = _match_body_error_from_response(
+                        resp_body, cs.get_body_error_rules())
+                    _be_secs = (resolve_cooldown_seconds(_be_code, cs)
+                                if _be_code is not None else None)
+                    if _be_code is not None and failover == "on" and _be_secs is not None:
+                        log.warning("cooldown+failover(body_error): supply=%s status=%s "
+                                    "code=%s secs=%s",
+                                    supply_id, resp_status, _be_code, _be_secs)
+                        self._acc["failover"] = 1
+                        self._acc["attempt_errors"].append((supply_id, _be_code))
+                        self._acc["body_error"] = _be_code
+                        cd.cooldown(supply_id, _be_secs, _be_code)
+                        tried_set.add(supply_id)
+                        continue
 
                     secs = resolve_cooldown_seconds(resp_status, cs)
                     if failover == "on" and secs is not None:

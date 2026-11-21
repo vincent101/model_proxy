@@ -87,6 +87,36 @@ class BridgeError(RuntimeError):
     """桥调用失败（库缺失、启动失败、读取错误）。"""
 
 
+class UpstreamError(BridgeError):
+    """上游返回非 2xx。
+
+    与 BridgeError 区分开：这是**上游的**响应，应当走与 legacy 相同的
+    冷却/failover 路径；而凭据/库问题才该快速失败。
+    """
+
+    def __init__(self, status: int, body: str):
+        super().__init__(f"上游 HTTP {status}: {body[:300]}")
+        self.status = status
+        self.body = body
+
+
+# Go 桥把上游非 2xx 编码成 `上游 HTTP <code>: <body>`
+_UPSTREAM_PREFIX = "上游 HTTP "
+
+
+def _as_upstream_error(exc: "BridgeError") -> "BridgeError":
+    """把桥的 `上游 HTTP N: body` 错误转成 UpstreamError，其余原样返回。"""
+    msg = str(exc)
+    if not msg.startswith(_UPSTREAM_PREFIX):
+        return exc
+    head, _, body = msg[len(_UPSTREAM_PREFIX):].partition(": ")
+    try:
+        status = int(head)
+    except ValueError:
+        return exc
+    return UpstreamError(status, body)
+
+
 class _Library:
     """惰性加载 c-shared 库；未使用 IDE provider 时不会触发任何加载。"""
 
@@ -222,7 +252,8 @@ def start_request(lib_path: str, cred: dict, body: bytes, conversation: str = ""
     handle = lib.CatpawStart(
         auth_json, body, (conversation or "").encode("utf-8"), err, _ERR_SIZE)
     if handle < 0:
-        raise BridgeError(err.value.decode("utf-8", "replace") or "桥启动失败")
+        detail = err.value.decode("utf-8", "replace") or "桥启动失败"
+        raise _as_upstream_error(BridgeError(detail))
     try:
         streaming = json.loads(body).get("stream") is True
     except Exception:

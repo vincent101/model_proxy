@@ -24,6 +24,10 @@
 - **`mtsso_keeper` 新增 CatPaw IDE 凭据段**：PKCE 登录（回调 8576/9576）、三头刷新、
   `whoami` 校验；刷新判据用 `whoami.expire`（实测 AT 寿命 72h），剩余 <48h 才刷。
   刷新后身份变化即拒绝回写并转人工。
+- **上游非 2xx 不再直出 500**：IDE 桥把上游非 2xx 归为 `UpstreamError` 并转成
+  `HTTPError`，复用既有冷却/failover；凭据与桥加载故障仍快速 500、不进冷却。
+  同时 `body_error_rules` 现在也匹配非 2xx 错误体，可把「模型不在账号目录」
+  这类确定性错误映射成虚拟 `errorcode` 并配更长冷却（如 21600s）。
 - **实测记录**：IDE 真实端到端（非流式/流式/工具调用/多轮工具回传）通过；
   CLI 迁移前后 A/B 对拍语义一致；`protocol` 迁移干跑覆盖 9 条 mcli supply。
 

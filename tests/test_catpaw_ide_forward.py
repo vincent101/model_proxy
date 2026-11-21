@@ -1,7 +1,8 @@
 """catpaw-ide 走 ModelProxyHandler._forward 全链路（脱网络）。
 
 上游是 Go 桥 + pocfake 假 transport：验证 supply.protocol 分派、凭据只读、
-Anthropic 流式/非流式写回，以及失败不进 cooldown。
+Anthropic 流式/非流式写回；凭据/桥故障不进 cooldown；上游非 2xx 走
+body_error_rules→冷却→failover（无匹配规则时回落状态码）。
 """
 import io
 import json
@@ -25,9 +26,13 @@ GO_DIR = ROOT / "core" / "providers" / "catpaw_ide" / "go"
 
 
 class _Config:
-    def __init__(self, supplies, tier):
+    def __init__(self, supplies, tier, body_error_rules=None,
+                 cooldown_rules=None):
         self._sm = {s["id"]: s for s in supplies}
         self._rm = {"r1": {"id": "r1", "tiers": {"opus": tier}, "failover": "on"}}
+        self._be = list(body_error_rules or [])
+        self._cd = list(cooldown_rules or [{"errorcode": [500, 502],
+                                            "cooldown_seconds": 60}])
 
     def maybe_reload(self):
         return False
@@ -48,10 +53,10 @@ class _Config:
         return {"enabled": False, "max_retries": 0}
 
     def get_body_error_rules(self):
-        return []
+        return self._be
 
     def get_cooldown_rules(self):
-        return [{"errorcode": [500, 502], "cooldown_seconds": 60}]
+        return self._cd
 
 
 class _Cooldown:
@@ -87,9 +92,11 @@ class _Sidecar:
         pass
 
 
-def _handler(supplies, tier, body, cooldown):
+def _handler(supplies, tier, body, cooldown, body_error_rules=None,
+             cooldown_rules=None):
     ns = SimpleNamespace(
-        config_store=_Config(supplies, tier), cooldown_store=cooldown,
+        config_store=_Config(supplies, tier, body_error_rules, cooldown_rules),
+        cooldown_store=cooldown,
         pref_store=_Pref(), sidecar_store=_Sidecar(),
         thinking_strip_store=ThinkingStripStore())
     raw = json.dumps(body).encode()
@@ -207,6 +214,50 @@ class TestIdeForward(unittest.TestCase):
         self.assertEqual(status, 500)
         self.assertIn("过期", body.decode())
         self.assertEqual(cd.hits, [])
+
+    def test_upstream_model_missing_cooldowns_with_configured_code(self):
+        """IDE 目录无此模型（本地 invalid 400）→ body_error_rules 映射成
+        长冷却 errorcode 并 failover 到下一个供给，而不是直接 500。"""
+        cd = _Cooldown()
+        bad = self._ide_supply()
+        bad["target_model"] = "gpt-6-missing"
+        good = self._ide_supply()
+        good["id"] = "ide2"
+        good["target_model"] = "gpt-6.2-sol"
+        h = _handler([bad, good], ["ide1", "ide2"], {
+            "model": "claude-opus", "max_tokens": 8, "stream": False,
+            "messages": [{"role": "user", "content": "hi"}]}, cd,
+            body_error_rules=[{
+                "pattern": "当前账号目录中没有该模型", "match": "contains",
+                "errorcode": "upstream_model_unavailable", "max_text_len": 1000}],
+            cooldown_rules=[{"errorcode": ["upstream_model_unavailable"],
+                             "cooldown_seconds": 21600}])
+        h._forward("POST")
+        status, body = h._responses[-1]
+        self.assertEqual(status, 200, body.decode())
+        self.assertEqual(h._acc["supply"], "ide2")
+        self.assertEqual(h._acc["failover"], 1)
+        self.assertEqual(h._acc["body_error"], "upstream_model_unavailable")
+        self.assertEqual(cd.hits,
+                         [("ide1", 21600, "upstream_model_unavailable")])
+
+    def test_upstream_error_without_rule_falls_back_to_status_cooldown(self):
+        """无匹配 body 规则时保持原行为：按 400 状态码冷却后 failover。"""
+        cd = _Cooldown()
+        bad = self._ide_supply()
+        bad["target_model"] = "gpt-6-missing"
+        good = self._ide_supply()
+        good["id"] = "ide2"
+        good["target_model"] = "gpt-6.2-sol"
+        h = _handler([bad, good], ["ide1", "ide2"], {
+            "model": "claude-opus", "max_tokens": 8, "stream": False,
+            "messages": [{"role": "user", "content": "hi"}]}, cd,
+            cooldown_rules=[{"errorcode": [400], "cooldown_seconds": 5}])
+        h._forward("POST")
+        status, body = h._responses[-1]
+        self.assertEqual(status, 200, body.decode())
+        self.assertEqual(h._acc["supply"], "ide2")
+        self.assertEqual(cd.hits, [("ide1", 5, "http_400")])
 
     def test_count_tokens_short_circuits_locally(self):
         cd = _Cooldown()
