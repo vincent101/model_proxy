@@ -113,22 +113,30 @@ session override 的唯一来源是独立 sidecar 文件 `config/session_overrid
   完整语义与配置样例见 [docs/CONFIG.md](docs/CONFIG.md) 速查表与
   [docs/designs/2026-09-20-model_proxy接入mcli的supply层扩展.md](../docs/designs/2026-09-20-model_proxy接入mcli的supply层扩展.md)。
 
-  **CatPaw IDE 通道**（`provider: catpaw-ide`）走另一条路径：不用 appkey，改用本地动态库直连：
+  **两个 CatPaw provider** 用 `protocol` 字段识别，端点/凭据/header 全部内置到模块：
 
   ```json
-  {
-    "id": "catpaw-ide-1",
-    "provider": "catpaw-ide",
-    "protocol": "anthropic",
-    "target_model": "<IDE 模型名>",
-    "credential_file": "~/.mtsso_keeper/catpaw_ide_session.json",
-    "bridge_lib": "~/.local/lib/libcatpaw_bridge.dylib"
-  }
+  // CLI：端点、appkey_file、X-Working-Dir、计费 system 块均已内置
+  {"id": "claude-opus-mcli", "protocol": "catpaw-cli",
+   "target_model": "claude-opus-5.5",
+   "reasoning_capability": {"effort_enum": []}}
+
+  // IDE：端点内置；凭据由 mtsso_keeper 产出，桥路径需指明
+  {"id": "catpaw-ide-1", "protocol": "catpaw-ide",
+   "target_model": "<IDE 模型名>",
+   "credential_file": "~/.mtsso_keeper/catpaw_ide_session.json",
+   "bridge_lib": "~/.local/lib/libcatpaw_bridge.dylib"}
   ```
 
-  凭据由 `mtsso_keeper` 独占管理（登录 + 刷新），本代理**只读、不刷新**；凭据缺失/过期时
-  返回 500 且**不进 cooldown**（凭据问题不是上游故障，写冷却会误伤 failover）。
-  设计记录见 [docs/designs/2026-11-21-CatPaw-IDE凭据单点管理方案.md](../../docs/designs/2026-11-21-CatPaw-IDE凭据单点管理方案.md)。
+  `protocol` 在此表示「交由哪个协议模块处理」，线协议由模块决定（两者都是 anthropic）；
+  legacy 的 `anthropic`/`chat`/`responses` 三值行为不变。provider supply 若携带
+  `url`/`appkey`/`appkey_file`/`extra_headers`/`system_inject` 一律报错——这些已内置。
+
+  两个 provider 的凭据都由 `mtsso_keeper` 维护，本代理**只读、不刷新**：CLI 读
+  `~/.config/mcopilot-cli/.config.yaml`（keeper mcli 段重铸），IDE 读
+  `~/.mtsso_keeper/catpaw_ide_session.json`（keeper IDE 段刷新）。凭据缺失/过期返回 500
+  且**不进 cooldown**（凭据问题不是上游故障，写冷却会误伤 failover）。
+  设计记录见 [docs/designs/2026-11-21-message_start用量形态与三类provider配置设计.md](../../docs/designs/2026-11-21-message_start用量形态与三类provider配置设计.md)。
 - **routes**：家族模板，固定 opus/sonnet/haiku 三档，每档一个按优先级排列的 supply id 列表，
   取第一个未冷却的；route 本身不含 token，可被多条 strategy 复用。
 - **strategies**：把某个 client_token 绑定到某个 route——可以绑单个 route（`route_id`），也可以

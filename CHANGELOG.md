@@ -1,5 +1,32 @@
 # Changelog
 
+## 0.15 (2026-11-21)
+
+### CatPaw IDE 与 CLI 双 provider 接入；supply 配置减负
+
+- **`protocol` 承载 provider 识别**：新增取值 `catpaw-ide` / `catpaw-cli`。`protocol`
+  语义变为「交由哪个协议模块处理」，线协议由模块决定（两者均 anthropic）。
+  矛盾配置（如 `provider: catpaw-cli` + `protocol: chat`）**结构上无法表达**。
+  未知取值报错，不静默降级。legacy 三值 `anthropic`/`chat`/`responses` 行为逐字不变。
+- **CatPaw IDE 通道**（`protocol: catpaw-ide`）：复用 Catboss 的 `internal/sankuai`
+  源码（commit `6ea9129`，24 文件逐字复制 + 8 个内部包最小替身），经
+  c-shared/ctypes 在同进程调用，输出 Anthropic SSE 直接复用既有写回路径。
+  凭据 **只读**：端点/凭据由 `mtsso_keeper` 单点维护，桥内 `NoRefresh=true` 不发起任何
+  SSO 刷新；凭据缺失/过期返回 500 且**不进 cooldown**（避免误伤 failover）。
+- **CatPaw CLI 通道**（`protocol: catpaw-cli`）：端点、凭据文件、`X-Working-Dir`、
+  计费 system 块四件常量内置到模块。supply 从 7 字段降到 4 字段；provider supply
+  携带 `url`/`appkey`/`extra_headers` 等 legacy 字段一律报错。
+- **`http_compat.py`**：`resolve_appkey` / `inject_system_block` /
+  `build_standard_headers` 抽为 legacy 与 CLI 共用的纯逻辑，`server.py` 保留同名兼容导出。
+  抽取前做过 70 组逐项对拍。
+- **ACCESS 日志新增 `provider=`**：`target_protocol` 恒为线协议，单看它无法区分
+  CLI/IDE 与 legacy；legacy 显示 `legacy_http`。
+- **`mtsso_keeper` 新增 CatPaw IDE 凭据段**：PKCE 登录（回调 8576/9576）、三头刷新、
+  `whoami` 校验；刷新判据用 `whoami.expire`（实测 AT 寿命 72h），剩余 <48h 才刷。
+  刷新后身份变化即拒绝回写并转人工。
+- **实测记录**：IDE 真实端到端（非流式/流式/工具调用/多轮工具回传）通过；
+  CLI 迁移前后 A/B 对拍语义一致；`protocol` 迁移干跑覆盖 9 条 mcli supply。
+
 ## 0.14 (2026-11-20)
 
 - macOS 和 Windows 入口统一到 Python CLI；日志、账本、锁、PID 及私有暂存/备份归入项目根 `.runtime/`。
