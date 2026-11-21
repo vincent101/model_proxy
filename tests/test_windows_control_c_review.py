@@ -146,17 +146,25 @@ class StatusDynamicConfigReferenceTests(unittest.TestCase):
             return rc, out.getvalue(), err.getvalue(), '\n'.join(baseline)
 
     def test_visible_disk_reference_equal_to_actual_token_fails_without_output(self):
-        for token, pool, cooldown, degraded in (('0', False, True, False),
-                                                ('cc', True, True, False),
-                                                ('a,b', False, True, False),
-                                                ('z', False, False, True)):
-            with self.subTest(token=token, pool=pool, degraded=degraded):
+        """引用标注只在 cooldown 段渲染 → 只有该路径需要 fail-closed。"""
+        for token, pool, cooldown in (('0', False, True),
+                                      ('cc', True, True),
+                                      ('a,b', False, True)):
+            with self.subTest(token=token, pool=pool):
                 rc, out, err, baseline = self.run_status(actual_token=token, config_token=token,
-                                                          pool=pool, cooldown=cooldown, degraded=degraded)
+                                                          pool=pool, cooldown=cooldown,
+                                                          degraded=False)
                 self.assertEqual(rc, 1)
                 self.assertEqual(out, '')
                 self.assertIn('status_sensitive_conflict', err)
                 self.assertIn(f'route1({token}) sonnet', baseline)
+
+    def test_degraded_section_no_longer_exposes_reference_token(self):
+        """供给段不再显示引用关系 → degraded 场景不泄露 token，正常输出。"""
+        rc, out, err, _ = self.run_status(actual_token='z', config_token='z',
+                                           pool=False, cooldown=False, degraded=True)
+        self.assertEqual(rc, 0, err)
+        self.assertNotIn('route1(z) sonnet', out)
 
     def test_owned_same_socket_response_with_new_disk_reference_is_not_printed(self):
         import socket

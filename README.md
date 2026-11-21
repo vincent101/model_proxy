@@ -21,7 +21,7 @@ version: 0.16
 | **故障切换** | 供给按顺序尝试；命中冷却规则即标记坏供给并换下一个，坏供给在 `status` 里可见 |
 | **正文错误识别** | 上游 200 但正文是"限流/额度/模型不存在"等语义错误 → 按虚拟错误码冷却，不当作成功 |
 | **effort 映射** | 客户端档位按**相对排名**映射到上游档位，不同供应商档位数量不一致也不会错位 |
-| **用量观测** | 每请求一条 ACCESS 日志 + 独立 token 账本，可按天/月统计；`status` 汇总失败率与活跃会话 |
+| **用量观测** | 每请求一条 ACCESS 日志 + 独立 token 账本，可按天/月统计；`status` 汇总**每条在用供给的近 30min 成功率、首 token 中位数、输出 tps、失败码**，以及活跃会话 |
 | **三类上游接入** | 标准 HTTP（自带 url/appkey）、`catpaw-cli`（mcli 网关）、`catpaw-ide`（CatPaw IDE，凭据由 mtsso_keeper 管） |
 
 上游协议组合矩阵（行是客户端入站，列是上游；每条通路都有流式和非流式实现）：
@@ -269,7 +269,7 @@ source 能力按客户端 token 配在 strategy，target 能力配在 supply；�
 | 子命令 | 用途 |
 |---|---|
 | `on` / `off` / `restart` | 启动 / 停止 / 重启已核验实例 |
-| `status` / `reload` | 查看状态 / 强制加载配置并报告结果 |
+| `status` / `reload` | 查看状态（供给健康表 + 活跃会话）/ 强制加载配置并报告结果 |
 | `logs [N] [field=value]` | 默认最近 30 条 ACCESS，可按请求、级别或事件过滤 |
 | `stats [today\|month\|YYYY-MM-DD\|YYYY-MM]` | 独立累计账本；不传为全历史，日/月按 UTC+8 |
 | `supply` / `route` / `strategy` | 配置交互菜单 |

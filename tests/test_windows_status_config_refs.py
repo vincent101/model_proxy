@@ -68,18 +68,30 @@ class DiskConfigReferenceTests(unittest.TestCase):
             return rc, out.getvalue(), err.getvalue(), '\n'.join(baseline)
 
     def test_visible_current_disk_route_id_equal_to_auth_token_fails_closed(self):
-        for token, route_id, client, visible, pool, expected in (
-                ('0', '0', 'cc', 'cooldown', False, '0(cc) sonnet'),
-                ('cc', 'cc', 'normal-client', 'degraded', True, 'cc(normal-client) sonnet'),
-                ('a,b', 'a,b', 'other', 'cooldown', False, 'a,b(other) sonnet'),
-                ('0', 0, 'cc', 'cooldown', False, '0 sonnet')):
-            with self.subTest(token=token, route_id=route_id, visible=visible):
+        """引用标注只在 cooldown 段渲染 → 只有该路径需要 fail-closed。
+
+        2026-11-22 起供给段不再显示「被谁引用」，所以 route_id 撞 token 只在
+        cooldown 行尾暴露；degraded 场景不再产生可见引用（改为断言不泄露）。
+        """
+        for token, route_id, client, pool, expected in (
+                ('0', '0', 'cc', False, '0(cc) sonnet'),
+                ('a,b', 'a,b', 'other', False, 'a,b(other) sonnet'),
+                ('0', 0, 'cc', False, '0 sonnet')):
+            with self.subTest(token=token, route_id=route_id):
                 rc, out, err, baseline = self.run_status(token=token, route_id=route_id,
-                    client=client, visible=visible, pool=pool)
+                    client=client, visible='cooldown', pool=pool)
                 self.assertEqual(rc, 1)
                 self.assertEqual(out, '')
                 self.assertIn('status_sensitive_conflict', err)
                 self.assertIn(expected, baseline)
+
+    def test_supplies_section_does_not_expose_route_reference_token(self):
+        """供给段不渲染引用关系，因此 degraded 场景不再泄露 token。"""
+        rc, out, err, _ = self.run_status(token='cc', route_id='cc',
+                                          client='normal-client',
+                                          visible='degraded', pool=True)
+        self.assertEqual(rc, 0, err)
+        self.assertNotIn('cc(normal-client)', out)
 
     def test_current_disk_client_token_still_guarded_without_reload(self):
         for token, pool in (('0', False), ('cc', True), ('a,b', False)):

@@ -84,18 +84,30 @@ class VisibleStatusIdentityTests(unittest.TestCase):
         self.assertEqual(rc, 0, err)
         self.assertIn('r1(cc) sonnet', out)
 
-    def test_visible_cooldown_and_degraded_supply_identity_still_fail_closed(self):
-        scenarios = [({'supplies': [{'id': '0'}], 'routes': [], 'strategies': [],
-                       'cooldown': {'0': {'remain': 3, 'reason': '429'}}}, {}),
-                     ({'supplies': [{'id': '0'}], 'routes': [], 'strategies': [], 'cooldown': {}},
-                      {'0': {'requests': 10, 'fail': 4}})]
-        for data, health in scenarios:
-            with self.subTest(data=data, health=health):
-                rc, out, err, baseline = self.run_status(data=data, health=health)
-                self.assertEqual(rc, 1)
-                self.assertEqual(out, '')
-                self.assertIn('status_sensitive_conflict', err)
-                self.assertIn('  0', baseline)
+    def test_visible_cooldown_supply_identity_still_fail_closed(self):
+        data = {'supplies': [{'id': '0'}], 'routes': [], 'strategies': [],
+                'cooldown': {'0': {'remain': 3, 'reason': '429'}}}
+        rc, out, err, baseline = self.run_status(data=data, health={})
+        self.assertEqual(rc, 1)
+        self.assertEqual(out, '')
+        self.assertIn('status_sensitive_conflict', err)
+        self.assertIn('  0', baseline)
+
+    def test_supplies_section_never_renders_supply_identity_when_unreferenced(self):
+        """供给段只渲染被 route 引用的 id；未引用摘要也受同一脱敏守卫。
+
+        2026-11-22 起供给段不再显示引用关系，因此「供给 id 撞 token」只在
+        cooldown 段与未引用摘要两处可能泄露——前者由既有用例覆盖，后者在此。
+        """
+        data = {'supplies': [{'id': '0'}], 'routes': [], 'strategies': [],
+                'cooldown': {}}
+        # 供给清单来自磁盘配置（与 _supply_refs 同源）：让它真的含有 id=0，
+        # 否则这条用例连渲染路径都走不到。
+        cfg = {'supplies': [{'id': '0'}], 'routes': [], 'strategies': []}
+        rc, out, err, _ = self.run_status(data=data, cfg=cfg, health={})
+        self.assertEqual(rc, 1, '未引用摘要里的 0 必须 fail-closed')
+        self.assertEqual(out, '')
+        self.assertIn('status_sensitive_conflict', err)
 
     def test_visible_disk_route_reference_still_fails_closed(self):
         data = {'supplies': [{'id': 's1'}], 'routes': [], 'strategies': [],

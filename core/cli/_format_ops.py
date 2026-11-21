@@ -272,6 +272,9 @@ def parse_access_line(line: str) -> dict | None:
         "terminal_status": fields.get("terminal_status", ""),
         "terminal_reason": fields.get("terminal_reason", ""),
         "first_event_ms": fields.get("first_event_ms", ""),
+        # ms / attempts 供 status 的供给段算吞吐与重试率；老日志行没有就留空。
+        "ms": fields.get("ms", ""),
+        "attempts": fields.get("attempts", ""),
     }
 
 
@@ -283,23 +286,17 @@ def _short_supply(sid: str) -> str:
     return sid.replace("-sankuai", "").replace("-openai", "")
 
 
-def load_active_sessions(log_path: str, *, now: datetime | None = None,
-                         window_minutes: int = 30,
-                         tail_bytes: int = 2 * 1024 * 1024) -> dict:
-    """tail 读日志末 tail_bytes，过滤 30min 窗口内 ACCESS 行，按 session 分组聚合。
+def tail_access_rows(log_path: str, *, tail_bytes: int = 2 * 1024 * 1024) -> dict:
+    """读日志末 tail_bytes 并解析出全部 ACCESS 行。
 
-    返回 ``{"sessions": {...}, "truncated": bool, "log_missing": bool}``。
+    返回 ``{"rows": [parsed...], "seek_tail": bool, "log_missing": bool}``。
 
-    - builtin=route 行计入活跃、不计入统计（n/fail/fo）
-    - 空串 session 聚成 ``(none)`` 桶
-    - 截断检测：文件 > tail_bytes 且 buffer 内首条可解析行 ts 已在窗口内
+    抽出的原因：status 的供给段与活跃 session 段用的是同一份日志滚窗，
+    各读一遍 2MB 再各解析一遍是纯浪费（一次 status 调用读两次盘）。
+    调用方各自再做时间窗过滤，因为两段的窗口口径可能不同。
     """
     if not os.path.isfile(log_path):
-        return {"sessions": {}, "truncated": False, "log_missing": True}
-    if now is None:
-        now = datetime.now()
-    window_start = now - timedelta(minutes=window_minutes)
-
+        return {"rows": [], "seek_tail": False, "log_missing": True}
     file_size = os.path.getsize(log_path)
     seek_tail = file_size > tail_bytes
     try:
@@ -311,16 +308,58 @@ def load_active_sessions(log_path: str, *, now: datetime | None = None,
                 f.seek(0)
             raw = f.read()
     except OSError:
-        return {"sessions": {}, "truncated": False, "log_missing": True}
+        return {"rows": [], "seek_tail": False, "log_missing": True}
+    rows = []
+    for line in raw.decode("utf-8", errors="replace").splitlines():
+        parsed = parse_access_line(line)
+        if parsed is not None:
+            rows.append(parsed)
+    return {"rows": rows, "seek_tail": seek_tail, "log_missing": False}
 
-    lines_decode = raw.decode("utf-8", errors="replace").splitlines()
+
+def load_active_sessions(log_path: str, *, now: datetime | None = None,
+                         window_minutes: int = 30,
+                         tail_bytes: int = 2 * 1024 * 1024,
+                         rows=None, seek_tail: bool | None = None) -> dict:
+    """tail 读日志末 tail_bytes，过滤 30min 窗口内 ACCESS 行，按 session 分组聚合。
+
+    返回 ``{"sessions": {...}, "truncated": bool, "log_missing": bool}``。
+
+    - builtin=route 行计入活跃、不计入统计（n/fail/fo）
+    - 空串 session 聚成 ``(none)`` 桶
+    - 截断检测：文件 > tail_bytes 且 buffer 内首条可解析行 ts 已在窗口内
+    """
+    if now is None:
+        now = datetime.now()
+
+    if rows is not None:
+        # 调用方（status）已读过同一份日志，直接复用，避免二次读盘/二次解析。
+        return _group_sessions(rows, now=now, window_minutes=window_minutes,
+                               seek_tail=bool(seek_tail), log_missing=False)
+    tail = tail_access_rows(log_path, tail_bytes=tail_bytes)
+    if tail["log_missing"]:
+        return {"sessions": {}, "truncated": False, "log_missing": True}
+    return _group_sessions(tail["rows"], now=now, window_minutes=window_minutes,
+                           seek_tail=tail["seek_tail"],
+                           log_missing=False)
+
+
+def _group_sessions(rows, *, now: datetime | None = None,
+                    window_minutes: int = 30, seek_tail: bool = False,
+                    log_missing: bool = False) -> dict:
+    """把已解析的 ACCESS 行按 session 聚合成 load_active_sessions 的返回形态。
+
+    抽出是为了让 status 一次 tail 的结果同时喂给供给段和 session 段；
+    ``load_active_sessions`` 保留为「读盘 + 聚合」的兼容入口。
+    """
+    if now is None:
+        now = datetime.now()
+    window_start = now - timedelta(minutes=window_minutes)
+
     sessions: dict[str, dict] = {}
     first_ts_in_buffer: datetime | None = None
 
-    for line in lines_decode:
-        parsed = parse_access_line(line)
-        if parsed is None:
-            continue
+    for parsed in rows:
         if first_ts_in_buffer is None:
             first_ts_in_buffer = parsed["ts"]
         if parsed["ts"] < window_start:
@@ -386,7 +425,228 @@ def load_active_sessions(log_path: str, *, now: datetime | None = None,
         and first_ts_in_buffer >= window_start
     )
 
-    return {"sessions": sessions, "truncated": truncated, "log_missing": False}
+    return {"sessions": sessions, "truncated": truncated, "log_missing": log_missing}
+
+
+# ---------------------------------------------------------------------------
+# 供给健康段：窗口内的可用状态 / 成功率 / 首 token / 吞吐
+# ---------------------------------------------------------------------------
+
+SUPPLY_WINDOW_MINUTES = 30     # 与活跃 session 段同一滚窗
+SUPPLY_MIN_SAMPLES = 5         # 低于此样本量不给成功率（避免假精度）
+SUPPLY_FAIL_PCT = 30.0         # 失败率阈值（与 DEGRADED_FAIL_PCT 同口径）
+_FLAKY_CONSECUTIVE = 2         # stream_health 连续 invalid ≥ 此值判 flaky
+
+
+def _is_supply_sample(parsed: dict) -> bool:
+    """该 ACCESS 行是否计入供给统计。
+
+    排除三类——它们不代表上游供给的健康度：
+    - ``builtin=route``：`$route` 查询/切换，不发给上游
+    - ``provider`` 为空：count_tokens 本地短路等未出站的请求
+    - ``client_disconnect``：客户端中途断开，不是上游故障
+    """
+    if parsed.get("builtin") == "route":
+        return False
+    if not parsed.get("provider"):
+        return False
+    return parsed.get("stream_integrity") != "client_disconnect"
+
+
+def _access_ok(parsed: dict) -> bool:
+    """与账本 UsageTotalsStore.record() 的 ok/fail 判定保持一致。
+
+    有 stream_integrity 时以它为准（200+invalid 视为失败）；没有时只看状态码。
+    """
+    integrity = parsed.get("stream_integrity") or ""
+    status = parsed.get("status") or ""
+    if integrity:
+        return status == "200" and integrity == "valid"
+    return status == "200"
+
+
+def load_supply_stats(rows, *, now: datetime | None = None,
+                      window_minutes: int = SUPPLY_WINDOW_MINUTES) -> dict[str, dict]:
+    """把已解析的 ACCESS 行按 supply 聚合成窗口统计。
+
+    返回 ``{supply_id: {"n", "fail", "ok_pct", "ttft_ms", "tps", "codes"}}``：
+
+    - ``ttft_ms``：成功流式行 ``first_event_ms`` 的**中位数**（p50，抗思考长尾）；
+      窗口内没有可用样本时为 None（非流式请求不产生该字段）。
+    - ``tps``：``Σusage_out / Σ(ms - first_event_ms)``，仅统计成功流式且
+      ``usage_out > 0`` 的行。**先聚合再相除**——逐请求算 TPS 再取均值会被
+      短回答（几十 token）严重虚高。
+    - ``codes``：失败行的错误码计数（``final_error`` 优先，回退
+      ``http_<status>`` / ``invalid_stream``），用于显示最高频失败原因。
+    """
+    if now is None:
+        now = datetime.now()
+    window_start = now - timedelta(minutes=window_minutes)
+
+    agg: dict[str, dict] = {}
+    for parsed in rows:
+        if parsed["ts"] < window_start or not _is_supply_sample(parsed):
+            continue
+        sid = parsed.get("supply") or "(none)"
+        item = agg.setdefault(sid, {
+            "n": 0, "fail": 0, "ttft": [], "usage_out": 0, "gen_seconds": 0.0,
+            "codes": {},
+        })
+        item["n"] += 1
+        if not _access_ok(parsed):
+            item["fail"] += 1
+            code = (parsed.get("final_error")
+                    or (f"http_{parsed['status']}" if parsed.get("status") != "200"
+                        else "invalid_stream"))
+            item["codes"][code] = item["codes"].get(code, 0) + 1
+            continue
+        try:
+            first_event_ms = int(parsed.get("first_event_ms") or 0)
+        except (TypeError, ValueError):
+            first_event_ms = 0
+        if first_event_ms <= 0:
+            continue      # 非流式 / 未记录首 token
+        item["ttft"].append(first_event_ms)
+        try:
+            total_ms = int(parsed.get("ms") or 0)
+        except (TypeError, ValueError):
+            total_ms = 0
+        try:
+            usage_out = int(parsed.get("usage_out") or 0)
+        except (TypeError, ValueError):
+            usage_out = 0
+        if total_ms > first_event_ms and usage_out > 0:
+            item["usage_out"] += usage_out
+            item["gen_seconds"] += (total_ms - first_event_ms) / 1000.0
+
+    out: dict[str, dict] = {}
+    for sid, item in agg.items():
+        n, fail = item["n"], item["fail"]
+        ttft = sorted(item["ttft"])
+        out[sid] = {
+            "n": n,
+            "fail": fail,
+            "ok_pct": (100.0 * (n - fail) / n) if n else None,
+            "ttft_ms": ttft[len(ttft) // 2] if ttft else None,
+            "tps": (item["usage_out"] / item["gen_seconds"]
+                    if item["gen_seconds"] > 0 else None),
+            "codes": item["codes"],
+        }
+    return out
+
+
+def _fmt_ttft(ms: int | None) -> str:
+    if not ms:
+        return "-"
+    return f"{ms / 1000:.1f}s" if ms >= 1000 else f"{ms}ms"
+
+
+def _fmt_tps(tps: float | None) -> str:
+    return f"{tps:.0f}" if tps else "-"
+
+
+def _top_code(codes: dict) -> str:
+    """最高频失败码：去掉下划线便于单行渲染，附次数。"""
+    if not codes:
+        return ""
+    code = max(codes, key=codes.get)
+    return f"{code.replace('_', ' ')}×{codes[code]}"
+
+
+def resolve_supply_state(sid: str, stat: dict | None, *, cooling: dict | None,
+                         stream_health: dict | None, window_total: int) -> str:
+    """单条供给的状态枚举。优先级 cool > fail > flaky > ok > low > idle。"""
+    if cooling and sid in cooling:
+        return "cool"
+    n = stat["n"] if stat else 0
+    if n >= SUPPLY_MIN_SAMPLES:
+        if stat["ok_pct"] is not None and stat["ok_pct"] < 100.0 - SUPPLY_FAIL_PCT:
+            return "fail"
+        consecutive = 0
+        supplies = (stream_health or {}).get("supplies") or {}
+        entry = supplies.get(sid)
+        if isinstance(entry, dict):
+            try:
+                consecutive = int(entry.get("consecutive") or 0)
+            except (TypeError, ValueError):
+                consecutive = 0
+        if consecutive >= _FLAKY_CONSECUTIVE:
+            return "flaky"
+        return "ok"
+    if n > 0:
+        return "low"          # 有样本但不足，成功率显示 "-"
+    return "idle"
+
+
+def _format_supplies(cfg: dict, stats: dict[str, dict], *, cooldown: dict | None,
+                     stream_health: dict | None, truncated: bool,
+                     log_missing: bool, refs: dict[str, list[str]],
+                     forbidden_reference_token: str | None = None) -> list[str]:
+    """渲染供给段：只列被 route 引用的供给，未引用的折成一行摘要。
+
+    行格式：``<id>  <state>  <ok%>  <n>  <ttft>  <tps>  [<失败码>]``
+    """
+    header = (f"supplies (last {SUPPLY_WINDOW_MINUTES}min"
+              + (" · tail" if truncated else "")
+              + " · ttft=p50 首token · tps=输出tok/s)")
+    referenced: list[str] = []
+    seen: set[str] = set()
+    for supply in cfg.get("supplies", []):
+        if not isinstance(supply, dict):
+            continue
+        sid = supply.get("id")
+        if isinstance(sid, str) and sid and sid not in seen and sid in refs:
+            seen.add(sid)
+            referenced.append(sid)
+
+    unreferenced = [s.get("id") for s in cfg.get("supplies", [])
+                    if isinstance(s, dict) and isinstance(s.get("id"), str)
+                    and s["id"] and s["id"] not in refs]
+    # 未引用摘要同样会渲染 supply id：撞上本次管理 token 时按既有约定 fail-closed。
+    # 放在日志缺失的 early-return 之前——脱敏守卫不能因为「这次没数据」而失效。
+    if forbidden_reference_token is not None and forbidden_reference_token in unreferenced:
+        raise StatusReferenceConflict("visible supply identity conflicts with admin token")
+
+    if log_missing:
+        return [header, "  无数据（日志文件缺失）"]
+
+    window_total = sum(stat["n"] for stat in stats.values())
+    lines = [header]
+    state_order = {"cool": 0, "fail": 1, "flaky": 2, "ok": 3, "low": 4, "idle": 5}
+    rendered: list[tuple[int, int, str]] = []
+    for sid in referenced:
+        if forbidden_reference_token is not None and sid == forbidden_reference_token:
+            raise StatusReferenceConflict("visible supply identity conflicts with admin token")
+        stat = stats.get(sid)
+        state = resolve_supply_state(sid, stat, cooling=cooldown,
+                                     stream_health=stream_health,
+                                     window_total=window_total)
+        state_text = state
+        if state == "cool":
+            info = (cooldown or {}).get(sid) or {}
+            remain = info.get("remain", 0) if isinstance(info, dict) else info
+            state_text = f"cool {int(remain)}s"
+            reason = info.get("reason", "") if isinstance(info, dict) else ""
+            if (forbidden_reference_token is not None and reason
+                    and str(reason) == forbidden_reference_token):
+                raise StatusReferenceConflict("visible cooldown reason conflicts with admin token")
+            code = (reason or "").replace("_", " ")
+        elif state == "fail":
+            code = _top_code(stat["codes"]) if stat else ""
+        else:
+            code = ""
+        ok_pct = "-" if (stat is None or state == "low" or state == "idle") else f"{stat['ok_pct']:.0f}%"
+        n = stat["n"] if stat else 0
+        ttft = _fmt_ttft(stat["ttft_ms"] if stat else None)
+        tps = _fmt_tps(stat["tps"] if stat else None)
+        rendered.append((state_order[state], -n,
+                         f"  {_pad(sid, 26)} {_pad(state_text, 8)} {ok_pct:>4} {n:>5} "
+                         f"{ttft:>7} {tps:>5}  {code}".rstrip()))
+    for _, _, line in sorted(rendered):
+        lines.append(line)
+    if unreferenced:
+        lines.append(f"  unreferenced {len(unreferenced)}: " + ", ".join(unreferenced))
+    return lines
 
 
 def _format_active_sessions(result: dict, cfg: dict | None = None,
@@ -734,10 +994,19 @@ def _format_status_from_json(data: dict, config_path: str, totals_path: str,
                 (rendered_path in cfg_err or repr(rendered_path) in cfg_err)):
             raise StatusReferenceConflict("status config error conflicts with admin token")
 
-    # supply health
-    health = load_supply_health(totals_path)
-    degraded = _compute_degraded(health)
-    n_degraded = len(degraded)
+    # 供给统计：日志滚窗（与活跃 session 段同一份 tail，只读一次）。
+    # 改用日志而非账本的原因：账本只有天粒度、无延迟字段、且失败码不入账；
+    # 窗口统计能反映「现在」的状态，坏供给滑出窗口后自动消失。
+    tail = tail_access_rows(log_path) if log_path else {"rows": [], "seek_tail": False,
+                                                        "log_missing": True}
+    supply_stats = load_supply_stats(tail["rows"]) if log_path else {}
+    supply_states = {
+        sid: resolve_supply_state(sid, stat, cooling=None if cooldown_unknown else cooldown,
+                                  stream_health=data.get("stream_health"),
+                                  window_total=sum(v["n"] for v in supply_stats.values()))
+        for sid, stat in supply_stats.items()
+    }
+    n_degraded = sum(1 for state in supply_states.values() if state == "fail")
 
     n_cooldown = len(cooldown)
 
@@ -764,31 +1033,37 @@ def _format_status_from_json(data: dict, config_path: str, totals_path: str,
     parts.append(f"overrides {overrides_count}")
     lines.append("health: " + " · ".join(parts))
 
-    # supply 引用标注（degraded/cooldown 行尾标出被哪个 route.tier(strategy) 引用）
+    # supply 引用标注（cooldown 行尾标出被哪个 route.tier(strategy) 引用）
     if forbidden_reference_token is None:
         refs = _supply_refs(cfg)
     else:
-        visible_supply_ids = {item["id"] for item in degraded}
+        visible_supply_ids = set(supply_stats)
         if not cooldown_unknown:
             visible_supply_ids.update(cooldown)
         refs = _supply_refs(cfg, forbidden_reference_token=forbidden_reference_token,
                             visible_supply_ids=visible_supply_ids)
 
-    # degraded supplies 段（只列问题）
-    if degraded:
+    # 供给段（被 route 引用的全部供给，含健康项；未引用的折成一行）
+    if cfg:
         lines.append("")
-        lines.append(f"degraded supplies (today fail%>{DEGRADED_FAIL_PCT:.0f}%, n>={DEGRADED_MIN_REQUESTS}):")
-        for d in degraded:
-            if forbidden_reference_token is not None and str(d["id"]) == forbidden_reference_token:
-                raise StatusReferenceConflict("visible supply identity conflicts with admin token")
-            ref = ",".join(refs.get(d["id"], [])) or "未被引用"
-            lines.append(f"  {_pad(d['id'], 24)} fail {d['fail_pct']:.1f}% ({d['fail']}/{d['requests']})  ← {ref}")
+        lines.extend(_format_supplies(
+            cfg, supply_stats, cooldown=cooldown,
+            stream_health=data.get("stream_health"),
+            truncated=tail["seek_tail"],
+            log_missing=(not log_path) or tail["log_missing"],
+            refs=refs,
+            forbidden_reference_token=forbidden_reference_token))
 
     # active sessions 段（在线时恒展示；行首 name 标注取自 session 注册快照）
     if log_path:
         lines.append("")
         session_names = load_session_names(sessions_dir)
-        sessions = load_active_sessions(log_path)
+        # 已读到的行直接复用；日志缺失时把 None 交给 load_active_sessions
+        # 自行判定（它同样处理缺失，且保留可替换性供测试注入）。
+        sessions = load_active_sessions(
+            log_path,
+            rows=None if tail["log_missing"] else tail["rows"],
+            seek_tail=tail["seek_tail"])
         if forbidden_reference_token is None:
             lines.extend(_format_active_sessions(sessions, cfg, session_names))
         else:

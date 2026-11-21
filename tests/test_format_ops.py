@@ -193,6 +193,40 @@ class TestStatusFormatFromJson(unittest.TestCase):
             json.dump(cfg, f)
         return path
 
+    def _mk_log(self, td, rows):
+        """写 ACCESS 日志（一行一条），返回路径。
+
+        rows 每项 ``(supply, ok, extra)``；ok=False 时 extra 可给
+        ``status`` / ``final_error`` 覆盖默认值。
+        """
+        path = os.path.join(td, "access.log")
+        now = datetime.now()
+        out = []
+        for i, (supply, ok, extra) in enumerate(rows):
+            ts = (now - timedelta(seconds=len(rows) - i)).strftime("%Y-%m-%d %H:%M:%S,") \
+                + (now - timedelta(seconds=len(rows) - i)).strftime("%f")[:3]
+            e = extra or {}
+            tail = (f"source=anthropic operation=messages route=r1 tier=opus "
+                    f"supply={supply} provider=legacy_http target_protocol=anthropic "
+                    f"conversion_kind=passthrough failover=0 attempts=1 "
+                    f"token=cc session=s1 route_failover=0 builtin= "
+                    f"budget_retried= budget_truncated=0 stop_reason=end_turn "
+                    f"body_error= nudge_rewritten= thinking_strip=0")
+            if ok:
+                body = (f"ms=3000 status=200 {tail} usage_in=100 usage_out=200 "
+                        f"final_error= response_committed=1 stream_integrity=valid "
+                        f"terminal_status=completed terminal_reason=end_turn "
+                        f"first_event_ms=1000")
+            else:
+                body = (f"ms=200 status={e.get('status', '500')} {tail} "
+                        f"usage_in=0 usage_out=0 final_error={e.get('final_error', '')} "
+                        f"response_committed=0 stream_integrity= terminal_status= "
+                        f"terminal_reason= first_event_ms=")
+            out.append(f"{ts} req_id=r{i:04d} ACCESS {body}")
+        with open(path, "w", encoding="utf-8") as f:
+            f.write("\n".join(out) + "\n")
+        return path
+
     def _make_totals(self, td, combos=None):
         """写 totals 文件，返回路径。"""
         path = os.path.join(td, "totals.json")
@@ -222,77 +256,72 @@ class TestStatusFormatFromJson(unittest.TestCase):
             self.assertIn("cooldown 0/1", joined)
             self.assertIn("overrides 1", joined)
 
-    def test_degraded_listed_sorted_by_fail_pct(self):
-        """degraded supply 按 fail% 降序列出，格式 fail X% (f/r)。"""
+    def test_fail_supplies_sorted_and_healthy_after(self):
+        """坏供给（ok% < 70）按样本量降序排前，健康供给在后。"""
         with tempfile.TemporaryDirectory() as td:
-            cfg_path = self._make_config(td, {
-                "default_cooldown_seconds": 60,
+            cfg = {
                 "supplies": [{"id": "s1"}, {"id": "s2"}, {"id": "s3"}],
-                "routes": [{"id": "r1", "tiers": {"opus": ["s1", "s2", "s3"], "sonnet": [], "haiku": []}}],
+                "routes": [{"id": "r1", "tiers": {"opus": ["s1", "s2", "s3"],
+                                                  "sonnet": [], "haiku": []}}],
                 "strategies": [],
-            })
-            combos = {
-                "supply=s1|route=r1|strategy=cc": {"requests": 10, "ok": 2, "fail": 8},   # 80%
-                "supply=s2|route=r1|strategy=cc": {"requests": 10, "ok": 5, "fail": 5},   # 50%
-                "supply=s3|route=r1|strategy=cc": {"requests": 10, "ok": 9, "fail": 1},   # 10% (not degraded)
             }
-            totals_path = self._make_totals(td, combos)
-            data = {
-                "supplies": [{"id": "s1"}, {"id": "s2"}, {"id": "s3"}],
-                "routes": [], "strategies": [],
-                "cooldown": {}, "default_cooldown_seconds": 60,
-            }
-            lines = _format_status_from_json(data, cfg_path, totals_path)
-            joined = "\n".join(lines)
-            self.assertIn("degraded supplies", joined)
-            self.assertIn("s1", joined)
-            self.assertIn("fail 80.0% (8/10)", joined)
-            self.assertIn("s2", joined)
-            self.assertIn("fail 50.0% (5/10)", joined)
-            self.assertNotIn("s3", joined.split("config:")[0])  # s3 not in degraded section
-            # s1 在 s2 之前（fail% 降序）
+            cfg_path = self._make_config(td, cfg)
+            rows = ([("s1", False, None)] * 8 + [("s1", True, None)] * 2
+                    + [("s2", False, None)] * 5 + [("s2", True, None)] * 5
+                    + [("s3", False, None)] + [("s3", True, None)] * 9)
+            log_path = self._mk_log(td, rows)
+            totals_path = self._make_totals(td)
+            data = {"supplies": cfg["supplies"], "routes": [], "strategies": [],
+                    "cooldown": {}}
+            joined = "\n".join(_format_status_from_json(
+                data, cfg_path, totals_path, log_path=log_path))
+            self.assertIn("supplies (last 30min", joined)
             self.assertLess(joined.index("s1"), joined.index("s2"))
+            s3_line = next(l for l in joined.splitlines() if " s3 " in l)
+            self.assertIn("ok", s3_line)
 
-    def test_threshold_boundary_fail_pct_eq_30_not_degraded(self):
-        """fail% == 30.0 时不报 degraded（阈值是 >30，严格大于）。"""
+    def test_threshold_boundary_ok_pct_eq_70_is_not_fail(self):
+        """ok% == 70.0（fail 30%）不判 fail：阈值是严格小于 70。"""
         with tempfile.TemporaryDirectory() as td:
-            cfg_path = self._make_config(td, {
-                "default_cooldown_seconds": 60,
-                "supplies": [{"id": "s1"}],
-                "routes": [{"id": "r1", "tiers": {"opus": ["s1"], "sonnet": [], "haiku": []}}],
-                "strategies": [],
-            })
-            # 10 req, 3 fail = 30.0%（不满足 >30）
-            combos = {"supply=s1|route=r1|strategy=cc": {"requests": 10, "ok": 7, "fail": 3}}
-            totals_path = self._make_totals(td, combos)
-            data = {
-                "supplies": [{"id": "s1"}], "routes": [], "strategies": [],
-                "cooldown": {}, "default_cooldown_seconds": 60,
-            }
-            lines = _format_status_from_json(data, cfg_path, totals_path)
-            joined = "\n".join(lines)
-            self.assertNotIn("degraded supplies", joined)
+            cfg = {"supplies": [{"id": "s1"}],
+                   "routes": [{"id": "r1", "tiers": {"opus": ["s1"],
+                                                     "sonnet": [], "haiku": []}}],
+                   "strategies": []}
+            cfg_path = self._make_config(td, cfg)
+            log_path = self._mk_log(td, [("s1", False, None)] * 3
+                                      + [("s1", True, None)] * 7)
+            totals_path = self._make_totals(td)
+            data = {"supplies": cfg["supplies"], "routes": [], "strategies": [],
+                    "cooldown": {}}
+            joined = "\n".join(_format_status_from_json(
+                data, cfg_path, totals_path, log_path=log_path))
+            line = next(l for l in joined.splitlines() if " s1 " in l)
+            self.assertIn(" ok ", line)
+            self.assertNotIn(" fail ", line)
 
-    def test_threshold_boundary_requests_eq_5_is_degraded(self):
-        """requests == 5 且 fail% > 30 时报 degraded（阈值 n>=5）。"""
+    def test_samples_boundary_five_evaluated_four_is_low(self):
+        """n>=5 才判状态；n=4 时标 low 且不给成功率（避免假精度）。"""
         with tempfile.TemporaryDirectory() as td:
-            cfg_path = self._make_config(td, {
-                "default_cooldown_seconds": 60,
-                "supplies": [{"id": "s1"}],
-                "routes": [{"id": "r1", "tiers": {"opus": ["s1"], "sonnet": [], "haiku": []}}],
-                "strategies": [],
-            })
-            # 5 req, 2 fail = 40%
-            combos = {"supply=s1|route=r1|strategy=cc": {"requests": 5, "ok": 3, "fail": 2}}
-            totals_path = self._make_totals(td, combos)
-            data = {
-                "supplies": [{"id": "s1"}], "routes": [], "strategies": [],
-                "cooldown": {}, "default_cooldown_seconds": 60,
-            }
-            lines = _format_status_from_json(data, cfg_path, totals_path)
-            joined = "\n".join(lines)
-            self.assertIn("degraded supplies", joined)
-            self.assertIn("fail 40.0% (2/5)", joined)
+            cfg = {"supplies": [{"id": "s1"}, {"id": "s2"}],
+                   "routes": [{"id": "r1", "tiers": {"opus": ["s1", "s2"],
+                                                     "sonnet": [], "haiku": []}}],
+                   "strategies": []}
+            cfg_path = self._make_config(td, cfg)
+            log_path = self._mk_log(td, [("s1", False, None)] * 2
+                                      + [("s1", True, None)] * 3
+                                      + [("s2", False, None)] * 2
+                                      + [("s2", True, None)] * 2)
+            totals_path = self._make_totals(td)
+            data = {"supplies": cfg["supplies"], "routes": [], "strategies": [],
+                    "cooldown": {}}
+            joined = "\n".join(_format_status_from_json(
+                data, cfg_path, totals_path, log_path=log_path))
+            s1_line = next(l for l in joined.splitlines() if " s1 " in l)
+            self.assertIn("fail", s1_line)
+            self.assertIn("60%", s1_line)   # ok% = 3/5，不是 fail%
+            s2_line = next(l for l in joined.splitlines() if " s2 " in l)
+            self.assertIn("low", s2_line)
+            self.assertNotIn("50%", s2_line)
 
     def test_cooldown_listed(self):
         """有 cooldown 时列 supply 剩余秒。"""
@@ -374,27 +403,24 @@ class TestStatusFormatFromJson(unittest.TestCase):
             self.assertNotIn("degraded supplies", joined)
             self.assertNotIn("unmatched:", joined)
 
-    def test_degraded_rows_annotated_with_refs(self):
-        """degraded supply 行尾标出被哪个 route.tier(strategy) 引用。"""
+    def test_supplies_section_omits_reference_annotations(self):
+        """供给段按设计不显示「被谁引用」；引用关系仅保留在 cooldown 段。"""
         with tempfile.TemporaryDirectory() as td:
-            cfg_path = self._make_config(td, {
-                "default_cooldown_seconds": 60,
-                "supplies": [{"id": "s1"}, {"id": "s2"}],
-                "routes": [{"id": "r1", "tiers": {"opus": ["s1", "s2"], "sonnet": [], "haiku": []}}],
-                "strategies": [{"client_token": "cc", "route_id": "r1"}],
-            })
-            combos = {"supply=s1|route=r1|strategy=cc": {"requests": 10, "ok": 2, "fail": 8}}
-            totals_path = self._make_totals(td, combos)
-            data = {
-                "supplies": [{"id": "s1"}, {"id": "s2"}],
-                "routes": [{"id": "r1"}],
-                "strategies": [{"client_token": "cc", "route_id": "r1"}],
-                "cooldown": {}, "default_cooldown_seconds": 60,
-            }
-            lines = _format_status_from_json(data, cfg_path, totals_path)
-            joined = "\n".join(lines)
-            self.assertIn("s1", joined)
-            self.assertIn("fail 80.0% (8/10)  ← r1(cc) opus", joined)
+            cfg = {"supplies": [{"id": "s1"}],
+                   "routes": [{"id": "r1", "tiers": {"opus": ["s1"],
+                                                     "sonnet": [], "haiku": []}}],
+                   "strategies": [{"client_token": "cc", "route_id": "r1"}]}
+            cfg_path = self._make_config(td, cfg)
+            log_path = self._mk_log(td, [("s1", True, None)] * 6)
+            totals_path = self._make_totals(td)
+            data = {"supplies": cfg["supplies"], "routes": [{"id": "r1"}],
+                    "strategies": [{"client_token": "cc", "route_id": "r1"}],
+                    "cooldown": {}}
+            joined = "\n".join(_format_status_from_json(
+                data, cfg_path, totals_path, log_path=log_path))
+            section = joined.split("supplies (last")[1].split("\n\n")[0]
+            self.assertNotIn("r1(cc)", section)
+            self.assertNotIn("←", section)
 
 
 # ---------------------------------------------------------------------------

@@ -2,6 +2,20 @@
 
 ## 0.16 (2026-11-22)
 
+### status 改为「在用供给健康表」
+
+- **替换 `degraded supplies` 段**：原来只列失败率超阈值的供给，健康项完全不显示。
+  现在列出**被 route 引用的每条供给**（未引用的折成一行摘要），给出
+  近 30min 的：成功率、样本量、首 token 中位数、输出 tps、最高频失败码。
+- **状态枚举**：`cool`（冷却中，显示剩余秒与原因）/ `fail`（ok% < 70 且 n≥5）/
+  `flaky`（流完整性连续 invalid ≥2）/ `ok` / `low`（样本 <5，不给成功率）/
+  `idle`（被引用但窗口内无请求）。
+- **口径**：窗口 30min 与活跃 session 段一致；排除 `builtin=route`、
+  `provider` 为空的本地短路、`client_disconnect`（客户端断开不算上游坏）。
+  tps 为 `Σusage_out / Σ(ms−first_event_ms)`，先聚合再相除；ttft 取中位数。
+- **一次读盘**：抽出 `tail_access_rows()`，供给段与 session 段共用同一份日志缓冲。
+- **脱敏**：未引用摘要也会渲染 supply id，同样受 admin token 冲突守卫（fail-closed）。
+
 ### reload 校验失败即拒绝；provider 路径收敛；桥跨平台构建
 
 - **热重载改为「先校验、通过才提交」**：此前 `_reload_locked` 先替换内存快照，
