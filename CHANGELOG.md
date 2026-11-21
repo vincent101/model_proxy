@@ -39,6 +39,10 @@
   导致 `gpt-6.2-astra` 被误判为「当前账号目录中没有该模型」；放开后实测
   `gpt-6.2-astra` 正常出文（服务端按 SSO 身份自行解析）。真正的权限由上游
   把关，无权限仍走冷却/failover。
+- **桥库跨平台构建**：新增 `.github/workflows/build-catpaw-bridge.yml`，
+  windows-latest（MinGW-w64 + cgo）与 macos-14 各出一份 c-shared artifact
+  （`libcatpaw_bridge.dll` / `.dylib`）。c-shared 不能交叉编译，Windows 侧
+  必须由 CI 产出；构建产物入 `.gitignore`。
 - **实测记录**：IDE 真实端到端（非流式/流式/工具调用/多轮工具回传）通过；
   CLI 迁移前后 A/B 对拍语义一致；`protocol` 迁移干跑覆盖 9 条 mcli supply。
 

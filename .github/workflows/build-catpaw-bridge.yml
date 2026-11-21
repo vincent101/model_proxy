@@ -1,0 +1,107 @@
+# 构建 CatPaw IDE 桥动态库（Go c-shared）。
+#
+# 为什么需要 CI：c-shared 产物是**平台相关**的二进制，且不能交叉编译
+# （需要目标平台的 C 工具链）。本机是 macOS，无法产出 Windows .dll。
+#
+# 产物命名必须与 core/providers/settings.py 的默认值对齐：
+#   darwin → libcatpaw_bridge.dylib
+#   win32  → libcatpaw_bridge.dll
+#   linux  → libcatpaw_bridge.so
+#
+# 用法：Actions → build-catpaw-bridge → Run workflow，下载对应平台的 artifact，
+# 放到 provider_settings.json 里 bridge_lib 指向的位置（默认 ~/.local/lib/）。
+
+name: build-catpaw-bridge
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - 'bridge-v*'
+
+permissions:
+  contents: read
+
+env:
+  GO_VERSION: '1.24.1'
+  GO_DIR: core/providers/catpaw_ide/go
+
+jobs:
+  windows:
+    name: windows/amd64
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache-dependency-path: ${{ env.GO_DIR }}/go.sum
+
+      - name: Install MinGW-w64 (cgo toolchain)
+        shell: pwsh
+        run: |
+          # c-shared 需要 gcc；先装，装完找不到则回退到镜像预装的 MSYS2。
+          choco install mingw -y --no-progress
+          $candidates = @('C:\ProgramData\mingw64\bin', 'C:\msys64\mingw64\bin')
+          $mingw = $candidates | Where-Object { Test-Path (Join-Path $_ 'gcc.exe') } | Select-Object -First 1
+          if (-not $mingw) { throw "no gcc.exe found in $($candidates -join ', ')" }
+          "$mingw" | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
+          & (Join-Path $mingw 'gcc.exe') --version
+
+      - name: Test (no network)
+        working-directory: ${{ env.GO_DIR }}
+        env:
+          CGO_ENABLED: '1'
+        run: go test ./...
+
+      - name: Build c-shared
+        working-directory: ${{ env.GO_DIR }}
+        env:
+          CGO_ENABLED: '1'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
+          gcc --version
+          go build -buildmode=c-shared -o dist/libcatpaw_bridge.dll ./cmd/native
+          if (-not (Test-Path dist/libcatpaw_bridge.dll)) { throw 'dll not produced' }
+          Get-Item dist/libcatpaw_bridge.dll | Format-List Name,Length
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: libcatpaw_bridge-windows-amd64
+          path: ${{ env.GO_DIR }}/dist/libcatpaw_bridge.dll
+          if-no-files-found: error
+
+  macos:
+    name: darwin/arm64
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache-dependency-path: ${{ env.GO_DIR }}/go.sum
+
+      - name: Test (no network)
+        working-directory: ${{ env.GO_DIR }}
+        env:
+          CGO_ENABLED: '1'
+        run: go test ./...
+
+      - name: Build c-shared
+        working-directory: ${{ env.GO_DIR }}
+        env:
+          CGO_ENABLED: '1'
+        run: |
+          mkdir -p dist
+          go build -buildmode=c-shared -o dist/libcatpaw_bridge.dylib ./cmd/native
+          test -f dist/libcatpaw_bridge.dylib
+          ls -l dist
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: libcatpaw_bridge-darwin-arm64
+          path: ${{ env.GO_DIR }}/dist/libcatpaw_bridge.dylib
+          if-no-files-found: error

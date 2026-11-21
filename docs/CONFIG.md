@@ -123,6 +123,28 @@ supply **只声明差异**：
   reload 解耦）。
 - Windows：`bridge_lib` 默认解析成 `libcatpaw_bridge.dll`；换机时一般只需改这一行。
 
+#### 桥库从哪来
+
+`libcatpaw_bridge` 是 Go 编出的 **c-shared 动态库**（代码产物，与鉴权无关：
+凭据运行时由 keeper 提供）。c-shared **不能交叉编译**，必须由目标平台的 C
+工具链产出，因此走 CI：
+
+```
+Actions → build-catpaw-bridge → Run workflow
+  windows/amd64 → libcatpaw_bridge.dll
+  darwin/arm64  → libcatpaw_bridge.dylib
+```
+
+下载对应 artifact 后放到 `bridge_lib` 指向的位置（默认 `~/.local/lib/`），
+或在 `provider_settings.json` 里指到任意路径。本地手工构建：
+
+```bash
+cd core/providers/catpaw_ide/go
+go build -buildmode=c-shared -o ~/.local/lib/libcatpaw_bridge.dylib ./cmd/native
+```
+
+**正式构建不得带 `pocfake` 标签**（会把上游换成假 transport）。
+
 **provider supply 若携带 `url`/`appkey`/`appkey_file`/`extra_headers`/`system_inject`
 一律报错**——写了说明配置有误，不静默忽略。
 

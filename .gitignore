@@ -17,5 +17,9 @@ config/model_proxy_config.json.bk*
 .model_proxy_runtime/
 .runtime/
 
+# CatPaw IDE 桥构建产物（CI 出，按平台）
+core/providers/catpaw_ide/go/dist/
+core/providers/catpaw_ide/go/*.h
+
 # Disposable offline test fixtures
 /.isolated-run.*/
