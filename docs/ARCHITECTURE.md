@@ -20,15 +20,16 @@
 
 ## 2. 入站协议识别
 
-入站 source 协议由 `detect_source` 按客户端请求 path 尾缀判断（大小写不敏感）：
-`/v1/messages`→anthropic、`/v1/responses`→responses、`/chat/completions`→chat；三者互斥
-的尾缀都不命中时，退而看请求体特征（`input` 字段→responses；`messages`+`max_tokens`/
-`system`→anthropic；仅 `messages`→chat）；仍不中则 `unknown`，走该组合的兜底/501。
+`detect_source` 先去掉 query 和末尾斜杠，再按不区分大小写的 path 尾缀识别：
+`/v1/messages` 或 `/v1/messages/count_tokens`→anthropic、`/v1/responses`→responses、
+`/chat/completions`→chat。尾缀未命中才按 body 特征兜底：`input`→responses；
+`messages` 且有 `max_tokens` 或 `system`→anthropic；其余含 `messages`→chat；否则为 unknown。
+路径还用于识别具体 operation，不能认为任意 path 等价；控制接口也有独立处理。
 
-客户端把 `base_url` 配到本代理后，无论自己在其后拼了什么路径（根路径、`/v1/messages`、
-`/chat/completions`，甚至多余的斜杠如 `//chat/completions`）都不影响识别；出站转发时统一
-丢弃客户端 path，只用配置好的 `supply.url` + 净化后的 query 拼真实上游请求（见
-`_sanitize_forward_query`），代理自己决定往上游发什么路径，与客户端怎么拼无关。
+识别出 chat 不代表支持 Chat 入站：生成请求仅支持 Anthropic→Anthropic/Chat/Responses
+和 Responses→Anthropic/Responses 五种组合，其余组合返回 501。`count_tokens` 走独立处理，
+仅支持 Anthropic 供给。普通生成请求的出站目标由配置的完整 `supply.url` 和净化后的 query 决定；
+同协议分支也会改写部分字段，不等于字节透传。
 
 ## 3. 三阶段匹配（含跨 route 兜底）
 
@@ -68,7 +69,7 @@
 ```
 客户端请求
   │  Authorization: Bearer <token>  或  x-api-key: <token>
-  │  POST <任意 path>   body: {"model": "claude-sonnet", ...}
+  │  POST /v1/messages   body: {"model": "claude-sonnet", ...}
   ▼
 ┌────────────────────────────────────────────────────────────────────┐
 │ ① 入站鉴权识别 extract_client_token         （见「入站鉴权识别」） │
@@ -82,7 +83,7 @@
 │ ③ 三阶段匹配                                  （见「三阶段匹配」） │
 │     a. client_token ──查 strategies──▶ route_id 直选                │
 │        或 route_pool ──session_hash/override──▶ route 候选列表    │
-│     b. body.model ──精确查表──▶ tier(opus/sonnet/haiku)            │
+│     b. body.model ──精确查表──▶ tier(fable/opus/sonnet/haiku)      │
 │     c. 候选 route 逐个：route.tiers[tier] ──▶ supplies 列表         │
 │        ──同route内failover──▶ supply；该候选全挂──▶ 换下一候选     │
 │        route（route_failover）                                     │
@@ -98,18 +99,18 @@
 │     (source,target) 组合 → PASSTHROUGH 或 转换（core/translate）   │
 │     出站 URL = supply.url + 净化 query（丢客户端 path、剔 beta）   │
 │     出站头双发 Authorization: Bearer <appkey> + x-api-key          │
-│     失败(401/403/429/5xx)且 failover=on → 冷却+换同档下一 supply   │
+│     失败命中 cooldown_rules 且 failover=on → 冷却并尝试下一供给    │
 └────────────────────────────────────────────────────────────────────┘
   ▼
 真实上游（supply.url / supply.target_model）
 ```
 
-关键点：入站阶段代理不关心客户端把 base_url 后面拼了什么 path（③ 用 body.model
-选 tier，出站 ⑤ 只用配置的 `supply.url`），所以各 SDK 的 path 拼接差异不影响转发目标。
+关键点：入站 path 和 body 共同影响协议与 operation 的识别；普通生成出站目标则使用
+配置的 `supply.url`。同 route 的切换还须有可用供给；未匹配冷却规则不自动切换。
 
-### 跨协议语义保真（2026-11-06 全向补齐）
+### 跨协议字段处理（历史记录）
 
-转换组合（a2r/r2a/a2chat 等）在字段映射之外维护以下保真机制：
+以下记录部分转换机制和当时观察，不代表跨协议语义完全等价或所有功能组合均已验收：
 
 - **messages 内 system 消息**：a2r 把 `role="system"` 的消息按位置转为 Responses
   input 的 `role:"system"` message item（上游实测内容可达、mid-conversation 生效）；
@@ -134,17 +135,21 @@
 
 ## 6. 启动与停止
 
-```bash
-tools/model_proxy/model_proxy_cli.sh on
-```
-
-或手动：
+在选定的 model_proxy 项目根目录操作。Mac：
 
 ```bash
-MODEL_PROXY_PORT=18889 python3 tools/model_proxy/core/cli/model_proxy.py
+./model_proxy_cli.sh on
+./model_proxy_cli.sh off
 ```
 
-端口默认 18889，可用 `MODEL_PROXY_PORT` 环境变量覆盖。六个运行文件默认全部落在
+Windows CMD（仅测试，尚未原生验收）：
+
+```cmd
+model_proxy_cli.bat on
+model_proxy_cli.bat off
+```
+
+未配置 `listen` 时，端口使用合法的 `MODEL_PROXY_PORT`，否则默认 18889；显式 `listen` 须包含合法的 host 和 port，其 port 优先于环境变量。非法 `MODEL_PROXY_PORT` 即使有显式 `listen` 也会导致失败。六个运行文件默认全部落在
 项目根 `.runtime/`：`model_proxy.log`（启动时自动截断保留最后 5000 行）、
 `model_proxy_totals.json`、`model_proxy.lock`（单实例锁）、`model_proxy.pid`、
 `model_proxy_ensure.log`、`model_proxy_start.lock`；另有 CLI 独占的 `tmp/` 与
@@ -156,7 +161,7 @@ MODEL_PROXY_PORT=18889 python3 tools/model_proxy/core/cli/model_proxy.py
 只委托同一 CLI 执行 `on`；非交互 hook 不能代替首次确认。`install` 仅在识别到标准
 vault 布局时维护 SessionStart hook，不在独立目录或 worktree 中向上猜测。
 
-停止用 `model_proxy_cli.sh off`：核验安装路径、服务入口、PID 和进程启动身份后
+上述 `off` 命令会核验安装路径、服务入口、PID 和进程启动身份后
 停止；不按端口或文件名宽泛杀进程。身份检查与信号并非原子操作，不承诺消除 PID
 竞争或同用户仿冒风险。`status`/`reload` 发送管理 token 前还会核验同一连接的对端。
 Windows 的锁、ACL 与控制链路共用同一份 Python 实现（`.bat` 只做解释器选择与转调），
