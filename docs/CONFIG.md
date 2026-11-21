@@ -4,7 +4,7 @@
 
 ## 1. 配置路径与权限
 
-配置文件默认路径 `tools/model_proxy/config/model_proxy_config.json`（600 权限，已加入
+相对 model_proxy 项目根，配置文件默认路径为 `config/model_proxy_config.json`（Mac 保持 600 权限，已加入
 `.gitignore`，不被 git 跟踪；含真实 appkey/admin_token，不要手动纳入版本控制）。可用环境变量
 `MODEL_PROXY_CONFIG` 覆盖路径。`config/model_proxy_config.example.json` 是不含真实凭证的
 样例，纳入跟踪。
@@ -29,7 +29,6 @@ session override 存放在独立 sidecar 文件 `config/session_overrides.json`�
   "protocol": "anthropic",
   "appkey": "<APPKEY_PLACEHOLDER>",
   "target_model": "claude-sonnet-5",
-  "cooldown_seconds": 300,
   "reasoning_capability": {
     "effort_enum": ["low", "medium", "high", "xhigh", "max"]
   }
@@ -43,8 +42,6 @@ session override 存放在独立 sidecar 文件 `config/session_overrides.json`�
   下方「protocol 推断规则」）。
 - `appkey`：鉴权用 Bearer token，注入到转发请求。
 - `target_model`：实际下发给上游的模型名（客户端请求里的 model 字段会被替换成这个）。
-- `cooldown_seconds`（可选）：该 supply 触发失败后的冷却时长，不填则用顶层
-  `default_cooldown_seconds`。
 - `reasoning_capability`（可选）：该 supply（target 侧，真实上游）支持的 effort 档位能力
   描述，字段完整语义见 [REASONING.md](REASONING.md)「effort_enum 字段语义」。不配置时用默认 5 档
   （`["off","low","medium","high","xhigh"]`），按 supply 独立生效，不影响其他 supply。
@@ -60,35 +57,28 @@ session override 存放在独立 sidecar 文件 `config/session_overrides.json`�
 | 字段 | 类型 | 必填 | 语义 | 默认值 |
 |---|---|---|---|---|
 | `id` | string | 必填 | 唯一标识，routes 里按 id 引用 | — |
-| `url` | string | 必填（`catpaw-*` provider 时不需要） | 完整终态请求端点，代理不做拼接，只在其后拼接净化后的原始 query | — |
-| `protocol` | string | 可选 | **既是线协议也是处理模块选择**：`anthropic`/`chat`/`responses` 走原有 HTTP 路径（缺省从 url 推断）；`catpaw-cli`/`catpaw-ide` 交由对应模块，线协议恒为 anthropic。未知值报错 | 从 url 推断 |
+| `url` | string | 必填 | 完整终态请求端点，代理不做拼接，只在其后拼接净化后的原始 query | — |
 | `protocol` | string | 可选 | `anthropic`/`chat`/`responses`，缺省从 url 尾缀推断，推断不出报 500 | 从 url 推断 |
 | `appkey` | string | 与 appkey_file 二选一 | 鉴权用 Bearer token（静态），注入转发请求 | — |
 | `appkey_file` | string | 与 appkey 二选一 | 鉴权值的文件来源：每请求读取（~ 展开），逐行匹配 `AUTHORIZATION:` 前缀取值（mcopilot-cli 登录态）。读取失败该请求 500 且不冷却 | — |
 | `target_model` | string | 必填 | 实际下发给上游的模型名 | — |
-| `cooldown_seconds` | number | 可选 | 触发失败后的冷却时长 | 顶层 `default_cooldown_seconds` |
 | `extra_headers` | object | 可选 | 出站 header 注入，优先级最高（覆盖客户端透传值与内置注入）；禁止 `authorization`/`x-api-key`/`content-length` 键 | `{}` |
 | `system_inject` | string | 可选 | 注入计费标识等 system 块（前置合并进客户端 system，幂等）；仅 `protocol: anthropic` 的 supply 可配 | — |
 | `reasoning_capability.effort_enum` | string[] | 可选 | target 侧真实支持的 effort 档位有序列表 | 默认 5 档 `off/low/medium/high/xhigh` |
 | `reasoning_capability.off_alias` | string | 可选 | 关闭动作具体落到哪个档位 | 含 off 则落 off，否则不设（走 STRIP） |
-| `credential_file` | string | `catpaw-ide` 必填 | 凭据文件路径（`~` 展开），由 `mtsso_keeper` 产出与刷新；含 `accessToken`/`refreshToken`/`attestation`/`mis`/`expire`。每请求读取；缺失或 `expire` 已过则 500 且不冷却 | — |
-| `bridge_lib` | string | `catpaw-ide` 必填 | 桥动态库路径（`~` 展开）；惰性加载并校验 ABI 版本，仅配置了 IDE supply 时才加载 | — |
 
-`catpaw-ide` 的 `credential_file`/`bridge_lib` 语义与部署方式见
-[docs/designs/2026-11-21-CatPaw-IDE凭据单点管理方案.md](../../docs/designs/2026-11-21-CatPaw-IDE凭据单点管理方案.md)。
-
-三个扩展字段的完整语义（合并矩阵/校验规则/失败语义）见
-[docs/designs/2026-09-20-model_proxy接入mcli的supply层扩展.md](../../docs/designs/2026-09-20-model_proxy接入mcli的supply层扩展.md)；
-mcli（CatPaw）supply 配置样例见该文档头部。
+mcli（CatPaw）的 `appkey_file`、`extra_headers`、`system_inject` 组合见项目内
+[配置样例](../config/model_proxy_config.example.json)的 `glm-53-mcli-example`；使用前须确认本机登录态有效。字段和校验限制以上表为准。
 
 ## 3. routes 字段
 
-家族模板 = 一个 route id + 三档（opus/sonnet/haiku）各自的 supplies 列表。
+家族模板 = 一个 route id + 按需配置的模型档位及其 supplies 列表；服务可识别 fable、opus、sonnet、haiku。
 
 ```json
 {
   "id": "claude",
   "tiers": {
+    "fable": ["claude-fable-k0"],
     "opus": ["claude-opus-k0"],
     "sonnet": ["claude-sonnet-k0"],
     "haiku": ["claude-haiku-k0"]
@@ -99,10 +89,10 @@ mcli（CatPaw）supply 配置样例见该文档头部。
 
 - `id`：家族唯一标识，strategies 里按 id 引用。route 本身不含 client_token，只是一个可复用
   的家族模板。
-- `tiers`：固定三档 `opus`/`sonnet`/`haiku`，每档一个按优先级排列的 supply id 列表，取第一个
-  「未冷却」的。
-- `failover`：`on` 时上游返回 401/403/429/5xx 会把当前 supply 打入冷却并换同档下一个再试；
-  `off` 时失败直接返回给客户端，不重试。failover 是 route（家族）级开关，不细分到 tier。
+- `tiers`：可按需配置 `fable`/`opus`/`sonnet`/`haiku`，每档为按优先级排列的 supply id 列表。使用某档前须为其配置可用供给；缺档时 pool 可能尝试下一 route。
+- `failover`：`on` 时，同 route 内按顶层 `cooldown_rules` 的首条匹配规则冷却并尝试同档下一可用 supply；未匹配的错误不因此切换。`off` 不执行此类同 route 切换。
+
+**菜单安全**：route 菜单的新增和编辑只处理 opus/sonnet/haiku；编辑会重建 `tiers`，丢失已有 fable 或其他额外档位。先备份，带 fable 的 route 请手工合并配置。删除 route 的检查不包含 `route_pool`，删除前须人工检查并移除 pool 引用。
 
 **多档共享同一组真实上游**：不是每个家族都天然有三种不同能力的模型。某家族只有两种真实模型时，
 多个 tier 可以直接填同一组 supply id 列表，不必引入额外抽象层。例如 deepseek 家族只有
@@ -128,8 +118,8 @@ mcli（CatPaw）supply 配置样例见该文档头部。
 | 字段 | 类型 | 必填 | 语义 | 默认值 |
 |---|---|---|---|---|
 | `id` | string | 必填 | 家族唯一标识，strategies 里按 id 引用 | — |
-| `tiers.opus` / `tiers.sonnet` / `tiers.haiku` | string[] | 必填（三档固定） | 每档一个按优先级排列的 supply id 列表 | — |
-| `failover` | `"on"`/`"off"` | 必填 | on：失败换同档下一 supply；off：失败直接返回 | — |
+| `tiers.fable` / `tiers.opus` / `tiers.sonnet` / `tiers.haiku` | string[] | 按使用的档位配置 | 每档按优先级排列的 supply id 列表 | — |
+| `failover` | `"on"`/`"off"` | 必填 | on：错误命中冷却规则时尝试同档下一供给；off：不执行此类切换 | — |
 
 ## 4. strategies 字段
 
@@ -150,7 +140,7 @@ mcli（CatPaw）supply 配置样例见该文档头部。
   [ARCHITECTURE.md](ARCHITECTURE.md)「入站鉴权识别」，`Authorization: Bearer <token>` 与
   `x-api-key: <token>` 两种写法均支持）。
 - `route_id`：该 token 绑定的 route 家族 id，必须是 routes 里存在的 id。运行时切换家族用
-  `switch <token> <route_id>` 改这个字段。**与 `route_pool` 二选一、互斥**（见下方「route_pool
+  `switch <token> <route_id>` 改这个字段，但会暴露 token 于进程参数、可能的命令历史及 CLI 回显；也可用 `strategy` 交互菜单，菜单仍可能显示 token。**与 `route_pool` 二选一、互斥**（见下方「route_pool
   哈希分配」）。
 - `tiers_source_capability`（可选）：该 client_token 各 tier 的 source 侧 reasoning 能力声明，
   结构与 supply 的 `reasoning_capability` 同构、解析逻辑复用同一套；某 tier 未声明或整条
@@ -169,8 +159,8 @@ mcli（CatPaw）supply 配置样例见该文档头部。
 | `dispatch.session_overrides` | — | 已移除 | session override 已迁移到独立 sidecar 文件 `config/session_overrides.json`，不再是 strategy 字段。通过 `$route` 命令或直接编辑 sidecar 维护 | — |
 | `dispatch.type` | string | 可选 | 预留分配策略扩展位，当前代码不读取该字段，只有一种哈希分配算法 | 不生效 |
 | `dispatch.fallback` | string | 可选 | 预留字段，当前代码不读取，session_key 缺失时行为固定为「route_pool 首项」，写该字段不改变实际行为 | 不生效 |
-| `tiers_source_capability.<opus\|sonnet\|haiku>.effort_enum` | string[] | 可选 | 该 tier 的 source 侧 effort 档位有序列表 | 默认 5 档 |
-| `tiers_source_capability.<opus\|sonnet\|haiku>.off_alias` | string | 可选 | 同 supply 语义 | 同 supply 缺省规则 |
+| `tiers_source_capability.<fable\|opus\|sonnet\|haiku>.effort_enum` | string[] | 可选 | 该 tier 的 source 侧 effort 档位有序列表 | 默认 5 档 |
+| `tiers_source_capability.<fable\|opus\|sonnet\|haiku>.off_alias` | string | 可选 | 同 supply 语义 | 同 supply 缺省规则 |
 | `note` | string | 可选 | 备注 | — |
 
 ## 5. 顶层字段
@@ -178,11 +168,24 @@ mcli（CatPaw）supply 配置样例见该文档头部。
 | 字段 | 类型 | 必填 | 语义 |
 |---|---|---|---|
 | `admin_token` | string | 必填 | 控制 API 鉴权，供 `X-Proxy-Admin-Token` 请求头校验 |
-| `default_cooldown_seconds` | number | 必填 | supply 未单独配置 `cooldown_seconds` 时的默认冷却时长 |
+| `cooldown_rules` | array | 可选 | 按错误码首条匹配的冷却规则；未配置或未匹配不按此规则切换供给 |
 | `upstream_timeout_seconds` | number | 可选 | 上游请求超时（秒），缺省 1800（30min，对齐 API_TIMEOUT_MS） |
 | `budget_retry` | object | 可选 | ④b 输出预算自动放大重试：`{"enabled": true, "max_retries": 5}`，缺省全开；封顶 131072 硬编码不暴露；无 per-supply 维度 |
 
-完整样例见 `config/model_proxy_config.example.json`。
+冷却规则写在顶层，供所有 supply 共用；例如：
+
+```json
+{
+  "cooldown_rules": [
+    {"errorcode": [429, 503], "cooldown_seconds": 60},
+    {"errorcode": ["URLError"], "cooldown_seconds": 60}
+  ]
+}
+```
+
+`errorcode` 为非空数组（HTTP 状态码或非空字符串），`cooldown_seconds` 为正整数；按顺序首条匹配，空数组不是兜底。正文错误须先由 `body_error_rules` 识别，其错误码也须匹配冷却规则才能触发相应冷却和切换。实际切换还取决于 route 的 `failover` 和可用供给。供给级 `cooldown_seconds` 和旧顶层 `default_cooldown_seconds` 不参与当前规则。
+
+完整样例见 [配置样例](../config/model_proxy_config.example.json)。
 
 ## 6. protocol 推断规则
 
@@ -289,10 +292,9 @@ sidecar 里的 override 若连续 **7 天**没有被任何请求命中（`last_s
 
 ## 9. strategy 录入流程
 
-`strategy add`/`edit` 录入 `tiers_source_capability` 时逐 tier 人工问答（source 侧无可探测
-的真实上游，只能人工填，原因见 [REASONING.md](REASONING.md)「source 能力为何挂 strategy、为何人工填」）：输入逗号分隔列表→对应
-`effort_enum`；输入 `-`→空列表 `[]`（该 tier 无思考能力）；留空→add 时不写该 tier 键（走默认
-5 档）、edit 时保留原值。默认值绝不物化写入配置。
+`strategy` 一级菜单的 `[a]dd`/`[e]dit` 可录入 `tiers_source_capability`；source 侧无真实上游可探测，须人工填写，原因见 [REASONING.md](REASONING.md)。菜单只询问 opus/sonnet/haiku：输入逗号分隔列表→对应 `effort_enum`；输入 `-`→空列表 `[]`；留空→add 不写该 tier、edit 保留该三档原值。默认值不物化写入配置。
+
+服务也可读取 fable 的 source 能力，但菜单重新录入能力时会重建字段，可能丢掉原有 fable 或其他额外档位；此类配置先备份并手工合并，不要在菜单中重新录入。
 
 ## 10. supply test 归因与探测
 
@@ -328,12 +330,29 @@ text 截 100 字符），并跳过 effort 探测与 `reasoning_capability` 写�
 持续选用同一账本且文件未丢失时，已持久化的累计数据不会因正常重启或日志截断而清零。
 天分桶只保留最近 `KEEP_DAYS=400` 天，超窗旧天桶汇总进 `months_archive`
 月归档节点（永久保留）。天/月边界固定按 UTC+8 划分（`timezone(timedelta(hours=8))`，不依赖系统时区）。
-schema 升级（v2→v3）在 `_load` 启动时自动迁移**已选路径上的账本**：旧桶 combo 补 `attempts=0`/`attempt_fail=0`、
-bucket 补 `max_ms=0`（断档但保真，不虚高），既有值保留，记 `usage_totals.migrated` INFO 日志。
+schema 升级（v2→v3）在 `_load` 启动时自动迁移**已选路径上的账本到内存**：旧桶 combo 补 `attempts=0`/`attempt_fail=0`、
+bucket 补 `max_ms=0`（断档但保真，不虚高），既有值保留，记 `usage_totals.migrated` INFO 日志；正常记账并成功持久化后才写入磁盘。
 这只是 schema 迁移，不会自动把项目根旧账本 `.model_proxy_totals.json` 迁移到新默认路径
 `.runtime/model_proxy_totals.json`；使用新默认路径不会自动承接旧路径上的历史。
-**迁移与重启顺序**：先停旧进程；如需迁移旧路径账本，须使用经过验收的手动切换脚本完成迁移，
-再启动新进程加载已选账本。脚本是否完成及通过验收需另行确认；不能以启动时 schema 迁移替代路径迁移。
+**迁移与重启顺序**：先停旧进程并备份旧账本；如需承接旧路径账本，在新路径尚无账本时单独迁移，
+再启动新进程加载已选账本。新路径已有账本时不要直接覆盖；不能以启动时 schema 迁移替代路径迁移。
 即使无需路径迁移，也须先停旧进程再启动新进程，避免旧进程用旧 schema 覆盖已升级的文件。
 账本供 `stats` 命令查询（见 README「CLI 命令速查」），与 ACCESS 日志完全独立。账本结构细节见设计记录
 `docs/designs/2026-07-23-usage-totals-ledger.md` + `docs/designs/2026-08-08-log-optimization-plan.md`。
+
+## 用户环境可选 MCP 服务
+
+仅适用于用户自己的 vault 环境：open-websearch 和 friday-websearch 是独立部署的可选服务，不由 model_proxy CLI 管理，也不是独立 clone 的依赖。其示例地址分别为 `http://server.local:3000/mcp`、`http://server.local:3001/mcp`；`server.local` 只是占位符，按实际部署替换。vault 根下 `.claude/skills/websearch-router/runtime/ensure_websearch.sh` 是用户环境中的恢复入口，存在与可用性须自行确认。
+
+客户端可将以下片段合并到已有 `.mcp.json`，不要覆盖其他服务：
+
+```json
+{
+  "mcpServers": {
+    "open-websearch": {"type": "http", "url": "http://server.local:3000/mcp"},
+    "friday-websearch": {"type": "http", "url": "http://server.local:3001/mcp"}
+  }
+}
+```
+
+两服务的绑定地址、鉴权、TLS 和网络访问须分别评估；model_proxy 的 Host 检查不保护它们，不能据此假定 LAN 或公网访问安全。
