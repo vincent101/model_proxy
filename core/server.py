@@ -44,6 +44,7 @@ from . import session_identity
 from . import translate as pt
 from .providers import CATPAW_IDE, LEGACY_HTTP, resolve_provider
 from .providers import catpaw_ide as ide_provider
+from .providers import http_compat as _http_compat
 from .item_id_normalize import sanitize_responses_input_ids
 from .thinking_guard import (
     CountTokensUnsupportedStore,
@@ -1806,7 +1807,7 @@ def detect_target(supply: dict) -> str:
 
 # extra_headers 禁键（小写比较）：鉴权归 appkey/appkey_file 管，避免双来源
 # 冲突；content-length 由 body 长度决定，不可覆盖。
-_EXTRA_HEADER_FORBIDDEN_KEYS = {"authorization", "x-api-key", "content-length"}
+_EXTRA_HEADER_FORBIDDEN_KEYS = _http_compat.FORBIDDEN_EXTRA_HEADERS
 
 
 def validate_supply_ext(supply: dict) -> None:
@@ -1864,65 +1865,19 @@ def validate_supply_ext(supply: dict) -> None:
 def inject_system_block(body_json: dict, text: str) -> bool:
     """system_inject：向 body["system"] 前置合并注入块（幂等，原地修改）。
 
-    合并矩阵（设计记录 §2）：
-    - system 缺省 / 空数组 → [inject_block]
-    - 字符串 → [inject_block, {"type":"text","text":原值}]
-    - 非空数组 → 首块 text == 注入文本 → 跳过（幂等硬约束：budget_retry /
-      failover 重试复用同一 body_json，重复注入会叠加计费标识块）；
-      否则前置插入
-    - 首块畸形（非 dict）→ 视为不匹配 → 前置插入
-    返回是否发生修改（False = 幂等跳过；未知形态不动）。
+    实现已抽到 core.providers.http_compat（legacy 与 catpaw-cli 共用），
+    此处保留同名导出以兼容既有调用方与测试。完整合并矩阵见该模块 docstring。
     """
-    inject_block = {"type": "text", "text": text}
-    system = body_json.get("system")
-    if system is None or (isinstance(system, list) and not system):
-        body_json["system"] = [inject_block]
-        return True
-    if isinstance(system, str):
-        body_json["system"] = [inject_block, {"type": "text", "text": system}]
-        return True
-    if isinstance(system, list):
-        first = system[0]
-        if isinstance(first, dict) and first.get("text") == text:
-            return False
-        body_json["system"] = [inject_block] + system
-        return True
-    return False
+    return _http_compat.inject_system_block(body_json, text)
 
 
 def resolve_appkey(supply: dict) -> str:
     """出站鉴权值：appkey 直取，或 appkey_file 每请求读取解析。
 
-    - appkey_file 支持 ~ 展开（os.path.expanduser）；逐行 strip 后精确匹配
-      "AUTHORIZATION:" 前缀取值（目标文件非标准 YAML，勿用 yaml 库；
-      与 CatpawCLI token store 同款策略，无缓存）。
-    - 失败（文件不存在 / 无 AUTHORIZATION 行 / 值为空）抛 ValueError（消息含
-      supply id 与原因），调用方出站前 500 返回、不进 cooldown（配置问题
-      非上游问题，冷却会误伤 failover）。
-    - appkey 与 appkey_file 均缺 → 返回 ""（维持历史空串照发行为；必填由
-      validate_supply_ext 在加载/写盘层把关，热重载降级路径不额外拦截）。
+    实现已抽到 core.providers.http_compat（legacy 与 catpaw-cli 共用），
+    此处保留同名导出以兼容既有调用方（含 core/cli/_config_ops.py）。
     """
-    appkey = supply.get("appkey")
-    if appkey:
-        return appkey
-    appkey_file = supply.get("appkey_file")
-    if not appkey_file:
-        return ""
-    sid = supply.get("id", "")
-    path = os.path.expanduser(appkey_file)
-    try:
-        with open(path, "r", encoding="utf-8") as f:
-            lines = f.readlines()
-    except OSError as e:
-        raise ValueError(f"supply {sid} appkey_file 读取失败: {e}") from e
-    for line in lines:
-        line = line.strip()
-        if line.startswith("AUTHORIZATION:"):
-            token = line[len("AUTHORIZATION:"):].strip()
-            if token:
-                return token
-            raise ValueError(f"supply {sid} appkey_file 读取失败: AUTHORIZATION 值为空")
-    raise ValueError(f"supply {sid} appkey_file 读取失败: 无 AUTHORIZATION 行")
+    return _http_compat.resolve_appkey(supply)
 
 
 def pick_translator(source: str, target: str) -> str:
@@ -2434,15 +2389,10 @@ class ModelProxyHandler(BaseHTTPRequestHandler):
                 self._write_buffered_response(
                     500, [], error_body_for_source("anthropic", 500, str(e)))
                 return
-            headers = {k: v for k, v in self.headers.items()
-                       if k.lower() not in {"host", "content-length", "authorization", "x-api-key"}}
-            headers.update({"Authorization": f"Bearer {appkey}", "x-api-key": appkey,
-                            "Content-Type": "application/json", "Content-Length": str(len(send_body))})
-            # extra_headers：supply 声明的出站 header，最高优先（跳过 content-length）
-            for k, v in (supply.get("extra_headers") or {}).items():
-                if k.lower() == "content-length":
-                    continue
-                headers[k] = v
+            # 与 _forward 共用同一 header 构造（count_tokens body 恒为 JSON）
+            headers = _http_compat.build_standard_headers(
+                self.headers, appkey, len(send_body),
+                converted=True, extra_headers=supply.get("extra_headers"))
             req = urllib.request.Request(target_url, data=send_body, headers=headers, method=method)
             try:
                 resp = urllib.request.urlopen(req, timeout=cs.get_upstream_timeout())
@@ -3027,25 +2977,13 @@ class ModelProxyHandler(BaseHTTPRequestHandler):
                         self._write_buffered_response(
                             500, [], error_body_for_source(source, 500, str(e)))
                         return
-                    _skip_req_headers = {"host", "content-length", "authorization", "x-api-key"}
-                    fwd_headers: dict[str, str] = {}
-                    for key, val in self.headers.items():
-                        if key.lower() in _skip_req_headers:
-                            continue
-                        fwd_headers[key] = val
-                    fwd_headers["Authorization"] = f"Bearer {appkey}"
-                    fwd_headers["x-api-key"] = appkey
-                    fwd_headers["Content-Length"] = str(len(send_body))
-                    if mode != PASSTHROUGH:
-                        # 转换后 body 一律 JSON
-                        fwd_headers["Content-Type"] = "application/json"
-                    # extra_headers：supply 声明的出站 header，最高优先——覆盖透传值
-                    # 与内置注入（含转换路径的 Content-Type）；content-length 由 body
-                    # 长度决定，跳过不覆盖
-                    for k, v in (supply.get("extra_headers") or {}).items():
-                        if k.lower() == "content-length":
-                            continue
-                        fwd_headers[k] = v
+                    # header 构造已抽到 http_compat（legacy 与 catpaw-cli 共用）：
+                    # 剔除客户端鉴权/长度 → 双认证注入 → Content-Length →
+                    # 转换时强制 JSON → extra_headers 最后覆盖（跳过 content-length）
+                    fwd_headers = _http_compat.build_standard_headers(
+                        self.headers, appkey, len(send_body),
+                        converted=(mode != PASSTHROUGH),
+                        extra_headers=supply.get("extra_headers"))
 
                     req = urllib.request.Request(
                         url=target_url,
