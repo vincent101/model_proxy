@@ -471,7 +471,12 @@ func (c *Client) ideModels(ctx context.Context) ([]Model, bool, error) {
 		name := str(m["modelTypeName"])
 		t := num(m["modelType"])
 		requiresAppID := m["requireCustomFridayAppid"] == true
-		if m["supportAgent"] != true || requiresAppID || name == "" || t <= 0 || t != float64(int(t)) {
+		// requireCustomFridayAppid 只是「该模型需要账号侧已开通个人 Friday
+		// AppId」，不是「本客户端必须发送 AppId」。实测放开后 gpt-6.2-astra
+		// 直接可用（服务端按 SSO 身份自行解析）；保留过滤会把可用模型误判成
+		// 「目录中没有该模型」。真正的权限由上游把关：无权限时上游会返回错误，
+		// 走与其它上游错误相同的冷却/failover 路径。
+		if m["supportAgent"] != true || name == "" || t <= 0 || t != float64(int(t)) {
 			continue
 		}
 		if seen[name] {

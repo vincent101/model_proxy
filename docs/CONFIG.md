@@ -66,8 +66,8 @@ session override 存放在独立 sidecar 文件 `config/session_overrides.json`�
 | `system_inject` | string | 可选 | 注入计费标识等 system 块（前置合并进客户端 system，幂等）；仅 `protocol: anthropic` 的 supply 可配 | — |
 | `reasoning_capability.effort_enum` | string[] | 可选 | target 侧真实支持的 effort 档位有序列表 | 默认 5 档 `off/low/medium/high/xhigh` |
 | `reasoning_capability.off_alias` | string | 可选 | 关闭动作具体落到哪个档位 | 含 off 则落 off，否则不设（走 STRIP） |
-| `credential_file` | string | `catpaw-ide` 必填 | 凭据文件路径（`~` 展开），由 `mtsso_keeper` 产出与刷新。每请求读取；缺失或 `expire` 已过则 500 且不冷却 | — |
-| `bridge_lib` | string | `catpaw-ide` 必填 | 桥动态库路径（`~` 展开）；惰性加载并校验 ABI 版本，仅配置 IDE supply 时才加载 | — |
+| `credential_file` | string | 可选覆盖 | 凭据文件路径（`~` 展开），由 `mtsso_keeper` 产出与刷新。每请求读取；缺失或 `expire` 已过则 500 且不冷却 | 模块默认 + `provider_settings.json` 段 |
+| `bridge_lib` | string | 可选覆盖 | 桥动态库路径（`~` 展开）；惰性加载并校验 ABI 版本，仅配置 IDE supply 时才加载 | 按平台默认 + `provider_settings.json` 段 |
 
 mcli（CatPaw）的 `appkey_file`、`extra_headers`、`system_inject` 组合见项目内
 [配置样例](../config/model_proxy_config.example.json)的 `glm-53-mcli-example`；使用前须确认本机登录态有效。字段和校验限制以上表为准。
@@ -84,19 +84,44 @@ supply **只声明差异**：
 
 {"id": "catpaw-ide-sol", "protocol": "catpaw-ide",
  "target_model": "gpt-6.2-sol",
- "credential_file": "~/.mtsso_keeper/catpaw_ide_session.json",
- "bridge_lib": "~/.local/lib/libcatpaw_bridge.dylib"}
+ "reasoning_capability": {"effort_enum": ["low", "medium", "high", "xhigh", "max"]}}
 ```
+
+两类 provider 的 supply 都只留 4 个字段：**路径不进 supply**（见下节）。
 
 内置内容（`core/providers/catpaw_cli.py`）：
 
 | 项 | catpaw-cli | catpaw-ide |
 |---|---|---|
 | 端点 | `https://mcli.sankuai.com/v1/messages` | 模块内部构造 |
-| 凭据 | `~/.config/mcopilot-cli/.config.yaml` | `credential_file` 指定 |
+| 凭据默认路径 | `~/.config/mcopilot-cli/.config.yaml` | `~/.mtsso_keeper/catpaw_ide_session.json` |
+| 桥库默认路径 | — | `~/.local/lib/libcatpaw_bridge.{dylib,dll,so}`（按平台） |
 | `extra_headers` | `{"X-Working-Dir": "/"}` | — |
 | `system_inject` | 计费 header（跟随 Claude Code 版本） | — |
 | 鉴权 | Bearer + `x-api-key` | OIDC 四要素，桥内部处理 |
+
+### 2.1 provider 本机设置（`config/provider_settings.json`）
+
+凭据/桥库这类**跟机器和平台绑定**的路径，放在本机设置文件里，不动 supply、
+不动主配置；文件缺失或某个键缺失即回落模块默认值（fail-open）。
+
+```json
+{
+  "catpaw-cli": { "credential_file": "~/.config/mcopilot-cli/.config.yaml" },
+  "catpaw-ide": {
+    "credential_file": "~/.mtsso_keeper/catpaw_ide_session.json",
+    "bridge_lib": "~/.local/lib/libcatpaw_bridge.dylib"
+  }
+}
+```
+
+- 样例：`config/provider_settings.example.json`；实际文件 `config/provider_settings.json`
+  不入 Git（机器相关），首次需要改路径时复制样例再改。
+- 解析优先级：**supply 字段 > `provider_settings.json` 段 > 模块默认值**。
+  多账号/多桥库并存时才在单条 supply 上写覆盖。
+- 按 `(mtime, size)` 缓存，改文件后下一次请求即生效，**不需要重启**（路径变更与主配置
+  reload 解耦）。
+- Windows：`bridge_lib` 默认解析成 `libcatpaw_bridge.dll`；换机时一般只需改这一行。
 
 **provider supply 若携带 `url`/`appkey`/`appkey_file`/`extra_headers`/`system_inject`
 一律报错**——写了说明配置有误，不静默忽略。

@@ -8,13 +8,20 @@
 
 **凭据归属**：文件由 mtsso_keeper 的 mcli 段维护（探测 health → 失效重铸 → 原子回写），
 本模块只读。这与 catpaw-ide 是同一分工：keeper 管、proxy 只读。
+
+**路径归属**：`credential_file` 默认在模块内置；换机器/换平台改
+`config/provider_settings.json` 的 `catpaw-cli` 段即可，不需要动 supply。
 """
 from __future__ import annotations
 
 import os
 
+from . import settings as provider_settings
+
 # ── 内置常量（原写在每条 supply 上，12 条各重复一遍）──────────────────
 ENDPOINT = "https://mcli.sankuai.com/v1/messages"
+
+PROVIDER = "catpaw-cli"
 
 # mc CLI 自身也在用这个文件，keeper 代管而非独占；model_proxy 只读取。
 CREDENTIAL_FILE = "~/.config/mcopilot-cli/.config.yaml"
@@ -58,9 +65,18 @@ def validate_supply(supply: dict) -> None:
             "端点/凭据/header/注入均已内置到模块，请删除这些字段")
 
 
+def credential_file() -> str:
+    """凭据文件路径（未展开 ~）。
+
+    优先级：provider_settings.json 的 catpaw-cli 段 > 模块默认值。
+    supply 上不允许写该字段（见 _FORBIDDEN_SUPPLY_FIELDS）。
+    """
+    return provider_settings.get(PROVIDER, "credential_file") or CREDENTIAL_FILE
+
+
 def credential_path() -> str:
     """凭据文件实际路径（展开 ~）。供误导排查与测试 patch。"""
-    return os.path.expanduser(CREDENTIAL_FILE)
+    return os.path.expanduser(credential_file())
 
 
 def target_model_of(supply: dict) -> str:
@@ -83,7 +99,7 @@ def materialize(supply: dict) -> dict:
     """
     out = dict(supply)
     out["url"] = ENDPOINT
-    out["appkey_file"] = CREDENTIAL_FILE
+    out["appkey_file"] = credential_file()
     out["extra_headers"] = dict(EXTRA_HEADERS)
     out["system_inject"] = SYSTEM_INJECT
     out["protocol"] = WIRE_PROTOCOL

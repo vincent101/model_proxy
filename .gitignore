@@ -7,6 +7,7 @@ __pycache__/
 config/model_proxy_config.json
 config/model_proxy_config.json.bak.*
 config/session_overrides.json
+config/provider_settings.json
 config/session_overrides.json.tmp*
 .pytest_cache/
 .DS_Store

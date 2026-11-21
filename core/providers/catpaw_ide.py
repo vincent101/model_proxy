@@ -7,6 +7,11 @@
 
 凭据文件格式（keeper 产出）：
     {"accessToken","refreshToken","attestation","mis","expire","issuedAt"}
+
+**路径归属**：`credential_file` / `bridge_lib` 都有模块默认值（见
+`resolve_paths`），supply 上不写也能跑；换机器/换平台改
+`config/provider_settings.json` 的 `catpaw-ide` 段即可。supply 上的同名字段
+保留为最高优先级覆盖（多账号并存时用）。
 """
 from __future__ import annotations
 
@@ -15,6 +20,13 @@ import json
 import os
 import threading
 import time
+
+from . import settings as provider_settings
+
+PROVIDER = "catpaw-ide"
+
+# 凭据默认路径：mtsso_keeper 的 CatPaw IDE 段固定写这里。
+DEFAULT_CREDENTIAL_FILE = "~/.mtsso_keeper/catpaw_ide_session.json"
 
 # 剩余寿命低于该阈值即拒绝出站：给 keeper 一次 tick 的窗口，避免边界抖动。
 _EXPIRE_MARGIN_SECONDS = 300
@@ -26,6 +38,25 @@ _ERR_SIZE = 1024
 
 class CredentialError(ValueError):
     """凭据缺失/过期/残缺。调用方应 500，且**不进 cooldown**。"""
+
+
+def default_bridge_lib() -> str:
+    """桥库默认路径（按平台选 .dylib/.dll/.so）。"""
+    return provider_settings.default_bridge_lib()
+
+
+def resolve_paths(supply: dict) -> tuple[str, str]:
+    """解析 (credential_file, bridge_lib)。
+
+    优先级：supply 字段 > provider_settings.json 的 catpaw-ide 段 > 模块默认值。
+    """
+    cred = (supply.get("credential_file")
+            or provider_settings.get(PROVIDER, "credential_file")
+            or DEFAULT_CREDENTIAL_FILE)
+    lib = (supply.get("bridge_lib")
+           or provider_settings.get(PROVIDER, "bridge_lib")
+           or default_bridge_lib())
+    return cred, lib
 
 
 def read_credential(path: str) -> dict:

@@ -28,6 +28,17 @@
   `HTTPError`，复用既有冷却/failover；凭据与桥加载故障仍快速 500、不进冷却。
   同时 `body_error_rules` 现在也匹配非 2xx 错误体，可把「模型不在账号目录」
   这类确定性错误映射成虚拟 `errorcode` 并配更长冷却（如 21600s）。
+- **provider 本机设置层**：新增 `config/provider_settings.json`（样例
+  `provider_settings.example.json`，实际文件不入 Git）。`credential_file` /
+  `bridge_lib` 从 supply 必填项降为**可选覆盖**，解析优先级
+  `supply > provider_settings.json > 模块默认值`；桥库默认值按平台取
+  `.dylib`/`.dll`/`.so`。改文件按 (mtime,size) 生效，不需重启。
+  9 条 provider supply 统一收敛为 4 字段。
+- **`requireCustomFridayAppid` 模型不再被过滤**：该标记只表示「账号需已开通
+  个人 Friday AppID」，不代表客户端要发送 AppID。此前 `ideModels` 无条件剔除，
+  导致 `gpt-6.2-astra` 被误判为「当前账号目录中没有该模型」；放开后实测
+  `gpt-6.2-astra` 正常出文（服务端按 SSO 身份自行解析）。真正的权限由上游
+  把关，无权限仍走冷却/failover。
 - **实测记录**：IDE 真实端到端（非流式/流式/工具调用/多轮工具回传）通过；
   CLI 迁移前后 A/B 对拍语义一致；`protocol` 迁移干跑覆盖 9 条 mcli supply。
 

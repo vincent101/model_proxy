@@ -1847,10 +1847,13 @@ def validate_supply_ext(supply: dict) -> None:
         if supply.get("extra_headers") or supply.get("system_inject"):
             raise ValueError(
                 f"supply {sid}: catpaw-ide 不支持 extra_headers/system_inject")
-        if not supply.get("credential_file"):
-            raise ValueError(f"supply {sid}: catpaw-ide 须配置 credential_file")
-        if not supply.get("bridge_lib"):
-            raise ValueError(f"supply {sid}: catpaw-ide 须配置 bridge_lib")
+        # credential_file / bridge_lib 不是必填：模块有默认值，换机器改
+        # config/provider_settings.json 即可（supply 上写了则作为最高优先级覆盖）。
+        # 这里只校验类型，避免 pathlib/ctypes 收到非字符串。
+        for _key in ("credential_file", "bridge_lib"):
+            _val = supply.get(_key)
+            if _val is not None and not isinstance(_val, str):
+                raise ValueError(f"supply {sid}: {_key} 必须为字符串")
         return
 
     # ---- legacy：原有校验逐字保留 ----
@@ -2985,10 +2988,10 @@ class ModelProxyHandler(BaseHTTPRequestHandler):
                 _ide_upstream_error = None
                 if _handler == CATPAW_IDE:
                     try:
-                        _cred = ide_provider.read_credential(
-                            supply.get("credential_file", ""))
+                        _cred_path, _lib_path = ide_provider.resolve_paths(supply)
+                        _cred = ide_provider.read_credential(_cred_path)
                         resp = ide_provider.start_request(
-                            supply.get("bridge_lib", ""), _cred, send_body)
+                            _lib_path, _cred, send_body)
                     except ide_provider.UpstreamError as e:
                         # 上游非 2xx：转成 HTTPError，复用它下方的冷却/failover 处理。
                         # 否则 IDE 供给排在第 2 位时，模型不可用会把客户端卡死在 500。

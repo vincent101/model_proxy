@@ -1,0 +1,9 @@
+{
+  "catpaw-cli": {
+    "credential_file": "~/.config/mcopilot-cli/.config.yaml"
+  },
+  "catpaw-ide": {
+    "credential_file": "~/.mtsso_keeper/catpaw_ide_session.json",
+    "bridge_lib": "~/.local/lib/libcatpaw_bridge.dylib"
+  }
+}

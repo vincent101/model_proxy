@@ -60,7 +60,7 @@ if exist config\model_proxy_config.json (echo 配置已存在，未覆盖) else 
 1. 示例是 `listen.host: "0.0.0.0"` 加空 `allow_hosts`，**原样会拒绝启动**。本机使用改成 `127.0.0.1`；远程使用见[下文](#从另一台电脑使用)。
 2. 为要使用的 supply 填入真实上游完整端点、`target_model` 和 `appkey` 或 `appkey_file`；示例不是可用凭据。示例 `nation1` 的 `sonnet` 还引用 mcli：不用 mcli 时先从该 route 的 tier 列表移除引用，再删除其 supply。使用 mcli 时需有效登录态；`appkey_file`、`extra_headers`、`system_inject` 示例在配置样例中，不应假设本机已有登录态。
 
-   mcli 供应也可改写成 `protocol: catpaw-cli`——端点、`appkey_file`、`X-Working-Dir`、计费 system 块全部内置到模块，supply 只留 `id`/`protocol`/`target_model`/`reasoning_capability`。CatPaw IDE 另用 `protocol: catpaw-ide` 加 `credential_file`/`bridge_lib`。两者的凭据都由 `mtsso_keeper` 维护，本代理只读不刷新。字段与内置值见 [CONFIG](docs/CONFIG.md#两个-catpaw-provider)。
+   mcli 供应也可改写成 `protocol: catpaw-cli`——端点、`appkey_file`、`X-Working-Dir`、计费 system 块全部内置到模块，supply 只留 `id`/`protocol`/`target_model`/`reasoning_capability`。CatPaw IDE 另用 `protocol: catpaw-ide`，supply 同样是这 4 个字段——凭据与桥库路径由模块默认值给出（换机器改 `config/provider_settings.json`，样例见 `config/provider_settings.example.json`）。两者的凭据都由 `mtsso_keeper` 维护，本代理只读不刷新。字段与内置值见 [CONFIG](docs/CONFIG.md#两个-catpaw-provider)。
 3. 设置相互独立的随机强 `admin_token` 和 strategy `client_token`，核对 routes、tiers 和 supplies 的引用。示例 strategy 使用 `route_pool`，不是单值 `route_id`。
 4. 密钥和配置不得提交或分享。Mac 保持私有文件权限；Windows 私有 ACL 检查失败时不要绕过或反复重试：记录并脱敏错误，参考 [Windows 路径与 ACL 限制](docs/designs/2026-11-16-model-proxy-Windows路径ACL默认目录兼容方案.md)（草稿，非已验收修复步骤），必要时请管理员协助核对路径和权限。Windows 尚未原生验收。
 
