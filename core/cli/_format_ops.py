@@ -261,6 +261,7 @@ def parse_access_line(line: str) -> dict | None:
         "route": fields.get("route", ""),
         "tier": fields.get("tier", ""),
         "supply": fields.get("supply", ""),
+        "provider": fields.get("provider", ""),
         "failover": fields.get("failover", ""),
         "session": fields.get("session", ""),
         "route_failover": fields.get("route_failover", ""),

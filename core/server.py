@@ -2236,7 +2236,7 @@ class ModelProxyHandler(BaseHTTPRequestHandler):
         """
         self._acc = {
             "status": 0, "source": "", "operation": "", "route": "", "tier": "",
-            "supply": "", "target_protocol": "", "conversion_kind": "",
+            "supply": "", "provider": "", "target_protocol": "", "conversion_kind": "",
             "failover": 0, "attempts": 0, "token": "",
             "usage_in": 0, "usage_out": 0,
             "strategy": "", "session": "", "route_failover": 0,
@@ -2296,7 +2296,7 @@ class ModelProxyHandler(BaseHTTPRequestHandler):
             ms = int((time.monotonic() - t0) * 1000)
             access_log.info(
                 "ACCESS ms=%d status=%s source=%s operation=%s route=%s tier=%s supply=%s "
-                "target_protocol=%s conversion_kind=%s failover=%s attempts=%s "
+                "provider=%s target_protocol=%s conversion_kind=%s failover=%s attempts=%s "
                 "usage_in=%s usage_out=%s token=%s session=%s "
                 "route_failover=%s builtin=%s budget_retried=%s budget_truncated=%s "
                 "stop_reason=%s final_error=%s body_error=%s nudge_rewritten=%s "
@@ -2304,7 +2304,7 @@ class ModelProxyHandler(BaseHTTPRequestHandler):
                 "response_committed=%s "
                 "stream_integrity=%s terminal_status=%s terminal_reason=%s first_event_ms=%s",
                 ms, a["status"], a["source"], a["operation"],
-                a["route"], a["tier"], a["supply"],
+                a["route"], a["tier"], a["supply"], a.get("provider", ""),
                 a["target_protocol"], a["conversion_kind"], a["failover"], a["attempts"],
                 a["usage_in"], a["usage_out"], a["token"], a["session"],
                 a["route_failover"], a["builtin"], a["budget_retried"],
