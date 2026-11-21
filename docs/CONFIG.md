@@ -57,8 +57,8 @@ session override 存放在独立 sidecar 文件 `config/session_overrides.json`�
 | 字段 | 类型 | 必填 | 语义 | 默认值 |
 |---|---|---|---|---|
 | `id` | string | 必填 | 唯一标识，routes 里按 id 引用 | — |
-| `url` | string | 必填 | 完整终态请求端点，代理不做拼接，只在其后拼接净化后的原始 query | — |
-| `protocol` | string | 可选 | `anthropic`/`chat`/`responses`，缺省从 url 尾缀推断，推断不出报 500 | 从 url 推断 |
+| `url` | string | 必填（`catpaw-cli`/`catpaw-ide` 不需要） | 完整终态请求端点，代理不做拼接，只在其后拼接净化后的原始 query | — |
+| `protocol` | string | 可选 | **既是线协议也是处理模块选择**：`anthropic`/`chat`/`responses` 走原有 HTTP 路径（缺省从 url 尾缀推断）；`catpaw-cli`/`catpaw-ide` 交由对应模块，线协议恒为 anthropic。未知值报错 | 从 url 推断 |
 | `appkey` | string | 与 appkey_file 二选一 | 鉴权用 Bearer token（静态），注入转发请求 | — |
 | `appkey_file` | string | 与 appkey 二选一 | 鉴权值的文件来源：每请求读取（~ 展开），逐行匹配 `AUTHORIZATION:` 前缀取值（mcopilot-cli 登录态）。读取失败该请求 500 且不冷却 | — |
 | `target_model` | string | 必填 | 实际下发给上游的模型名 | — |
@@ -66,9 +66,43 @@ session override 存放在独立 sidecar 文件 `config/session_overrides.json`�
 | `system_inject` | string | 可选 | 注入计费标识等 system 块（前置合并进客户端 system，幂等）；仅 `protocol: anthropic` 的 supply 可配 | — |
 | `reasoning_capability.effort_enum` | string[] | 可选 | target 侧真实支持的 effort 档位有序列表 | 默认 5 档 `off/low/medium/high/xhigh` |
 | `reasoning_capability.off_alias` | string | 可选 | 关闭动作具体落到哪个档位 | 含 off 则落 off，否则不设（走 STRIP） |
+| `credential_file` | string | `catpaw-ide` 必填 | 凭据文件路径（`~` 展开），由 `mtsso_keeper` 产出与刷新。每请求读取；缺失或 `expire` 已过则 500 且不冷却 | — |
+| `bridge_lib` | string | `catpaw-ide` 必填 | 桥动态库路径（`~` 展开）；惰性加载并校验 ABI 版本，仅配置 IDE supply 时才加载 | — |
 
 mcli（CatPaw）的 `appkey_file`、`extra_headers`、`system_inject` 组合见项目内
 [配置样例](../config/model_proxy_config.example.json)的 `glm-53-mcli-example`；使用前须确认本机登录态有效。字段和校验限制以上表为准。
+
+#### 两个 CatPaw provider
+
+`protocol: catpaw-cli` / `catpaw-ide` 时，端点、鉴权、header、system 注入全部内置在模块里，
+supply **只声明差异**：
+
+```json
+{"id": "claude-opus-mcli-3339", "protocol": "catpaw-cli",
+ "target_model": "claude-opus-5.5",
+ "reasoning_capability": {"effort_enum": ["low", "medium", "high", "xhigh", "max"]}}
+
+{"id": "catpaw-ide-sol", "protocol": "catpaw-ide",
+ "target_model": "gpt-6.2-sol",
+ "credential_file": "~/.mtsso_keeper/catpaw_ide_session.json",
+ "bridge_lib": "~/.local/lib/libcatpaw_bridge.dylib"}
+```
+
+内置内容（`core/providers/catpaw_cli.py`）：
+
+| 项 | catpaw-cli | catpaw-ide |
+|---|---|---|
+| 端点 | `https://mcli.sankuai.com/v1/messages` | 模块内部构造 |
+| 凭据 | `~/.config/mcopilot-cli/.config.yaml` | `credential_file` 指定 |
+| `extra_headers` | `{"X-Working-Dir": "/"}` | — |
+| `system_inject` | 计费 header（跟随 Claude Code 版本） | — |
+| 鉴权 | Bearer + `x-api-key` | OIDC 四要素，桥内部处理 |
+
+**provider supply 若携带 `url`/`appkey`/`appkey_file`/`extra_headers`/`system_inject`
+一律报错**——写了说明配置有误，不静默忽略。
+
+两个 provider 的凭据都由 `mtsso_keeper` 维护，本代理**只读、不刷新**；凭据缺失或过期返回
+500 且不进 cooldown（凭据问题不是上游故障，写冷却会误伤 failover）。
 
 ## 3. routes 字段
 
@@ -189,10 +223,25 @@ mcli（CatPaw）的 `appkey_file`、`extra_headers`、`system_inject` 组合见�
 
 ## 6. protocol 推断规则
 
-`supply["protocol"]` 是可选字段，唯一权威解析逻辑在
-`core/reasoning/registry.py::resolve_protocol`，优先级：
+`supply["protocol"]` 是可选字段，承担**两个职责**：声明上游线协议，以及（对 CatPaw）
+选择处理模块。解析分两层：
 
-1. 显式 `supply["protocol"]`（须是下表合法值之一，否则报错）。
+**第一层：选处理模块**（`core/providers/__init__.py::resolve_handler`）
+
+| 取值 | 处理模块 | 上游线协议 |
+|---|---|---|
+| `anthropic` / `chat` / `responses` | legacy HTTP 路径 | 同名 |
+| `catpaw-cli` | CatPaw CLI 模块 | `anthropic`（内置） |
+| `catpaw-ide` | CatPaw IDE 模块 | `anthropic`（内置） |
+| 未配置 | legacy，交由第二层推断 | — |
+| 其他 | **报错** | — |
+
+这样 `protocol` 与线协议**不可能矛盾**（不存在 `provider: catpaw-cli` + `protocol: chat`
+这种写法），因此不需要额外的互斥校验。
+
+**第二层：legacy 的线协议**（`core/reasoning/registry.py::resolve_protocol`）
+
+1. 显式 `supply["protocol"]`（合法值见上表 legacy 三项，否则报错）。
 2. 未显式配置时，从 `supply["url"]` 的路径尾缀推断（三者互斥，无公共后缀，可靠判断）：
 
    | url 尾缀 | protocol |
@@ -203,6 +252,8 @@ mcli（CatPaw）的 `appkey_file`、`extra_headers`、`system_inject` 组合见�
 
 3. 两者都推断不出（url 尾缀不属于上表、且未显式配置 protocol）→ 直接抛错，代理返回明确的
    500 错误响应，不做任何猜测性兜底——避免请求悄悄走错转换分支产生难排查的错误响应。
+
+`catpaw-*` 两个取值不参与第二层推断：它们的端点与线协议由模块决定，supply 上也不再有 `url`。
 
 ## 7. route_pool 哈希分配
 
