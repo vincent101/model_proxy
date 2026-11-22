@@ -196,6 +196,30 @@ def _normalize_windows_launch(args, environment):
     environment['MODEL_PROXY_PORT'] = port
 
 
+def _windows_same_path(first: str, second: str) -> bool:
+    """两个路径是否指向同一文件；比较前把 8.3 短名展开。
+
+    之前直接比 ``normcase(abspath(a))`` 与 ``normcase(resolve(b))``：前者是纯
+    文本运算、保留 8.3 短名，后者走文件系统、返回长名。只要路径里有短名
+    （实测 GitHub Windows runner 的 ``C:/Users/RUNNER~1/...``，以及任何过长
+    的 Windows 用户名），两者必然不等，无参直启被误判为「不可安全归一化」。
+
+    这里两边都用同一种解析：优先 ``resolve()``（会展开 8.3 与符号链接），
+    解析失败才退回 ``abspath``。比较仍然是"同一文件"，不比原来宽松——
+    真实不同的脚本路径依旧是不等的。
+    """
+    import ntpath
+
+    def canonical(value: str) -> str:
+        try:
+            resolved = str(Path(value).resolve(strict=True))
+        except (OSError, RuntimeError, ValueError):
+            resolved = ntpath.abspath(value)
+        return ntpath.normcase(resolved)
+
+    return canonical(first) != canonical(second)
+
+
 def _normalize_windows_direct_launch(environment, *, root, entry, executable, original,
                                      spawn=None, resolve=None):
     """Run a no-argument direct launch with observable explicit options.
@@ -212,7 +236,7 @@ def _normalize_windows_direct_launch(environment, *, root, entry, executable, or
     if (not isinstance(original, (tuple, list)) or len(original) < 2
             or any(not isinstance(arg, str) for arg in original)
             or any(flag not in ('-B', '-I', '-S') for flag in original[1:-1])
-            or ntpath.normcase(ntpath.abspath(original[-1])) != ntpath.normcase(entry)
+            or _windows_same_path(original[-1], entry)
             or not ntpath.isabs(executable) or not ntpath.isabs(entry)):
         raise ValueError('unsupported Windows direct launch')
     config = ntpath.abspath(environment.get('MODEL_PROXY_CONFIG')
@@ -236,6 +260,21 @@ if __name__ == '__main__' and sys.platform == 'darwin':
                  'use an absolute Python launcher and python [-B] <service-entry> '
                  'without extra arguments (exec failure or unsupported launch).')
 
+# 只回显本文件自己抛出的固定文案；其它异常一律只给类名。
+# 直接打印 str(exc) 会把路径/环境值带上，而这里是服务启动的必经之路。
+_WINDOWS_LAUNCH_REASONS = frozenset({
+    'unsupported Windows direct launch',
+    'invalid internal launch arguments',
+})
+
+
+def _windows_launch_reason(exc: BaseException) -> str:
+    text = str(exc)
+    if isinstance(exc, ValueError) and text in _WINDOWS_LAUNCH_REASONS:
+        return text
+    return type(exc).__name__
+
+
 if __name__ == '__main__':
     if sys.platform == 'win32':
         import os
@@ -245,8 +284,13 @@ if __name__ == '__main__':
                     os.environ, root=str(ROOT), entry=str(Path(__file__).resolve()),
                     executable=sys.executable, original=getattr(sys, 'orig_argv', ())))
             _normalize_windows_launch(sys.argv[1:], os.environ)
-        except Exception:
-            sys.exit('Error: Windows service launch cannot be safely normalized.')
+        except SystemExit:
+            raise
+        except Exception as exc:
+            # 原始信息被吞掉时无法定位（实测：两个直启用例在原生 Windows 上
+            # 都只报这一句）。这里补上安全原因码，仍然不外泄路径或环境值。
+            sys.exit('Error: Windows service launch cannot be safely normalized '
+                     f'({_windows_launch_reason(exc)}).')
     from core.server import main
     main()
 elif sys.platform != 'darwin':
