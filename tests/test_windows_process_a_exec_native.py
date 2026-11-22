@@ -54,7 +54,10 @@ class WindowsExecSmoke(unittest.TestCase):
             data = json.loads(receipt.read_text(encoding="utf-8"))
             self.assertEqual(data["config"], str(config))
             self.assertEqual(data["port"], "12345")
-            self.assertEqual(data["argv"][-5:], [str(entry), "--config", str(config), "--port", "12345"])
+            # 产品在 re-exec 前把入口/配置规范化成长路径（8.3 短名会被展开）。
+            # tempfile 在 runner 上给的是 RUNNER~1 短名，因此期望值同样取规范化结果。
+            self.assertEqual(data["argv"][-5:], [str(entry.resolve()), "--config",
+                                                 str(config.resolve()), "--port", "12345"])
 
     def test_direct_parent_returns_the_owned_service_child_failure(self):
         source = Path(__file__).resolve().parents[1]

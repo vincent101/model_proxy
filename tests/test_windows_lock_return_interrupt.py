@@ -57,10 +57,13 @@ class TransferReturnInterruptTests(unittest.TestCase):
         snapshot = discovery.inspect_runtime_identities(self.root, self.paths)
         expected_offset = offsets[point]
         captured = {}
+        seen = []
         previous = sys.gettrace()
         def trace(frame, event, arg):
             if frame.f_code is win.lock_private_object.__code__:
                 frame.f_trace_opcodes = True
+                if event == 'opcode':
+                    seen.append(frame.f_lasti)
                 if event == 'opcode' and frame.f_lasti == expected_offset:
                     captured['raw'] = frame.f_locals.get('raw')
                     captured['fd'] = frame.f_locals.get('fd')
@@ -74,6 +77,16 @@ class TransferReturnInterruptTests(unittest.TestCase):
             sys.settrace(trace)
             with self.assertRaises(interruption) as caught:
                 locks.acquire_lock(snapshot, 'anchor.lock', create=create)
+        except AssertionError:
+            # 只有「断点没被走到」需要现场：给出真实执行到的偏移与断点邻近指令，
+            # 避免在别的 Python 版本/分支上只看到一句 not raised。
+            listing = [(item.offset, item.opname, item.argrepr)
+                       for item in dis.get_instructions(win.lock_private_object)]
+            near = [item for item in listing
+                    if expected_offset - 24 <= item[0] <= expected_offset + 24]
+            raise AssertionError(
+                f'interruption not raised; point={point} offset={expected_offset} '
+                f'create={create} seen={seen[-60:]} near={near}') from None
         finally:
             sys.settrace(previous)
         self.assertTrue(captured, 'opcode interruption did not execute')

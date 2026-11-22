@@ -52,8 +52,11 @@ class ListenerBaselineComparisonTests(unittest.TestCase):
             return fake
 
         result = None
+        # allow_reuse_address 是类体在 import 时求值的常量：Windows 宿主上是
+        # False。模拟 darwin 时必须一并还原，否则比较的是宿主常量而非代码路径。
         with patch.object(os, "name", "posix"), \
              patch.object(sys, "platform", "darwin"), \
+             patch.object(server.ProxyHTTPServer, "allow_reuse_address", True), \
              patch.object(socket, "socket", side_effect=new_socket), \
              patch.object(socket, "getfqdn", return_value="fixture"), \
              patch.object(socket, "getaddrinfo", side_effect=AssertionError("DNS forbidden")):

@@ -74,7 +74,9 @@ class NativeOwnedChildTests(unittest.TestCase):
         start, image = self.identity(child)
         with wp.open_verified_process(child.pid, start, image) as process:
             process.revalidate()
-            observed = PowerShellWmiReader(timeout=8).read_command_line(child.pid)
+            # 只验证「读取能力」本身；CI 里 PowerShell 首次启动 + WMI 查询在并发下
+            # 会超过 8s（生产默认 5s 面向常态机器），这里给足预算以免误报。
+            observed = PowerShellWmiReader(timeout=25).read_command_line(child.pid)
             process.revalidate()
         self.assertIn("-c", parse_windows_argv(observed))
 

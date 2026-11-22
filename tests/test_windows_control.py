@@ -2,6 +2,7 @@
 import copy
 import io
 import math
+import os
 import socket
 import unittest
 from unittest.mock import Mock, patch
@@ -49,7 +50,14 @@ class WindowsControlTests(unittest.TestCase):
         self.authority.locked.assert_not_called()
         probe.assert_not_called()
         self.assertEqual(self.sock.sent, [])
-        self.assertIn("no signal or credential sent", self.err.getvalue())
+        message = self.err.getvalue()
+        if os.name == "nt":
+            # Windows 上会真正进入生命周期：fixture 根目录不存在，先以
+            # unreadable_file fail-closed。信号/凭据同样一个都不许发。
+            self.assertIn("unreadable_file", message)
+            self.assertNotIn("succeeded", message)
+        else:
+            self.assertIn("no signal or credential sent", message)
 
     def test_record_and_peer_can_be_observed_without_credentials(self):
         observation = self.control.observe_peer(self.sock, self.active, self.last,

@@ -189,6 +189,7 @@ class WindowsConfigBoundaryTests(unittest.TestCase):
                 self.assertTrue(any(not c.kwargs["with_data"] for c in calls))
 
 
+@unittest.skipIf(os.name == "nt", "POSIX read semantics; Windows uses handle snapshots")
 class PosixCompatibilityTests(unittest.TestCase):
     def test_optional_boundary_does_not_change_posix_reads(self):
         with tempfile.TemporaryDirectory() as directory:
