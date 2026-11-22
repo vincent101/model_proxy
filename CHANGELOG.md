@@ -25,6 +25,17 @@
 **实测**：修复前 `stats today` 停在 11-21；修复后重启即恢复，`CLEAN` 状态
 正常，`stats today` 有实时数据。
 
+### status：供给段与 health 行合并、隐藏 idle 行
+
+- `health: cooldown 0/21 · degraded 0 · overrides 2` 不再单独成行，改为供给段标题
+  `supply health: cooldown 0/21 · degraded 0 · overrides 2 · last 30min · 图例`。
+  数字与表格**同源同窗口**：`degraded` 只统计被 route 引用且在窗口内有样本的
+  供给，永远等于表内 `fail` 行数；`cooldown` 与 `cool` 行数同理。
+- **idle 行不再显示**：窗口内零请求的供给没有任何可评估信息，列出只会稀释表格。
+  被引用的供给全都 idle 时给一行占位；非引用的仍折成一行摘要。
+- config 不可读时仍输出标题行（计数来自进程态，与配置解析无关），并追加
+  「配置不可读，供给清单未知」。
+
 ### 清理既有测试失败 + 提供可用的测试入口
 
 - `test_secure_files.py` / `test_backup_close_failure.py` 共 29 项失败的根因是

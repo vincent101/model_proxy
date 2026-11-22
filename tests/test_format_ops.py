@@ -275,7 +275,7 @@ class TestStatusFormatFromJson(unittest.TestCase):
                     "cooldown": {}}
             joined = "\n".join(_format_status_from_json(
                 data, cfg_path, totals_path, log_path=log_path))
-            self.assertIn("supplies (last 30min", joined)
+            self.assertIn("supply health: cooldown", joined)
             self.assertLess(joined.index("s1"), joined.index("s2"))
             s3_line = next(l for l in joined.splitlines() if " s3 " in l)
             self.assertIn("ok", s3_line)
@@ -403,6 +403,50 @@ class TestStatusFormatFromJson(unittest.TestCase):
             self.assertNotIn("degraded supplies", joined)
             self.assertNotIn("unmatched:", joined)
 
+    def test_degraded_count_matches_visible_fail_rows(self):
+        """标题里的 degraded 必须等于表内 fail 行数（同口径、同窗口）。"""
+        with tempfile.TemporaryDirectory() as td:
+            cfg = {"supplies": [{"id": "s1"}, {"id": "s2"}, {"id": "s3"}],
+                   "routes": [{"id": "r1", "tiers": {"opus": ["s1", "s2", "s3"],
+                                                     "sonnet": [], "haiku": []}}],
+                   "strategies": []}
+            cfg_path = self._make_config(td, cfg)
+            log_path = self._mk_log(td, [("s1", False, None)] * 8
+                                      + [("s1", True, None)] * 2      # 20% ok → fail
+                                      + [("s2", False, None)] * 6
+                                      + [("s2", True, None)] * 4      # 40% ok → fail
+                                      + [("s3", True, None)] * 9)     # 100% → ok
+            totals_path = self._make_totals(td)
+            data = {"supplies": cfg["supplies"], "routes": [], "strategies": [],
+                    "cooldown": {}}
+            joined = "\n".join(_format_status_from_json(
+                data, cfg_path, totals_path, log_path=log_path))
+            title = next(l for l in joined.splitlines() if l.startswith("supply health:"))
+            body = [l for l in joined.splitlines()
+                    if l.startswith("  ") and " fail " in l]
+            self.assertIn("degraded 2", title)
+            self.assertEqual(len(body), 2, body)
+            self.assertNotIn("degraded supplies", joined)
+
+    def test_cooldown_count_matches_visible_cool_rows(self):
+        """标题里的 cooldown 计数与表内 cool 行同源。"""
+        with tempfile.TemporaryDirectory() as td:
+            cfg = {"supplies": [{"id": "s1"}, {"id": "s2"}],
+                   "routes": [{"id": "r1", "tiers": {"opus": ["s1", "s2"],
+                                                     "sonnet": [], "haiku": []}}],
+                   "strategies": []}
+            cfg_path = self._make_config(td, cfg)
+            log_path = self._mk_log(td, [("s1", True, None)] * 6)
+            totals_path = self._make_totals(td)
+            data = {"supplies": cfg["supplies"], "routes": [], "strategies": [],
+                    "cooldown": {"s1": {"remain": 42, "reason": "http_429"}}}
+            joined = "\n".join(_format_status_from_json(
+                data, cfg_path, totals_path, log_path=log_path))
+            title = next(l for l in joined.splitlines() if l.startswith("supply health:"))
+            self.assertIn("cooldown 1/2", title)
+            cool_rows = [l for l in joined.splitlines() if "cool 42s" in l]
+            self.assertEqual(len(cool_rows), 1, cool_rows)
+
     def test_supplies_section_omits_reference_annotations(self):
         """供给段按设计不显示「被谁引用」；引用关系仅保留在 cooldown 段。"""
         with tempfile.TemporaryDirectory() as td:
@@ -418,7 +462,7 @@ class TestStatusFormatFromJson(unittest.TestCase):
                     "cooldown": {}}
             joined = "\n".join(_format_status_from_json(
                 data, cfg_path, totals_path, log_path=log_path))
-            section = joined.split("supplies (last")[1].split("\n\n")[0]
+            section = joined.split("supply health:")[1].split("\n\n")[0]
             self.assertNotIn("r1(cc)", section)
             self.assertNotIn("←", section)
 

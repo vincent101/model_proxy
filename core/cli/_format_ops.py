@@ -581,14 +581,20 @@ def resolve_supply_state(sid: str, stat: dict | None, *, cooling: dict | None,
 def _format_supplies(cfg: dict, stats: dict[str, dict], *, cooldown: dict | None,
                      stream_health: dict | None, truncated: bool,
                      log_missing: bool, refs: dict[str, list[str]],
+                     summary: list[str] | tuple[str, ...] = (),
                      forbidden_reference_token: str | None = None) -> list[str]:
-    """渲染供给段：只列被 route 引用的供给，未引用的折成一行摘要。
+    """渲染供给段：只列被 route 引用、且窗口内有请求的供给。
+
+    标题行 = ``supply health: <summary> · last 30min · ttft=p50 首token · tps=输出tok/s``，
+    把 cooldown/degraded/overrides 计数与表格放在同一处，数字和行数同口径。
 
     行格式：``<id>  <state>  <ok%>  <n>  <ttft>  <tps>  [<失败码>]``
     """
-    header = (f"supplies (last {SUPPLY_WINDOW_MINUTES}min"
-              + (" · tail" if truncated else "")
-              + " · ttft=p50 首token · tps=输出tok/s)")
+    legend = [f"last {SUPPLY_WINDOW_MINUTES}min"]
+    if truncated:
+        legend.append("tail")
+    legend += ["ttft=p50 首token", "tps=输出tok/s"]
+    header = "supply health: " + " · ".join([*summary, *legend])
     referenced: list[str] = []
     seen: set[str] = set()
     for supply in cfg.get("supplies", []):
@@ -612,7 +618,7 @@ def _format_supplies(cfg: dict, stats: dict[str, dict], *, cooldown: dict | None
 
     window_total = sum(stat["n"] for stat in stats.values())
     lines = [header]
-    state_order = {"cool": 0, "fail": 1, "flaky": 2, "ok": 3, "low": 4, "idle": 5}
+    state_order = {"cool": 0, "fail": 1, "flaky": 2, "ok": 3, "low": 4}
     rendered: list[tuple[int, int, str]] = []
     for sid in referenced:
         if forbidden_reference_token is not None and sid == forbidden_reference_token:
@@ -621,6 +627,10 @@ def _format_supplies(cfg: dict, stats: dict[str, dict], *, cooldown: dict | None
         state = resolve_supply_state(sid, stat, cooling=cooldown,
                                      stream_health=stream_health,
                                      window_total=window_total)
+        if state == "idle":
+            # 窗口内零请求的供给不占行：它没有任何可评估的健康信息，
+            # 列出来只会稀释表格。需要看清单时看 config 行的计数或 unreferenced 摘要。
+            continue
         state_text = state
         if state == "cool":
             info = (cooldown or {}).get(sid) or {}
@@ -644,6 +654,8 @@ def _format_supplies(cfg: dict, stats: dict[str, dict], *, cooldown: dict | None
                          f"{ttft:>7} {tps:>5}  {code}".rstrip()))
     for _, _, line in sorted(rendered):
         lines.append(line)
+    if not rendered and referenced:
+        lines.append(f"  （近 {SUPPLY_WINDOW_MINUTES}min 内被引用的供给均无请求）")
     if unreferenced:
         lines.append(f"  unreferenced {len(unreferenced)}: " + ", ".join(unreferenced))
     return lines
@@ -1000,13 +1012,6 @@ def _format_status_from_json(data: dict, config_path: str, totals_path: str,
     tail = tail_access_rows(log_path) if log_path else {"rows": [], "seek_tail": False,
                                                         "log_missing": True}
     supply_stats = load_supply_stats(tail["rows"]) if log_path else {}
-    supply_states = {
-        sid: resolve_supply_state(sid, stat, cooling=None if cooldown_unknown else cooldown,
-                                  stream_health=data.get("stream_health"),
-                                  window_total=sum(v["n"] for v in supply_stats.values()))
-        for sid, stat in supply_stats.items()
-    }
-    n_degraded = sum(1 for state in supply_states.values() if state == "fail")
 
     n_cooldown = len(cooldown)
 
@@ -1021,18 +1026,6 @@ def _format_status_from_json(data: dict, config_path: str, totals_path: str,
         config_text = f"config {n_supplies} supplies / {n_routes} routes / {n_strategies} strategies{mtime_part}"
     lines.append(config_text)
 
-    # health 行
-    if cooldown_unknown:
-        parts = [f"cooldown (未知)/{n_supplies}"]
-    else:
-        parts = [f"cooldown {n_cooldown}/{n_supplies}"]
-    if n_degraded > 0:
-        parts.append(f"degraded {n_degraded}")
-    else:
-        parts.append("degraded 0")
-    parts.append(f"overrides {overrides_count}")
-    lines.append("health: " + " · ".join(parts))
-
     # supply 引用标注（cooldown 行尾标出被哪个 route.tier(strategy) 引用）
     if forbidden_reference_token is None:
         refs = _supply_refs(cfg)
@@ -1043,16 +1036,38 @@ def _format_status_from_json(data: dict, config_path: str, totals_path: str,
         refs = _supply_refs(cfg, forbidden_reference_token=forbidden_reference_token,
                             visible_supply_ids=visible_supply_ids)
 
-    # 供给段（被 route 引用的全部供给，含健康项；未引用的折成一行）
-    if cfg:
-        lines.append("")
-        lines.extend(_format_supplies(
-            cfg, supply_stats, cooldown=cooldown,
-            stream_health=data.get("stream_health"),
-            truncated=tail["seek_tail"],
-            log_missing=(not log_path) or tail["log_missing"],
-            refs=refs,
-            forbidden_reference_token=forbidden_reference_token))
+    # 状态只算「被 route 引用」的供给：表格里不显示的供给不该进 degraded 计数，
+    # 否则标题数字与表内行数对不上。
+    supply_states = {
+        sid: resolve_supply_state(sid, stat, cooling=None if cooldown_unknown else cooldown,
+                                  stream_health=data.get("stream_health"),
+                                  window_total=sum(v["n"] for v in supply_stats.values()))
+        for sid, stat in supply_stats.items()
+        if sid in refs
+    }
+    n_degraded = sum(1 for state in supply_states.values() if state == "fail")
+
+    # 供给段标题前缀（cooldown/degraded/overrides 与表格同一口径、同一处输出）
+    if cooldown_unknown:
+        summary = [f"cooldown (未知)/{n_supplies}"]
+    else:
+        summary = [f"cooldown {n_cooldown}/{n_supplies}"]
+    summary.append(f"degraded {n_degraded}")
+    summary.append(f"overrides {overrides_count}")
+
+    # 供给段（被 route 引用的全部供给，含健康项；未引用的折成一行）。
+    # 即使 config 不可读也照常输出标题行：cooldown/degraded 计数来自进程态，
+    # 与配置能否解析无关；丢掉这一行等于把现成的健康信号一起藏了。
+    lines.append("")
+    lines.extend(_format_supplies(
+        cfg, supply_stats, cooldown=cooldown,
+        stream_health=data.get("stream_health"),
+        truncated=tail["seek_tail"],
+        log_missing=(not log_path) or tail["log_missing"],
+        refs=refs, summary=summary,
+        forbidden_reference_token=forbidden_reference_token))
+    if not cfg:
+        lines.append("  （配置不可读，供给清单未知）")
 
     # active sessions 段（在线时恒展示；行首 name 标注取自 session 注册快照）
     if log_path:

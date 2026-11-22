@@ -151,6 +151,36 @@ class TestStateResolution(unittest.TestCase):
 
 
 class TestRendering(unittest.TestCase):
+    def test_header_merges_summary_and_legend(self):
+        """标题行 = supply health: <summary> · last 30min · 图例。"""
+        lines = f._format_supplies(self.CFG, {}, cooldown={}, stream_health=None,
+                                   truncated=False, log_missing=True, refs={"s1": ["x"]},
+                                   summary=["cooldown 0/2", "degraded 0", "overrides 1"])
+        self.assertTrue(lines[0].startswith("supply health: cooldown 0/2 · degraded 0"), lines[0])
+        self.assertIn("overrides 1", lines[0])
+        self.assertIn("last 30min", lines[0])
+        self.assertIn("ttft=p50", lines[0])
+        self.assertIn("tps=输出tok/s", lines[0])
+
+    def test_idle_rows_are_hidden(self):
+        """窗口内零请求的供给不占行。"""
+        stats = {"s1": {"n": 6, "fail": 0, "ok_pct": 100.0, "ttft_ms": 900,
+                        "tps": 50.0, "codes": {}}}
+        lines = f._format_supplies(self.CFG, stats, cooldown={}, stream_health=None,
+                                   truncated=False, log_missing=False, refs={"s1": ["x"]})
+        joined = "\n".join(lines)
+        self.assertIn(" s1 ", joined)
+        self.assertNotIn(" s2 ", joined, "idle 供给不显示")
+        self.assertNotIn("idle", joined)
+
+    def test_all_idle_shows_placeholder(self):
+        """全部 idle 时给一行占位，而不是空表。"""
+        cfg = {"supplies": [{"id": "s1"}],
+               "routes": [{"id": "r1", "tiers": {"opus": ["s1"]}}]}
+        lines = f._format_supplies(cfg, {}, cooldown={}, stream_health=None,
+                                   truncated=False, log_missing=False, refs={"s1": ["x"]})
+        self.assertIn("均无请求", "\n".join(lines))
+
     CFG = {"supplies": [{"id": "s1"}, {"id": "s2"}],
            "routes": [{"id": "r1", "tiers": {"opus": ["s1"]}}]}
 
