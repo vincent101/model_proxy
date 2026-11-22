@@ -93,7 +93,7 @@ def diagnostic(*, fresh_restart=False):
                 sys.path.remove(str(root))
             return {"environment": "Whisky/Wine, not native Windows",
                     "commands": results, "owned_children": len(owned), "cleanup": cleanup,
-                    "state_exists": (root / ".model_proxy_runtime").exists(),
+                    "state_exists": (root / ".runtime").exists(),
                     "default_runtime_exists": (home / "model_proxy" / "runtime").exists()}
 
 

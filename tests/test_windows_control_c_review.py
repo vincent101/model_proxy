@@ -254,6 +254,11 @@ class StatusDynamicConfigReferenceTests(unittest.TestCase):
 
 class ControlLockOutputTests(unittest.TestCase):
     def setUp(self):
+        # 必须在把 os.name 伪造成 'nt' 之前导入 core.server：它在导入期按
+        # 平台构造 pathlib 路径，POSIX 宿主上伪造 os.name 会让导入抛
+        # WindowsPath/UnsupportedOperation（该异常没有 .code，会被上层折叠成
+        # 无信息量的 control_failed）。
+        import core.server  # noqa: F401
         self.out, self.err = io.StringIO(), io.StringIO()
         self.control = wc.WindowsControl(ROOT, config_path=CONFIG, out=self.out, err=self.err)
         self.stack = contextlib.ExitStack()
@@ -264,6 +269,7 @@ class ControlLockOutputTests(unittest.TestCase):
                      patch.object(self.control, '_active', return_value=RECORD),
                      patch.object(windows_process, 'recorded_process_state', return_value='running'),
                      patch.object(self.control, '_request', return_value=None),
+                     patch('core.server._windows_check_config_targets'),
                      patch('core.discovery.prepare_windows_runtime_directories')):
             self.stack.enter_context(item)
 
@@ -462,6 +468,7 @@ class StartupDiagnosticsTests(unittest.TestCase):
              patch.object(control, '_probe_start_locks'), \
              patch.object(control, '_probe_port'), \
              patch.object(control, '_locked', return_value=contextlib.nullcontext()), \
+             patch('core.server._windows_check_config_targets'), \
              patch('core.discovery.prepare_windows_runtime_directories'), \
              patch.object(wc.subprocess, 'Popen', side_effect=owned_popen):
             self.assertEqual(control.on(), 1)

@@ -82,7 +82,7 @@ def diagnostic():
         (root / "config").mkdir()
         (root / "runtime").mkdir()
         (root / "home").mkdir()
-        state = root / ".model_proxy_runtime"
+        state = root / ".runtime"
         state.mkdir()
         (state / "control.lock").write_bytes(b"")
         stop, received = threading.Event(), []

@@ -298,13 +298,21 @@ class WindowsStartupWiringTests(fixtures.WindowsCoreMockStartupTests):
         self.assertEqual(self.fs.commit_calls, before)
         bind.assert_not_called()
 
-    def test_corrupt_ledger_fails_without_reset_or_writes(self):
+    def test_corrupt_ledger_degrades_to_unavailable_without_reset_or_writes(self):
+        """损坏的账本降级为 LedgerUnavailable，不抛错、不重置、不写入。
+
+        契约变更：只有「稳定的 JSON/schema 失败」可降级；身份、保护、I/O、
+        关闭与竞态失败仍然是启动错误。本用例覆盖前者，因此断言降级而不是
+        抛 PreflightError。
+        """
         self.fs.objects[self.paths["totals"]] = dict(self.fs.obj(720), data=b'{"broken":')
         snapshot = discovery.inspect_runtime_identities(self.ROOT, self.paths)
         before = self.fs.objects[self.paths["totals"]]["data"]
-        with self.assertRaises(discovery.PreflightError):
-            server._capture_migration_ledger(snapshot)
+        writes = list(self.fs.write_calls)
+        captured = server._capture_migration_ledger(snapshot)
+        self.assertIsInstance(captured, server.LedgerUnavailable)
         self.assertEqual(self.fs.objects[self.paths["totals"]]["data"], before)
+        self.assertEqual(self.fs.write_calls, writes)
 
     def test_present_ledger_is_captured_with_guarded_identity_without_writing(self):
         ledger = {"version": 3, "total": server._zero_bucket(), "days": {}, "months_archive": {}}

@@ -1,6 +1,6 @@
 """Prepare *only a caller-owned* mp-minimal-b fake project for Wine tests.
 
-Prepare before the harness creates ``runtime``, ``.model_proxy_runtime``, or
+Prepare before the harness creates ``runtime``, ``.runtime``, or
 either fake config. This uses real Win32 APIs and the copied project's real
 validators; preparation never changes an existing ACL, overwrites a file,
 reads configuration, or starts a process. Verification reads only those two
@@ -131,7 +131,7 @@ def prepare_private_fixture(project_path):
     ``project_path`` must be the caller's freshly created
     ``<Windows temp>/mp-minimal-b-XXXXXXXX/project`` containing its copied
     ``core`` and an existing ``config`` directory. ``runtime``,
-    ``.model_proxy_runtime``, and both fake config files must be absent.
+    ``.runtime``, and both fake config files must be absent.
     No cleanup or retry is attempted on error; ``FixtureError.created`` lists
     paths this invocation created. Never use for real configurations/secrets.
     """
@@ -144,7 +144,7 @@ def prepare_private_fixture(project_path):
         raise FixtureError('native_api_unavailable') from None
     created = []
     objects = {}
-    state = ntpath.join(project, '.model_proxy_runtime')
+    state = ntpath.join(project, '.runtime')
     runtime = ntpath.join(project, 'runtime')
     # Never reuse or change an existing directory, including a failed prior run.
     config = ntpath.join(project, 'config')
@@ -164,7 +164,7 @@ def prepare_private_fixture(project_path):
             parent = acl.read_stable_evidence(raw, kind='directory', policy='ancestor',
                                               required_access=paths._DIR_CHECK_ACCESS | 0x4)
             user = parent.observation.user
-            for label, path in (('.model_proxy_runtime', state), ('runtime', runtime)):
+            for label, path in (('.runtime', state), ('runtime', runtime)):
                 project_lease.revalidate()
                 acl.verify_unchanged(raw, parent)
                 _create(path, directory=True, user=user, api=api, acl=acl,

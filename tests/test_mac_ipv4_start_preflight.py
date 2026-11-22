@@ -88,7 +88,7 @@ class MacNewListenerPreflight(unittest.TestCase):
                 cli._start(lease)
             self.assertEqual(caught.exception.code, 'mac_ipv6_listen_unsupported')
             initialize.assert_not_called(); spawn.assert_not_called(); signal.assert_not_called()
-        self.assertFalse((self.root / '.model_proxy_runtime/install.json').exists())
+        self.assertFalse((self.root / '.runtime/install.json').exists())
 
     def test_initialization_rechecks_ipv6_drift_before_record_commit(self):
         # Real PTY and local listener; the input wrapper mutates only fake config.
@@ -112,7 +112,7 @@ class MacNewListenerPreflight(unittest.TestCase):
                     obs.initialize_interactively(inp, out)
                 self.assertEqual(caught.exception.code, 'mac_ipv6_listen_unsupported')
                 initialize.assert_not_called()
-        self.assertFalse((self.root / '.model_proxy_runtime/install.json').exists())
+        self.assertFalse((self.root / '.runtime/install.json').exists())
 
 
 if __name__ == '__main__': unittest.main()

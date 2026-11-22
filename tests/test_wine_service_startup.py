@@ -125,7 +125,7 @@ def exercise(server, stack, root, project, config, pathsfile, paths, mock):
         assert len(mock.calls) == 1
         assert mock.calls[0][0] == '/v1/messages'
         assert mock.calls[0][2]['model'] == 'fake-model'
-        record = json.loads((project / '.model_proxy_runtime' / 'active.json').read_text(encoding='utf-8'))
+        record = json.loads((project / '.runtime' / 'active.json').read_text(encoding='utf-8'))
         assert record['state'] == 'READY' and record['pid'] == os.getpid()
         assert record['process_start'] is not None and record['executable'] is not None
         print('Real current-process probes returned:', record['process_start'].get('kind'),
@@ -163,7 +163,7 @@ def main():
             configdir = project / 'config'
             runtime = project / 'runtime'
             home = root / 'home'
-            for path in (configdir, runtime, home, project / '.model_proxy_runtime'):
+            for path in (configdir, runtime, home, project / '.runtime'):
                 path.mkdir(parents=True, exist_ok=True)
             config = configdir / 'fake.json'
             pathsfile = configdir / 'runtime_paths.json'

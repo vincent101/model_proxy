@@ -35,7 +35,7 @@ def diagnostic():
         env = {key: value for key, value in os.environ.items() if not key.startswith("MODEL_PROXY_")}
         env.update({"HOME": str(home), "USERPROFILE": str(home), "LOCALAPPDATA": str(local),
                     "APPDATA": str(home), "MODEL_PROXY_CONFIG": str(config)})
-        targets = {"state": root / ".model_proxy_runtime",
+        targets = {"state": root / ".runtime",
                    "default_parent": local / "model_proxy",
                    "log": root / ".model_proxy.log", "totals": root / ".model_proxy_totals.json"}
         before = {name: value.exists() for name, value in targets.items()}

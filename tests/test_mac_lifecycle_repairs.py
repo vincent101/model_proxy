@@ -214,7 +214,7 @@ class ProtectedMetadataTests(unittest.TestCase):
         self.addCleanup(self.temp.cleanup)
         self.root = Path(self.temp.name).resolve() / 'project'
         self.root.mkdir(mode=0o700)
-        (self.root / '.model_proxy_runtime').mkdir(mode=0o700)
+        (self.root / '.runtime').mkdir(mode=0o700)
         (self.root / 'config').mkdir(mode=0o700)
         (self.root / 'runtime').mkdir(mode=0o700)
         (self.root / 'core/cli').mkdir(parents=True, mode=0o700)
@@ -226,7 +226,7 @@ class ProtectedMetadataTests(unittest.TestCase):
         self.config.chmod(0o600)
         self.runtime = self.root / 'config/runtime_paths.json'
         self.runtime.write_text(json.dumps(self.paths)); self.runtime.chmod(0o600)
-        self.state = self.root / '.model_proxy_runtime'
+        self.state = self.root / '.runtime'
         self.cli = control.MacControl(self.root, authority=authority.MacInstallationAuthority(),
                                       config_path=self.config, out=io.StringIO(), err=io.StringIO())
 

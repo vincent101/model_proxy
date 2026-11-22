@@ -24,7 +24,7 @@ from tests.test_windows_discovery import PathWinBridge
 
 class WindowsStatusCLITests(unittest.TestCase):
     ROOT = r"C:\fixture\project"
-    STATE = ROOT + r"\.model_proxy_runtime"
+    STATE = ROOT + r"\.runtime"
 
     def setUp(self):
         self.fs = ConfigFS()

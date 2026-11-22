@@ -27,11 +27,11 @@ class ProvisionTests(unittest.TestCase):
         ensure = lambda path, *, trusted_boundary: calls.append(path) or SimpleNamespace(
             created=True, identity=(17, 101, 1, 16), protection=("private",))
         discovery.prepare_windows_runtime_directories(ROOT, paths, local, ensure_directory=ensure)
-        self.assertEqual(calls, [ROOT + r"\.model_proxy_runtime", local + r"\model_proxy",
+        self.assertEqual(calls, [ROOT + r"\.runtime", local + r"\model_proxy",
                                  local + r"\model_proxy\runtime"])
         calls.clear()
         discovery.prepare_windows_runtime_directories(ROOT, PATHS, local, ensure_directory=ensure)
-        self.assertEqual(calls, [ROOT + r"\.model_proxy_runtime"])
+        self.assertEqual(calls, [ROOT + r"\.runtime"])
 
     def test_unsafe_existing_directory_or_unknown_create_stops_without_repair(self):
         def reject(_path, *, trusted_boundary):
@@ -84,7 +84,7 @@ class ProvisionTests(unittest.TestCase):
             ROOT, dict(PATHS, lock=custom), local,
             ensure_directory=lambda path, *, trusted_boundary: calls.append(path) or SimpleNamespace(
                 created=True, identity=(17, 101, 1, 16), protection=("private",)))
-        self.assertEqual(calls, [ROOT + r"\.model_proxy_runtime"])
+        self.assertEqual(calls, [ROOT + r"\.runtime"])
 
     def test_log_created_only_when_missing_and_fresh_protection_is_checked(self):
         missing = SimpleNamespace(as_dict=lambda: {"log": SimpleNamespace(exists=False, canonical=PATHS["log"])})
@@ -128,7 +128,7 @@ class ProvisionTests(unittest.TestCase):
         fixture = PrivateCreation("runTest")
         fixture.setUp()
         root = fixture.ROOT
-        state = root + r"\.model_proxy_runtime"
+        state = root + r"\.runtime"
         fixture.fs.objects.pop(state)
         paths = {key: r"C:\fixture\runtime" + "\\" + key for key in PATH_KEYS}
         def ensure(path, *, trusted_boundary):

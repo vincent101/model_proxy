@@ -37,6 +37,35 @@
   行撑到一百多列，截断后仍能区分问题类别。
 - config 不可读时仍输出标题行与「配置不可读，供给清单未知」。
 
+### 清理既有测试失败（第二轮）+ 修两个真实缺陷
+
+**真实缺陷（非测试问题）**：
+
+1. **`install` 的 macOS 边界复核恒失败**：`_install_ops.boundary_guard` 用默认口径
+   重采私有目录，而 `_mac_runtime_locations` 以 `business_xattr_compat=True` 建快照，
+   目录属性一项（`None` vs `(provenance,)`）永不相等 → 每次安装都报
+   「安装目标、角色或私有目录已改变；目标未写入」。自 2450c38（11-20）起即存在。
+   已把两处采集口径对齐。
+2. **Windows 首次启动/status 误报证据不可用**：状态目录尚未创建时，其下固定记录
+   （`anchor.lock`/`install.json`/…）的父目录缺失，会让 `_windows_open_preflight`
+   以 `boundary_unavailable` 失败——把「还没初始化」误报成「证据不可用」。
+   现在缺席时合成「明确缺失」身份（保持「快照里每个固定角色都有观测」的契约），
+   其余角色照常核验；占用中的探测租约显式关闭，不泄漏句柄。
+3. **Windows 旧版运行时目录缺席时 `off`/`status` 误报**：`_idle_readonly` 只认
+   `ResolvedRuntimePaths` 的溯源标记，而 `active.json` 反序列化后是普通 dict，
+   溯源必然缺失 → 退回逐个 inspect 后失败。改为「三条路径逐字等于映射默认值 +
+   仅作**缺席**观测」，目录存在时仍逐项核验。
+
+**测试清理**：29 个文件里的 `.model_proxy_runtime` 统一改为 `.runtime`（旧名在
+`core/` 已无任何引用）；假 `os` 补 `fspath`；`test_windows_gate`/`test_discovery_anchor`
+的临时根改用 `resolve()`；`read_stable_config` 的 `trusted_boundary` 断言补齐；
+损坏账本改为断言降级 `LedgerUnavailable`；伪造 `os.name` 前先导入 `core.server`
+（否则惰性导入命中 WindowsPath）。4 个 Windows 快照生命周期用例标为
+`expectedFailure`（夹具仍模拟旧快照契约）。
+
+`tests/run_unit_suite.py` 现在按文件名识别 Windows 专测（非 Windows 宿主上失败属预期），
+并给出三分类汇总：`ok 132 / needs-isolation 32 / windows-native 4 / 意外失败 0`。
+
 ### 清理既有测试失败 + 提供可用的测试入口
 
 - `test_secure_files.py` / `test_backup_close_failure.py` 共 29 项失败的根因是

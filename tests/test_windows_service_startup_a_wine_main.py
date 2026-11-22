@@ -38,7 +38,7 @@ if __name__ == "__main__":
                 traceback.print_exc()
                 raise
         stack.enter_context(patch.object(server, "_windows_main", side_effect=traced_main))
-        state = project / ".model_proxy_runtime"
+        state = project / ".runtime"
         def read_active(directory):
             if Path(directory) != state:
                 raise AssertionError("test record escaped owned fixture")

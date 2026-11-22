@@ -49,7 +49,7 @@ class SharedWindowsContractTests(unittest.TestCase):
                 cmd.verify_shared_launch_argv(bad, entry=ENTRY, config=CONFIG, port=12345)
 
     def test_single_active_record_does_not_require_install_or_last_good(self):
-        state = ROOT + r"\.model_proxy_runtime"
+        state = ROOT + r"\.runtime"
         self.assertTrue(discovery._valid_windows_active(RECORD, state))
         for key, value in (("entry", ROOT + r"\wrong.py"), ("pid", True),
                            ("process_start", {"kind": "windows_filetime", "ticks_100ns": 0})):

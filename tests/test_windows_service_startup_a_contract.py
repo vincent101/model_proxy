@@ -19,7 +19,7 @@ class LightStartupTests(unittest.TestCase):
         items = {key: SimpleNamespace(canonical=str(value), exists=True)
                  for key, value in self.paths.items()}
         items["state_dir"] = SimpleNamespace(
-            canonical=str(self.root / ".model_proxy_runtime"), exists=True)
+            canonical=str(self.root / ".runtime"), exists=True)
         self.snapshot = SimpleNamespace(project_root=str(self.root), as_dict=lambda: items)
         self.anchor = SimpleNamespace(snapshot=self.snapshot)
         self.legacy = SimpleNamespace(snapshot=self.snapshot)
@@ -43,6 +43,8 @@ class LightStartupTests(unittest.TestCase):
         p(discovery, "prepare_windows_runtime_directories")
         p(discovery, "prepare_windows_log", side_effect=lambda root, paths, snapshot: snapshot)
         p(server, "_check_config_targets")
+        # _windows_main 直接调用 _windows_check_config_targets（不走 _check_config_targets）
+        p(server, "_windows_check_config_targets")
         p(server, "inspect_runtime_identities", return_value=self.snapshot)
         p(server, "verify_record_directory")
         p(server, "acquire_lock", side_effect=acquire)
@@ -109,7 +111,7 @@ class LightStartupTests(unittest.TestCase):
         logging.assert_not_called()
 
     def test_config_role_conflict_fails_before_log_creation(self):
-        with patch.object(server, "_check_config_targets",
+        with patch.object(server, "_windows_check_config_targets",
                           side_effect=server.LockError("config_path_conflict")), \
              patch.object(discovery, "prepare_windows_log") as log:
             with self.assertRaises(server.LockError):
@@ -132,7 +134,21 @@ class LightStartupTests(unittest.TestCase):
 
 
 class LightWindowsLockTests(unittest.TestCase):
-    def test_untrusted_legacy_record_files_are_not_a_light_preflight_dependency(self):
+    def test_light_preflight_fails_closed_on_untrusted_record_evidence(self):
+        """记录文件不可信时，light 预检也必须 fail-closed（当前契约）。
+
+        历史背景：本用例原名
+        test_untrusted_legacy_record_files_are_not_a_light_preflight_dependency，
+        当时把不可信的 install.json / last_good_paths.json 放在**旧目录名**
+        （`.model_proxy_runtime`）下——与真实固定目录无关，所以断言自然成立，
+        但并不能证明任何行为。固定目录自 v0.14 起统一为 `.runtime`（`core/`
+        已无旧名引用），修正路径后暴露出真实契约：light 模式**仍然会** open
+        所有固定记录名（防「运行角色伪装成固定记录」的别名攻击），因此证据
+        不可信时必须拒绝，而不是静默跳过。
+
+        真正被 light 模式豁免的只有「快照里不含 aux 记录」，这一点在可读时
+        仍然成立（见下半段）。
+        """
         from core import platform_lock
         from tests.test_windows_discovery import WindowsDiscoveryLockTests
         fixture = WindowsDiscoveryLockTests("runTest")
@@ -144,13 +160,28 @@ class LightWindowsLockTests(unittest.TestCase):
             fixture.fs.objects[fixture.STATE + "\\" + name] = obj
         with self.assertRaises(discovery.PreflightError):
             discovery.inspect_runtime_identities(fixture.ROOT, fixture.paths)
-        snapshot = discovery.inspect_runtime_identities(fixture.ROOT, fixture.paths, windows_light=True)
+        with self.assertRaises(discovery.PreflightError) as caught:
+            discovery.inspect_runtime_identities(fixture.ROOT, fixture.paths,
+                                                 windows_light=True)
+        self.assertEqual(caught.exception.code, "windows_evidence_unavailable")
+
+    def test_light_snapshot_omits_aux_records_but_still_verifies_locks(self):
+        """可读时 light 快照不含 aux 记录，且锚点/legacy 锁仍可核验。"""
+        from core import platform_lock
+        from tests.test_windows_discovery import WindowsDiscoveryLockTests
+        fixture = WindowsDiscoveryLockTests("runTest")
+        fixture.setUp()
+        self.addCleanup(fixture.doCleanups)
+        for index, name in enumerate(("install.json", "last_good_paths.json"), 500):
+            fixture.fs.objects[fixture.STATE + "\\" + name] = fixture.fs.obj(index)
+        snapshot = discovery.inspect_runtime_identities(fixture.ROOT, fixture.paths,
+                                                        windows_light=True)
         self.assertNotIn("install.json", snapshot.as_dict())
         self.assertNotIn("last_good_paths.json", snapshot.as_dict())
         with platform_lock.acquire_lock(snapshot, "anchor.lock", create=True) as anchor:
-            with platform_lock.acquire_lock(anchor.snapshot, "lock", create=True, anchor=anchor) as legacy:
+            with platform_lock.acquire_lock(anchor.snapshot, "lock", create=True,
+                                            anchor=anchor) as legacy:
                 discovery.verify_held_instance_locks(anchor, legacy)
-
 
 if __name__ == "__main__":
     unittest.main()

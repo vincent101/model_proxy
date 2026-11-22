@@ -62,6 +62,8 @@ def _run_fixture(root_text, entered, release, result):
         p(discovery, 'prepare_windows_runtime_directories')
         p(discovery, 'prepare_windows_log', side_effect=prepare_log)
         p(server, '_check_config_targets')
+        # _windows_main 直接调用 _windows_check_config_targets（不走 _check_config_targets）
+        p(server, '_windows_check_config_targets')
         p(server, 'inspect_runtime_identities', return_value=initial)
         p(server, 'verify_record_directory')
         p(server, 'acquire_lock', side_effect=acquire)
@@ -206,6 +208,7 @@ class RealHeldLockRefreshTests(unittest.TestCase):
              patch.object(discovery, 'prepare_windows_runtime_directories'), \
              patch.object(discovery, 'prepare_windows_log', side_effect=create_log), \
              patch.object(server, '_check_config_targets'), \
+             patch.object(server, '_windows_check_config_targets'), \
              patch.object(server, '_check_legacy_observations'), \
              patch.object(server, 'ConfigStore', return_value=object()), \
              patch.object(server, '_capture_migration_guard', side_effect=guard):

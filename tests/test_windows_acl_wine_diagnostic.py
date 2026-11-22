@@ -177,7 +177,7 @@ def diagnostic():
     win, backend = paths.NativeWin32(), acl._NativeBackend()
     with tempfile.TemporaryDirectory(prefix="mp-acl-probe-") as temp:
         # Simulate only directory creation inside this newly created fixture.
-        state = ntpath.join(temp, ".model_proxy_runtime")
+        state = ntpath.join(temp, ".runtime")
         os.mkdir(state)
         drive, tail = ntpath.splitdrive(ntpath.abspath(temp))
         result = {"environment": environment, "temp_drive": drive.upper(),

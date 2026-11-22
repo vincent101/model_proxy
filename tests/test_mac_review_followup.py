@@ -34,7 +34,7 @@ class ReviewFindingTests(unittest.TestCase):
         self.addCleanup(self.temp.cleanup)
         self.root = Path(self.temp.name).resolve() / 'fake-project'
         self.root.mkdir(mode=0o700)
-        (self.root / '.model_proxy_runtime').mkdir(mode=0o700)
+        (self.root / '.runtime').mkdir(mode=0o700)
         (self.root / 'runtime').mkdir(mode=0o700)
         (self.root / 'config').mkdir(mode=0o700)
         self.config_path = self.root / 'config/business.json'
@@ -288,7 +288,7 @@ print('safe')
                     authority._validate_restart_business_config(SimpleNamespace(exists=True, contents=data))
 
     def setup_anchor(self):
-        path = self.root / '.model_proxy_runtime/anchor.lock'
+        path = self.root / '.runtime/anchor.lock'
         path.write_bytes(b''); path.chmod(0o600)
         st = path.stat()
         self.active['locks'] = {'anchor': {'device': st.st_dev, 'inode': st.st_ino}}

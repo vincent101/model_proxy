@@ -28,6 +28,9 @@ class VirtualFS(VirtualWindows):
             r"C:\fixture": self.obj(2, directory=True),
             r"C:\fixture\project": self.obj(11, directory=True),
             r"C:\fixture\project\.runtime": self.obj(12, directory=True),
+            # 生产把 runtime_paths.json 放在 <project>\config\ 下；虚拟卷补上该目录，
+            # 否则所有走 config 角色预检的用例都会判「父目录未观测」。
+            r"C:\fixture\project\config": self.obj(14, directory=True),
             r"C:\fixture\runtime": self.obj(13, directory=True),
         }
         self.next_index = 1000
@@ -85,7 +88,9 @@ class WindowsDiscoveryLockTests(unittest.TestCase):
             item.start()
             self.addCleanup(item.stop)
 
-    def snapshot(self): return discovery.inspect_runtime_identities(self.ROOT, self.paths)
+    def snapshot(self, *, light=False):
+        return discovery.inspect_runtime_identities(self.ROOT, self.paths,
+                                                   windows_light=light)
 
     def test_unified_default_preflight_before_and_after_private_creation(self):
         self.paths = {key: self.STATE + "\\" + name for key, name in {
@@ -581,6 +586,24 @@ class WindowsDiscoveryLockTests(unittest.TestCase):
         self.assertTrue(snapshot.as_dict()["start_lock"].exists)
         self.assertEqual(snapshot.windows_dict()["start_lock"].expected_kind, "directory")
         self.assertFalse(self.fs.handles)
+
+    def test_missing_state_synthesizes_missing_fixed_identities(self):
+        """状态目录缺席时，固定记录仍以「明确缺失」身份出现在快照里。
+
+        契约：light 与完整预检都必须能回答「每个固定角色现在是什么样」。
+        缺席时不能因为父目录不存在就整体失败（那会把「尚未初始化」误报成
+        「证据不可用」），而要合成 exists=False 的身份。
+        """
+        self.fs.objects.pop(self.STATE)
+        for light in (True, False):
+            with self.subTest(light=light):
+                snapshot = self.snapshot(light=light)
+                identities = snapshot.as_dict()
+                self.assertFalse(identities["state_dir"].exists)
+                for name in ("anchor.lock", "control.lock", "active.json"):
+                    self.assertIn(name, identities)
+                    self.assertFalse(identities[name].exists, name)
+                self.assertFalse(self.fs.handles, "缺席路径不得泄漏句柄")
 
     def test_initial_missing_state_is_recorded_but_locking_fails_before_io(self):
         self.fs.objects.pop(self.STATE)

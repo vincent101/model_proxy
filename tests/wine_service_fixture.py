@@ -19,7 +19,7 @@ def install(stack, server, root, project, config, pathsfile, paths):
     from core.runtime_paths import PATH_KEYS
 
     root, project = Path(root), Path(project)
-    state = project / '.model_proxy_runtime'
+    state = project / '.runtime'
     anchor_path = state / 'anchor.lock'
     allowed_snapshots = {config, pathsfile, paths['totals']}
 

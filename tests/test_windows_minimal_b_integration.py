@@ -275,8 +275,8 @@ def run_private_helper(project, evidence, *, verify=False, tag='private-fixture'
 
 def prepare_private_objects(project, evidence):
     result = run_private_helper(project, evidence)
-    expected = {'.model_proxy_runtime', 'runtime', r'.model_proxy_runtime\control.lock',
-                r'.model_proxy_runtime\anchor.lock', r'runtime\lock', r'runtime\log',
+    expected = {'.runtime', 'runtime', r'.runtime\control.lock',
+                r'.runtime\anchor.lock', r'runtime\lock', r'runtime\log',
                 r'config\runtime_paths.json', r'config\model_proxy_config.json'}
     objects = result.get('objects', {})
     if (set(objects) != expected or result.get('runtime_preflight') != 'verified'
@@ -284,7 +284,7 @@ def prepare_private_objects(project, evidence):
             or any(info.get('private_acl') is not True or info.get('effective_access') is not True
                    or info.get('protected') is not False for info in objects.values())
             or any(objects[name].get('empty') is not True for name in expected - {
-                '.model_proxy_runtime', 'runtime'})):
+                '.runtime', 'runtime'})):
         raise RuntimeError('private fixture evidence incomplete: ' + repr(result))
     return result
 
@@ -534,11 +534,11 @@ class WinePrivateFixtureSelfTest(unittest.TestCase):
                         ignore=shutil.ignore_patterns('__pycache__', '*.pyc'))
         (project / 'config').mkdir()
         self.assertFalse((project / 'runtime').exists())
-        self.assertFalse((project / '.model_proxy_runtime').exists())
+        self.assertFalse((project / '.runtime').exists())
         result = prepare_private_objects(project, root)
         self.assertEqual(result['runtime_preflight'], 'verified')
         self.assertEqual(result['record_directory'], 'verified')
-        self.assertFalse((project / '.model_proxy_runtime/active.json').exists())
+        self.assertFalse((project / '.runtime/active.json').exists())
         contents = {r'config\runtime_paths.json': json.dumps({'fake': 'runtime'}),
                     r'config\model_proxy_config.json': json.dumps({'fake': 'config'})}
         for name, text in contents.items():
@@ -567,7 +567,7 @@ class WinePrivateFixtureSelfTest(unittest.TestCase):
             prepare_private_objects(project, root)
         self.assertEqual(existing.read_text(encoding='utf-8'), 'untouched fake')
         self.assertFalse((project / 'runtime').exists())
-        self.assertFalse((project / '.model_proxy_runtime').exists())
+        self.assertFalse((project / '.runtime').exists())
 
     def test_real_bat_help_with_private_fake_config(self):
         # Exercise only setUp's real .bat --help, never an acceptance test or on.
@@ -795,7 +795,7 @@ class WindowsMinimalBAcceptance(unittest.TestCase):
         return wait_for(read, 10)['children']
 
     def require_owned_service(self, result):
-        active = json.loads((self.project / '.model_proxy_runtime/active.json').read_text(encoding='utf-8'))
+        active = json.loads((self.project / '.runtime/active.json').read_text(encoding='utf-8'))
         pid = active.get('pid')
         self.assertIn(pid, result['children'], 'refusing to control an uncaptured process')
         self.assertTrue(any(c['pid'] == pid and c['exit'] is None for c in self.live_children(result)),

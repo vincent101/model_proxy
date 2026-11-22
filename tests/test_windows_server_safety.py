@@ -70,6 +70,9 @@ class WindowsLegacyObservationTests(unittest.TestCase):
         self.acl = VirtualACL(self.fs)
         self.backend = WindowsPathBackend(win32=PathWinBridge(self.fs), acl_backend=self.acl)
         self.paths = {key: self.RUNTIME + "\\" + key for key in PATH_KEYS}
+        # 生产把 runtime_paths.json 放在 <project>\\config\\ 下；夹具补上该目录，
+        # 否则 config 角色预检会判定父目录未观测（config_path_unknown）。
+        self.fs.objects[self.ROOT + r"\config"] = self.fs.obj(12, directory=True)
         self.fs.objects[self.paths["log"]] = dict(self.fs.obj(701), data=b"fake log")
         for item in (
             patch.object(os, "name", "nt"),
@@ -92,7 +95,9 @@ class WindowsLegacyObservationTests(unittest.TestCase):
     def test_config_and_runtime_roles_are_checked_with_held_path_evidence(self):
         from pathlib import PureWindowsPath
         business = self.ROOT + r"\config.json"
-        paths_config = self.ROOT + r"\runtime_paths.json"
+        # 生产读取的是 <project>\config\runtime_paths.json（不是项目根下），
+        # 夹具按真实布局创建，否则 _windows_check_config_targets 判定父目录未观测。
+        paths_config = self.ROOT + r"\config\runtime_paths.json"
         self.fs.objects[business] = dict(self.fs.obj(710), data=b"{}")
         self.fs.objects[paths_config] = dict(self.fs.obj(711), data=b"{}")
         with patch.object(server, "_PACKAGE_DIR", PureWindowsPath(self.ROOT)), \
@@ -108,7 +113,9 @@ class WindowsLegacyObservationTests(unittest.TestCase):
     def test_config_hardlink_alias_to_runtime_role_is_rejected(self):
         from pathlib import PureWindowsPath
         business = self.ROOT + r"\config.json"
-        paths_config = self.ROOT + r"\runtime_paths.json"
+        # 生产读取的是 <project>\config\runtime_paths.json（不是项目根下），
+        # 夹具按真实布局创建，否则 _windows_check_config_targets 判定父目录未观测。
+        paths_config = self.ROOT + r"\config\runtime_paths.json"
         obj = dict(self.fs.obj(710), data=b"{}")
         self.fs.objects[business] = obj
         self.fs.objects[self.paths["log"]] = obj

@@ -125,6 +125,9 @@ class WindowsRecordCommitTests(unittest.TestCase):
                                         anchor=self.anchor, legacy=self.legacy)
 
     def test_old_state_path_cannot_use_new_state_locks(self):
+        # 必须传一个**不同于**当前固定目录（.runtime）的状态路径，才能验证
+        # 「旧目录不能借用新目录持有的锁」这条护栏。这里用一个历史上存在过、
+        # 现已废弃的名字。
         with self.assertRaises(discovery.PreflightError) as caught:
             discovery.write_instance_record(
                 self.ROOT + r"\.model_proxy_runtime", "install.json", self.install,

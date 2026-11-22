@@ -18,7 +18,7 @@ from tests.test_windows_process_a_stop import StopBackend
 
 class UnstartedTests(unittest.TestCase):
     ROOT = r"C:\fixture\project"
-    STATE = ROOT + r"\.model_proxy_runtime"
+    STATE = ROOT + r"\.runtime"
     APPDATA = r"C:\fixture\Local"
     DEFAULT = APPDATA + r"\model_proxy\runtime"
 
@@ -29,9 +29,14 @@ class UnstartedTests(unittest.TestCase):
         self.crt = VirtualCRT(self.fs)
         self.acl = VirtualACL(self.fs)
         self.backend = WindowsPathBackend(win32=PathWinBridge(self.fs), acl_backend=self.acl)
-        self.paths = {key: str(value) for key, value in parse_runtime_paths(
+        # 保留 ResolvedRuntimePaths（dict 子类）：Windows 控制层用
+        # windows_legacy_keys 溯源决定「三个 legacy 标记可以合并成一次
+        # 缺席观测」。早前这里转成普通 dict，溯源丢失后逐个 inspect 落在
+        # 不存在的父目录上，被误判为 boundary_unavailable。
+        self.paths = parse_runtime_paths(
             dict(LEGACY_DEFAULTS), project_root=self.ROOT, platform="windows",
-            local_appdata=self.APPDATA).items()}
+            local_appdata=self.APPDATA)
+        self.paths = self.paths.map_values(str)
         self.listen = {"host": "127.0.0.1", "port": 19431}
         self.out, self.err = io.StringIO(), io.StringIO()
         self.control = wc.WindowsControl(self.ROOT, out=self.out, err=self.err)

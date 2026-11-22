@@ -663,11 +663,17 @@ def _mac_install_locations(guard, snapshot, targets):
                                        allow_target_staging=allow_target_staging)
 
     def boundary_guard():
+        # 必须与 `_mac_runtime_locations` 用同一采集口径：那里以
+        # business_xattr_compat=True 建快照（兼容 macOS 自动附着的
+        # com.apple.provenance），这里若按默认口径重采集，目录属性一项
+        # （None vs (provenance,)）永远不相等，boundary_guard 必然失败。
         from core.secure_files import capture_private_directory
         if (not preflight(snapshot)
-                or capture_private_directory(locations.staging.path, purpose='staging')
+                or capture_private_directory(locations.staging.path, purpose='staging',
+                                             business_xattr_compat=True)
                 != locations.staging
-                or capture_private_directory(locations.backup.path, purpose='backup')
+                or capture_private_directory(locations.backup.path, purpose='backup',
+                                             business_xattr_compat=True)
                 != locations.backup):
             raise InstallFailure('安装目标、角色或私有目录已改变')
     return locations, boundary_guard

@@ -174,7 +174,7 @@ class ACLParserTests(unittest.TestCase):
         self.assertEqual(caught.exception.code, 'protection_changed')
 
     def test_record_write_compares_full_directory_protection_including_flags(self):
-        state = SANDBOX / 'cases' / '.model_proxy_runtime'
+        state = SANDBOX / 'cases' / '.runtime'
         parent = str(state.parent)
         name = str(state)
         before = [(parent, (1, 2, 0o700, 3, 4, 0), b'parent-deny'),
@@ -326,7 +326,7 @@ class RealACLTests(unittest.TestCase):
         project.mkdir(mode=0o700)
         self.targets.append(project)
         self.add(project, 'group:everyone deny delete')
-        state = project / '.model_proxy_runtime'
+        state = project / '.runtime'
         state.mkdir(mode=0o700)
         original = discovery._verify_directory
         synthetic = self.case.stat()
@@ -349,7 +349,7 @@ class RealACLTests(unittest.TestCase):
         project.mkdir(mode=0o700)
         self.targets.append(project)
         self.add(project, 'group:everyone deny delete')
-        state = project / '.model_proxy_runtime'
+        state = project / '.runtime'
         state.mkdir(mode=0o700)
         runtime = project / 'runtime'
         runtime.mkdir(mode=0o700)
@@ -470,7 +470,7 @@ class RealACLTests(unittest.TestCase):
 
     def test_record_chain_compares_full_acl_snapshots_between_passes(self):
         project = self.target('project')
-        state = project / '.model_proxy_runtime'
+        state = project / '.runtime'
         state.mkdir(mode=0o700)
         info = project.stat()
         count = 0

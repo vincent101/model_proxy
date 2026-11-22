@@ -29,7 +29,7 @@ class RestartTargetsTests(unittest.TestCase):
         self.addCleanup(self.tmp.cleanup)
         self.root = Path(self.tmp.name).resolve() / 'fake'
         self.root.mkdir(mode=0o700)
-        for name in ('.model_proxy_runtime', 'runtime', 'config'):
+        for name in ('.runtime', 'runtime', 'config'):
             (self.root / name).mkdir(mode=0o700)
         self.paths = {k: str(self.root / 'runtime' / k) for k in PATH_KEYS}
         self.config = self.root / 'config' / 'business.json'

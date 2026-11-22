@@ -43,10 +43,18 @@ WINDOWS_NATIVE_HINT = (
 )
 
 
-def classify(output: str) -> str:
-    """ok / isolation / windows-native / fail"""
-    if any(name in output for name in NEEDS_ISOLATION_ENV):
+def classify(name: str, output: str) -> str:
+    """ok / isolation / windows-native / fail
+
+    判据顺序：隔离环境变量 → 文件名（Windows/Wine 专测）→ 错误信息特征。
+    `test_windows_*` / `test_wine_*` 在非 Windows 宿主上失败属预期：它们
+    专测 Win32 句柄/ACL/记录目录，真实验收位置是 Windows runner。
+    """
+    if any(var in output for var in NEEDS_ISOLATION_ENV):
         return 'isolation'
+    if sys.platform != 'win32' and (name.startswith('test_windows_')
+                                    or name.startswith('test_wine_')):
+        return 'windows-native'
     if any(hint in output for hint in WINDOWS_NATIVE_HINT):
         return 'windows-native'
     return 'fail'
@@ -61,7 +69,7 @@ def run_one(path: pathlib.Path) -> tuple[str, str, str]:
     # pytest 用 5 表示「没有收集到用例」，对本套件不算失败
     if done.returncode in (0, 5):
         return path.name, 'ok', summary
-    return path.name, classify(output), summary
+    return path.name, classify(path.name, output), summary
 
 
 def main(argv=None) -> int:

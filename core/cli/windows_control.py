@@ -651,16 +651,22 @@ class WindowsControl:
             # When all three legacy markers are exact mapped defaults and
             # their runtime directory is absent, one protected absence lease
             # covers all three instead of repeatedly walking the same parents.
-            from core.runtime_paths import ResolvedRuntimePaths, _WINDOWS_LEGACY_NAMES
+            #
+            # 这里**不能**只认 ResolvedRuntimePaths 的溯源标记：本方法也会收到
+            # 来自 active.json 的 runtime_paths（JSON 反序列化后是普通 dict，
+            # 结构上无法携带溯源）。若因此退回逐个 inspect，父目录不存在时
+            # 会以 boundary_unavailable 失败，把「legacy 目录尚未创建」误报成
+            # 「证据不可用」。替代判据是逐字相等 + 仅作**缺席**观测：三条路径
+            # 必须精确等于 LOCALAPPDATA 下的映射默认值，且随后只用于证明该
+            # 目录不存在（存在则整组判定失效，回到逐项核验）。
+            from core.runtime_paths import _WINDOWS_LEGACY_NAMES
             appdata = os.environ.get("LOCALAPPDATA")
             default_dir = None
             if appdata and _local_absolute(ntpath.normpath(appdata)):
                 candidate = ntpath.join(ntpath.normpath(appdata), "model_proxy", "runtime")
-                if (isinstance(paths, ResolvedRuntimePaths)
-                        and {"lock", "pid", "start_lock"}.issubset(paths.windows_legacy_keys)
-                        and all(ntpath.normcase(paths[key]) == ntpath.normcase(
+                if all(ntpath.normcase(paths[key]) == ntpath.normcase(
                         ntpath.join(candidate, _WINDOWS_LEGACY_NAMES[key]))
-                        for key in ("lock", "pid", "start_lock"))):
+                        for key in ("lock", "pid", "start_lock")):
                     default_dir = candidate
             grouped_absence = False
             if default_dir:

@@ -17,7 +17,7 @@ from tests.test_windows_discovery import PathWinBridge
 
 class WindowsRecordReadTests(unittest.TestCase):
     ROOT = r"C:\fixture\project"
-    STATE = r"C:\fixture\project\.model_proxy_runtime"
+    STATE = r"C:\fixture\project\.runtime"
 
     def setUp(self):
         self.fs = ConfigFS()

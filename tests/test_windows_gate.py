@@ -21,7 +21,9 @@ class StartupIsolationTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
-        self.root = Path(self.tmp.name) / "project"
+        # macOS 的 /var → /private/var 是符号链接；verify_record_directory 要求
+        # 固定目录为规范路径（生产不变量），临时根必须先 resolve。
+        self.root = Path(self.tmp.name).resolve() / "project"
         self.root.mkdir(mode=0o700)
         runtime = self.root / "runtime"
         runtime.mkdir(mode=0o700)
@@ -57,7 +59,7 @@ class StartupIsolationTests(unittest.TestCase):
                 server.main()
         log.assert_not_called()
         totals.assert_not_called()
-        self.assertFalse((self.root / ".model_proxy_runtime").exists())
+        self.assertFalse((self.root / ".runtime").exists())
 
     def test_conflict_stops_before_state_logging_or_ledger(self):
         self.paths["totals"] = self.paths["log"]
@@ -68,7 +70,7 @@ class StartupIsolationTests(unittest.TestCase):
             with self.assertRaises(SystemExit):
                 server.main()
         self.assertEqual(self.paths["log"].read_text(), "sentinel")
-        self.assertFalse((self.root / ".model_proxy_runtime").exists())
+        self.assertFalse((self.root / ".runtime").exists())
         log.assert_not_called()
         totals.assert_not_called()
 
@@ -95,7 +97,7 @@ class StartupIsolationTests(unittest.TestCase):
         logging.assert_not_called()
         totals.assert_not_called()
         record.assert_not_called()
-        self.assertFalse((self.root / ".model_proxy_runtime").exists())
+        self.assertFalse((self.root / ".runtime").exists())
         self.assertFalse(self.paths["log"].exists())
         self.assertFalse(self.paths["totals"].exists())
         self.assertEqual((target / "marker" if directory else target).read_text(), "legacy sentinel")
@@ -111,7 +113,7 @@ class StartupIsolationTests(unittest.TestCase):
 
     def test_unstarted_existing_install_and_old_pid_fail_before_any_new_write(self):
         from core.discovery import initialize_installation, read_instance_set
-        state = self.root / ".model_proxy_runtime"
+        state = self.root / ".runtime"
         state.mkdir(mode=0o700)
         snapshot = inspect_runtime_identities(self.root, self.paths)
         with acquire_lock(snapshot, "anchor.lock", create=True, access_verifier=verify_local_access) as anchor:
@@ -157,7 +159,7 @@ class StartupIsolationTests(unittest.TestCase):
         logging.assert_not_called()
         bind.assert_not_called()
         self.assertEqual(ledger.read_text(), "legacy ledger sentinel")
-        self.assertFalse((self.root / ".model_proxy_runtime").exists())
+        self.assertFalse((self.root / ".runtime").exists())
 
     def test_hardlinked_legacy_runtime_file_fails_before_any_new_write(self):
         ledger = self.paths["totals"]
@@ -174,7 +176,7 @@ class StartupIsolationTests(unittest.TestCase):
         logging.assert_not_called()
         self.assertEqual(ledger.read_text(), "legacy ledger sentinel")
         self.assertEqual(alias.read_text(), "legacy ledger sentinel")
-        self.assertFalse((self.root / ".model_proxy_runtime").exists())
+        self.assertFalse((self.root / ".runtime").exists())
 
     def test_unknown_legacy_identity_stops_before_any_write(self):
         original_lstat = os.lstat
@@ -189,7 +191,7 @@ class StartupIsolationTests(unittest.TestCase):
                 server.main()
         mkdir.assert_not_called()
         bind.assert_not_called()
-        self.assertFalse((self.root / ".model_proxy_runtime").exists())
+        self.assertFalse((self.root / ".runtime").exists())
 
     def test_legacy_pid_created_after_readonly_preflight_is_rechecked_under_locks(self):
         real_verify = server.verify_record_directory
@@ -267,7 +269,7 @@ class StartupIsolationTests(unittest.TestCase):
                             server.main()
                     self.assertEqual(sidecar.read_text(), "sidecar sentinel")
                     self.assertEqual(sidecar.stat().st_ino, original_inode)
-                    self.assertFalse((self.root / ".model_proxy_runtime").exists())
+                    self.assertFalse((self.root / ".runtime").exists())
                     log.assert_not_called()
                     totals.assert_not_called()
                     sidecar_store.assert_not_called()
@@ -283,7 +285,7 @@ class StartupIsolationTests(unittest.TestCase):
             with self.assertRaises(SystemExit):
                 server.main()
         self.assertFalse(sidecar.exists())
-        self.assertFalse((self.root / ".model_proxy_runtime").exists())
+        self.assertFalse((self.root / ".runtime").exists())
         log.assert_not_called()
 
     def test_log_and_totals_final_symlinks_rejected_before_writes(self):
@@ -301,7 +303,7 @@ class StartupIsolationTests(unittest.TestCase):
                         server.main()
                 self.assertTrue(alias.is_symlink())
                 self.assertEqual(target.read_text(), f"{role} sentinel")
-                self.assertFalse((self.root / ".model_proxy_runtime").exists())
+                self.assertFalse((self.root / ".runtime").exists())
                 log.assert_not_called()
                 totals.assert_not_called()
                 run.assert_not_called()
@@ -317,17 +319,17 @@ class StartupIsolationTests(unittest.TestCase):
             with self.assertRaises(SystemExit):
                 server.main()
         self.assertEqual(self.path_file.read_text(), original)
-        self.assertFalse((self.root / ".model_proxy_runtime").exists())
+        self.assertFalse((self.root / ".runtime").exists())
         log.assert_not_called()
         totals.assert_not_called()
 
     def test_config_inside_fixed_state_is_rejected_before_state_creation(self):
-        fake_config = self.root / ".model_proxy_runtime" / "install.json"
+        fake_config = self.root / ".runtime" / "install.json"
         with patch.object(server, "_DEFAULT_CONFIG_PATH", fake_config), \
              patch.object(server, "init_logging") as log, redirect_stderr(io.StringIO()):
             with self.assertRaises(SystemExit):
                 server.main()
-        self.assertFalse((self.root / ".model_proxy_runtime").exists())
+        self.assertFalse((self.root / ".runtime").exists())
         log.assert_not_called()
 
     def test_bind_failure_does_not_initialize_logging_or_ledger(self):
@@ -365,13 +367,13 @@ class StartupIsolationTests(unittest.TestCase):
                 server_address = ("127.0.0.1", port)
                 def __init__(self, *args): pass
                 def serve_forever(self):
-                    records = read_instance_set(self_root / ".model_proxy_runtime")
+                    records = read_instance_set(self_root / ".runtime")
                     assert records["active"]["state"] == "READY"
                 def shutdown(self): pass
                 def server_close(self): pass
             nonce = "a" * 32
             def check_starting(path):
-                records = read_instance_set(self.root / ".model_proxy_runtime")
+                records = read_instance_set(self.root / ".runtime")
                 active, install = records["active"], records["install"]
                 self.assertEqual(active["state"], "STARTING")
                 self.assertEqual(active["instance_nonce"], nonce)
@@ -389,7 +391,7 @@ class StartupIsolationTests(unittest.TestCase):
                  patch.object(server, "SessionOverridesSidecar"), \
                  patch.object(server, "log", MagicMock()):
                 server.main()
-        records = read_instance_set(self.root / ".model_proxy_runtime")
+        records = read_instance_set(self.root / ".runtime")
         self.assertEqual(records["active"]["state"], "READY")
         self.assertEqual(records["last_good_paths"]["instance_nonce"], nonce)
         self.assertTrue(records["install"]["ever_started"])
@@ -416,7 +418,7 @@ class StartupIsolationTests(unittest.TestCase):
                 with self.assertRaises(SystemExit):
                     server.main()
         failpoint.assert_called_once()
-        records = read_instance_set(self.root / ".model_proxy_runtime")
+        records = read_instance_set(self.root / ".runtime")
         self.assertIsNotNone(records, stderr.getvalue())
         self.assertFalse(records["install"]["ever_started"])
         self.assertIsNone(records["active"])
@@ -450,7 +452,7 @@ class StartupIsolationTests(unittest.TestCase):
                 with self.assertRaises(SystemExit):
                     server.main()
             log.assert_not_called()
-        records = read_instance_set(self.root / ".model_proxy_runtime")
+        records = read_instance_set(self.root / ".runtime")
         self.assertFalse(records["install"]["ever_started"])
         self.assertIsNone(records["active"])
         self.assertIsNone(records["last_good_paths"])
@@ -483,7 +485,7 @@ class StartupIsolationTests(unittest.TestCase):
                  patch.object(server, "SessionOverridesSidecar"), redirect_stderr(io.StringIO()):
                 with self.assertRaises(SystemExit):
                     server.main()
-        records = read_instance_set(self.root / ".model_proxy_runtime")
+        records = read_instance_set(self.root / ".runtime")
         self.assertFalse(records["install"]["ever_started"])
         self.assertIsNone(records["active"])
         self.assertIsNone(records["last_good_paths"])
@@ -517,7 +519,7 @@ class StartupIsolationTests(unittest.TestCase):
                     server.main()
         self.assertIn("record_cleanup_failed", stderr.getvalue())
         with self.assertRaises(server.PreflightError):
-            read_instance_set(self.root / ".model_proxy_runtime")
+            read_instance_set(self.root / ".runtime")
 
     def test_existing_legacy_lock_blocks_before_log_or_ledger(self):
         import fcntl
@@ -536,7 +538,7 @@ class StartupIsolationTests(unittest.TestCase):
 
     def test_initialization_api_rejects_without_explicit_confirmation(self):
         from core.discovery import initialize_installation, read_instance_set
-        state = self.root / ".model_proxy_runtime"
+        state = self.root / ".runtime"
         state.mkdir(mode=0o700)
         snapshot = inspect_runtime_identities(self.root, self.paths)
         with acquire_lock(snapshot, "anchor.lock", create=True, access_verifier=verify_local_access) as anchor:
@@ -598,7 +600,7 @@ class StartupIsolationTests(unittest.TestCase):
             self.assertIn(expected_error, stderr.getvalue())
         self.assertEqual(log_path.read_text(), "log sentinel")
         self.assertEqual(totals_path.read_text(), totals_text)
-        state = self.root / ".model_proxy_runtime"
+        state = self.root / ".runtime"
         for name in ("install.json", "active.json", "last_good_paths.json"):
             self.assertFalse((state / name).exists())
 
@@ -678,7 +680,7 @@ class StartupIsolationTests(unittest.TestCase):
 
     def _initialize_hostname_fixture(self, candidates, *, expected_success):
         from core.discovery import initialize_installation, read_instance_set
-        state = self.root / ".model_proxy_runtime"
+        state = self.root / ".runtime"
         state.mkdir(mode=0o700)
         snapshot = inspect_runtime_identities(self.root, self.paths)
         with acquire_lock(snapshot, "anchor.lock", create=True, access_verifier=verify_local_access) as anchor:
@@ -745,7 +747,7 @@ class StartupIsolationTests(unittest.TestCase):
              patch.object(server, "UsageTotalsStore") as totals, redirect_stderr(io.StringIO()):
             with self.assertRaises(SystemExit):
                 server.main()
-        state = self.root / ".model_proxy_runtime"
+        state = self.root / ".runtime"
         self.assertFalse((state / "install.json").exists())
         self.assertFalse((state / "active.json").exists())
         log.assert_not_called()
@@ -753,7 +755,7 @@ class StartupIsolationTests(unittest.TestCase):
 
     def _seed_stopped_instance(self, old_sock):
         from core.discovery import initialize_installation, write_instance_record, read_instance_set
-        state = self.root / ".model_proxy_runtime"
+        state = self.root / ".runtime"
         state.mkdir(mode=0o700)
         snapshot = inspect_runtime_identities(self.root, self.paths)
         with acquire_lock(snapshot, "anchor.lock", create=True, access_verifier=verify_local_access) as anchor:
@@ -801,7 +803,7 @@ class StartupIsolationTests(unittest.TestCase):
         self.fail("could not obtain a distinct fixture port")
 
     def _record_bytes(self):
-        state = self.root / ".model_proxy_runtime"
+        state = self.root / ".runtime"
         return {name: (state / name).read_bytes() for name in ("install.json", "active.json", "last_good_paths.json")}
 
     def _assert_stopped_instance_can_change_listen(self, *, reused=False):
@@ -817,7 +819,7 @@ class StartupIsolationTests(unittest.TestCase):
         self.assertNotEqual(old_port, new_port)
         self._write_listen_config(new_port)
         before = ledger.read_bytes()
-        state = self.root / ".model_proxy_runtime"
+        state = self.root / ".runtime"
         observed = []
         def serve_once(http):
             records = read_instance_set(state)
@@ -968,7 +970,7 @@ class StartupIsolationTests(unittest.TestCase):
             start, executable = process_start_identity(proc.pid), process_executable(proc.pid)
             self.assertIsNotNone(start)
             self.assertIsNotNone(executable)
-            state = self.root / ".model_proxy_runtime"
+            state = self.root / ".runtime"
             snapshot = inspect_runtime_identities(self.root, self.paths)
             with acquire_lock(snapshot, "anchor.lock", access_verifier=verify_local_access) as anchor:
                 with acquire_lock(anchor.snapshot, "lock", access_verifier=verify_local_access, anchor=anchor) as legacy:
@@ -1035,7 +1037,7 @@ class StartupIsolationTests(unittest.TestCase):
                                                 "listen": {"host": "::1", "port": old_port}}))
         ledger_before = ledger.read_bytes()
         records_before = self._record_bytes()
-        state = self.root / ".model_proxy_runtime"
+        state = self.root / ".runtime"
         # Neither listener construction nor bind is mocked. The old baseline
         # must itself reject IPv6 on its actual IPv4 socket.
         try:
@@ -1073,7 +1075,7 @@ class StartupIsolationTests(unittest.TestCase):
         new_port = self._unused_fixture_port()
         self._write_listen_config(new_port)
         before = ledger.read_bytes()
-        state = self.root / ".model_proxy_runtime"
+        state = self.root / ".runtime"
         def fake_trim(path):
             replacement = path.with_name("fake-log-trim")
             replacement.write_text("trimmed fake log")
@@ -1342,7 +1344,7 @@ class StartupIsolationTests(unittest.TestCase):
             self._seed_stopped_instance(old)
         new_port = self._unused_fixture_port()
         self._write_listen_config(new_port)
-        state = self.root / ".model_proxy_runtime"
+        state = self.root / ".runtime"
         observed = []
         def serve_once(http):
             self.assertFalse(ledger.exists())
@@ -1443,7 +1445,7 @@ class StartupIsolationTests(unittest.TestCase):
         new_port = old_port if same_listen else self._unused_fixture_port()
         self._write_listen_config(new_port)
         before, inode = ledger.read_bytes(), ledger.stat().st_ino
-        state = self.root / ".model_proxy_runtime"
+        state = self.root / ".runtime"
         observed = []
         def serve_once(http):
             records = read_instance_set(state)
@@ -1545,7 +1547,7 @@ class StartupIsolationTests(unittest.TestCase):
         self.assertEqual(ledger.read_bytes(), before)
         self.assertEqual(ledger.stat().st_ino, inode)
         self.assertEqual(list(ledger.parent.glob("totals.corrupt.*")), [])
-        state = self.root / ".model_proxy_runtime"
+        state = self.root / ".runtime"
         for name in ("install.json", "active.json", "last_good_paths.json"):
             self.assertFalse((state / name).exists())
 
@@ -1596,7 +1598,7 @@ class StartupIsolationTests(unittest.TestCase):
             server._ensure_stale_instance(*args)
 
     def test_corrupt_existing_observation_is_not_overwritten(self):
-        state = self.root / ".model_proxy_runtime"
+        state = self.root / ".runtime"
         state.mkdir(mode=0o700)
         record = state / "active.json"
         record.write_text("corrupt")

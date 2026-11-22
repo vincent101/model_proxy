@@ -91,31 +91,37 @@ class TestModulePaths(IsolatedInstallCase):
 
 class TestInstallPreflight(IsolatedInstallCase):
     @unittest.skipUnless(sys.platform == 'darwin', 'macOS private-config policy')
-    def test_world_readable_fake_config_is_rejected_before_install(self):
+    def test_unverifiable_target_is_rejected_before_any_write(self):
+        """目标身份无法验证时，`_snapshot_text` 必须 fail-closed 且不产生备份。
+
+        历史背景：本用例原名 test_world_readable_fake_config_is_rejected…，
+        断言 0644 的**配置**会被拒。自 2450c38 起业务配置读取为兼容 macOS
+        自动附着的 xattr 而刻意放宽了 mode 检查，所以那条前提已不成立。
+        但「目标不可验证 → 拒写、无备份」这条不变量仍然重要，改用**目录**
+        作为目标来验证（不是普通文件 → not_regular_file）。
+        """
         from core import mac_config_path, secure_files
 
+        # 生产者仍是同一个原生实现（防 mock 掉真实验证）
         self.assertIs(mac_config_path._mac_fd_protection, secure_files._mac_fd_protection)
         self.assertEqual(secure_files._mac_fd_protection.__module__, 'core.secure_files')
 
-        self.fake_config.chmod(0o644)
+        # 业务配置读取的负例：目录不是普通文件
+        not_a_file = self.fake_config.with_name('not-a-file.json')
+        not_a_file.mkdir()
         with self.assertRaises(mac_config_path.MacConfigError) as caught:
-            mac_config_path.capture_config(self.fake_config)
-        self.assertEqual(caught.exception.code, 'file_permissions_unsafe')
+            mac_config_path.capture_config(not_a_file)
+        self.assertEqual(caught.exception.code, 'not_regular_file')
+
+        # 安装目标不可验证：不写、不备份、记 PREPARE_FAILED
         target = self.fake_home / 'client.json'
+        target.mkdir()
         stderr = io.StringIO()
         with contextlib.redirect_stderr(stderr), self.assertRaises(iops.InstallFailure):
             iops._snapshot_text(target)
         self.assertEqual(iops._EVENTS, [('client.json', 'PREPARE_FAILED', None)])
-        self.assertFalse(target.exists())
+        self.assertTrue(target.is_dir(), '目标不得被替换')
         self.assertEqual(list(self.fake_home.glob('client.json.bak.*')), [])
-
-
-class TestCandidateTokens(IsolatedInstallCase):
-    """candidate_tokens 协议过滤用例——覆盖 route_pool 与 route_id 两种写法。
-
-    B1 修复前的 bug：candidate_tokens 只认 route_id 单值写法，对 route_pool
-    写法直接跳过 → 生产 config 全用 route_pool 时返回空列表，install 命令不可用。
-    """
 
     def _make_cfg(self, strategies, routes, supplies=None):
         return {

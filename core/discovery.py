@@ -247,15 +247,34 @@ def _windows_open_preflight(project_root, runtime_paths, *, light=False, initial
     # as a fixed record during first-start/status preflight.
     fixed = ("anchor.lock", "control.lock", "install.json", "active.json",
              "last_good_paths.json")
-    for name in fixed:
-        paths[name] = str(PureWindowsPath(state) / name)
     leases = {}
     try:
         leases["__root__"] = windows_paths.inspect(root, backend=backend, kind="directory", private=False,
                                                    trusted_boundary=root)
         if not leases["__root__"].evidence.exists:
             raise PreflightError("invalid_root", "Project root is unavailable")
+        # 固定的状态目录可能尚未创建（首次启动/首次 status）。此时状态目录下的
+        # 固定记录既不可能存在、也不可能被伪装成运行角色，因此不参与本轮
+        # 采集——否则它们的父目录缺失会让整个 light 预检以 boundary_unavailable
+        # 失败，把「还没初始化」误报成「证据不可用」。已存在时仍然全部参与。
+        try:
+            state_lease = windows_paths.inspect(
+                state, backend=backend, kind="directory", private=True,
+                trusted_boundary=_windows_trusted_boundary(
+                    root, state, initial_missing_parents=initial_missing_parents))
+        except windows_paths.PathEvidenceError:
+            state_lease = None
+        state_present = bool(state_lease is not None and state_lease.evidence.exists)
+        missing_fixed: dict[str, object] = {}
+        if state_present:
+            for name in fixed:
+                paths[name] = str(PureWindowsPath(state) / name)
+            leases["state_dir"] = state_lease
         for name, path in paths.items():
+            if name == "state_dir" and name in leases:
+                # 前面已为「判断状态目录是否存在」持有该租约；复用，避免重复
+                # inspect 后覆盖 lease 泄漏句柄。
+                continue
             kind = "directory" if name in ("state_dir", "tmp_dir", "backups_dir") else "file"
             private = True
             fixed_single = name in ("anchor.lock", "control.lock", "lock", "install.json", "active.json", "last_good_paths.json")
@@ -277,6 +296,25 @@ def _windows_open_preflight(project_root, runtime_paths, *, light=False, initial
                     trusted_boundary=_windows_trusted_boundary(
                         root, path, initial_missing_parents=initial_missing_parents))
             leases[name] = lease
+        if not state_present and state_lease is not None:
+            from core.windows_paths import PathEvidence
+            state_ev = state_lease.evidence
+            for name in fixed:
+                if light and name in ("install.json", "last_good_paths.json"):
+                    # light 模式的快照契约历来不含这两条辅助记录；
+                    # 缺席路径同样保持该契约，避免 locator 侧出现新键。
+                    continue
+                synth = PathEvidence(
+                    drive=state_ev.drive, components=state_ev.components,
+                    missing=tuple(state_ev.missing) + (name,),
+                    expected_kind="file", private=True, single_link=True,
+                    boundary_depth=state_ev.boundary_depth)
+                missing_fixed[name] = _windows_identity(
+                    str(PureWindowsPath(state) / name), synth)
+            # 这条探测租约只用于「缺席时合成身份」；真正参与冲突扫描的
+            # state_dir 租约由下面的循环重新取得。这里必须显式关闭，
+            # 否则每次 light 预检都会泄漏整条父链句柄。
+            state_lease.close()
         for name in PATH_KEYS:
             if not leases[name].evidence.direct_parent_observed:
                 # Only the fixed, not-yet-created state container may be
@@ -328,8 +366,12 @@ def _windows_open_preflight(project_root, runtime_paths, *, light=False, initial
             # They participate in the held collision scan above, but retain
             # the existing light-snapshot contract for locator state updates.
             auxiliary.update(("install.json", "last_good_paths.json"))
-        identities = tuple((name, _windows_identity(path, leases[name].evidence))
-                           for name, path in paths.items() if name not in auxiliary)
+        identities = [(name, _windows_identity(path, leases[name].evidence))
+                      for name, path in paths.items() if name not in auxiliary]
+        # 状态目录尚不存在时，其下的固定记录一定不存在：这里补上「明确缺失」的
+        # 身份而不是省略，保持「快照里每个固定角色都有观测」的既有契约。
+        identities.extend(missing_fixed.items())
+        identities = tuple(identities)
         evidence = tuple((name, lease.evidence) for name, lease in leases.items()
                          if name not in auxiliary)
         return WindowsPathPreflight(root, identities, evidence), leases

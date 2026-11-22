@@ -35,7 +35,7 @@ class HeldLockPermissionsTests(unittest.TestCase):
         self.case = Path(tempfile.mkdtemp(prefix="held-lock-", dir=SANDBOX / "cases")).resolve()
         self.addCleanup(shutil.rmtree, self.case)
         self.project = self.case / "project"
-        self.state = self.project / ".model_proxy_runtime"
+        self.state = self.project / ".runtime"
         self.runtime = self.project / "runtime"
         self.project.mkdir(mode=0o700)
         self.state.mkdir(mode=0o700)

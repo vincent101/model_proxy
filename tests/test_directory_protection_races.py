@@ -29,7 +29,7 @@ class DirectoryProtectionRaces(unittest.TestCase):
         self.case = Path(tempfile.mkdtemp(prefix="dir-race-", dir=SANDBOX / "cases")).resolve()
         self.shared = self.case / "shared"
         self.project = self.shared / "project"
-        self.state = self.project / ".model_proxy_runtime"
+        self.state = self.project / ".runtime"
         self.runtime = self.project / "runtime"
         self.shared.mkdir(mode=0o700)
         self.project.mkdir(mode=0o700)

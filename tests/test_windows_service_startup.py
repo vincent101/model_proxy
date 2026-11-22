@@ -40,7 +40,7 @@ class FakeServer:
 
 class WindowsCoreMockStartupTests(unittest.TestCase):
     ROOT = r"C:\fixture\project"
-    STATE = r"C:\fixture\project\.model_proxy_runtime"
+    STATE = r"C:\fixture\project\.runtime"
     RUNTIME = r"C:\fixture\runtime"
 
     def setUp(self):
@@ -197,7 +197,7 @@ class FakeBoundSocket:
 
 class WindowsFirstInitializationTests(unittest.TestCase):
     ROOT = r"C:\fixture\project"
-    STATE = r"C:\fixture\project\.model_proxy_runtime"
+    STATE = r"C:\fixture\project\.runtime"
     RUNTIME = r"C:\fixture\runtime"
     def setUp(self):
         self.fs = RecordFS()

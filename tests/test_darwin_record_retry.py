@@ -136,7 +136,7 @@ class DarwinRecordReplacementTests(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory(prefix="record-retry-", dir=SANDBOX / "cases")
         self.addCleanup(self.tmp.cleanup)
         self.root = Path(self.tmp.name)
-        self.state = self.root / ".model_proxy_runtime"
+        self.state = self.root / ".runtime"
         self.state.mkdir(mode=0o700)
         self.path = self.state / "install.json"
         self.replacement = self.state / "replacement.json"

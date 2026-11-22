@@ -1134,7 +1134,7 @@ class MacLinksIntegration(unittest.TestCase):
             self.children.append(child)
             self.child_identity[child] = (process_start_identity(child.pid), process_executable(child.pid))
             self._await_guard_attestation(child, 'service')
-            active_file = self.root / '.model_proxy_runtime/active.json'
+            active_file = self.root / '.runtime/active.json'
             deadline = time.monotonic() + 20
             while time.monotonic() < deadline:
                 self.assertIsNone(child.poll(), 'direct service exited before READY')
@@ -1340,7 +1340,7 @@ print('FAKE_PEER_FINISHED', flush=True)
                 self.assertNotEqual(child.returncode, 0)
                 self.assertIn(b'config_read_error', output + error)
                 self.assertNotIn(ADMIN.encode(), output + error)
-                self.assertFalse((self.root / '.model_proxy_runtime/active.json').exists())
+                self.assertFalse((self.root / '.runtime/active.json').exists())
                 self.assertEqual(self.target.read_bytes(), before)
                 self.assertEqual(list(self.target.parent.glob(self.target.name + '.bak.*')), [])
                 # Bind, never connect, to detect an unexpected lingering listener.

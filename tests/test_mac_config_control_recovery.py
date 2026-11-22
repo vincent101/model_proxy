@@ -42,9 +42,9 @@ class RealOwnedRecovery(unittest.TestCase):
         self.temp = tempfile.TemporaryDirectory(dir=ISO, prefix='owned-recovery-')
         self.addCleanup(self.temp.cleanup)
         self.root = Path(self.temp.name).resolve() / 'project'
-        for name in ('config', 'aliases', 'runtime', 'home', 'tmp', 'core/cli', '.model_proxy_runtime'):
+        for name in ('config', 'aliases', 'runtime', 'home', 'tmp', 'core/cli', '.runtime'):
             (self.root / name).mkdir(parents=True, mode=0o700)
-        self.state = self.root / '.model_proxy_runtime'
+        self.state = self.root / '.runtime'
         self.entry = self.root / 'core/cli/model_proxy.py'
         self.entry.write_text(_CHILD)
         self.entry.chmod(0o600)

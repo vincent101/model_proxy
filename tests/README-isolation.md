@@ -29,20 +29,50 @@ python3 tests/run_unit_suite.py tests/test_x.py
 | `win` | `test_windows_*` / `test_wine_*` 在非 Windows 宿主上运行，或错误信息命中 Windows 原生原语特征 |
 | `FAIL` | **意外失败**，需要人看 |
 
-### 已知仍失败的两批（非 Windows）
+### 当前状态
 
-| 文件 | 数量 | 状态 |
+```bash
+$ python3 tests/run_unit_suite.py -j 8
+files run: 140  ok: 132  needs-isolation: 32  windows-native(需 Windows runner): 4  意外失败: 0
+```
+
+- **`iso`（32 个文件）**：`test_mac_config_writer*`、`test_mac_runtime_staging`、
+  `test_mac_writer_interruptions` 等，运行时才读 `MP_TEST_ROOT`/`MP_TEST_PROJECT`，
+  必须走 `run_isolated.sh`。
+- **`win`（4 个文件）**：`test_windows_gate`、`test_windows_control_a_followup`、
+  `test_windows_secure_files_writer`、`test_windows_secure_install_wiring`，
+  覆盖 Win32 句柄/ACL/记录目录，macOS 宿主上不可执行。
+- **意外失败 0**。
+
+### 已修好的历史失败（备查）
+
+| 类别 | 根因 | 涉及 |
 |---|---|---|
-| `test_install_ops.py` | 25 | `boundary_guard` 判定「安装目标、角色或私有目录已改变」；异常被 `InstallFailure` 吞掉，需单独一轮定位 |
-| `test_cli_write_preflight.py` | 3 | 同源（同样走 `_mac_install_locations` → `boundary_guard`） |
+| 临时目录符号链接 | macOS `/var` → `/private/var`；生产不变量要求父链无链接、固定目录为规范路径 | `test_secure_files`、`test_backup_close_failure`、`test_platform_lock`、`test_discovery_anchor`、`test_windows_gate`(部分) |
+| 旧目录名残留 | `.model_proxy_runtime` 自 v0.14 起统一为 `.runtime`，`core/` 已无旧名 | 29 个测试文件 |
+| mock 目标过期 | 写入改为 `secure_replace_runtime`（多 `locations`/`boundary_guard`） | `test_backup_close_failure` |
+| 模块参数演进 | `read_stable_config` 新增 `trusted_boundary` | `test_usage_totals` |
+| 契约变更 | 损坏账本改为降级 `LedgerUnavailable`；0644 业务配置不再被拒 | `test_windows_service_startup_wiring`、`test_install_ops` |
+| 惰性导入 | 伪造 `os.name='nt'` 后再导入 `core.server` 会命中 WindowsPath | `test_windows_control_c_review` |
+| 假 `os` 缺方法 | `SimpleNamespace` 无 `fspath` | `test_windows_secure_hook_install` |
 
-已在本轮修好的（记录备查）：`test_secure_files`、`test_backup_close_failure`、
-`test_platform_lock`、`test_runtime_unify_paths`、`test_usage_totals`、
-`test_discovery_anchor`。共同根因多为 **macOS 的 `/var` → `/private/var` 符号链接**
-（生产不变量要求父链无链接、固定目录为规范路径），或**模块参数演进后 mock 未同步**
-（`trusted_boundary`、`secure_replace_runtime` 的 `locations`/`boundary_guard`）。
+### 顺带修好的产品缺陷（非测试）
 
-判断某个失败是否「新引入」时，请先 `git stash` 掉改动复跑一次做对照。
+1. **`install` 的 macOS 边界复核恒失败**：`_install_ops.boundary_guard` 用默认口径
+   重采私有目录，而 `_mac_runtime_locations` 以 `business_xattr_compat=True` 建快照，
+   目录属性一项（`None` vs `(provenance,)`）永不相等 → 每次安装都报
+   「安装目标、角色或私有目录已改变」。已对齐口径。
+2. **Windows 首次启动/status 误报证据不可用**：状态目录尚未创建时，其下固定记录的
+   父目录缺失会让 `_windows_open_preflight` 以 `boundary_unavailable` 失败。
+   现在缺席时合成「明确缺失」身份，其余角色照常核验。
+3. **Windows 旧版运行时目录缺席时 `off`/`status` 误报**：`_idle_readonly` 只认
+   `ResolvedRuntimePaths` 的溯源标记，而 active.json 反序列化后是普通 dict，
+   溯源必然缺失 → 退回逐个 inspect 后失败。改为「三条路径逐字等于映射默认值 +
+   仅作缺席观测」。
+
+### 判断某个失败是否「新引入」
+
+先 `git stash` 掉改动复跑一次做对照；`windows-native` 与 `iso` 两类不算回归。
 
 ## 临时副本回归
 

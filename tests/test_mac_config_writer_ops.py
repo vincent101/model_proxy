@@ -995,7 +995,7 @@ class ConfigOpsWriteTests(unittest.TestCase):
                     self.root / 'config.json.bak.0123456789abcdef',
                     self.root / 'CONFIG.JSON.BAK.0123456789ABCDEF',
                     self.root / '.model-proxy-config-0123456789abcdef01234567']
-        state = self.project / '.model_proxy_runtime'
+        state = self.project / '.runtime'
         state.mkdir(mode=0o700)
         targets.append(state / 'install.json')
         original = self.config.read_bytes()
