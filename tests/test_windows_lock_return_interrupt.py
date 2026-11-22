@@ -49,14 +49,51 @@ class TransferReturnInterruptTests(unittest.TestCase):
         self.paths = {key: self.state + '\\' + key for key in PATH_KEYS}
 
     def _exercise(self, *, create, point, expected_unknown, interruption=KeyboardInterrupt):
-        offsets = _transfer_offsets()
-        if point not in offsets:
+        offsets = _transfer_offsets() if point != 'assigned' else {}
+        if point != 'assigned' and point not in offsets:
             self.skipTest('interpreter combines raw/fd assignment into one opcode')
         if not create:
             self.fs.objects[self.target] = self.fs.obj(71)
         snapshot = discovery.inspect_runtime_identities(self.root, self.paths)
-        expected_offset = offsets[point]
         captured = {}
+        if point == 'assigned':
+            # 「fd 已赋值」之后的第一处外部调用就是 make_noninheritable。
+            # 在这里注入中断与按指令偏移打断等价，且不依赖解释器字节码布局
+            # （3.12/Windows 上按偏移打断会漏过该点）。
+            def interrupt(fd):
+                frame = sys._getframe(1)  # lock_private_object
+                captured['fd'] = fd
+                captured['raw'] = frame.f_locals.get('raw')
+                captured['closed'] = frame.f_locals['owned'].closed
+                captured['mapping'] = dict(self.crt.mapping)
+                raise interruption()
+            with patch.object(self.crt, 'make_noninheritable', interrupt):
+                with self.assertRaises(interruption) as caught:
+                    locks.acquire_lock(snapshot, 'anchor.lock', create=create)
+            self.assertTrue(captured, 'injected interruption did not execute')
+            self.assertEqual(len(captured['mapping']), 1)
+            original_fd, original_handle = next(iter(captured['mapping'].items()))
+            self.assertIs(caught.exception.created, create)
+            self.assertIs(caught.exception.release_unknown, expected_unknown)
+            self.assertIs(locks._windows_release_unknown, expected_unknown)
+            self.assertTrue(captured['closed'])
+            if expected_unknown:
+                self.assertIsNone(captured['fd'])
+                self.assertEqual(self.crt.mapping[original_fd], original_handle)
+                self.assertIn(original_handle, self.fs.handles)
+                self.assertEqual(self.crt.close_calls, [])
+                self.assertEqual(self.fs.close_calls.count(original_handle), 0)
+                with self.assertRaises(locks.LockError) as blocked:
+                    locks.acquire_lock(snapshot, 'anchor.lock', create=False)
+                self.assertEqual(blocked.exception.code, 'lock_release_unknown')
+            else:
+                self.assertEqual(captured['fd'], original_fd)
+                self.assertEqual(captured['raw'], original_handle)
+                self.assertEqual(self.crt.close_calls, [original_fd])
+                self.assertNotIn(original_fd, self.crt.mapping)
+                self.assertNotIn(original_handle, self.fs.handles)
+            return
+        expected_offset = offsets[point]
         seen = []
         previous = sys.gettrace()
         def trace(frame, event, arg):
