@@ -74,7 +74,24 @@ def classify(name: str, output: str) -> str:
     return 'fail'
 
 
-def run_one(path: pathlib.Path) -> tuple[str, str, str]:
+DETAIL_LINES = 24     # 失败时要保留的输出行数（足够看到首个断言）
+
+
+def _failure_detail(output: str) -> list[str]:
+    """挑出「首个失败用例 + 断言」附近的若干行。
+
+    `-q` 模式的失败段以 `____ test_name ____` 开头；直接取第一段比取整个
+    输出尾部更有用——尾部常常只剩进度点和汇总行。
+    """
+    lines = output.splitlines()
+    start = next((i for i, line in enumerate(lines)
+                  if line.startswith('_') and line.strip('_ ')), None)
+    if start is None:
+        start = max(0, len(lines) - DETAIL_LINES)
+    return lines[start:start + DETAIL_LINES]
+
+
+def run_one(path: pathlib.Path) -> tuple[str, str, str, list[str]]:
     done = subprocess.run([sys.executable, '-m', 'pytest', str(path), '-q'],
                           capture_output=True, text=True,
                           encoding='utf-8', errors='replace')
@@ -83,8 +100,10 @@ def run_one(path: pathlib.Path) -> tuple[str, str, str]:
     summary = tail[-1] if tail else '(no output)'
     # pytest 用 5 表示「没有收集到用例」，对本套件不算失败
     if done.returncode in (0, 5):
-        return path.name, 'ok', summary
-    return path.name, classify(path.name, output), summary
+        return path.name, 'ok', summary, []
+    kind = classify(path.name, output)
+    detail = _failure_detail(output) if kind == 'fail' else []
+    return path.name, kind, summary, detail
 
 
 def main(argv=None) -> int:
@@ -112,12 +131,14 @@ def main(argv=None) -> int:
     buckets = {'ok': [], 'isolation': [], 'windows-native': [], 'macos-native': [],
                'fail': []}
     with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, args.jobs)) as pool:
-        for name, kind, summary in pool.map(run_one, runnable):
+        for name, kind, summary, detail in pool.map(run_one, runnable):
             buckets[kind].append(name)
             prefix = {'ok': 'ok  ', 'isolation': 'iso ',
                       'windows-native': 'win ', 'macos-native': 'mac ',
                       'fail': 'FAIL'}[kind]
             print(f'{prefix} {name:<52} {summary}')
+            for line in detail:
+                print(f'     | {line}')
 
     print()
     print(f'files run: {len(runnable)}  ok: {len(buckets["ok"])}'
