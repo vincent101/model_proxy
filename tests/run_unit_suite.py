@@ -78,17 +78,23 @@ DETAIL_LINES = 60     # 失败时要保留的输出行数（够看到首个断�
 
 
 def _failure_detail(output: str) -> list[str]:
-    """挑出「首个失败用例 + 断言」附近的若干行。
+    """挑出「首个失败段头部 + 真正的异常行」。
 
-    `-q` 模式的失败段以 `____ test_name ____` 开头；直接取第一段比取整个
-    输出尾部更有用——尾部常常只剩进度点和汇总行。
+    只取头部不够：pytest 会在回溯里展开整段被调函数源码（本例里有 40+ 行），
+    把真正抛错的 `E ...` 行顶出窗口。所以头部与尾部各取一段，中间用省略号
+    连接——头部给定位，尾部给错误码。
     """
     lines = output.splitlines()
     start = next((i for i, line in enumerate(lines)
                   if line.startswith('_') and line.strip('_ ')), None)
     if start is None:
         start = max(0, len(lines) - DETAIL_LINES)
-    return lines[start:start + DETAIL_LINES]
+    head = lines[start:start + DETAIL_LINES]
+    tail_start = max(start + DETAIL_LINES, len(lines) - 15)
+    tail = lines[tail_start:] if tail_start < len(lines) else []
+    if not tail:
+        return head
+    return [*head, f'     | ... ({tail_start - start - DETAIL_LINES} lines omitted)', *tail]
 
 
 def run_one(path: pathlib.Path) -> tuple[str, str, str, list[str]]:
