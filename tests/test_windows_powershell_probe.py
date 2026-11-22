@@ -17,12 +17,17 @@ from core.cli import windows_command_line as wcl
 @unittest.skipUnless(os.name == "nt", "requires Windows Python")
 class PowerShellProbe(unittest.TestCase):
     def test_probe(self):
+        lines = []
+
+        def record(text):
+            lines.append(text)
+            print(text, flush=True)
         directory = wcl._system_directory()
         root = ntpath.dirname(directory)
         psdir = ntpath.join(directory, "WindowsPowerShell", "v1.0")
         exe = ntpath.join(psdir, "powershell.exe")
         env = {"SystemRoot": root, "PSModulePath": ntpath.join(psdir, "Modules")}
-        print("probe system_directory=%r exe_exists=%r" % (directory, os.path.exists(exe)), flush=True)
+        record("probe system_directory=%r exe_exists=%r" % (directory, os.path.exists(exe)))
 
         def run(args, stdin_data, budget):
             started = time.monotonic()
@@ -31,16 +36,16 @@ class PowerShellProbe(unittest.TestCase):
                                         stderr=subprocess.PIPE, env=env, shell=False,
                                         creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
             except BaseException as exc:
-                print("probe spawn failed %r after %.2fs" % (exc, time.monotonic() - started), flush=True)
+                record("probe spawn failed %r after %.2fs" % (exc, time.monotonic() - started))
                 return
             try:
                 out, err = proc.communicate(stdin_data, timeout=budget)
-                print("probe rc=%r elapsed=%.2fs out=%r err=%r"
-                      % (proc.returncode, time.monotonic() - started,
-                         out[:200], err[:400]), flush=True)
+                record("probe rc=%r elapsed=%.2fs out=%r err=%r"
+                       % (proc.returncode, time.monotonic() - started,
+                          out[:200], err[:400]))
             except subprocess.TimeoutExpired:
                 proc.kill()
-                print("probe TIMEOUT after %.2fs" % (time.monotonic() - started), flush=True)
+                record("probe TIMEOUT after %.2fs" % (time.monotonic() - started))
 
         run([exe, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", "exit 0"], b"", 30)
         run([exe, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command",
@@ -48,3 +53,4 @@ class PowerShellProbe(unittest.TestCase):
              "Select-Object -ExpandProperty CommandLine" % os.getpid()], b"", 60)
         run([exe, "-NoLogo", "-NoProfile", "-NonInteractive", "-EncodedCommand",
              wcl._ENCODED_SCRIPT], ("%d\n" % os.getpid()).encode("ascii"), 60)
+        self.fail("PROBE RESULTS\n" + "\n".join(lines))
