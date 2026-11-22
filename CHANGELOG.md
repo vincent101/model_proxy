@@ -25,6 +25,25 @@
 **实测**：修复前 `stats today` 停在 11-21；修复后重启即恢复，`CLEAN` 状态
 正常，`stats today` 有实时数据。
 
+### 清理既有测试失败 + 提供可用的测试入口
+
+- `test_secure_files.py` / `test_backup_close_failure.py` 共 29 项失败的根因是
+  macOS 上 `tempfile` 返回 `/var/folders/…`，而 `/var` 是指向 `/private/var` 的
+  符号链接；`_parents()` 拒绝父链出现链接（生产不变量）。测试改用
+  `Path(...).resolve()` 构造临时根。
+- 5 项 CLI 路径用例的 mock 目标过期：写入已改为 `secure_replace_runtime`
+  （多 `locations` / `boundary_guard`），用例仍在 patch `install.secure_replace`，
+  于是「被调用 0 次」。改为 patch 真实符号并新增适配器剥离多出的关键字参数。
+- 1 项子进程用例的负例过期：自 `2450c38` 起业务配置读取为兼容 macOS xattr
+  放宽了 mode 检查，`0644` 不再被拒；负例改用**目录**（仍 fail-closed，
+  `not_regular_file`）。
+- 1 项子进程用例的前置断言过期：写入链路现在会提前 import
+  `core.cli.authority`，不再强制「替换时尚未 import」；原生对象身份仍由后续
+  `check_imports` 断言。
+- 新增 `tests/run_unit_suite.py`：按文件分进程跑单元测试。直接 `pytest tests/`
+  不可用——隔离回归用例在 import 阶段就中止、Windows 仿真用例会跨文件泄漏
+  `os.name`。README-isolation.md 补齐说明与「macOS 上必然失败的 Windows 用例」清单。
+
 ### status 改为「在用供给健康表」
 
 - **替换 `degraded supplies` 段**：原来只列失败率超阈值的供给，健康项完全不显示。

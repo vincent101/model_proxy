@@ -51,7 +51,9 @@ class BackupCloseFailure(unittest.TestCase):
         self.addCleanup(os.umask, old_umask)
         self.tmp = tempfile.TemporaryDirectory(prefix='mp-backup-close-')
         self.addCleanup(self.tmp.cleanup)
-        self.root = Path(self.tmp.name)
+        # 同 test_secure_files：macOS 的 /var → /private/var 是符号链接，而
+        # _parents() 拒绝父链出现链接（生产不变量）。测试用解析后的真实路径。
+        self.root = Path(self.tmp.name).resolve()
         project = self.root / 'project'
         (project / 'config').mkdir(parents=True)
         (project / 'runtime').mkdir()
@@ -109,6 +111,17 @@ class BackupCloseFailure(unittest.TestCase):
                     for attribute in attributes:
                         self.assertIs(getattr(module, attribute), getattr(sf, attribute))
         self.addCleanup(assert_protection_restored)
+
+    def runtime_writer(self, snap, data, *, max_bytes, locations=None,
+                       boundary_guard=None, **_):
+        """把 `secure_replace_runtime` 的调用形态适配到故障注入用的写入器。
+
+        CLI 路径（`_install_ops._preview_confirm_captured`）调用的是
+        `secure_replace_runtime(snap, bytes, max_bytes=…, locations=…,
+        boundary_guard=…)`；而本类注入的是 secure_files 内部私有桩，
+        不关心 staging 位置与边界复核（那两项由真实代码在调用前算好）。
+        """
+        return self.secure_replace(snap, data, max_bytes=max_bytes)
 
     @staticmethod
     def protection(path, info):
@@ -188,20 +201,23 @@ class BackupCloseFailure(unittest.TestCase):
                         if on_replace is not None:
                             on_replace()
                         try:
-                            return self.secure_replace(*args, **kwargs)
+                            return self.runtime_writer(*args, **kwargs)
                         except sf.SecureWriteError as exc:
                             errors.append(exc)
                             raise
                     with mock.patch.object(install, 'confirm', return_value=True), \
-                         mock.patch.object(install, 'secure_replace', side_effect=checked_replace) as replace, \
+                         mock.patch('core.secure_files.secure_replace_runtime', side_effect=checked_replace) as replace, \
                          mock.patch.object(install, '_EVENTS', []), \
                          contextlib.redirect_stdout(output):
                         with self.assertRaises(install.InstallFailure) as caught:
                             install.preview_confirm_write(
                                 self.target, self.original.decode(), 'FAKE_REPLACEMENT',
                                 'test', [], snapshot=self.snapshot)
-                        replace.assert_called_once_with(
-                            self.snapshot, b'FAKE_REPLACEMENT', max_bytes=install._MAX_CLIENT_BYTES)
+                        replace.assert_called_once()
+                        self.assertEqual(replace.call_args.args,
+                                         (self.snapshot, b'FAKE_REPLACEMENT'))
+                        self.assertEqual(replace.call_args.kwargs['max_bytes'],
+                                         install._MAX_CLIENT_BYTES)
                         self.assertEqual(len(errors), 1, 'secure_replace did not raise the injected error')
                         err = errors[0]
                         self.assertEqual(str(caught.exception), '安全提交失败 (' + err.code + ')')
@@ -390,7 +406,7 @@ class BackupCloseFailure(unittest.TestCase):
              mock.patch.object(install, '_ensure_onboarding_completed') as onboarding, \
              mock.patch.object(install, 'choose_token', return_value=token) as chooser, \
              mock.patch.object(install, 'confirm', return_value=True), \
-             mock.patch.object(install, 'secure_replace', wraps=self.secure_replace) as replace, \
+             mock.patch('core.secure_files.secure_replace_runtime', side_effect=self.runtime_writer) as replace, \
              mock.patch.object(os, 'open', side_effect=open_file), \
              mock.patch.object(os, 'close', side_effect=close_file), \
              mock.patch.object(sys, 'argv', ['install', 'install', str(config), '28371', 'claude,openclaw']), \
@@ -430,14 +446,17 @@ class BackupCloseFailure(unittest.TestCase):
                 output = io.StringIO()
                 with mock.patch.object(install, '_EVENTS', []), \
                      mock.patch.object(install, 'confirm', return_value=True), \
-                     mock.patch.object(install, 'secure_replace', side_effect=error) as replace, \
+                     mock.patch('core.secure_files.secure_replace_runtime', side_effect=error) as replace, \
                      contextlib.redirect_stdout(output):
                     with self.assertRaises(install.InstallFailure):
                         install.preview_confirm_write(self.target, self.original.decode(),
                                                       'FAKE_NEW_TOKEN', 'test', [],
                                                       snapshot=self.snapshot)
-                    replace.assert_called_once_with(
-                        self.snapshot, b'FAKE_NEW_TOKEN', max_bytes=install._MAX_CLIENT_BYTES)
+                    replace.assert_called_once()
+                    self.assertEqual(replace.call_args.args,
+                                     (self.snapshot, b'FAKE_NEW_TOKEN'))
+                    self.assertEqual(replace.call_args.kwargs['max_bytes'],
+                                     install._MAX_CLIENT_BYTES)
                     self.assertEqual(install._EVENTS, [('test', 'POSTCHECK_FAILED', backup)])
                 text = output.getvalue()
                 self.assertIn('目标已替换，后验验证失败', text)
@@ -454,13 +473,16 @@ class BackupCloseFailure(unittest.TestCase):
         output = io.StringIO()
         with mock.patch.object(install, '_EVENTS', []), \
              mock.patch.object(install, 'confirm', return_value=True), \
-             mock.patch.object(install, 'secure_replace', side_effect=error) as replace, \
+             mock.patch('core.secure_files.secure_replace_runtime', side_effect=error) as replace, \
              contextlib.redirect_stdout(output):
             with self.assertRaises(install.InstallFailure):
                 install.preview_confirm_write(self.target, self.original.decode(),
                                               'FAKE_NEW_TOKEN', 'test', [], snapshot=self.snapshot)
-            replace.assert_called_once_with(
-                self.snapshot, b'FAKE_NEW_TOKEN', max_bytes=install._MAX_CLIENT_BYTES)
+            replace.assert_called_once()
+            self.assertEqual(replace.call_args.args,
+                             (self.snapshot, b'FAKE_NEW_TOKEN'))
+            self.assertEqual(replace.call_args.kwargs['max_bytes'],
+                             install._MAX_CLIENT_BYTES)
             self.assertEqual(install._EVENTS, [('test', 'VERIFIED_RELEASE_UNKNOWN', None)])
         self.assertIn('后验通过', output.getvalue())
         self.assertNotIn('备份或残留文件:', output.getvalue())
@@ -623,8 +645,11 @@ class Probe(BackupCloseFailure):
         self.assertIsNot(self.secure_replace.__globals__['_mac_fd_protection'], native_fd)
         def import_during_fault():
             self.assertIn(names[0], sys.modules)  # real write preflight
+            # 写入已改走 secure_replace_runtime + 安装期 staging/边界复核，
+            # 这条链路会提前 import core.cli.authority；因此只要求
+            # mac_config_writer 仍是「故障点后才首次导入」。authority 的
+            # 原生对象身份改由下面的 check_imports 断言（已导入也必须原生）。
             self.assertNotIn(names[1], sys.modules)
-            self.assertNotIn(names[2], sys.modules)
             path, writer, authority = (importlib.import_module(name) for name in names)
             check_imports((path, writer, authority))
             self.assertIs(path._mac_fd_protection, native_fd)
@@ -657,15 +682,17 @@ assert path._mac_fd_protection is native_fd and writer._mac_fd_protection is nat
 assert authority.mac_private_protection is native_path
 from core.cli import _install_ops as install
 assert install.secure_replace is native_writer and install.mac_private_protection is native_path
+# 负例必须选「仍然被拒」的形态：自 2450c38 起业务配置读取为兼容 macOS
+# xattr 放宽了 mode 检查（0644/0666 均可读）。目录不是普通文件，仍然
+# fail-closed —— 用它证明原生代码确实在把关，而不是全放行。
 negative = scratch / 'home' / 'negative.json'
-negative.write_text('{}')
-negative.chmod(0o644)
+negative.mkdir()
 try:
     path.capture_config(negative)
 except path.MacConfigError as exc:
-    assert exc.code == 'file_permissions_unsafe', exc.code
+    assert exc.code == 'not_regular_file', exc.code
 else:
-    raise AssertionError('native 0644 protection did not reject')
+    raise AssertionError('native capture_config accepted a directory')
 print('CHILD_OK:' + scenario)
 '''
         source = Path(__file__).resolve().parent.parent

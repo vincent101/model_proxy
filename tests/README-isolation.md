@@ -1,4 +1,32 @@
-# 临时副本回归
+# 测试运行入口
+
+## 单元测试（每个文件独立进程）
+
+```bash
+python3 tests/run_unit_suite.py          # 全部可直跑的单元测试
+python3 tests/run_unit_suite.py -j 8     # 并行度
+python3 tests/run_unit_suite.py tests/test_x.py
+```
+
+**不要直接 `pytest tests/`**，有两个结构性原因：
+
+1. 本目录下有一批隔离回归用例（`test_cli_*`、`test_mac_*`、`test_windows_*` 的一部分）
+   在 **import 阶段**就要求「隔离项目 + 假 HOME」，直接收集会让整个会话中止
+   （退出码 126/2，且没有任何输出）。它们必须走下面的 `run_isolated.sh`。
+2. Windows 仿真用例会临时替换 `os.name`；同进程内跨文件串联会互相污染，
+   表现是后面一批用例集体报 `WindowsPath` / POSIX 相关的错。
+
+`run_unit_suite.py` 先探一次可收集性（rc=2 视为需要隔离环境），再按文件分进程
+并行执行，因此两类干扰都不存在。
+
+### 已知在 macOS 上失败的 Windows 用例
+
+`test_windows_records.py`、`test_windows_secure_*`、`test_windows_service_startup*`
+等一批用例覆盖 Windows 原生原语（句柄、ACL、记录目录）。它们在 macOS 上必然失败，
+**属预期**，真正验收位置是 Windows runner（见 `.github/workflows/`）。
+判断某个失败是否「新引入」时，请先 `git stash` 掉改动复跑一次做对照。
+
+## 临时副本回归
 
 worktree 只是源码隔离，不等于数据隔离。此方案**不使用 OS 全域 sandbox**，也不提供抵御恶意代码或同用户并发篡改的安全边界。仅用于已审阅、协作开发中的 Python 代码；核心和 CLI 修改未完成之前，**只运行 `--fixture` 和夹具单测**。不要运行旧 shell CLI、生产服务或主工作区代码。
 

@@ -16,7 +16,11 @@ class SecureSnapshotTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
-        self.root = Path(self.tmp.name) / "authorized"
+        # macOS 上 /var 是指向 /private/var 的符号链接，而 tempfile 返回
+        # /var/folders/...；_parents() 会逐级 lstat 并**拒绝任何符号链接**
+        # （生产不变量：父链不得有链接）。测试必须用解析后的真实路径，
+        # 否则连「正常快照」这条基线都建不起来。
+        self.root = Path(self.tmp.name).resolve() / "authorized"
         self.root.mkdir(mode=0o700)
         self.target = self.root / "client.json"
         self.target.write_bytes(b'{"token":"FAKE_SECRET"}')
