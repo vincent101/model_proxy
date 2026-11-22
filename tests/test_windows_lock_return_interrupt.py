@@ -10,6 +10,15 @@ from core.runtime_paths import PATH_KEYS
 from tests import test_windows_discovery as fixtures
 
 
+def _warm_up_opcode_tracing():
+    """CPython 3.12 的首个被跟踪帧不会产生 opcode 事件。
+
+    先让一个帧在 trace 里打开 f_trace_opcodes 并正常跑完、重新安装 trace 后，
+    解释器才会为后续帧生成 opcode 事件；否则按偏移打断会静默失效（seen 为空）。
+    """
+    return None
+
+
 def _transfer_offsets():
     instructions = list(dis.get_instructions(win.lock_private_object))
     index = next(i for i, item in enumerate(instructions)
@@ -97,8 +106,8 @@ class TransferReturnInterruptTests(unittest.TestCase):
         seen = []
         previous = sys.gettrace()
         def trace(frame, event, arg):
+            frame.f_trace_opcodes = True
             if frame.f_code is win.lock_private_object.__code__:
-                frame.f_trace_opcodes = True
                 if event == 'opcode':
                     seen.append(frame.f_lasti)
                 if event == 'opcode' and frame.f_lasti == expected_offset:
@@ -111,6 +120,11 @@ class TransferReturnInterruptTests(unittest.TestCase):
                     raise interruption()
             return trace
         try:
+            sys.settrace(trace)
+            _warm_up_opcode_tracing()
+            # 首个帧只用来让解释器打开 opcode instrumentation；重新安装后
+            # 后续帧才会真正收到 opcode 事件（3.12 实测必需）。
+            sys.settrace(None)
             sys.settrace(trace)
             with self.assertRaises(interruption) as caught:
                 locks.acquire_lock(snapshot, 'anchor.lock', create=create)
