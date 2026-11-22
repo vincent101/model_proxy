@@ -44,17 +44,22 @@ WINDOWS_NATIVE_HINT = (
 
 
 def classify(name: str, output: str) -> str:
-    """ok / isolation / windows-native / fail
+    """ok / isolation / windows-native / macos-native / fail
 
-    判据顺序：隔离环境变量 → 文件名（Windows/Wine 专测）→ 错误信息特征。
-    `test_windows_*` / `test_wine_*` 在非 Windows 宿主上失败属预期：它们
-    专测 Win32 句柄/ACL/记录目录，真实验收位置是 Windows runner。
+    判据顺序：隔离环境变量 → 文件名（平台专测）→ 错误信息特征。
+
+    `test_windows_*` / `test_wine_*` 专测 Win32 句柄/ACL/记录目录，
+    `test_mac_*` / `test_darwin_*` 专测 macOS 原生保护——各自只能在对应宿主上
+    验收。跨平台 CI 必须两边都跑才能覆盖全部；缺哪边，哪边就是「未原生验收」。
     """
     if any(var in output for var in NEEDS_ISOLATION_ENV):
         return 'isolation'
     if sys.platform != 'win32' and (name.startswith('test_windows_')
                                     or name.startswith('test_wine_')):
         return 'windows-native'
+    if sys.platform != 'darwin' and (name.startswith('test_mac_')
+                                     or name.startswith('test_darwin_')):
+        return 'macos-native'
     if any(hint in output for hint in WINDOWS_NATIVE_HINT):
         return 'windows-native'
     return 'fail'
@@ -94,18 +99,21 @@ def main(argv=None) -> int:
             print('  -', path.name)
         print()
 
-    buckets = {'ok': [], 'isolation': [], 'windows-native': [], 'fail': []}
+    buckets = {'ok': [], 'isolation': [], 'windows-native': [], 'macos-native': [],
+               'fail': []}
     with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, args.jobs)) as pool:
         for name, kind, summary in pool.map(run_one, runnable):
             buckets[kind].append(name)
             prefix = {'ok': 'ok  ', 'isolation': 'iso ',
-                      'windows-native': 'win ', 'fail': 'FAIL'}[kind]
+                      'windows-native': 'win ', 'macos-native': 'mac ',
+                      'fail': 'FAIL'}[kind]
             print(f'{prefix} {name:<52} {summary}')
 
     print()
     print(f'files run: {len(runnable)}  ok: {len(buckets["ok"])}'
           f'  needs-isolation: {len(skipped) + len(buckets["isolation"])}'
-          f'  windows-native(需 Windows runner): {len(buckets["windows-native"])}'
+          f'  windows-native: {len(buckets["windows-native"])}'
+          f'  macos-native: {len(buckets["macos-native"])}'
           f'  意外失败: {len(buckets["fail"])}')
     if buckets['fail']:
         print()

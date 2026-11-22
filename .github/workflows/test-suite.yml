@@ -1,0 +1,81 @@
+# 跨平台单元测试：Windows 与 macOS 各跑一遍。
+#
+# 为什么必须两边都跑：
+#   - `test_windows_*` / `test_wine_*` 专测 Win32 句柄、ACL、记录目录；
+#   - `test_mac_*` / `test_darwin_*` 专测 macOS 原生保护与 ACL；
+#   - 在非对应宿主上它们必然失败，但那是「未在该平台验收」，不是代码缺陷。
+#   `tests/run_unit_suite.py` 按文件名把它们归为 windows-native / macos-native
+#   两类（不算失败），只有真正的意外失败才让 job 红。
+#
+# 不跑的：`tests/run_isolated.sh`（POSIX shell + lsof）——它需要隔离项目与
+# 假 HOME，只在本地 macOS 跑；`test_cli_live` 需要真实服务。
+#
+# 依赖：纯标准库 + pytest（Win32 通过 ctypes.WinDLL 直调，不需要 pywin32）。
+
+name: test-suite
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - 'test-v*'
+
+permissions:
+  contents: read
+
+env:
+  PYTHON_VERSION: '3.12'
+
+jobs:
+  windows:
+    name: windows/amd64
+    runs-on: windows-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install pytest
+        run: python -m pip install --upgrade pip pytest
+
+      - name: Environment fingerprint
+        run: |
+          python -c "import platform,sys; print(platform.platform()); print(sys.version)"
+
+      - name: Run unit suite (per-file isolation)
+        # run_unit_suite.py 对每个文件起独立进程：Windows 仿真用例会临时改写
+        # os.name，同进程跨文件串联会互相污染。
+        run: python tests/run_unit_suite.py -j 4
+
+      - name: Upload failure details
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-test-logs
+          path: |
+            .pytest_cache
+          if-no-files-found: ignore
+
+  macos:
+    name: darwin/arm64
+    runs-on: macos-14
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install pytest
+        run: python -m pip install --upgrade pip pytest
+
+      - name: Environment fingerprint
+        run: |
+          python -c "import platform,sys; print(platform.platform()); print(sys.version)"
+
+      - name: Run unit suite (per-file isolation)
+        run: python tests/run_unit_suite.py -j 4
