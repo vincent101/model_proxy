@@ -16,6 +16,11 @@ name: test-suite
 
 on:
   workflow_dispatch:
+    inputs:
+      files:
+        description: '只跑这些文件（空格分隔，留空跑全部）'
+        required: false
+        default: ''
   push:
     tags:
       - 'test-v*'
@@ -51,7 +56,8 @@ jobs:
       - name: Run unit suite (per-file isolation)
         # run_unit_suite.py 对每个文件起独立进程：Windows 仿真用例会临时改写
         # os.name，同进程跨文件串联会互相污染。
-        run: python tests/run_unit_suite.py -j 4
+        shell: bash
+        run: python tests/run_unit_suite.py -j 4 ${{ inputs.files }}
 
       - name: Upload failure details
         if: failure()

@@ -74,7 +74,7 @@ def classify(name: str, output: str) -> str:
     return 'fail'
 
 
-DETAIL_LINES = 24     # 失败时要保留的输出行数（足够看到首个断言）
+DETAIL_LINES = 60     # 失败时要保留的输出行数（够看到首个断言的完整回溯）
 
 
 def _failure_detail(output: str) -> list[str]:
