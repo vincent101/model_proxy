@@ -31,14 +31,37 @@ def collectable(path: pathlib.Path) -> bool:
     return done.returncode != 2
 
 
-def run_one(path: pathlib.Path) -> tuple[str, bool, str]:
+# 这些用例在运行期才读隔离环境变量（收集阶段看不出来），必须走 run_isolated.sh。
+# 判据用环境变量名出现在失败输出里，而不是猜文件名。
+NEEDS_ISOLATION_ENV = ('MP_TEST_ROOT', 'MP_TEST_PROJECT', 'MP_TEST_VENV', 'MP_TEST_GUARD')
+# Windows 原生原语（句柄/ACL/记录目录）在 macOS 上必然失败，验收位置是 Windows runner。
+WINDOWS_NATIVE_HINT = (
+    'cannot instantiate \'WindowsPath\'',
+    'WindowsPrivateCreationError',
+    'Invalid fixed directory',
+    'record_unavailable',
+)
+
+
+def classify(output: str) -> str:
+    """ok / isolation / windows-native / fail"""
+    if any(name in output for name in NEEDS_ISOLATION_ENV):
+        return 'isolation'
+    if any(hint in output for hint in WINDOWS_NATIVE_HINT):
+        return 'windows-native'
+    return 'fail'
+
+
+def run_one(path: pathlib.Path) -> tuple[str, str, str]:
     done = subprocess.run([sys.executable, '-m', 'pytest', str(path), '-q'],
                           capture_output=True, text=True)
-    tail = (done.stdout or done.stderr).strip().splitlines()
+    output = (done.stdout or '') + (done.stderr or '')
+    tail = output.strip().splitlines()
     summary = tail[-1] if tail else '(no output)'
     # pytest 用 5 表示「没有收集到用例」，对本套件不算失败
-    ok = done.returncode in (0, 5)
-    return path.name, ok, summary
+    if done.returncode in (0, 5):
+        return path.name, 'ok', summary
+    return path.name, classify(output), summary
 
 
 def main(argv=None) -> int:
@@ -63,19 +86,26 @@ def main(argv=None) -> int:
             print('  -', path.name)
         print()
 
-    failures = []
+    buckets = {'ok': [], 'isolation': [], 'windows-native': [], 'fail': []}
     with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, args.jobs)) as pool:
-        for name, ok, summary in pool.map(run_one, runnable):
-            if ok:
-                print(f'ok   {name:<52} {summary}')
-            else:
-                print(f'FAIL {name:<52} {summary}')
-                failures.append(name)
+        for name, kind, summary in pool.map(run_one, runnable):
+            buckets[kind].append(name)
+            prefix = {'ok': 'ok  ', 'isolation': 'iso ',
+                      'windows-native': 'win ', 'fail': 'FAIL'}[kind]
+            print(f'{prefix} {name:<52} {summary}')
 
     print()
-    print(f'files run: {len(runnable)}  passed: {len(runnable) - len(failures)}'
-          f'  failed: {len(failures)}  skipped(isolation): {len(skipped)}')
-    return 1 if failures else 0
+    print(f'files run: {len(runnable)}  ok: {len(buckets["ok"])}'
+          f'  needs-isolation: {len(skipped) + len(buckets["isolation"])}'
+          f'  windows-native(需 Windows runner): {len(buckets["windows-native"])}'
+          f'  意外失败: {len(buckets["fail"])}')
+    if buckets['fail']:
+        print()
+        print('意外失败（既不是隔离环境缺失，也不是 Windows 原生限制）:')
+        for name in buckets['fail']:
+            print('  -', name)
+        return 1
+    return 0
 
 
 if __name__ == '__main__':

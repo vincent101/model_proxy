@@ -36,7 +36,7 @@ class StatusStructureTests(unittest.TestCase):
                                                       'log': str(Path(td)/'log')},
                                             (safe, 'fake-admin-secret'))
         output = '\n'.join(lines)
-        self.assertIn('cooldown 1/1', output)
+        self.assertIn('cooldown (剩余秒)', output)
         self.assertIn('service_secret', output)
 
     def test_numeric_admin_token_does_not_match_normal_zero_counts(self):
@@ -48,8 +48,9 @@ class StatusStructureTests(unittest.TestCase):
             control.config_path = str(cfg)
             lines = control._display_status(RECORD, {'totals': str(Path(td)/'totals'),
                                                       'log': str(Path(td)/'log')}, (data, '0'))
-        self.assertIn('cooldown 0/0', '\n'.join(lines))
-        self.assertIn('degraded 0', '\n'.join(lines))
+        # 计数项已移除；用供给段标题作为「status 正常产出」的稳定锚点
+        self.assertIn('supply health', '\n'.join(lines))
+        self.assertIn('config 0 supplies', '\n'.join(lines))
 
     def test_short_admin_token_does_not_match_ordinary_status_word(self):
         control = wc.WindowsControl(ROOT, config_path=CONFIG, out=io.StringIO())
@@ -241,13 +242,13 @@ class StatusDynamicConfigReferenceTests(unittest.TestCase):
                                                   disk_admin='0')
         self.assertEqual(rc, 0, err)
         self.assertIn('route1(0) sonnet', out)
-        self.assertIn('cooldown 1/1', out)
+        self.assertIn('cooldown (剩余秒)', out)
         self.assertIn('route1(0) sonnet', baseline)
 
     def test_unused_matching_reference_does_not_block_zero_counts(self):
         rc, out, err, _ = self.run_status(actual_token='0', config_token='0', cooldown=False)
         self.assertEqual(rc, 0, err)
-        self.assertIn('cooldown 0/1', out)
+        self.assertIn('supply health', out)
         self.assertNotIn('route1(0)', out)
 
 

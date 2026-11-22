@@ -60,7 +60,7 @@ class VisibleStatusIdentityTests(unittest.TestCase):
         rc, out, err, baseline = self.run_status(data=data, cfg=cfg)
         self.assertEqual(rc, 0, err)
         self.assertIn('config 1 supplies / 1 routes / 1 strategies', out)
-        self.assertIn('cooldown 0/1', out)
+        self.assertIn('supply health', out)
         self.assertNotIn('0(cc) sonnet', out)
         self.assertNotIn('0(cc) sonnet', baseline)
 
@@ -71,7 +71,7 @@ class VisibleStatusIdentityTests(unittest.TestCase):
                'strategies': [{'client_token': '0', 'route_id': 'r1'}]}
         rc, out, err, _ = self.run_status(data=data, cfg=cfg)
         self.assertEqual(rc, 0, err)
-        self.assertIn('cooldown 0/1', out)
+        self.assertIn('supply health', out)
         self.assertNotIn('r1(0) sonnet', out)
 
     def test_hidden_response_route_does_not_block_an_unrelated_visible_reference(self):
@@ -180,7 +180,7 @@ class VisibleStatusIdentityTests(unittest.TestCase):
                 'cooldown': {'s1': {'remain': 3, 'reason': '0'}}}
         rc, out, err, _ = self.run_status(data=data)
         self.assertEqual(rc, 0, err)
-        self.assertIn('cooldown 1/1', out)
+        self.assertIn('cooldown (剩余秒)', out)
         self.assertIn('(0)', out)
 
 

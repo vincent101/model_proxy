@@ -19,11 +19,29 @@ python3 tests/run_unit_suite.py tests/test_x.py
 `run_unit_suite.py` 先探一次可收集性（rc=2 视为需要隔离环境），再按文件分进程
 并行执行，因此两类干扰都不存在。
 
-### 已知在 macOS 上失败的 Windows 用例
+### 结果分类怎么做
 
-`test_windows_records.py`、`test_windows_secure_*`、`test_windows_service_startup*`
-等一批用例覆盖 Windows 原生原语（句柄、ACL、记录目录）。它们在 macOS 上必然失败，
-**属预期**，真正验收位置是 Windows runner（见 `.github/workflows/`）。
+`run_unit_suite.py` 把非零退出分成三类，只有最后一类返回非零：
+
+| 前缀 | 含义 |
+|---|---|
+| `iso` | 运行期才读 `MP_TEST_ROOT` 等隔离变量 → 必须走 `run_isolated.sh` |
+| `win` | `test_windows_*` / `test_wine_*` 在非 Windows 宿主上运行，或错误信息命中 Windows 原生原语特征 |
+| `FAIL` | **意外失败**，需要人看 |
+
+### 已知仍失败的两批（非 Windows）
+
+| 文件 | 数量 | 状态 |
+|---|---|---|
+| `test_install_ops.py` | 25 | `boundary_guard` 判定「安装目标、角色或私有目录已改变」；异常被 `InstallFailure` 吞掉，需单独一轮定位 |
+| `test_cli_write_preflight.py` | 3 | 同源（同样走 `_mac_install_locations` → `boundary_guard`） |
+
+已在本轮修好的（记录备查）：`test_secure_files`、`test_backup_close_failure`、
+`test_platform_lock`、`test_runtime_unify_paths`、`test_usage_totals`、
+`test_discovery_anchor`。共同根因多为 **macOS 的 `/var` → `/private/var` 符号链接**
+（生产不变量要求父链无链接、固定目录为规范路径），或**模块参数演进后 mock 未同步**
+（`trusted_boundary`、`secure_replace_runtime` 的 `locations`/`boundary_guard`）。
+
 判断某个失败是否「新引入」时，请先 `git stash` 掉改动复跑一次做对照。
 
 ## 临时副本回归

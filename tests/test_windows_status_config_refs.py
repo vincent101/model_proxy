@@ -139,7 +139,7 @@ class DiskConfigReferenceTests(unittest.TestCase):
     def test_unreferenced_matching_route_does_not_block_zero_counts(self):
         rc, out, err, _ = self.run_status(token='0', route_id='0', visible='none')
         self.assertEqual(rc, 0, err)
-        self.assertIn('cooldown 0/1', out)
+        self.assertIn('supply health', out)
         self.assertNotIn('0(cc)', out)
 
     def test_nonmatching_business_values_and_unused_metadata_stay_unchanged(self):
@@ -147,7 +147,7 @@ class DiskConfigReferenceTests(unittest.TestCase):
                                                  client='cc0', extras=True)
         self.assertEqual(rc, 0, err)
         self.assertIn('route0(cc0) sonnet', out)
-        self.assertIn('cooldown 1/1', out)
+        self.assertIn('cooldown (剩余秒)', out)
         self.assertIn('route0(cc0) sonnet', baseline)
 
     def test_disk_admin_is_not_substituted_for_real_authenticated_token(self):
@@ -192,7 +192,7 @@ class DiskConfigReferenceTests(unittest.TestCase):
                                                           forbidden_reference_token='0')
             output = '\n'.join(result)
             self.assertIn(repr(str(missing)), output)
-            self.assertIn('cooldown 0/0', output)
+            self.assertIn('supply health', output)
 
     def test_explicit_placeholder_shaped_identities_are_guarded(self):
         for route_id, client in (('?', 'cc'), ('route1', '?')):

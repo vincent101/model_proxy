@@ -252,9 +252,11 @@ class TestStatusFormatFromJson(unittest.TestCase):
             }
             lines = _format_status_from_json(data, cfg_path, totals_path)
             joined = "\n".join(lines)
-            self.assertIn("health:", joined)
-            self.assertIn("cooldown 0/1", joined)
-            self.assertIn("overrides 1", joined)
+            self.assertIn("supply health", joined)
+            # 计数项已移除：信息在表内以 cool / fail 行呈现，不重复列出
+            self.assertNotIn("cooldown 0/1", joined)
+            self.assertNotIn("overrides 1", joined)
+            self.assertNotIn("degraded 0", joined)
 
     def test_fail_supplies_sorted_and_healthy_after(self):
         """坏供给（ok% < 70）按样本量降序排前，健康供给在后。"""
@@ -275,7 +277,7 @@ class TestStatusFormatFromJson(unittest.TestCase):
                     "cooldown": {}}
             joined = "\n".join(_format_status_from_json(
                 data, cfg_path, totals_path, log_path=log_path))
-            self.assertIn("supply health: cooldown", joined)
+            self.assertIn("supply health", joined)
             self.assertLess(joined.index("s1"), joined.index("s2"))
             s3_line = next(l for l in joined.splitlines() if " s3 " in l)
             self.assertIn("ok", s3_line)
@@ -374,7 +376,7 @@ class TestStatusFormatFromJson(unittest.TestCase):
             }
             lines = _format_status_from_json(data, cfg_path, totals_path)
             joined = "\n".join(lines)
-            self.assertLess(joined.index("config "), joined.index("health:"))
+            self.assertLess(joined.index("config "), joined.index("supply health"))
 
     def test_all_zero_no_anomaly_sections(self):
         """全 0（无 cooldown/degraded/overrides/缺档）时无异常段。"""
@@ -394,11 +396,11 @@ class TestStatusFormatFromJson(unittest.TestCase):
             }
             lines = _format_status_from_json(data, cfg_path, totals_path)
             joined = "\n".join(lines)
-            # health 行有
-            self.assertIn("health:", joined)
-            self.assertIn("cooldown 0/3", joined)
-            self.assertIn("degraded 0", joined)
-            self.assertIn("overrides 0", joined)
+            # 供给段标题在（计数项已移除）
+            self.assertIn("supply health", joined)
+            self.assertNotIn("cooldown 0/3", joined)
+            self.assertNotIn("degraded 0", joined)
+            self.assertNotIn("overrides 0", joined)
             # 无异常段标题
             self.assertNotIn("degraded supplies", joined)
             self.assertNotIn("unmatched:", joined)
@@ -421,11 +423,11 @@ class TestStatusFormatFromJson(unittest.TestCase):
                     "cooldown": {}}
             joined = "\n".join(_format_status_from_json(
                 data, cfg_path, totals_path, log_path=log_path))
-            title = next(l for l in joined.splitlines() if l.startswith("supply health:"))
+            title = next(l for l in joined.splitlines() if l.startswith("supply health"))
             body = [l for l in joined.splitlines()
                     if l.startswith("  ") and " fail " in l]
-            self.assertIn("degraded 2", title)
             self.assertEqual(len(body), 2, body)
+            self.assertNotIn("degraded 2", title, "标题不再列计数")
             self.assertNotIn("degraded supplies", joined)
 
     def test_cooldown_count_matches_visible_cool_rows(self):
@@ -442,8 +444,8 @@ class TestStatusFormatFromJson(unittest.TestCase):
                     "cooldown": {"s1": {"remain": 42, "reason": "http_429"}}}
             joined = "\n".join(_format_status_from_json(
                 data, cfg_path, totals_path, log_path=log_path))
-            title = next(l for l in joined.splitlines() if l.startswith("supply health:"))
-            self.assertIn("cooldown 1/2", title)
+            title = next(l for l in joined.splitlines() if l.startswith("supply health"))
+            self.assertNotIn("cooldown 1/2", title, "标题不再列计数")
             cool_rows = [l for l in joined.splitlines() if "cool 42s" in l]
             self.assertEqual(len(cool_rows), 1, cool_rows)
 
@@ -462,7 +464,7 @@ class TestStatusFormatFromJson(unittest.TestCase):
                     "cooldown": {}}
             joined = "\n".join(_format_status_from_json(
                 data, cfg_path, totals_path, log_path=log_path))
-            section = joined.split("supply health:")[1].split("\n\n")[0]
+            section = joined.split("supply health")[1].split("\n\n")[0]
             self.assertNotIn("r1(cc)", section)
             self.assertNotIn("←", section)
 
@@ -1189,8 +1191,8 @@ class TestStatusFormatWithSessions(unittest.TestCase):
                 data, cfg_path, totals_path, log_path)
         joined = "\n".join(lines)
         # config 行（头部）→ health 行 → session 段
-        self.assertLess(joined.index("config "), joined.index("health:"))
-        self.assertLess(joined.index("health:"), joined.index("active sessions"))
+        self.assertLess(joined.index("config "), joined.index("supply health"))
+        self.assertLess(joined.index("supply health"), joined.index("active sessions"))
 
     def test_no_log_path_no_session_section(self):
         """不传 log_path 时不展示 session 段（兼容已有调用）。"""

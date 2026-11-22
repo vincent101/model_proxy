@@ -20,12 +20,17 @@ class PosixLockTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
-        self.base = Path(self.tmp.name)
+        # macOS 上 /var 是 /private/var 的符号链接：生产不变量要求父链无链接，
+        # 用未解析的临时路径会让 acquire_lock 的 identity 校验直接拒绝。
+        self.base = Path(self.tmp.name).resolve()
         self.root = self.base / "project"
         self.runtime = self.base / "runtime"
         self.root.mkdir(mode=0o700)
         self.runtime.mkdir(mode=0o700)
-        self.state = self.root / ".model_proxy_runtime"
+        # 固定运行目录自 v0.14 起统一为 <root>/.runtime（.model_proxy_runtime 是
+        # 已废弃的旧名，core/ 里已无任何引用）。锁的私有目录断言要求
+        # target == state_dir/role，用旧名会恒被判 access_unverified。
+        self.state = self.root / ".runtime"
         self.state.mkdir(mode=0o700)
         self.paths = {key: self.runtime / key for key in PATH_KEYS}
         self.check_fake_acl = lambda path, kind: True

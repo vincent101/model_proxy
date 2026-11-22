@@ -76,6 +76,10 @@ class UnifiedPathTests(unittest.TestCase):
 class FirstConfigMarkerTests(unittest.TestCase):
     """Fake Windows backend and helper transport; no process or service."""
 
+    @unittest.skipUnless(sys.platform == "win32",
+                         "_windows_marker_scope 依赖 Windows 原生锁/ACL/租约证据；"
+                         "POSIX 上 acquire_lock 要求显式 access_verifier，且 "
+                         "write_preflight 需要 nofollow/xattr 证据，二者都无法伪造")
     def test_first_windows_write_preflights_then_prepares_fixed_marker_root(self):
         from core.cli import dispatch
         from core import discovery, platform_windows, server, windows_secure_files

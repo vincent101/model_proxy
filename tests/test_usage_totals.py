@@ -1172,7 +1172,9 @@ class TestMigrationLedgerValidation(unittest.TestCase):
              patch.object(server_module, "current_file_marker", return_value=valid.marker) as marker, \
              patch.object(server_module, "read_stable_config", return_value=valid) as read:
             self.assertIs(server_module._capture_migration_ledger(preflight), valid)
-        read.assert_called_once_with(fake_path, reject_duplicate_keys=True)
+        # trusted_boundary 是后加的透传口（Windows 上限定读取边界），缺省 None
+        read.assert_called_once_with(fake_path, reject_duplicate_keys=True,
+                                     trusted_boundary=None)
         self.assertEqual(marker.call_count, 2)
         self.assertTrue(all(call.args == (fake_path,) for call in marker.call_args_list))
 
@@ -1217,8 +1219,12 @@ class TestMigrationLedgerValidation(unittest.TestCase):
             self.assertNotIn("FAKE_PRIVATE_VALUE", repr(captured))
             replace.assert_not_called()
         self.assertEqual(read.call_count, 3)
+        # trusted_boundary 是后加的透传口：Windows 侧要据此把读取限制在项目边界内，
+        # 缺省 None 也必须显式传给底层。
         self.assertEqual([call.kwargs for call in read.call_args_list],
-                         [{"with_data": False}, {"with_data": True}, {"with_data": False}])
+                         [{"with_data": False, "trusted_boundary": None},
+                          {"with_data": True, "trusted_boundary": None},
+                          {"with_data": False, "trusted_boundary": None}])
 
     def test_windows_capture_rejects_identity_io_and_marker_drift(self):
         from types import SimpleNamespace

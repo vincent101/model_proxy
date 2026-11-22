@@ -150,17 +150,34 @@ class TestStateResolution(unittest.TestCase):
                                                 stream_health=None, window_total=0), "idle")
 
 
+class TestCodeClipping(unittest.TestCase):
+    def test_short_code_untouched(self):
+        self.assertEqual(f._clip_code("http 429×3"), "http 429×3")
+
+    def test_long_upstream_text_is_clipped(self):
+        raw = "net error:<urlopen error [Errno 8] nodename nor servname provided>"
+        out = f._clip_code(raw)
+        self.assertEqual(len(out), f.CODE_CLIP)
+        self.assertTrue(out.endswith("…"))
+        self.assertTrue(out.startswith("net error:"))
+
+    def test_top_code_applies_clip(self):
+        codes = {"net_error:<urlopen error [Errno 8] nodename nor servname provided>": 4}
+        self.assertLessEqual(len(f._top_code(codes)), f.CODE_CLIP)
+
+
 class TestRendering(unittest.TestCase):
-    def test_header_merges_summary_and_legend(self):
-        """标题行 = supply health: <summary> · last 30min · 图例。"""
+    def test_header_has_only_window_and_legend(self):
+        """标题行 = supply health (last 30min · 图例)，不含任何计数项。"""
         lines = f._format_supplies(self.CFG, {}, cooldown={}, stream_health=None,
-                                   truncated=False, log_missing=True, refs={"s1": ["x"]},
-                                   summary=["cooldown 0/2", "degraded 0", "overrides 1"])
-        self.assertTrue(lines[0].startswith("supply health: cooldown 0/2 · degraded 0"), lines[0])
-        self.assertIn("overrides 1", lines[0])
-        self.assertIn("last 30min", lines[0])
-        self.assertIn("ttft=p50", lines[0])
-        self.assertIn("tps=输出tok/s", lines[0])
+                                   truncated=False, log_missing=True, refs={"s1": ["x"]})
+        header = lines[0]
+        self.assertTrue(header.startswith("supply health ("), header)
+        self.assertIn("last 30min", header)
+        self.assertIn("ttft=p50", header)
+        self.assertIn("tps=输出tok/s", header)
+        for gone in ("cooldown 0/", "degraded 0", "overrides "):
+            self.assertNotIn(gone, header, f"计数项 {gone!r} 应已移除")
 
     def test_idle_rows_are_hidden(self):
         """窗口内零请求的供给不占行。"""

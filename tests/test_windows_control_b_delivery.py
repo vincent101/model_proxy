@@ -79,7 +79,7 @@ class DeliveryControlTests(unittest.TestCase):
             self.assertEqual(errors, [])
             self.assertIn(('X-Proxy-Admin-Token: ' + token).encode(), received[0])
             output = '\n'.join(lines)
-            self.assertIn('cooldown 1/1', output)
+            self.assertIn('cooldown (剩余秒)', output)
             self.assertIn('1 strategies', output)
             self.assertEqual(result[0]['strategies'][0]['client_token'], 'a')
             self.assertEqual(result[0]['supplies'][0]['appkey_tail4'], 'ABCD')
@@ -187,7 +187,7 @@ class DeliveryControlTests(unittest.TestCase):
                                                          'log': str(root / 'log')},
                                                 (safe, config['admin_token']))
         output = '\n'.join(lines)
-        self.assertIn('cooldown 1/1', output)
+        self.assertIn('cooldown (剩余秒)', output)
         self.assertIn('1 strategies', output)
         self.assertIn('[cc,codex]', output)
         self.assertIn('port 12345', output)

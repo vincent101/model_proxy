@@ -25,16 +25,17 @@
 **实测**：修复前 `stats today` 停在 11-21；修复后重启即恢复，`CLEAN` 状态
 正常，`stats today` 有实时数据。
 
-### status：供给段与 health 行合并、隐藏 idle 行
+### status：供给段只留表格与图例
 
-- `health: cooldown 0/21 · degraded 0 · overrides 2` 不再单独成行，改为供给段标题
-  `supply health: cooldown 0/21 · degraded 0 · overrides 2 · last 30min · 图例`。
-  数字与表格**同源同窗口**：`degraded` 只统计被 route 引用且在窗口内有样本的
-  供给，永远等于表内 `fail` 行数；`cooldown` 与 `cool` 行数同理。
-- **idle 行不再显示**：窗口内零请求的供给没有任何可评估信息，列出只会稀释表格。
-  被引用的供给全都 idle 时给一行占位；非引用的仍折成一行摘要。
-- config 不可读时仍输出标题行（计数来自进程态，与配置解析无关），并追加
-  「配置不可读，供给清单未知」。
+- **计数项全部移除**：`cooldown N/M`、`degraded N`、`overrides N` 不再展示。
+  cooldown 与 degraded 在表内分别以 `cool` 行、`fail` 行呈现，重复列出只会
+  多一层「数字与行数是否一致」的心智负担；overrides 只影响会话 pin，不再展示。
+- 标题行 = `supply health (last 30min · tail · ttft=p50 首token · tps=输出tok/s)`。
+- **idle 行不再显示**：窗口内零请求的供给没有可评估信息。被引用的供给全 idle 时
+  给一行占位；非引用的仍折成一行摘要。
+- **失败码列截断到 48 列**：`net_error:<urlopen error ...>` 这类整段上游异常会把
+  行撑到一百多列，截断后仍能区分问题类别。
+- config 不可读时仍输出标题行与「配置不可读，供给清单未知」。
 
 ### 清理既有测试失败 + 提供可用的测试入口
 

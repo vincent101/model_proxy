@@ -284,7 +284,9 @@ class InstanceObservationTests(unittest.TestCase):
         from core.platform_lock import acquire_lock, verify_local_access
         @contextmanager
         def fixture():
-            root = Path(directory) / "project"
+            # macOS 的 /var → /private/var 是符号链接；verify_record_directory
+            # 要求固定目录为规范路径（生产不变量），临时根必须先 resolve。
+            root = Path(directory).resolve() / "project"
             root.mkdir(mode=0o700)
             state = root / ".runtime"
             state.mkdir(mode=0o700)
