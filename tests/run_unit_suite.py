@@ -23,6 +23,15 @@ import pathlib
 import subprocess
 import sys
 
+# Windows 控制台默认 cp1252，中文输出会直接 UnicodeEncodeError 打断整套测试
+# （实测 GitHub Actions windows-latest）。这里强制 UTF-8，并在不支持时降级为
+# 替换字符——回归工具不该因为终端编码而失败。
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(encoding="utf-8", errors="replace")
+    except (AttributeError, ValueError, OSError):
+        pass
+
 
 def collectable(path: pathlib.Path) -> bool:
     """能否在本机直接收集（rc=2 表示 import/收集阶段就拒绝）。"""
@@ -67,7 +76,8 @@ def classify(name: str, output: str) -> str:
 
 def run_one(path: pathlib.Path) -> tuple[str, str, str]:
     done = subprocess.run([sys.executable, '-m', 'pytest', str(path), '-q'],
-                          capture_output=True, text=True)
+                          capture_output=True, text=True,
+                          encoding='utf-8', errors='replace')
     output = (done.stdout or '') + (done.stderr or '')
     tail = output.strip().splitlines()
     summary = tail[-1] if tail else '(no output)'

@@ -75,7 +75,8 @@ jobs:
 
   macos:
     name: darwin/arm64
-    runs-on: macos-14
+    # macos-14 在本仓库报 'macos-14-arm64-us-default' not supported；用 latest
+    runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
 
