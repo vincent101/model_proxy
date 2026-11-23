@@ -47,7 +47,6 @@ FILE_SCOPE: dict[str, tuple] = {
     'test_config_snapshot.py': (POSIX, 'POSIX 稳定快照语义（st_dev/st_ino/mtime+属主）；Windows 句柄快照由 test_windows_config_boundary 覆盖'),
     'test_discovery_anchor.py': (POSIX, 'POSIX inode 身份 preflight；Windows 身份由 test_windows_discovery 覆盖'),
     'test_install_ops.py': (POSIX, 'POSIX 私有安装目标校验；Windows 安装由 test_windows_secure_hook_install 覆盖'),
-    'test_identity_stability.py': (POSIX, '安装身份与锁语义依赖 fcntl、pty 及 st_dev+st_ino；Windows 身份由 test_windows_discovery 等覆盖'),
     # 这些用例显式 `platform="posix"`，测的是 POSIX 解析器本身；Windows 侧对应
     # test_windows_paths / test_windows_discovery / test_windows_discovery。
     'test_runtime_unify_paths.py': (POSIX, '显式 platform=posix 的路径解析器单测，与平台无关的产品分支'),
