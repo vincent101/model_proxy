@@ -8,6 +8,13 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
+import os
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+import platform_tmp  # noqa: E402  (同目录测试基建)
 from core.config_snapshot import ConfigSnapshotError
 from core.server import ConfigReloadCallbackError, ConfigStore, ModelProxyHandler
 
@@ -43,7 +50,7 @@ class FakeCooldown:
 
 class ReloadContractTests(unittest.TestCase):
     def setUp(self):
-        self.tmp = tempfile.TemporaryDirectory()
+        self.tmp = platform_tmp.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
         self.root = Path(self.tmp.name)
         self.path = self.root / "fake-config.json"

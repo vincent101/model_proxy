@@ -30,6 +30,9 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+import platform_tmp  # noqa: E402
 
 from core.server import (  # noqa: E402
     ConfigStore,
@@ -750,7 +753,7 @@ class TestStreamingBodyError(unittest.TestCase):
 class TestBodyErrorConfigValidation(unittest.TestCase):
 
     def _store(self, cfg) -> ConfigStore:
-        with tempfile.TemporaryDirectory() as d:
+        with platform_tmp.TemporaryDirectory() as d:
             path = Path(d) / "config.json"
             path.write_text(json.dumps(cfg), encoding="utf-8")
             path.chmod(0o600)

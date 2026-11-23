@@ -7,6 +7,13 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
+import os
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+import platform_tmp  # noqa: E402  (同目录测试基建)
 from core.commands import (
     CommandContext, SessionOverridesSidecar, SidecarWriteError,
     _atomic_write_json, handle_route_command,
@@ -45,7 +52,7 @@ class ReviewAdapter(FakeSecureIO):
 
 class TestReviewFollowup(unittest.TestCase):
     def setUp(self):
-        self.temp = tempfile.TemporaryDirectory()
+        self.temp = platform_tmp.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
         self.root = Path(self.temp.name)
         self.path = self.root / "session_overrides.json"
@@ -140,7 +147,7 @@ class TestReviewFollowup(unittest.TestCase):
 
     def test_classified_uncertain_cleanup_or_close_remains_unknown(self):
         for attr in ("cleanup_unknown", "close_unknown"):
-            with self.subTest(attr=attr), tempfile.TemporaryDirectory() as d:
+            with self.subTest(attr=attr), platform_tmp.TemporaryDirectory() as d:
                 path = Path(d) / "sidecar.json"
                 adapter = ReviewAdapter()
                 store = SessionOverridesSidecar(path, secure_io=adapter)
@@ -175,7 +182,7 @@ class TestReviewFollowup(unittest.TestCase):
 
     def test_windows_release_unknown_after_verified_target_stays_isolated(self):
         for translated in (False, True):
-            with self.subTest(translated=translated), tempfile.TemporaryDirectory() as d:
+            with self.subTest(translated=translated), platform_tmp.TemporaryDirectory() as d:
                 path = Path(d) / "sidecar.json"
                 adapter = ReviewAdapter()
                 store = SessionOverridesSidecar(path, secure_io=adapter)
@@ -239,7 +246,7 @@ class TestReviewFollowup(unittest.TestCase):
         for mode, state in (("secret_not_replaced", "NOT_REPLACED"),
                             ("secret_unknown", "UNKNOWN"),
                             ("secret_unclassified", "UNKNOWN")):
-            with self.subTest(mode=mode), tempfile.TemporaryDirectory() as d:
+            with self.subTest(mode=mode), platform_tmp.TemporaryDirectory() as d:
                 adapter = ReviewAdapter()
                 store = SessionOverridesSidecar(Path(d) / "sidecar.json", secure_io=adapter)
                 adapter.mode = mode
@@ -297,7 +304,7 @@ class _FileCloseSpy:
 
 class TestLegacyWriterResources(unittest.TestCase):
     def setUp(self):
-        self.temp = tempfile.TemporaryDirectory()
+        self.temp = platform_tmp.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
         self.root = Path(self.temp.name)
         self.path = self.root / "session_overrides.json"

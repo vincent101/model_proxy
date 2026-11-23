@@ -26,6 +26,9 @@ from pathlib import Path
 from unittest.mock import patch
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+import platform_tmp  # noqa: E402
 
 from core.commands import (  # noqa: E402
     CommandContext,
@@ -119,12 +122,12 @@ class TestNormalizeOverrideEntry(unittest.TestCase):
 class TestSidecarBasics(unittest.TestCase):
 
     def test_missing_file_is_empty_dict(self):
-        with tempfile.TemporaryDirectory() as d:
+        with platform_tmp.TemporaryDirectory() as d:
             sc = SessionOverridesSidecar(Path(d) / "session_overrides.json")
             self.assertEqual(sc.get_overrides_for("cc"), {})
 
     def test_corrupt_json_keeps_last_known_value(self):
-        with tempfile.TemporaryDirectory() as d:
+        with platform_tmp.TemporaryDirectory() as d:
             path = Path(d) / "session_overrides.json"
             sc = SessionOverridesSidecar(path)
             sc.apply_command("cc", "sess-1", "set", target_route_id="nation")
@@ -137,7 +140,7 @@ class TestSidecarBasics(unittest.TestCase):
             self.assertEqual(sc.get_overrides_for("cc"), {"sess-1": "nation"})
 
     def test_mtime_reload_picks_up_external_valid_write(self):
-        with tempfile.TemporaryDirectory() as d:
+        with platform_tmp.TemporaryDirectory() as d:
             path = Path(d) / "session_overrides.json"
             sc = SessionOverridesSidecar(path)
             self.assertEqual(sc.get_overrides_for("cc"), {})
@@ -152,7 +155,7 @@ class TestSidecarBasics(unittest.TestCase):
         回归 bug：_maybe_reload_locked 在 FileNotFoundError 时直接 return，
         导致已删除的 sidecar 数据残留在内存里（曾导致 status 误报 +6）。
         """
-        with tempfile.TemporaryDirectory() as d:
+        with platform_tmp.TemporaryDirectory() as d:
             path = Path(d) / "session_overrides.json"
             sc = SessionOverridesSidecar(path)
             # 用 apply_command 种一条记录（同时创建文件）
@@ -172,7 +175,7 @@ class TestSidecarBasics(unittest.TestCase):
         _maybe_reload_locked 内的 `if self._data or self._mtime` 守卫确保
         只有"内存非空且文件消失"时才清一次，后续调用内存已空、守卫短路。
         """
-        with tempfile.TemporaryDirectory() as d:
+        with platform_tmp.TemporaryDirectory() as d:
             path = Path(d) / "session_overrides.json"
             sc = SessionOverridesSidecar(path)
             sc.apply_command("cc", "sess-1", "set", target_route_id="nation")
@@ -200,7 +203,7 @@ class TestSidecarBasics(unittest.TestCase):
 class TestApplyCommandNoDeadlockOnExternalMtimeBump(unittest.TestCase):
 
     def test_apply_command_after_external_mtime_bump_does_not_deadlock(self):
-        with tempfile.TemporaryDirectory() as d:
+        with platform_tmp.TemporaryDirectory() as d:
             path = Path(d) / "session_overrides.json"
             sc = SessionOverridesSidecar(path)
             sc.apply_command("cc", "sess-1", "set", target_route_id="nation")
@@ -249,7 +252,7 @@ class TestApplyCommandNoDeadlockOnExternalMtimeBump(unittest.TestCase):
 class TestSingleAtomicWrite(unittest.TestCase):
 
     def test_apply_command_triggers_exactly_one_replace(self):
-        with tempfile.TemporaryDirectory() as d:
+        with platform_tmp.TemporaryDirectory() as d:
             path = Path(d) / "session_overrides.json"
             sc = SessionOverridesSidecar(path)
             with patch("os.replace", wraps=os.replace) as mock_replace:
@@ -257,7 +260,7 @@ class TestSingleAtomicWrite(unittest.TestCase):
                 self.assertEqual(mock_replace.call_count, 1)
 
     def test_reset_triggers_exactly_one_replace(self):
-        with tempfile.TemporaryDirectory() as d:
+        with platform_tmp.TemporaryDirectory() as d:
             path = Path(d) / "session_overrides.json"
             sc = SessionOverridesSidecar(path)
             sc.apply_command("cc", "sess-1", "set", target_route_id="nation")
@@ -282,7 +285,7 @@ class TestCleanupThreshold(unittest.TestCase):
         path.write_text(json.dumps(data), encoding="utf-8")
 
     def test_only_expired_beyond_7_days_removed(self):
-        with tempfile.TemporaryDirectory() as d:
+        with platform_tmp.TemporaryDirectory() as d:
             path = Path(d) / "session_overrides.json"
             now = datetime.now(timezone.utc)
             six_days_ago = _iso(now - timedelta(days=6))
@@ -304,7 +307,7 @@ class TestCleanupThreshold(unittest.TestCase):
             self.assertNotIn("sess-8d", remaining)
 
     def test_current_session_never_cleaned_even_if_expired(self):
-        with tempfile.TemporaryDirectory() as d:
+        with platform_tmp.TemporaryDirectory() as d:
             path = Path(d) / "session_overrides.json"
             now = datetime.now(timezone.utc)
             ten_days_ago = _iso(now - timedelta(days=10))
@@ -317,7 +320,7 @@ class TestCleanupThreshold(unittest.TestCase):
             self.assertEqual(remaining["sess-old"], "claude")
 
     def test_no_last_seen_never_cleaned(self):
-        with tempfile.TemporaryDirectory() as d:
+        with platform_tmp.TemporaryDirectory() as d:
             path = Path(d) / "session_overrides.json"
             # 手工塞入 sidecar 的旧式字符串条目（无 last_seen）
             path.write_text(json.dumps({"cc": {"sess-legacy": "nation"}}), encoding="utf-8")
@@ -341,7 +344,7 @@ class TestNoAliasPollution(unittest.TestCase):
         self.addCleanup(p.stop)
 
     def test_config_store_internal_dict_untouched_after_switch(self):
-        with tempfile.TemporaryDirectory() as d:
+        with platform_tmp.TemporaryDirectory() as d:
             cfg_path = Path(d) / "model_proxy_config.json"
             cfg = {
                 "admin_token": "x",
@@ -392,7 +395,7 @@ class TestNoAliasPollution(unittest.TestCase):
 class TestHotPathNoDiskIO(unittest.TestCase):
 
     def test_touch_does_not_write_disk(self):
-        with tempfile.TemporaryDirectory() as d:
+        with platform_tmp.TemporaryDirectory() as d:
             path = Path(d) / "session_overrides.json"
             sc = SessionOverridesSidecar(path)
             self.assertFalse(path.exists())
@@ -443,7 +446,7 @@ class TestRouteCommandHandler(unittest.TestCase):
         """旧式单值 route_id（无 route_pool）：extract_route_candidates 不读取
         session_overrides，写入 override 不会产生任何效果，必须拒绝而非假成功。
         """
-        with tempfile.TemporaryDirectory() as d:
+        with platform_tmp.TemporaryDirectory() as d:
             sidecar = SessionOverridesSidecar(Path(d) / "session_overrides.json")
             legacy_strategy = {"client_token": "cc", "route_id": "claude"}
             ctx = CommandContext(
@@ -455,7 +458,7 @@ class TestRouteCommandHandler(unittest.TestCase):
             self.assertEqual(sidecar.get_overrides_for("cc"), {})
 
     def test_legacy_route_id_strategy_rejects_reset_no_write(self):
-        with tempfile.TemporaryDirectory() as d:
+        with platform_tmp.TemporaryDirectory() as d:
             sidecar = SessionOverridesSidecar(Path(d) / "session_overrides.json")
             legacy_strategy = {"client_token": "cc", "route_id": "claude"}
             ctx = CommandContext(
@@ -466,7 +469,7 @@ class TestRouteCommandHandler(unittest.TestCase):
             self.assertFalse(result.wrote)
 
     def test_switch_to_nonexistent_route_rejected_no_write(self):
-        with tempfile.TemporaryDirectory() as d:
+        with platform_tmp.TemporaryDirectory() as d:
             sidecar = SessionOverridesSidecar(Path(d) / "session_overrides.json")
             ctx = CommandContext(
                 arg="not-a-route", client_token="cc", session_key="sess-x",
@@ -479,7 +482,7 @@ class TestRouteCommandHandler(unittest.TestCase):
 
     def test_switch_allows_target_outside_route_pool(self):
         """§5.3：允许切到 route_pool 之外的 route（现网 5 条全部指向 pool 外的 nation）。"""
-        with tempfile.TemporaryDirectory() as d:
+        with platform_tmp.TemporaryDirectory() as d:
             sidecar = SessionOverridesSidecar(Path(d) / "session_overrides.json")
             ctx = CommandContext(
                 arg="deepseek", client_token="cc", session_key="sess-x",
@@ -490,7 +493,7 @@ class TestRouteCommandHandler(unittest.TestCase):
             self.assertEqual(sidecar.get_overrides_for("cc")["sess-x"], "deepseek")
 
     def test_reset_removes_sidecar_entry(self):
-        with tempfile.TemporaryDirectory() as d:
+        with platform_tmp.TemporaryDirectory() as d:
             sidecar = SessionOverridesSidecar(Path(d) / "session_overrides.json")
             sidecar.apply_command("cc", "sess-x", "set", target_route_id="deepseek")
             ctx = CommandContext(
@@ -502,7 +505,7 @@ class TestRouteCommandHandler(unittest.TestCase):
             self.assertNotIn("sess-x", sidecar.get_overrides_for("cc"))
 
     def test_query_does_not_write(self):
-        with tempfile.TemporaryDirectory() as d:
+        with platform_tmp.TemporaryDirectory() as d:
             path = Path(d) / "session_overrides.json"
             sidecar = SessionOverridesSidecar(path)
             ctx = CommandContext(
@@ -520,7 +523,7 @@ class TestRouteCommandHandler(unittest.TestCase):
         route"——extract_route_candidates 对这种 strategy 完全不读取
         session_overrides，真实生效路由永远是 strategy["route_id"]。
         """
-        with tempfile.TemporaryDirectory() as d:
+        with platform_tmp.TemporaryDirectory() as d:
             sidecar = SessionOverridesSidecar(Path(d) / "session_overrides.json")
             sidecar.apply_command("cc", "sess-x", "set", target_route_id="nation")
             legacy_strategy = {"client_token": "cc", "route_id": "claude"}
@@ -539,7 +542,7 @@ class TestRouteCommandHandler(unittest.TestCase):
 
     def test_query_total_overrides_counts_sidecar_only(self):
         """sidecar 是唯一来源，总条数即 sidecar 条数。"""
-        with tempfile.TemporaryDirectory() as d:
+        with platform_tmp.TemporaryDirectory() as d:
             sidecar = SessionOverridesSidecar(Path(d) / "session_overrides.json")
             sidecar.apply_command("cc", "sess-legacy", "set", target_route_id="deepseek")
             sidecar.apply_command("cc", "sess-other", "set", target_route_id="nation")
@@ -606,7 +609,7 @@ class TestForwardInterceptEndToEnd(unittest.TestCase):
         # 隔离真实 HOME 与 vault：$route 回执会读 ~/.claude/sessions 注册表和
         # .claudian/sessions 会话标题，统一 patch 到临时空目录（未命中 → 回执
         # 仅附 uuid8，输出确定性；真实 vault 恰有同 UUID conv 会污染断言）。
-        self._sessions_td = tempfile.TemporaryDirectory()
+        self._sessions_td = platform_tmp.TemporaryDirectory()
         sessions_dir = Path(self._sessions_td.name) / "sessions"
         sessions_dir.mkdir()
         self._sessions_dir = sessions_dir
@@ -645,7 +648,7 @@ class TestForwardInterceptEndToEnd(unittest.TestCase):
         return cfg_path
 
     def test_switch_query_reset_query_roundtrip(self):
-        with tempfile.TemporaryDirectory() as d:
+        with platform_tmp.TemporaryDirectory() as d:
             cfg_path = self._write_cfg(d)
             sidecar_path = Path(d) / "session_overrides.json"
             h = _make_forward_handler(cfg_path, sidecar_path)
@@ -671,7 +674,7 @@ class TestForwardInterceptEndToEnd(unittest.TestCase):
     def test_unknown_keeps_b_on_real_forward_reload_path(self):
         from tests.test_route_sidecar_unknown import FakeSecureIO
 
-        with tempfile.TemporaryDirectory() as d:
+        with platform_tmp.TemporaryDirectory() as d:
             cfg_path = self._write_cfg(d)
             sidecar_path = Path(d) / "session_overrides.json"
             h = _make_forward_handler(cfg_path, sidecar_path)
@@ -694,7 +697,7 @@ class TestForwardInterceptEndToEnd(unittest.TestCase):
             self.assertEqual(acc["route"], "nation")
 
     def test_stream_response_event_sequence(self):
-        with tempfile.TemporaryDirectory() as d:
+        with platform_tmp.TemporaryDirectory() as d:
             cfg_path = self._write_cfg(d)
             sidecar_path = Path(d) / "session_overrides.json"
             h = _make_forward_handler(cfg_path, sidecar_path)
@@ -711,7 +714,7 @@ class TestForwardInterceptEndToEnd(unittest.TestCase):
         """fail-open 端到端：非指令消息不进入命令层，走原有转发逻辑
         （本例因 supplies 为空，最终应表现为原有的路由/供给错误，而不是命令回执）。
         """
-        with tempfile.TemporaryDirectory() as d:
+        with platform_tmp.TemporaryDirectory() as d:
             cfg_path = self._write_cfg(d)
             sidecar_path = Path(d) / "session_overrides.json"
             h = _make_forward_handler(cfg_path, sidecar_path)
@@ -733,7 +736,7 @@ class TestRouteReceiptSessionIdentity(unittest.TestCase):
         self.addCleanup(p.stop)
         # 同 TestForwardInterceptEndToEnd：隔离真实 HOME 与 vault 的两个外部
         # 状态源，回执输出确定性（真实 vault 恰有同 UUID conv 会污染断言）。
-        self._sessions_td = tempfile.TemporaryDirectory()
+        self._sessions_td = platform_tmp.TemporaryDirectory()
         sessions_dir = Path(self._sessions_td.name) / "sessions"
         sessions_dir.mkdir()
         self._sessions_dir = sessions_dir
@@ -775,7 +778,7 @@ class TestRouteReceiptSessionIdentity(unittest.TestCase):
 
     def test_receipt_identity_hit(self):
         """注册表命中 → 首行 `当前 session name · uuid8 生效 route:`。"""
-        with tempfile.TemporaryDirectory() as d:
+        with platform_tmp.TemporaryDirectory() as d:
             cfg_path = self._write_cfg(d)
             sidecar_path = Path(d) / "session_overrides.json"
             h = _make_forward_handler(cfg_path, sidecar_path)
@@ -788,7 +791,7 @@ class TestRouteReceiptSessionIdentity(unittest.TestCase):
 
     def test_receipt_identity_hit_on_switch(self):
         """写命令（切换）回执同样首行内嵌身份。"""
-        with tempfile.TemporaryDirectory() as d:
+        with platform_tmp.TemporaryDirectory() as d:
             cfg_path = self._write_cfg(d)
             sidecar_path = Path(d) / "session_overrides.json"
             h = _make_forward_handler(cfg_path, sidecar_path)
@@ -801,7 +804,7 @@ class TestRouteReceiptSessionIdentity(unittest.TestCase):
 
     def test_receipt_identity_miss_shows_uuid8_only(self):
         """注册表未命中 → 回执保持 uuid8，不带 name 与 ·。"""
-        with tempfile.TemporaryDirectory() as d:
+        with platform_tmp.TemporaryDirectory() as d:
             cfg_path = self._write_cfg(d)
             sidecar_path = Path(d) / "session_overrides.json"
             h = _make_forward_handler(cfg_path, sidecar_path)
@@ -812,7 +815,7 @@ class TestRouteReceiptSessionIdentity(unittest.TestCase):
 
     def test_receipt_no_session_no_identity_line(self):
         """无 session（session_key 为空）→ 不附身份行。"""
-        with tempfile.TemporaryDirectory() as d:
+        with platform_tmp.TemporaryDirectory() as d:
             cfg_path = self._write_cfg(d)
             h = _make_forward_handler(cfg_path, Path(d) / "session_overrides.json")
             h.wfile = io.BytesIO()
@@ -838,7 +841,7 @@ class TestRouteReceiptClaudianTitle(unittest.TestCase):
         p = patch("core.server._mac_business_enabled", return_value=False)
         p.start()
         self.addCleanup(p.stop)
-        self._sessions_td = tempfile.TemporaryDirectory()
+        self._sessions_td = platform_tmp.TemporaryDirectory()
         sessions_dir = Path(self._sessions_td.name) / "sessions"
         sessions_dir.mkdir()
         self._sessions_dir = sessions_dir
@@ -894,7 +897,7 @@ class TestRouteReceiptClaudianTitle(unittest.TestCase):
 
     def test_receipt_registry_and_title_both_hit(self):
         """① 注册表+标题双命中 → `当前 session name · uuid8（标题） 生效 route:`。"""
-        with tempfile.TemporaryDirectory() as d:
+        with platform_tmp.TemporaryDirectory() as d:
             cfg_path = self._write_cfg(d)
             sidecar_path = Path(d) / "session_overrides.json"
             h = _make_forward_handler(cfg_path, sidecar_path)
@@ -908,7 +911,7 @@ class TestRouteReceiptClaudianTitle(unittest.TestCase):
 
     def test_receipt_title_only_hit(self):
         """② 仅标题命中 → `session uuid8（标题）`，无 `·`。"""
-        with tempfile.TemporaryDirectory() as d:
+        with platform_tmp.TemporaryDirectory() as d:
             cfg_path = self._write_cfg(d)
             sidecar_path = Path(d) / "session_overrides.json"
             h = _make_forward_handler(cfg_path, sidecar_path)
@@ -921,7 +924,7 @@ class TestRouteReceiptClaudianTitle(unittest.TestCase):
 
     def test_receipt_both_miss_shows_uuid8_only(self):
         """③ 双未命中 → uuid8 原样，session id 后不接身份分隔/标题括号。"""
-        with tempfile.TemporaryDirectory() as d:
+        with platform_tmp.TemporaryDirectory() as d:
             cfg_path = self._write_cfg(d)
             sidecar_path = Path(d) / "session_overrides.json"
             h = _make_forward_handler(cfg_path, sidecar_path)

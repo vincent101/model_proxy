@@ -28,6 +28,9 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+import platform_tmp  # noqa: E402
 
 from core.server import (  # noqa: E402
     ConfigStore,
@@ -355,7 +358,7 @@ class TestResolveAppkey(unittest.TestCase):
         self.assertEqual(resolve_appkey(_supply()), "k")
 
     def test_file_hit(self):
-        with tempfile.TemporaryDirectory() as d:
+        with platform_tmp.TemporaryDirectory() as d:
             kf = Path(d) / "kf.yaml"
             _write_keyfile(kf, ["REQUEST_TIMEOUT: 600",
                                 "AUTHORIZATION: tk_abc123",
@@ -366,7 +369,7 @@ class TestResolveAppkey(unittest.TestCase):
             self.assertEqual(resolve_appkey(s), "tk_abc123")
 
     def test_file_no_authorization_line_raises(self):
-        with tempfile.TemporaryDirectory() as d:
+        with platform_tmp.TemporaryDirectory() as d:
             kf = Path(d) / "kf.yaml"
             _write_keyfile(kf, ["REQUEST_TIMEOUT: 600"])
             s = {"id": "s9", "appkey_file": str(kf)}
@@ -376,7 +379,7 @@ class TestResolveAppkey(unittest.TestCase):
             self.assertIn("读取失败", str(ctx.exception))
 
     def test_file_empty_value_raises(self):
-        with tempfile.TemporaryDirectory() as d:
+        with platform_tmp.TemporaryDirectory() as d:
             kf = Path(d) / "kf.yaml"
             _write_keyfile(kf, ["AUTHORIZATION:"])
             s = {"id": "s9", "appkey_file": str(kf)}
@@ -392,7 +395,7 @@ class TestResolveAppkey(unittest.TestCase):
     def test_tilde_expansion(self):
         """appkey_file 支持 ~ 展开（os.path.expanduser，HOME 指向临时目录）。"""
         # Windows 的 expanduser 读 USERPROFILE，POSIX 读 HOME；两边都指向临时目录。
-        with tempfile.TemporaryDirectory() as d, \
+        with platform_tmp.TemporaryDirectory() as d, \
                 patch.dict(os.environ, {"HOME": d, "USERPROFILE": d}):
             _write_keyfile(Path(d) / "kf.yaml", ["AUTHORIZATION: tk_home"])
             s = {"id": "s1", "appkey_file": "~/kf.yaml"}
@@ -523,7 +526,7 @@ class TestSystemInjectE2E(unittest.TestCase):
 class TestAppkeyFileE2E(unittest.TestCase):
 
     def test_success_from_file(self):
-        with tempfile.TemporaryDirectory() as d:
+        with platform_tmp.TemporaryDirectory() as d:
             kf = Path(d) / "kf.yaml"
             _write_keyfile(kf, ["AUTHORIZATION: tk123"])
             s = _supply()
@@ -580,7 +583,7 @@ class TestConfigValidationDualTrack(unittest.TestCase):
 
     def test_startup_path_raise(self):
         """启动路径 fail-fast：非法配置（appkey+appkey_file 互斥）加载即抛。"""
-        with tempfile.TemporaryDirectory() as d:
+        with platform_tmp.TemporaryDirectory() as d:
             p = Path(d) / "cfg.json"
             p.write_text(json.dumps(self._cfg(_supply(appkey_file=str(Path(tempfile.gettempdir()) / "fake-kf.yaml")))),
                          encoding="utf-8")
@@ -598,7 +601,7 @@ class TestConfigValidationDualTrack(unittest.TestCase):
         del no_appkey["appkey"]
         cases.append(no_appkey)
         for supply in cases:
-            with tempfile.TemporaryDirectory() as d:
+            with platform_tmp.TemporaryDirectory() as d:
                 p = Path(d) / "cfg.json"
                 p.write_text(json.dumps(self._cfg(supply)), encoding="utf-8")
                 p.chmod(0o600)
@@ -611,7 +614,7 @@ class TestConfigValidationDualTrack(unittest.TestCase):
         旧行为允许一份启动期会被拒的配置热加载生效，实测造成 catpaw-ide 全量
         500；现在必须拒绝并保留旧快照。
         """
-        with tempfile.TemporaryDirectory() as d:
+        with platform_tmp.TemporaryDirectory() as d:
             p = Path(d) / "cfg.json"
             p.write_text(json.dumps(self._cfg(_supply())), encoding="utf-8")
             p.chmod(0o600)
@@ -630,7 +633,7 @@ class TestConfigValidationDualTrack(unittest.TestCase):
                   "target_model": "glm-5.3",
                   "extra_headers": {"X-Working-Dir": "/"},
                   "system_inject": INJECT}
-        with tempfile.TemporaryDirectory() as d:
+        with platform_tmp.TemporaryDirectory() as d:
             p = Path(d) / "cfg.json"
             p.write_text(json.dumps(self._cfg(supply)), encoding="utf-8")
             p.chmod(0o600)

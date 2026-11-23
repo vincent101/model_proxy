@@ -9,6 +9,13 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
+import os
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+import platform_tmp  # noqa: E402  (同目录测试基建)
 from core import server
 from core.config_snapshot import ConfigSnapshot, ConfigSnapshotError, FileMarker
 from core.discovery import PreflightError
@@ -221,7 +228,7 @@ class TestLedgerStateMachine(unittest.TestCase):
         self.assertEqual(adapter.disk['total']['requests'], 101)
 
     def test_default_adapter_is_disabled_and_does_not_touch_file(self):
-        with tempfile.TemporaryDirectory() as directory:
+        with platform_tmp.TemporaryDirectory() as directory:
             path = Path(directory) / 'totals.json'
             content = json.dumps(initial_data())
             path.write_text(content)
@@ -316,7 +323,7 @@ class TestLedgerStateMachine(unittest.TestCase):
 @unittest.skipUnless(os.name == 'posix', 'POSIX unit evidence fixture')
 class TestUnavailableCapture(unittest.TestCase):
     def setUp(self):
-        self.tmp = tempfile.TemporaryDirectory()
+        self.tmp = platform_tmp.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
         self.path = Path(self.tmp.name) / 'fake-ledger.json'
         self.path.write_text('{invalid', encoding='utf-8')

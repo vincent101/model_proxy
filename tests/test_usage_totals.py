@@ -17,6 +17,9 @@ from pathlib import Path
 from unittest.mock import patch
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+import platform_tmp  # noqa: E402  (同目录测试基建)
 
 from core.server import (  # noqa: E402
     _cst_now,
@@ -42,7 +45,9 @@ class _FakeBusinessDiskAdapter:
     def __init__(self, path):
         self.path = Path(path)
         self.parent = self.path.parent.resolve(strict=True)
-        temp_root = Path(tempfile.gettempdir()).resolve(strict=True)
+        # 夹具必须待在专用临时目录内（防止误碰真实账本）。Windows 的私有
+        # 临时目录在 %LOCALAPPDATA%，不能按系统 tempdir 判断。
+        temp_root = Path(platform_tmp.base_dir() or tempfile.gettempdir()).resolve(strict=True)
         if self.parent == temp_root or temp_root not in self.parent.parents:
             raise AssertionError("fake fixture must be inside a dedicated temporary directory")
 
@@ -80,14 +85,15 @@ class _FakeBusinessDiskAdapter:
         if not self.matches(self.observe(path), baseline):
             return LedgerCommitResult("NOT_APPLIED")
         payload = json.dumps(data, indent=2, ensure_ascii=False)
-        with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=self.parent,
-                                         prefix="fake-ledger-", delete=False) as stream:
-            name = stream.name
-            stream.write(payload)
+        # 落到与目标同一目录的临时文件，再原子替换（夹具不模拟提交候选身份）。
+        fd, name = tempfile.mkstemp(prefix="fake-ledger-", dir=str(self.parent))
         try:
+            with os.fdopen(fd, mode="w", encoding="utf-8") as stream:
+                stream.write(payload)
             os.replace(name, self.path)
+            name = None
         finally:
-            if os.path.exists(name):
+            if name is not None and os.path.exists(name):
                 os.unlink(name)
         final = self.observe(path)
         # This fixture does not model precommit candidate identity or failures.
@@ -146,7 +152,7 @@ class TestCstNow(unittest.TestCase):
 class TestUsageTotalsStoreRecord(unittest.TestCase):
 
     def setUp(self):
-        self._tmpdir = tempfile.TemporaryDirectory()
+        self._tmpdir = platform_tmp.TemporaryDirectory()
         self.path = Path(self._tmpdir.name) / "totals.json"
 
     def tearDown(self):
@@ -283,7 +289,7 @@ class TestUsageTotalsStoreRecord(unittest.TestCase):
 class TestUsageTotalsStoreCorruptRecovery(unittest.TestCase):
 
     def setUp(self):
-        self._tmpdir = tempfile.TemporaryDirectory()
+        self._tmpdir = platform_tmp.TemporaryDirectory()
         self.path = Path(self._tmpdir.name) / "totals.json"
 
     def tearDown(self):
@@ -336,7 +342,7 @@ class TestArchiveBoundary(unittest.TestCase):
     """归档边界一致性：超窗最旧天桶按组合键汇总进 months_archive 且从 days 删除，不丢不重。"""
 
     def setUp(self):
-        self._tmpdir = tempfile.TemporaryDirectory()
+        self._tmpdir = platform_tmp.TemporaryDirectory()
         self.path = Path(self._tmpdir.name) / "totals.json"
 
     def tearDown(self):
@@ -686,7 +692,7 @@ class TestSchemaV3(unittest.TestCase):
     """OPT-10：v3 schema 新字段 + 迁移正确性。"""
 
     def setUp(self):
-        self._tmpdir = tempfile.TemporaryDirectory()
+        self._tmpdir = platform_tmp.TemporaryDirectory()
         self.path = Path(self._tmpdir.name) / "totals.json"
 
     def tearDown(self):
@@ -781,7 +787,7 @@ class TestV2ToV3Migration(unittest.TestCase):
     """OPT-10：v2→v3 迁移（旧桶补 0）。"""
 
     def setUp(self):
-        self._tmpdir = tempfile.TemporaryDirectory()
+        self._tmpdir = platform_tmp.TemporaryDirectory()
         self.path = Path(self._tmpdir.name) / "totals.json"
 
     def tearDown(self):
@@ -876,7 +882,7 @@ class TestV2ToV3Migration(unittest.TestCase):
 
 class TestMigrationLedgerValidation(unittest.TestCase):
     def setUp(self):
-        self.tmp = tempfile.TemporaryDirectory()
+        self.tmp = platform_tmp.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
         self.path = Path(self.tmp.name) / "totals.json"
         self.combo_key = "supply=s1|route=r1|strategy=cc"

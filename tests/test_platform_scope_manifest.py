@@ -54,11 +54,12 @@ class ManifestShapeTests(unittest.TestCase):
             self.assertTrue(scope.covers(name, pattern + '.test_a', scope.WINDOWS))
             self.assertFalse(scope.covers(name, 'OtherClass.test_a', scope.WINDOWS))
 
-    def test_gaps_are_non_empty_and_declared_posix(self):
-        gaps = scope.gaps()
-        self.assertTrue(gaps, '缺口表清空时应删除本断言，避免它悄然失效')
-        for name, reason in gaps:
-            self.assertTrue(reason.strip())
+    def test_gaps_are_well_formed(self):
+        # 缺口表可以被补完（当前已清空）。这里只约束「留下来的条目必须合规」，
+        # 不再要求非空——否则补完缺口反而要让测试失败。
+        for name, reason in scope.gaps():
+            self.assertIn('::', name, '缺口条目应能定位到文件或用例')
+            self.assertGreater(len(reason.strip()), 8, '缺口必须写清待补内容')
 
 
 if __name__ == '__main__':

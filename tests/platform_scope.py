@@ -47,9 +47,9 @@ FILE_SCOPE: dict[str, tuple] = {
     'test_config_snapshot.py': (POSIX, 'POSIX 稳定快照语义（st_dev/st_ino/mtime+属主）；Windows 句柄快照由 test_windows_config_boundary 覆盖'),
     'test_discovery_anchor.py': (POSIX, 'POSIX inode 身份 preflight；Windows 身份由 test_windows_discovery 覆盖'),
     'test_install_ops.py': (POSIX, 'POSIX 私有安装目标校验；Windows 安装由 test_windows_secure_hook_install 覆盖'),
-    'test_usage_totals.py': (POSIX, '账本读写夹具依赖 POSIX 快照与裸读配置', True),
-    'test_reload_contract.py': (POSIX, '热加载夹具把配置写在 tempdir；Windows 的 _read_business_config 只认项目树内已验证边界', True),
-    'test_runtime_unify_paths.py': (POSIX, '夹具注入 POSIX 形态的项目根/路径，且含 POSIX 侧 Windows 模拟', True),
+    # 这些用例显式 `platform="posix"`，测的是 POSIX 解析器本身；Windows 侧对应
+    # test_windows_paths / test_windows_discovery / test_windows_discovery。
+    'test_runtime_unify_paths.py': (POSIX, '显式 platform=posix 的路径解析器单测，与平台无关的产品分支'),
     'test_windows_control_a_followup.py': (POSIX, '在 POSIX 上用假 Win32 后端模拟 Windows 控制；原生 Windows 会先被真实启动前置条件拦下'),
 }
 
@@ -57,24 +57,8 @@ FILE_SCOPE: dict[str, tuple] = {
 # 键：(文件名, 'Class.test' 或 'test')；值：(scope, reason[, gap])
 TEST_SCOPE: dict[tuple, tuple] = {
     # 配置读取夹具把配置文件放在 tempdir；Windows 侧只认项目树内的已验证边界
-    ('test_body_error.py', 'TestBodyErrorConfigValidation'): (
-        POSIX, '夹具用 tempdir 裸读配置；Windows 的 _read_business_config 只认项目树内已验证边界', True),
-    ('test_supply_ext.py', 'TestConfigValidationDualTrack'): (
-        POSIX, '同上：热加载/启动校验夹具写在 tempdir', True),
-    ('test_route_command.py', 'TestRouteReceiptSessionIdentity'): (
-        POSIX, 'receipt 身份夹具写 tempdir 配置', True),
-    ('test_route_command.py', 'TestRouteReceiptClaudianTitle'): (
-        POSIX, 'receipt 标题夹具写 tempdir 配置', True),
-    ('test_route_command.py', 'TestNoAliasPollution'): (
-        POSIX, 'ConfigStore 夹具写 tempdir 配置', True),
-    ('test_route_command.py', 'TestForwardInterceptEndToEnd'): (
-        POSIX, '端到端夹具写 tempdir 配置', True),
     ('test_config_ops.py', 'TestConfigAtomicAndCsvContracts'): (
         POSIX, '原子写与权限位属 POSIX 语义（Windows 写入走 windows_secure_files）'),
-    ('test_ledger_state_machine.py', 'TestLedgerStateMachine.test_default_adapter_is_disabled_and_does_not_touch_file'): (
-        POSIX, '夹具经 POSIX 快照读账本', True),
-    ('test_sidecar_review_followup.py', 'TestReviewFollowup.test_real_forward_request_does_not_publish_masquerading_candidate'): (
-        POSIX, '夹具写 tempdir 配置', True),
     ('test_sidecar_review_followup.py', 'TestLegacyWriterResources.test_fdopen_close_failure_before_closing_is_unknown_and_not_retried'): (
         POSIX, '断言 POSIX 路径字符串与 fdopen 语义'),
     ('test_route_sidecar_unknown.py', 'TestSidecarUnknown.test_changed_protection_evidence_does_not_resolve_unknown'): (
