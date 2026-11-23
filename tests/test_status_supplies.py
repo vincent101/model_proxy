@@ -221,12 +221,13 @@ class TestRendering(unittest.TestCase):
         self.assertIn("cool 42s", line)
         self.assertIn("http 429", line)
 
-    def test_unreferenced_folded_to_one_line(self):
+    def test_unreferenced_supplies_are_not_rendered_at_all(self):
+        """未引用的供给既不占表格行，也不再折叠成摘要行（不看它就没意义）。"""
         lines = f._format_supplies(self.CFG, {}, cooldown={}, stream_health=None,
                                    truncated=False, log_missing=False, refs={"s1": ["x"]})
-        unreferenced = [l for l in lines if "unreferenced" in l]
-        self.assertEqual(len(unreferenced), 1)
-        self.assertIn("s2", unreferenced[0])
+        joined = "\n".join(lines)
+        self.assertNotIn("unreferenced", joined)
+        self.assertNotIn("s2", joined)
 
     def test_truncated_marker(self):
         lines = f._format_supplies(self.CFG, {}, cooldown={}, stream_health=None,

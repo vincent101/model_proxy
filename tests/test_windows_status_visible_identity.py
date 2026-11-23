@@ -93,21 +93,20 @@ class VisibleStatusIdentityTests(unittest.TestCase):
         self.assertIn('status_sensitive_conflict', err)
         self.assertIn('  0', baseline)
 
-    def test_supplies_section_never_renders_supply_identity_when_unreferenced(self):
-        """供给段只渲染被 route 引用的 id；未引用摘要也受同一脱敏守卫。
+    def test_unreferenced_supply_identity_is_never_rendered(self):
+        """未引用的供给 id 根本不进输出，因此不存在「撞 token 需脱敏」的问题。
 
-        2026-11-22 起供给段不再显示引用关系，因此「供给 id 撞 token」只在
-        cooldown 段与未引用摘要两处可能泄露——前者由既有用例覆盖，后者在此。
+        2026-11-23 起 status 不再输出 unreferenced 摘要行；原先那条 fail-closed
+        守卫（未引用 id 撞管理 token 就报 status_sensitive_conflict）随之移除。
+        这里锁定的是「不显示」这一事实本身：只要输出里没有这个 id，就不会泄露。
         """
         data = {'supplies': [{'id': '0'}], 'routes': [], 'strategies': [],
                 'cooldown': {}}
-        # 供给清单来自磁盘配置（与 _supply_refs 同源）：让它真的含有 id=0，
-        # 否则这条用例连渲染路径都走不到。
         cfg = {'supplies': [{'id': '0'}], 'routes': [], 'strategies': []}
         rc, out, err, _ = self.run_status(data=data, cfg=cfg, health={})
-        self.assertEqual(rc, 1, '未引用摘要里的 0 必须 fail-closed')
-        self.assertEqual(out, '')
-        self.assertIn('status_sensitive_conflict', err)
+        self.assertEqual(rc, 0, err)
+        self.assertNotIn('unreferenced', out)
+        self.assertNotIn('0', out.split('supply health', 1)[-1].splitlines()[1:])
 
     def test_visible_disk_route_reference_still_fails_closed(self):
         data = {'supplies': [{'id': 's1'}], 'routes': [], 'strategies': [],

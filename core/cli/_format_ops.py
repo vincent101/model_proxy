@@ -621,14 +621,6 @@ def _format_supplies(cfg: dict, stats: dict[str, dict], *, cooldown: dict | None
             seen.add(sid)
             referenced.append(sid)
 
-    unreferenced = [s.get("id") for s in cfg.get("supplies", [])
-                    if isinstance(s, dict) and isinstance(s.get("id"), str)
-                    and s["id"] and s["id"] not in refs]
-    # 未引用摘要同样会渲染 supply id：撞上本次管理 token 时按既有约定 fail-closed。
-    # 放在日志缺失的 early-return 之前——脱敏守卫不能因为「这次没数据」而失效。
-    if forbidden_reference_token is not None and forbidden_reference_token in unreferenced:
-        raise StatusReferenceConflict("visible supply identity conflicts with admin token")
-
     if log_missing:
         return [header, "  无数据（日志文件缺失）"]
 
@@ -645,7 +637,7 @@ def _format_supplies(cfg: dict, stats: dict[str, dict], *, cooldown: dict | None
                                      window_total=window_total)
         if state == "idle":
             # 窗口内零请求的供给不占行：它没有任何可评估的健康信息，
-            # 列出来只会稀释表格。需要看清单时看 config 行的计数或 unreferenced 摘要。
+            # 列出来只会稀释表格；供给总数看 config 行的 supplies 计数。
             continue
         state_text = state
         if state == "cool":
@@ -672,8 +664,10 @@ def _format_supplies(cfg: dict, stats: dict[str, dict], *, cooldown: dict | None
         lines.append(line)
     if not rendered and referenced:
         lines.append(f"  （近 {SUPPLY_WINDOW_MINUTES}min 内被引用的供给均无请求）")
-    if unreferenced:
-        lines.append(f"  unreferenced {len(unreferenced)}: " + ", ".join(unreferenced))
+    # 未引用的供给不再列名：它在窗口内没有请求、也没有健康信息可评估，列出来
+    # 只会稀释表格（需要时看 config 行的 supplies 计数）。顺带说明：既然不再
+    # 渲染这些 id，原先「未引用摘要撞管理 token 则 fail-closed」的守卫也一并
+    # 移除——若将来重新加上列名，必须同步恢复该守卫。
     return lines
 
 
