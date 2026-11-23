@@ -80,6 +80,34 @@ jobs:
           if (-not (Test-Path dist/libcatpaw_bridge.dll)) { throw 'dll not produced' }
           Get-Item dist/libcatpaw_bridge.dll | Format-List Name,Length
 
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      # 产得出文件 ≠ 能加载：导出符号名、调用约定、ABI 版本都要在原生 Windows 上
+      # 实际 LoadLibrary 一次才算数。这里按 core/providers/catpaw_ide.py 的声明
+      # 取全部入口并校验 CatpawBridgeVersion() == 1。
+      - name: Load produced library (ctypes + ABI)
+        working-directory: ${{ env.GO_DIR }}
+        shell: bash
+        run: |
+          python - <<'PY'
+          import ctypes, pathlib, sys
+          lib_path = pathlib.Path('dist/libcatpaw_bridge.dll').resolve()
+          lib = ctypes.CDLL(str(lib_path))
+          lib.CatpawBridgeVersion.restype = ctypes.c_int32
+          lib.CatpawStart.restype = ctypes.c_int64
+          lib.CatpawNext.restype = ctypes.c_int32
+          for name in ('CatpawStart', 'CatpawNext', 'CatpawCancel', 'CatpawClose'):
+              getattr(lib, name)
+          version = lib.CatpawBridgeVersion()
+          print(f'loaded={lib_path}')
+          print(f'exports=CatpawBridgeVersion,CatpawStart,CatpawNext,CatpawCancel,CatpawClose')
+          print(f'abi_version={version}')
+          if version != 1:
+              sys.exit(f'unexpected ABI version: {version}')
+          PY
+
       - uses: actions/upload-artifact@v4
         with:
           name: libcatpaw_bridge-windows-amd64
@@ -113,6 +141,25 @@ jobs:
           go build -buildmode=c-shared -o dist/libcatpaw_bridge.dylib ./cmd/native
           test -f dist/libcatpaw_bridge.dylib
           ls -l dist
+
+      - name: Load produced library (ctypes + ABI)
+        working-directory: ${{ env.GO_DIR }}
+        run: |
+          python3 - <<'PY'
+          import ctypes, pathlib, sys
+          lib_path = pathlib.Path('dist/libcatpaw_bridge.dylib').resolve()
+          lib = ctypes.CDLL(str(lib_path))
+          lib.CatpawBridgeVersion.restype = ctypes.c_int32
+          lib.CatpawStart.restype = ctypes.c_int64
+          lib.CatpawNext.restype = ctypes.c_int32
+          for name in ('CatpawStart', 'CatpawNext', 'CatpawCancel', 'CatpawClose'):
+              getattr(lib, name)
+          version = lib.CatpawBridgeVersion()
+          print(f'loaded={lib_path}')
+          print(f'abi_version={version}')
+          if version != 1:
+              sys.exit(f'unexpected ABI version: {version}')
+          PY
 
       - uses: actions/upload-artifact@v4
         with:

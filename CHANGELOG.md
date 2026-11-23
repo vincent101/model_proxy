@@ -2,6 +2,53 @@
 
 ## 未发布
 
+### Windows 测试覆盖缺口清零（11 → 0）
+
+**背景**：平台范围清单上线后还剩 11 项「跨平台逻辑、夹具绑定 POSIX」的缺口。
+补齐过程中用原生 windows-latest 逐步取证（6 轮探针），结论如下。
+
+**平台事实（值得记住）**：产品的 Windows 配置/账本读取要求目标 DACL 只含
+当前用户、SYSTEM、Administrators。GitHub runner 上实测：
+
+| 位置 | 目录 DACL | 产品判定 |
+|---|---|---|
+| `%TEMP%`（`mkdtemp`/`TemporaryDirectory`） | `Administrators` + `OWNER RIGHTS` | 拒（无显式用户 SID） |
+| `%LOCALAPPDATA%`（`mkdir()`） | `Administrators` + `<machine>\<user>` | 通过 |
+| `%LOCALAPPDATA%`（`mkdir(mode=0o700)`） | `Administrators` + `OWNER RIGHTS` | 拒 |
+| 工作区 `D:\a\...` | 含 `Authenticated Users` / `BUILTIN\Users` | 拒 |
+
+`OWNER RIGHTS` 是 S-1-3-4，不在产品的白名单里。**同一个父目录下，传不传
+`mode` 参数就会得到两种 DACL**——这是本轮最反直觉的一条。
+
+**改法**：
+- 新增 `tests/platform_tmp.py`：Windows 上把临时目录建在 `%LOCALAPPDATA%`，
+  且用 `mkdir()`（不传 mode）再在 POSIX 补 `chmod(0o700)`；另提供
+  `read_stable()`，按生产口径补 `trusted_boundary`（生产由
+  `_read_business_config` 补）。
+- 7 个文件的夹具改用它后，在原生 Windows 全部跑绿：
+  `test_body_error`、`test_ledger_state_machine`、`test_reload_contract`、
+  `test_route_command`、`test_sidecar_review_followup`、`test_supply_ext`
+  （`test_usage_totals` 只保留 POSIX：见下）。
+- `test_usage_totals` 保留 posix 声明：它验证的 `direct` 构造（不经 preflight
+  直接读账本）按产品设计在 Windows 上**有意**严格 fail-closed（`server.py`
+  「Other ledger callers and unproven snapshots retain the strict default」）；
+  启动路径的账本校验由 `test_windows_gate` 覆盖。
+- `test_runtime_unify_paths` 保留 posix 但不是缺口：它显式 `platform="posix"`，
+  测的是 POSIX 解析器本身。
+
+**结果**：`windows/amd64` 141 files / 119 ok / 34 needs-isolation / 15 本平台
+不适用 / 2 已知红灯 / **0 意外失败**，覆盖缺口 0 项；`darwin/arm64` 全绿。
+
+### CatPaw IDE 桥的 Windows .dll 可构建、可加载
+
+- `build-catpaw-bridge` 的 Windows job 之前必然在「找不到 gcc」处失败：
+  choco 的 mingw 实际落在 `C:\ProgramData\mingw64\mingw64\bin`（比直觉多一层），
+  原候选路径差一级。已修正并加 `Get-ChildItem` 兜底。
+- 两个 job 都新增「Load produced library (ctypes + ABI)」：实际 `LoadLibrary`
+  产物、按 `core/providers/catpaw_ide.py` 的声明取全部入口，并校验
+  `CatpawBridgeVersion() == 1`。**产得出文件 ≠ 能加载**，这一步补上。
+
+
 ### 测试平台范围清单（Windows CI 有真信号）
 
 **问题**：Windows 与 macOS 各跑一遍之后，Windows 侧有 23~28 项「意外失败」。
