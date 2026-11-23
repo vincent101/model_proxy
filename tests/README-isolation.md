@@ -21,28 +21,48 @@ python3 tests/run_unit_suite.py tests/test_x.py
 
 ### 结果分类怎么做
 
-`run_unit_suite.py` 把非零退出分成三类，只有最后一类返回非零：
+平台归属由 **`tests/platform_scope.py`** 声明（唯一真相源）。`run_unit_suite.py`
+按它判定，只有最后两类返回非零：
 
 | 前缀 | 含义 |
 |---|---|
 | `iso` | 运行期才读 `MP_TEST_ROOT` 等隔离变量 → 必须走 `run_isolated.sh` |
-| `win` | `test_windows_*` / `test_wine_*` 在非 Windows 宿主上运行，或错误信息命中 Windows 原生原语特征 |
+| `skip` | 该文件/用例在清单里声明为**另一平台专用**，本宿主上不适用（每次都会打印原因） |
+| `win` / `mac` | 原生专测在非对应宿主上失败（`test_windows_*` / `test_mac_*` 前缀兜底，仅当清单未声明） |
+| `KNOWN` | 已登记在 `KNOWN_BROKEN` 的历史红灯（两平台都坏，需单独修）；**一旦通过即报 `STALE` 并让 CI 红** |
 | `FAIL` | **意外失败**，需要人看 |
+
+清单约定（fail-closed）：**未列出的文件 = `both`**，必须在 macOS 与 Windows 上
+都通过；只有显式声明才会被跳过，且跳过要写「为什么换平台不成立」的理由。
+新增测试默认走 `both`；要声明平台先自问是语义上只属于该平台，还是夹具偷懒。
+
+```bash
+python3 tests/run_unit_suite.py --list-scope   # 打印清单与理由
+```
+
+每次运行还会打印两张待办清单：
+
+- **Windows 覆盖缺口**：被测逻辑跨平台、但夹具仍绑定 POSIX（如裸读 tempdir 配置）。
+  这是待补项，不是豁免——它们目前只在 macOS 上被验证。
+- **已知红灯**（`KNOWN_BROKEN`）：带登记日期与原因，防止沉淀成新的静默掩盖。
 
 ### 当前状态
 
 ```bash
+# macOS 宿主
 $ python3 tests/run_unit_suite.py -j 8
-files run: 140  ok: 132  needs-isolation: 32  windows-native(需 Windows runner): 4  意外失败: 0
+files run: 143  ok: 135  needs-isolation: 32  本平台不适用: 0  意外失败: 0
+
+# Windows 宿主（GitHub Actions windows-latest）
+files run: 141  ok: 114  needs-isolation: 33  本平台不适用: 20  已知红灯: 2  意外失败: 0
 ```
 
 - **`iso`（32 个文件）**：`test_mac_config_writer*`、`test_mac_runtime_staging`、
   `test_mac_writer_interruptions` 等，运行时才读 `MP_TEST_ROOT`/`MP_TEST_PROJECT`，
   必须走 `run_isolated.sh`。
-- **`win`（4 个文件）**：`test_windows_gate`、`test_windows_control_a_followup`、
-  `test_windows_secure_files_writer`、`test_windows_secure_install_wiring`，
-  覆盖 Win32 句柄/ACL/记录目录，macOS 宿主上不可执行。
-- **意外失败 0**。
+- **已知红灯 2 个**：`test_windows_gate`、`test_windows_secure_install_wiring`
+  ——两平台都已坏（此前分别被 `test_windows_` 前缀与 `windows-native` 特征串掩盖），
+  待单独修复。
 
 ### 已修好的历史失败（备查）
 

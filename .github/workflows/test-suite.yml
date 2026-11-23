@@ -4,8 +4,14 @@
 #   - `test_windows_*` / `test_wine_*` 专测 Win32 句柄、ACL、记录目录；
 #   - `test_mac_*` / `test_darwin_*` 专测 macOS 原生保护与 ACL；
 #   - 在非对应宿主上它们必然失败，但那是「未在该平台验收」，不是代码缺陷。
-#   `tests/run_unit_suite.py` 按文件名把它们归为 windows-native / macos-native
-#   两类（不算失败），只有真正的意外失败才让 job 红。
+#   平台归属由 `tests/platform_scope.py` 声明：每个文件/用例写明 posix / windows /
+#   both（默认 both，fail-closed）。未声明的文件必须两边都过；声明了另一平台的
+#   才会被跳过，且跳过清单每次都会打印，不是静默。
+#
+#   两条额外信号（都会打印，不会静默）：
+#   - 「Windows 覆盖缺口」：被测逻辑跨平台但夹具仍绑定 POSIX，待补而非豁免；
+#   - 「已知红灯」：两平台都已坏的历史文件，登记计数；一旦通过即报 STALE 并让
+#     job 红，逼着把它从清单里删掉。
 #
 # 不跑的：`tests/run_isolated.sh`（POSIX shell + lsof）——它需要隔离项目与
 # 假 HOME，只在本地 macOS 跑；`test_cli_live` 需要真实服务。

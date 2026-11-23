@@ -1,5 +1,50 @@
 # Changelog
 
+## 未发布
+
+### 测试平台范围清单（Windows CI 有真信号）
+
+**问题**：Windows 与 macOS 各跑一遍之后，Windows 侧有 23~28 项「意外失败」。
+分诊结果没有一项是新缺陷，全部是同一类：**POSIX 语义的用例在真实 Windows 上跑**
+（`fcntl`/`flock`/`O_NOFOLLOW`/`chmod` 权限位/inode 身份/裸读 tempdir 配置）。
+更糟的是反方向：靠「错误串特征」判定的旧逻辑会把 Windows 上的真失败标成
+`windows-native` 而永久掩盖——`test_windows_gate.py`（mac 25 项、Windows 14 项）
+与 `test_windows_secure_install_wiring.py`（两平台各 9 项）就是这样藏了不知多久。
+
+**改法**：新增 `tests/platform_scope.py` 作为平台归属的唯一真相源。
+
+- 文件级与用例级两级声明：`posix` / `windows` / `both`，每条必须写「为什么换平台
+  不成立」的理由，而不是「它现在红了」。
+- **fail-closed**：未声明的文件 = `both`，必须两边都过。想跳过另一平台必须显式登记。
+- 每次运行都打印三张清单：跳过清单（带原因）、**Windows 覆盖缺口**（被测逻辑跨平台
+  但夹具仍绑 POSIX，11 项待补，不是豁免）、**已知红灯**（`KNOWN_BROKEN`，两平台
+  都坏的历史文件；一旦通过即报 STALE 并让 CI 红，防止沉淀成新的静默掩盖）。
+- 修正判定顺序：Windows 专测特征串在 Windows 宿主上不再算 skip 理由。
+- 新增 `tests/test_platform_scope_manifest.py` 守则测试：清单里的文件必须存在、
+  必须写理由、未声明默认 both、用例级声明必须比文件级更窄、缺口表不能为空。
+
+顺带修掉 5 处真·用例缺陷（不是平台差异）：
+
+- `test_hooker_compat`：假 CLI 用 `echo %*`，参数正好是 `on` 时 `echo on` 是 cmd
+  的开关命令、不打印任何文本，原生 Windows 上恒失败；改为 `echo [%*]`。
+- `test_windows_process_a_exec_native`：入口与配置的规范化拼写不一致（入口长名、
+  配置保留 8.3 短名），改为按规范化后相等比较。
+- `test_windows_server_safety`：原生 Windows 上 `main()` 先校验启动形态，补齐放行。
+- `test_supply_ext`：Windows 的 `expanduser` 读 `USERPROFILE` 而不是 `HOME`。
+- `test_provider_settings`：缓存键是 `(mtime_ns, size)`，Windows 同一时钟刻度内
+  改写**同长度**内容会得到相同键；用例改用不同长度内容，只测「文件变了要重读」。
+
+**结果**：`windows/amd64` 与 `darwin/arm64` 双绿——Windows
+`141 files / 114 ok / 33 needs-isolation / 20 本平台不适用 / 2 已知红灯 / 0 意外失败`。
+
+### 修复 Windows 无参直启的路径比对（8.3 短名）
+
+`_normalize_windows_direct_launch` 原来用 `normcase(abspath(a))` 比
+`normcase(resolve(b))`：前者是纯文本运算、保留 8.3 短名，后者走文件系统返回长名。
+只要路径含短名（GitHub runner 的 `C:/Users/RUNNER~1/…`，以及任何过长用户名），
+两者必然不等，无参直启被误判为「不可安全归一化」而拒绝启动。
+改为两边同用 `resolve(strict=True)`（失败回退 `abspath`）后比较；判据仍是「同一文件」。
+
 ## 0.16 (2026-11-22)
 
 ### 修复统计账本停止落盘（provenance 跨启动上下文）
@@ -65,6 +110,7 @@
 
 `tests/run_unit_suite.py` 现在按文件名识别 Windows 专测（非 Windows 宿主上失败属预期），
 并给出三分类汇总：`ok 132 / needs-isolation 32 / windows-native 4 / 意外失败 0`。
+（**已由 2026-11-23 的平台范围清单取代**，见下。）
 
 ### 清理既有测试失败 + 提供可用的测试入口
 
@@ -117,6 +163,31 @@
   为「当前账号目录中没有该模型」；放开后实测正常出文。
 - **桥库跨平台构建**：新增 `build-catpaw-bridge` workflow（windows-latest +
   MinGW-w64 / macos-14），c-shared 不能交叉编译，Windows 侧必须由 CI 产出。
+
+### 安装身份改用卷 UUID + inode（schema 4），重启不再误判安装变更
+
+- **根因**：持久身份记录的是启动期 `st_dev`（重启可重排），安装校验是精确字典相等；
+  同一目录换一个 device 就被判 `installation_changed`。`active.json` 的锁身份同样
+  持久化了 `st_dev`，重启后 `status`/`off` 也会失败。
+- **修复**：macOS 三份记录升到 schema 4，身份 = 卷 UUID（`getattrlist` 路径式采集；
+  `fgetattrlist` 在目录 fd 上取不到）+ 目录 inode + 规范化 `project_root`；
+  `st_dev` 只用于同一启动期内交叉核对，不再落盘。schema 2 仍可读；仅当服务已持
+  双锁且 install 已按 schema 4 校验时，才允许按 inode 丢弃跨启动的 schema-2 陈旧
+  锁观测，并仍要求记录进程已退出或为僵尸。卷 UUID 不可得时 schema 4 一律拒绝，
+  不退化为 inode-only。
+- **迁移**：服务启动持双锁时自动升级三份记录，先备份到
+  `.runtime/backups/identity-v2-<UTC>/`；中途失败留下 2/4 混合记录，下次可续；
+  只读 `status` 不触发迁移。升级前已跨重启的 schema 2 记录不自动接受：`on` 在同一
+  TTY 交互确认后重绑定，写 schema 4 并追加有界 `identity_history`（保留 `install_id`）。
+  重绑定写回前必须证明记录进程已退出/僵尸、记录锁与当前持有的锁同卷同 inode；
+  进程仍存活、锁路径跨卷同 inode 或缺少同卷证据时拒绝并给出固定错误码。
+- **入口语义**：`off` 不因安装身份异常被阻断（仍校验真实进程/套接字/锚锁活体）；
+  `status` 运行中只报告身份告警、不阻断，已停止则给可操作错误；`reload` 与启动
+  保持严格。
+- **降级**：旧版本读不了 schema 4 记录（拒读）。降级必须 `off` 后用
+  `.runtime/backups/identity-v2-<UTC>/` 的备份原样恢复 `install.json`、
+  `active.json`、`last_good_paths.json`（保持 0600），再切回旧版本；不要手工改
+  `schema` 字段。
 
 ## 0.15 (2026-11-21)
 
