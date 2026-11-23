@@ -42,7 +42,10 @@ class ConfigBoundaryProbe(unittest.TestCase):
         def record(text):
             lines.append(text)
 
-        with tempfile.TemporaryDirectory(prefix='mp-boundary-') as temp:
+        # 不用 TemporaryDirectory：探针会故意保留打开的句柄，自动清理会先抛
+        # WinError 32 把结论吞掉（实测）。这里用 mkdtemp 且不清理。
+        temp = tempfile.mkdtemp(prefix='mp-boundary-')
+        if True:
             flat = Path(temp) / 'config.json'
             flat.write_text('{}', encoding='utf-8')
             target = ntpath.abspath(str(flat))
@@ -61,7 +64,13 @@ class ConfigBoundaryProbe(unittest.TestCase):
                  lambda: windows_paths.inspect(target, backend=monitor, kind='file',
                                                private=True, single_link=True,
                                                trusted_boundary=str(Path(temp))))
-            step(record, '7.open_read_file', lambda: pww.open_read_file(target, backend=api))
+            handle = step(record, '7.open_read_file', lambda: pww.open_read_file(target, backend=api))
+            if handle is not None:
+                try:
+                    handle.close()
+                    record('7b.handle closed')
+                except BaseException as exc:
+                    record(f'7b.close raised {describe(exc)}')
             step(record, '8.read_guarded_file',
                  lambda: pww.read_guarded_file(target, with_data=True,
                                                trusted_boundary=str(Path(temp))))
