@@ -476,6 +476,94 @@ def _darwin_has_reverse_connection(pid: int, target) -> bool:
     return found == 1
 
 
+_TSI_S_LISTEN = 1  # sys/proc_info.h TSI_S_LISTEN for struct tcp_sockinfo.
+
+
+def _darwin_listening_tcp_sockets(pid: int):
+    """Enumerate this exact PID's LISTEN TCP sockets as (family, local, port).
+
+    Only read-only FD metadata is used. Any unreadable FD or unexpected layout
+    is UNKNOWN; this cannot prove exclusive ownership or exclude races.
+    """
+    lib = _libproc()
+    size = lib.proc_pidinfo(pid, 1, 0, None, 0)  # PROC_PIDLISTFDS
+    if size <= 0 or size > 8 * 65536:
+        raise ProcessEvidenceError('fd_list_unavailable')
+    capacity = size + 8 * 128
+    buf = ctypes.create_string_buffer(capacity)
+    count = lib.proc_pidinfo(pid, 1, 0, buf, capacity)
+    if count <= 0 or count >= capacity or count % 8:
+        raise ProcessEvidenceError('fd_list_unavailable')
+    found = []
+    for fd, kind in struct.iter_unpack('=iI', buf.raw[:count]):
+        if kind != 2:  # PROX_FDTYPE_SOCKET
+            continue
+        info = ctypes.create_string_buffer(_SOCKET_FDINFO_SIZE)
+        got = lib.proc_pidfdinfo(pid, fd, 3, info, len(info))  # PROC_PIDFDSOCKETINFO
+        if got != _SOCKET_FDINFO_SIZE:
+            raise ProcessEvidenceError('socket_fd_unavailable')
+        data = info.raw
+        if struct.unpack_from('=i', data, _KIND)[0] != 2:  # SOCKINFO_TCP
+            continue
+        if struct.unpack_from('=i', data, _STATE)[0] != _TSI_S_LISTEN:
+            continue
+        flag = data[_VFLAG]
+        if flag & 1:  # INI_IPV4
+            family, local = socket.AF_INET, data[_LADDR + 12:_LADDR + 16]
+        elif flag & 2:  # INI_IPV6
+            family, local = socket.AF_INET6, data[_LADDR:_LADDR + 16]
+        else:
+            raise ProcessEvidenceError('socket_fd_unavailable')
+        port = socket.ntohs(struct.unpack_from('=I', data, _LPORT)[0] & 0xffff)
+        found.append((family, local, port))
+    return found
+
+
+def verify_listening_owner(pid: int, start: dict, executable: str, family: int,
+                           address: str, port: int) -> bool:
+    """Whether this exact PID has a listening TCP socket covering the endpoint.
+
+    ``address`` is the expected local address; an unspecified listener covers
+    any address of its own family. A cross-family wildcard is ambiguous (the
+    kernel may report only one side of a dual-stack socket, and V6ONLY is not
+    observable), so it raises instead of claiming or denying ownership.
+    ``False`` means the exact PID was enumerated and no matching listener
+    exists. An unreadable FD table, changed process identity or unsupported
+    platform raises; callers must not treat that as absence. Same-user
+    impersonation and observation races remain.
+    """
+    if sys.platform != 'darwin':
+        raise ProcessEvidenceError('listening_owner_unsupported')
+    if (family not in (socket.AF_INET, socket.AF_INET6)
+            or type(port) is not int or not 1 <= port <= 65535):
+        raise ProcessEvidenceError('socket_family_unsupported')
+    try:
+        expected = ipaddress.ip_address(address)
+    except (ValueError, TypeError):
+        raise ProcessEvidenceError('local_address_unavailable') from None
+    check_identity(pid, start, executable)
+    sockets = _darwin_listening_tcp_sockets(pid)
+    check_identity(pid, start, executable)
+    for socket_family, packed, local_port in sockets:
+        if local_port != port:
+            continue
+        try:
+            local = ipaddress.ip_address(packed)
+        except ValueError:
+            raise ProcessEvidenceError('socket_fd_unavailable') from None
+        if local.is_unspecified:
+            if socket_family == family:
+                return True
+            # Cross-family wildcards are ambiguous: an IPv4 wildcard may be
+            # the reported view of an IPv6 dual-stack listener, and an IPv6
+            # wildcard may or may not have been opened with V6ONLY. Never
+            # claim ownership in either direction.
+            raise ProcessEvidenceError('listening_owner_ambiguous')
+        if socket_family == family and local == expected:
+            return True
+    return False
+
+
 def verify_connected_peer(sock: socket.socket, pid: int, start: dict, executable: str,
                           *, timeout: float = 2.0, interval: float = 0.05) -> None:
     """Verify the reverse tuple in PID while keeping the *same* socket open.

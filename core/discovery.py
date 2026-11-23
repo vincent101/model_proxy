@@ -785,7 +785,31 @@ def prepare_windows_log(project_root, runtime_paths, snapshot, *, create_empty_f
 # Instance records are observations, not proof of ownership or authority to
 # signal a process/send credentials. The consumer must independently verify
 # process identity, held locks, installation trust and the connected peer.
+#
+# POSIX records use schema 4 (stable volume UUID + directory inode). Schema 2
+# (boot-local st_dev + inode) remains readable so an upgrade can be staged
+# record by record; Windows keeps schema 2 records and its schema 3 active
+# locator unchanged.
 INSTANCE_SCHEMA = 2
+POSIX_RECORD_SCHEMA = 4
+WINDOWS_ACTIVE_SCHEMA = 3
+VOLUME_IDENTITY_KIND = "macos_volume_uuid"
+
+# Read/judge separation verdicts; only SAME and LEGACY_SAME_BOOT pass unchanged.
+IDENTITY_SAME = "SAME"
+IDENTITY_LEGACY_SAME_BOOT = "LEGACY_SAME_BOOT"
+IDENTITY_LEGACY_OTHER_BOOT = "LEGACY_OTHER_BOOT"
+IDENTITY_INODE_CHANGED = "INODE_CHANGED"
+IDENTITY_VOLUME_CHANGED = "VOLUME_CHANGED"
+IDENTITY_UNAVAILABLE = "UNAVAILABLE"
+IDENTITY_INVALID = "INVALID"
+
+_UNVERIFIED_ERRORS = {
+    IDENTITY_LEGACY_OTHER_BOOT: "installation_identity_unverified",
+    IDENTITY_INODE_CHANGED: "installation_changed",
+    IDENTITY_VOLUME_CHANGED: "installation_changed",
+    IDENTITY_INVALID: "record_unavailable",
+}
 
 
 def process_start_identity(pid: int) -> dict | None:
@@ -1111,6 +1135,278 @@ def verify_record_directory(state_dir: str | os.PathLike[str], *, _capture=None)
         raise PreflightError("protection_unavailable", "Directory protection unavailable") from None
 
 
+@dataclass(frozen=True)
+class RootEvidence:
+    """One boot's observation of the stable project-root identity.
+
+    ``device`` is a boot-local mount number used only to compare against a
+    legacy schema-2 record in this same boot; it is never persisted.
+    """
+
+    kind: str
+    uuid: str
+    inode: int
+    device: int
+
+    def record(self) -> dict:
+        return {"kind": self.kind, "uuid": self.uuid, "inode": self.inode}
+
+
+def _darwin_volume_uuid(path: str) -> str | None:
+    """Return the APFS/HFS+ volume UUID for a path, normalized or None.
+
+    ``fgetattrlist`` does not return this attribute for a directory fd on
+    macOS, so the path form is required. Callers cross-check the fd identity
+    around this call; it is not by itself a proof against path replacement.
+    """
+    import ctypes
+    import sys
+    if os.name != "posix" or sys.platform != "darwin":
+        return None
+
+    class AttrList(ctypes.Structure):
+        _fields_ = [("bitmapcount", ctypes.c_uint16), ("reserved", ctypes.c_uint16),
+                    ("commonattr", ctypes.c_uint32), ("volattr", ctypes.c_uint32),
+                    ("dirattr", ctypes.c_uint32), ("fileattr", ctypes.c_uint32),
+                    ("forkattr", ctypes.c_uint32)]
+
+    try:
+        libc = ctypes.CDLL(None, use_errno=True)
+        call = libc.getattrlist
+        call.argtypes = [ctypes.c_char_p, ctypes.POINTER(AttrList), ctypes.c_void_p,
+                         ctypes.c_size_t, ctypes.c_uint32]
+        call.restype = ctypes.c_int
+        # ATTR_BIT_MAP_COUNT=5, ATTR_VOL_INFO|ATTR_VOL_UUID, FSOPT_NOFOLLOW=1.
+        attrs = AttrList(5, 0, 0, 0x80000000 | 0x00040000, 0, 0, 0)
+        buffer = ctypes.create_string_buffer(40)
+        if call(os.fsencode(path), ctypes.byref(attrs), buffer, len(buffer), 1) != 0:
+            return None
+        raw = buffer.raw
+        if int.from_bytes(raw[:4], "little") != 20:
+            return None
+        value = raw[4:20]
+    except (OSError, AttributeError, ValueError, TypeError):
+        return None
+    if not any(value):
+        return None
+    digits = value.hex()
+    return f"{digits[0:8]}-{digits[8:12]}-{digits[12:16]}-{digits[16:20]}-{digits[20:32]}"
+
+
+def collect_root_structure(state_dir: str | os.PathLike[str]) -> tuple[int, int]:
+    """Verify the fixed directory structure/protection without its UUID.
+
+    Used only where an unavailable volume UUID is reported rather than turned
+    into a refusal (plain stop and read-only status). A detected identity
+    change still fails closed.
+    """
+    if os.name == "nt":
+        raise PreflightError("volume_identity_unavailable", "Volume identity unavailable")
+    state = Path(state_dir)
+    first = verify_record_directory(state)
+    try:
+        root_stat = state.parent.lstat()
+        state_stat = state.lstat()
+    except OSError:
+        raise PreflightError("identity_evidence_changed", "Directory identity unavailable") from None
+    if (root_stat.st_dev, root_stat.st_ino) != first or not stat.S_ISDIR(root_stat.st_mode):
+        raise PreflightError("identity_evidence_changed", "Directory identity changed")
+    if state_stat.st_dev != root_stat.st_dev:
+        raise PreflightError("identity_evidence_changed", "Directory volume changed")
+    return first
+
+
+def collect_root_identity(state_dir: str | os.PathLike[str]) -> RootEvidence:
+    """Return verified stable identity evidence for the project root.
+
+    The directory protection pass opens the directory with O_NOFOLLOW and
+    compares fd and path ``(st_dev, st_ino)``. That evidence is re-verified
+    after the path-based volume probe to compress the replacement window.
+    A missing/zero UUID is an explicit UNAVAILABLE, never a downgrade.
+    """
+    if os.name == "nt":
+        raise PreflightError("volume_identity_unavailable", "Volume identity unavailable")
+    state = Path(state_dir)
+    first = collect_root_structure(state)
+    uuid = _darwin_volume_uuid(str(state.parent))
+    if uuid is None or not _is_volume_uuid(uuid):
+        raise PreflightError("volume_identity_unavailable", "Volume identity unavailable")
+    if verify_record_directory(state) != first:
+        raise PreflightError("identity_evidence_changed", "Directory identity changed")
+    return RootEvidence(VOLUME_IDENTITY_KIND, uuid, first[1], first[0])
+
+
+def verify_fixed_state_directory(state_dir: str | os.PathLike[str]) -> None:
+    """Verify the fixed state directory and collect its stable identity.
+
+    A missing/zero volume UUID, a changed directory identity or an unreadable
+    path fails closed. This is the startup/reload form only; plain status/off
+    never collect it and rely on structure plus live process/lock evidence.
+    """
+    collect_root_identity(state_dir)
+
+
+def _is_volume_uuid(value) -> bool:
+    import re
+    return isinstance(value, str) and re.fullmatch(
+        r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}", value) is not None
+
+
+def _stable_identity_shape(value) -> bool:
+    return (isinstance(value, dict) and set(value) == {"kind", "uuid", "inode"}
+            and value.get("kind") == VOLUME_IDENTITY_KIND and _is_volume_uuid(value.get("uuid"))
+            and type(value.get("inode")) is int and value["inode"] > 0)
+
+
+def _legacy_identity_shape(value) -> bool:
+    return (isinstance(value, dict) and set(value) == {"device", "inode"}
+            and type(value.get("device")) is int and type(value.get("inode")) is int
+            and value["inode"] > 0)
+
+
+def judge_installation_identity(install: dict, evidence: RootEvidence) -> str:
+    """Compare an already-read install record with current evidence."""
+    ident = install.get("root_identity") if isinstance(install, dict) else None
+    schema = install.get("schema") if isinstance(install, dict) else None
+    if schema == POSIX_RECORD_SCHEMA:
+        if not _stable_identity_shape(ident):
+            return IDENTITY_INVALID
+        if ident["uuid"] != evidence.uuid:
+            return IDENTITY_VOLUME_CHANGED
+        if ident["inode"] != evidence.inode:
+            return IDENTITY_INODE_CHANGED
+        return IDENTITY_SAME
+    if schema == INSTANCE_SCHEMA:
+        if not _legacy_identity_shape(ident):
+            return IDENTITY_INVALID
+        if ident["inode"] != evidence.inode:
+            return IDENTITY_INODE_CHANGED
+        # st_dev is boot-local, so equality only means "same boot as recorded".
+        return (IDENTITY_LEGACY_SAME_BOOT if ident["device"] == evidence.device
+                else IDENTITY_LEGACY_OTHER_BOOT)
+    return IDENTITY_INVALID
+
+
+@dataclass(frozen=True)
+class InstallationIdentity:
+    verdict: str
+    evidence: RootEvidence | None = None
+    code: str | None = None
+
+
+def installation_identity(state_dir: str | os.PathLike[str], install: dict) -> InstallationIdentity:
+    """Judge a read install record; collection failures become UNAVAILABLE."""
+    try:
+        evidence = collect_root_identity(state_dir)
+    except PreflightError as exc:
+        if exc.code in ("volume_identity_unavailable", "identity_evidence_changed"):
+            return InstallationIdentity(IDENTITY_UNAVAILABLE, None, exc.code)
+        raise
+    return InstallationIdentity(judge_installation_identity(install, evidence), evidence)
+
+
+def require_installation_identity(state_dir, install) -> RootEvidence:
+    """Fail closed unless the recorded install is this same stable directory."""
+    judged = installation_identity(state_dir, install)
+    if judged.verdict in (IDENTITY_SAME, IDENTITY_LEGACY_SAME_BOOT):
+        return judged.evidence
+    if judged.verdict == IDENTITY_UNAVAILABLE:
+        raise PreflightError(judged.code or "volume_identity_unavailable",
+                             "Volume identity unavailable")
+    raise PreflightError(_UNVERIFIED_ERRORS.get(judged.verdict, "record_unavailable"),
+                         "Installation identity unverified")
+
+
+def _lock_volume_identity(path, *, device: int, inode: int) -> RootEvidence:
+    """Collect stable volume evidence for one lock file's own path.
+
+    A lock may be configured on a different volume from the project root, so
+    only the lock's own path is consulted. The path identity is read before and
+    after the path-based UUID probe; a missing/zero UUID, an unreadable path or
+    any identity change around the probe fails closed and is never downgraded.
+    """
+    if os.name == "nt":
+        raise PreflightError("volume_identity_unavailable", "Volume identity unavailable")
+    if type(device) is not int or type(inode) is not int or inode <= 0:
+        raise PreflightError("identity_evidence_changed", "Lock evidence changed")
+    try:
+        before = os.lstat(path)
+    except OSError:
+        raise PreflightError("identity_evidence_changed", "Lock evidence changed") from None
+    if not stat.S_ISREG(before.st_mode) or (before.st_dev, before.st_ino) != (device, inode):
+        raise PreflightError("identity_evidence_changed", "Lock evidence changed")
+    uuid = _darwin_volume_uuid(os.fspath(path))
+    if uuid is None or not _is_volume_uuid(uuid):
+        raise PreflightError("volume_identity_unavailable", "Volume identity unavailable")
+    try:
+        after = os.lstat(path)
+    except OSError:
+        raise PreflightError("identity_evidence_changed", "Lock evidence changed") from None
+    if (after.st_dev, after.st_ino) != (device, inode):
+        raise PreflightError("identity_evidence_changed", "Lock evidence changed")
+    return RootEvidence(VOLUME_IDENTITY_KIND, uuid, inode, device)
+
+
+def stable_lock_record(lock_path, *, device: int, inode: int) -> dict:
+    """Build a persistable lock identity from the lock file's own path."""
+    return _lock_volume_identity(lock_path, device=device, inode=inode).record()
+
+
+def lock_identity_matches(recorded, current: dict, *, require_same_boot: bool,
+                          current_device: int | None = None) -> bool:
+    """Compare a recorded lock identity with the current stable observation.
+
+    Schema 4 must match uuid and inode exactly. Schema 2 additionally requires
+    the same boot because its device is boot-local; ``current_device`` supplies
+    that boot-local mount number because the current observation is itself the
+    stable form (``current`` keeps a ``device`` key only on Windows).
+    ``require_same_boot`` is False only in the cross-boot contexts allowed by
+    the design: the server's stale-instance judgment for a schema-4-verified
+    install, the stop-first locate/release checks, and interactive rebinding.
+    Live checks keep it True. Schema-4 records never consult it and stay exact.
+    """
+    if not isinstance(recorded, dict) or not isinstance(current, dict):
+        return False
+    if recorded.get("kind") == VOLUME_IDENTITY_KIND or "uuid" in recorded:
+        return _stable_identity_shape(recorded) and recorded["uuid"] == current.get("uuid") \
+            and recorded["inode"] == current.get("inode")
+    if not _legacy_identity_shape(recorded):
+        return False
+    if recorded["inode"] != current.get("inode"):
+        return False
+    if not require_same_boot:
+        return True
+    device = current.get("device") if current_device is None else current_device
+    return type(device) is int and recorded["device"] == device
+
+
+def lock_identity_requires_same_boot(record) -> bool:
+    """Whether a lock record's boot-local device is part of its identity.
+
+    Judged per owning record, never as a global switch: only schema 2 stores
+    a boot-local ``st_dev``. Schema 4 keeps the exact uuid+inode comparison,
+    so it is False here. Anything unrecognized keeps the requirement, so a
+    malformed record cannot opt out of the boot check. A mixed 2/4 set is
+    exactly the resumable state left by an interrupted migration.
+    """
+    return not (isinstance(record, dict) and record.get("schema") == POSIX_RECORD_SCHEMA)
+
+
+def lock_identity_matches_observed(recorded, identity, *,
+                                   require_same_boot: bool) -> bool:
+    """Compare a recorded lock identity with one inspected path identity.
+
+    The stable volume UUID is always collected. A missing/zero UUID, an
+    unreadable path or an observed identity change fails closed; no caller
+    degrades a schema-4 record to its inode alone. ``require_same_boot`` keeps
+    a schema-2 record's boot-local device comparable.
+    """
+    current = stable_lock_record(identity.canonical, device=identity.device,
+                                 inode=identity.inode)
+    return lock_identity_matches(recorded, current, require_same_boot=require_same_boot,
+                                 current_device=identity.device)
+
+
 def _record_target(state_dir: Path, name: str) -> Path:
     if name not in ("install.json", "active.json", "last_good_paths.json"):
         raise PreflightError("record_name_invalid", "Invalid instance record name")
@@ -1224,8 +1520,7 @@ def _check_record_target(path: Path) -> dict | None:
         if len(raw) > 65536:
             raise ValueError("record too large")
         data = json.loads(raw.decode("utf-8"))
-        if (not isinstance(data, dict) or data.get("schema") != INSTANCE_SCHEMA
-                or data.get("record") != path.stem
+        if (not isinstance(data, dict) or data.get("record") != path.stem
                 or not _valid_record(data, path.stem, path.parent)):
             raise ValueError("unknown record")
         return data
@@ -1371,8 +1666,6 @@ def _windows_write_instance_record(state_dir, name, record, *, anchor, legacy) -
                     or str(state) != snapshot.as_dict()["state_dir"].canonical):
                 raise PreflightError("locks_unverified", "Lock installation does not match record")
             if (not isinstance(record, dict)
-                    or (record.get("schema") != INSTANCE_SCHEMA
-                        and not (name == "active.json" and record.get("schema") == 3))
                     or record.get("record") != PureWindowsPath(name).stem
                     or not _valid_record(record, PureWindowsPath(name).stem, state)):
                 raise PreflightError("record_invalid", "Invalid instance record")
@@ -1586,8 +1879,7 @@ def write_instance_record(state_dir: str | os.PathLike[str], name: str, record: 
             raise PreflightError("locks_unverified", "Lock installation does not match record")
         protection_before = []
         verify_record_directory(state, _capture=protection_before)
-        if (not isinstance(record, dict) or record.get("schema") != INSTANCE_SCHEMA
-                or record.get("record") != target.stem
+        if (not isinstance(record, dict) or record.get("record") != target.stem
                 or not _valid_record(record, target.stem, state)):
             raise PreflightError("record_invalid", "Invalid instance record")
         _check_record_target(target)
@@ -1640,20 +1932,58 @@ def _hex_id(value) -> bool:
     return isinstance(value, str) and re.fullmatch(r"[0-9a-f]{32}", value) is not None
 
 
+def _record_schema_ok(record, name: str) -> bool:
+    """Per-record accepted schema set; POSIX reads 2 and 4, Windows unchanged."""
+    if not isinstance(record, dict):
+        return False
+    schema = record.get("schema")
+    if os.name == "nt":
+        return schema == INSTANCE_SCHEMA or (name == "active" and schema == WINDOWS_ACTIVE_SCHEMA)
+    return type(schema) is int and schema in (INSTANCE_SCHEMA, POSIX_RECORD_SCHEMA)
+
+
+def _valid_identity_history(value) -> bool:
+    import re
+    if value is None:
+        return True
+    if not isinstance(value, list) or len(value) > 8:
+        return False
+    for entry in value:
+        if not isinstance(entry, dict) or set(entry) != {"time", "reason", "old", "new", "source"}:
+            return False
+        if (not isinstance(entry["time"], str)
+                or re.fullmatch(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z", entry["time"]) is None
+                or not isinstance(entry["reason"], str)
+                or re.fullmatch(r"[a-z_]{1,64}", entry["reason"]) is None
+                or not isinstance(entry["source"], str)
+                or not entry["source"].strip() or len(entry["source"].strip()) > 256
+                or "\x00" in entry["source"]
+                or not _legacy_identity_shape(entry["old"])
+                or not _stable_identity_shape(entry["new"])):
+            return False
+    return True
+
+
+def _valid_root_identity(schema, ident) -> bool:
+    return (_stable_identity_shape(ident) if schema == POSIX_RECORD_SCHEMA
+            else _legacy_identity_shape(ident))
+
+
 def _valid_record(record: dict, name: str, state_dir: Path) -> bool:
     """Validate public on-disk schema; never grant trust based on a field."""
     if os.name == "nt" and name == "active" and isinstance(record, dict) and record.get("schema") == 3:
         return _valid_windows_active(record, state_dir)
-    if (not isinstance(record, dict) or record.get("schema") != INSTANCE_SCHEMA
+    if (not _record_schema_ok(record, name)
             or record.get("record") != name or not _hex_id(record.get("install_id"))
             or record.get("project_root") != str(state_dir.parent)):
         return False
+    schema = record["schema"]
     if name == "install":
         ident = record.get("root_identity")
         started = record.get("ever_started")
         nonce = record.get("last_instance_nonce")
-        return (isinstance(ident, dict) and type(ident.get("device")) is int
-                and type(ident.get("inode")) is int and ident["inode"] > 0
+        return (_valid_root_identity(schema, ident)
+                and _valid_identity_history(record.get("identity_history"))
                 and type(started) is bool and (not started and nonce is None or started and _hex_id(nonce))
                 and isinstance(record.get("initialization_source"), str)
                 and bool(record["initialization_source"].strip()))
@@ -1687,8 +2017,8 @@ def _valid_record(record: dict, name: str, state_dir: Path) -> bool:
             return False
     elif type(start.get("ticks_100ns")) is not int or start["ticks_100ns"] <= 0:
         return False
-    return all(isinstance(locks[k], dict) and type(locks[k].get("device")) is int
-               and type(locks[k].get("inode")) is int and locks[k]["inode"] > 0 for k in locks)
+    validate = _stable_identity_shape if schema == POSIX_RECORD_SCHEMA else _legacy_identity_shape
+    return all(validate(locks[k]) for k in locks)
 
 
 def _valid_windows_active(record, state_dir) -> bool:
@@ -1752,9 +2082,13 @@ def read_instance_set(state_dir: str | os.PathLike[str]) -> dict | None:
         if active is not None or last is not None:
             raise PreflightError("records_inconsistent", "Instance initialization is unknown")
         return None
-    identity = verify_record_directory(state)
-    if install["root_identity"] != {"device": identity[0], "inode": identity[1]}:
-        raise PreflightError("installation_changed", "Installation identity changed")
+    if os.name == "nt":
+        # Windows records and startup path are unchanged: keep the legacy
+        # boot-local identity equality here. POSIX identity is judged by
+        # installation_identity() so reading and judging stay separate.
+        identity = verify_record_directory(state)
+        if install["root_identity"] != {"device": identity[0], "inode": identity[1]}:
+            raise PreflightError("installation_changed", "Installation identity changed")
     if not install["ever_started"]:
         if active is not None or last is not None:
             raise PreflightError("records_inconsistent", "Instance records are inconsistent")
@@ -1828,14 +2162,19 @@ def initialize_installation(anchor, legacy, listener, *, listen: dict, source: s
         if current != snapshot:
             raise PreflightError("preflight_changed", "Runtime paths changed")
         state = Path(ids["state_dir"].canonical)
-        root_dev, root_ino = verify_record_directory(state)
+        if os.name == "nt":
+            root_dev, root_ino = verify_record_directory(state)
+            identity = {"device": root_dev, "inode": root_ino}
+            schema = INSTANCE_SCHEMA
+        else:
+            identity = collect_root_identity(state).record()
+            schema = POSIX_RECORD_SCHEMA
         if read_instance_set(state) is not None:
             raise PreflightError("already_initialized", "Installation is already initialized")
         if precommit_check is not None:
             precommit_check()
-        record = {"schema": INSTANCE_SCHEMA, "record": "install", "install_id": uuid.uuid4().hex,
-                  "project_root": snapshot.project_root,
-                  "root_identity": {"device": root_dev, "inode": root_ino},
+        record = {"schema": schema, "record": "install", "install_id": uuid.uuid4().hex,
+                  "project_root": snapshot.project_root, "root_identity": identity,
                   "initialization_source": source.strip(), "ever_started": False,
                   "last_instance_nonce": None}
         try:
@@ -1860,6 +2199,270 @@ def initialize_installation(anchor, legacy, listener, *, listen: dict, source: s
         raise
     except (OSError, AttributeError, ValueError, KeyError, TypeError):
         raise PreflightError("initialization_unverified", "Initialization could not be verified") from None
+
+
+def _utc_stamp() -> str:
+    import datetime
+    return datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+
+
+def _utc_time() -> str:
+    import datetime
+    return datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _private_directory(path: Path) -> None:
+    try:
+        os.mkdir(path, 0o700)
+    except FileExistsError:
+        pass
+    _verify_directory(path, private=True)
+
+
+def _write_backup_record(path: Path, data: bytes) -> None:
+    """Create a 0600 backup once; an existing backup is verified, never replaced."""
+    flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC
+    try:
+        fd = os.open(path, flags)
+    except FileNotFoundError:
+        fd = None
+    if fd is not None:
+        try:
+            info = os.fstat(fd)
+            if (not stat.S_ISREG(info.st_mode) or info.st_nlink != 1
+                    or info.st_uid != os.geteuid() or info.st_mode & 0o077):
+                raise PreflightError("record_backup_failed", "Backup protection unavailable")
+            verify_no_extended_acl(fd)
+            verify_local_filesystem_fd(fd)
+            with os.fdopen(fd, "rb", closefd=False) as stream:
+                existing = stream.read(65537)
+            if existing != data:
+                raise PreflightError("record_backup_failed", "Existing backup differs")
+        finally:
+            os.close(fd)
+        return
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
+    try:
+        os.fchmod(fd, 0o600)
+        verify_no_extended_acl(fd)
+        verify_local_filesystem_fd(fd)
+        with os.fdopen(fd, "wb", closefd=False) as stream:
+            stream.write(data)
+            stream.flush()
+            os.fsync(stream.fileno())
+        info = os.fstat(fd)
+        if (not stat.S_ISREG(info.st_mode) or info.st_nlink != 1
+                or info.st_uid != os.geteuid() or info.st_mode & 0o077):
+            raise PreflightError("record_backup_failed", "Backup identity unavailable")
+    finally:
+        os.close(fd)
+
+
+def backup_installation_records(state_dir, records: dict) -> Path:
+    """Copy the present records into a protected per-attempt backup directory.
+
+    A resumed migration can start within the same second, so an existing
+    ``identity-v2-<UTC>`` directory is never reused: the attempt gets a numeric
+    suffix instead. Existing backups are neither moved nor overwritten.
+    """
+    import json
+    state = Path(state_dir)
+    verify_record_directory(state)
+    backups = state / "backups"
+    _private_directory(backups)
+    stamp = "identity-v2-" + _utc_stamp()
+    target = None
+    for suffix in [""] + [f"-{index}" for index in range(1, 100)]:
+        candidate = backups / (stamp + suffix)
+        try:
+            os.mkdir(candidate, 0o700)
+        except FileExistsError:
+            continue
+        except OSError:
+            raise PreflightError("record_backup_failed", "Backup directory unavailable") from None
+        target = candidate
+        break
+    if target is None:
+        raise PreflightError("record_backup_failed", "Backup directory unavailable")
+    _verify_directory(target, private=True)
+    for file_name, key in (("install.json", "install"), ("active.json", "active"),
+                           ("last_good_paths.json", "last_good_paths")):
+        record = records.get(key)
+        if record is None:
+            continue
+        data = json.dumps(record, ensure_ascii=True, sort_keys=True,
+                          separators=(",", ":")).encode("utf-8")
+        _write_backup_record(target / file_name, data)
+    verify_record_directory(state)
+    return target
+
+
+def upgraded_installation_records(records: dict, evidence: RootEvidence, lock_ids: dict) -> dict:
+    """Pure schema-2 -> schema-4 upgrade; identity-free fields are preserved."""
+    result = {}
+    for name in ("install", "active", "last_good_paths"):
+        record = records.get(name)
+        if record is None:
+            result[name] = None
+            continue
+        schema = record.get("schema")
+        if schema not in (INSTANCE_SCHEMA, POSIX_RECORD_SCHEMA):
+            raise PreflightError("record_invalid", "Unsupported instance record schema")
+        if schema == POSIX_RECORD_SCHEMA:
+            result[name] = record
+            continue
+        upgraded = dict(record, schema=POSIX_RECORD_SCHEMA)
+        if name == "install":
+            upgraded["root_identity"] = evidence.record()
+        elif name == "active":
+            upgraded["locks"] = {role: dict(lock_ids[role]) for role in ("anchor", "legacy")}
+        result[name] = upgraded
+    return result
+
+
+def migrate_installation(state_dir, records: dict, evidence: RootEvidence, lock_ids: dict, *,
+                         anchor, legacy, before_active=None) -> dict:
+    """Upgrade a legacy record set in install -> active -> last_good order.
+
+    The protected backup exists before any rewrite. A failure is reported as
+    the write error; records are never rolled back or deleted, so a mixed 2/4
+    set remains readable and the migration can resume.
+    """
+    if os.name == "nt":
+        raise PreflightError("record_invalid", "POSIX record migration is unavailable")
+    state = Path(state_dir)
+    upgraded = upgraded_installation_records(records, evidence, lock_ids)
+    backup_installation_records(state, records)
+    for name in ("install", "active", "last_good_paths"):
+        if records.get(name) is None or upgraded[name] == records[name]:
+            continue
+        if name == "active" and before_active is not None:
+            before_active()
+        write_instance_record(state, name + ".json", upgraded[name], anchor=anchor, legacy=legacy)
+    return upgraded
+
+
+def _rebind_stale_process_evidence(active) -> None:
+    """Require the recorded instance to have exited or be an exact zombie.
+
+    Rebinding rewrites ``active.json``'s lock identity, so the observation must
+    be proven stale before it is blessed as the current form (design §3/§5).
+    A live or unidentifiable process keeps the record untouched.
+
+    ``process_gone`` raises ``process_identity_changed`` in two different
+    situations: a reused PID whose creation time differs (exit evidence for
+    the recorded process, the same rule the server's stale-instance judgment
+    applies) and an unchanged creation time whose image changed (the recorded
+    process is still alive after an exec). Only a different creation time
+    proves the recorded process exited; an image change or an unobservable
+    identity is refused.
+    """
+    if active is None:
+        return
+    from core import platform_process
+    pid, start = active.get("pid"), active.get("process_start")
+    try:
+        gone = platform_process.process_gone(pid, start, active.get("executable"))
+    except platform_process.ProcessEvidenceError as exc:
+        if str(exc) != "process_identity_changed":
+            raise PreflightError("process_unverified",
+                                 "Previous process identity unavailable") from None
+        current = process_start_identity(pid)
+        if current is None:
+            raise PreflightError("process_unverified",
+                                 "Previous process identity unavailable") from None
+        if current != start:
+            # The recorded creation time no longer exists: PID reuse, so the
+            # recorded process is gone.
+            return
+        raise PreflightError("process_still_active",
+                             "Previous process is still active with a changed image")
+    if gone is not True:
+        raise PreflightError("process_still_active", "Previous process is still active")
+
+
+def _rebind_lock_ownership_evidence(records, evidence: RootEvidence, lock_ids) -> None:
+    """Require held locks consistent with the recorded evidence before rewriting.
+
+    Schema-2 lock records carry a boot-local device and the observed inode.
+    Recorded lock and install devices were captured in one boot, so their
+    equality only proves the lock then lived on the recorded project volume;
+    the held lock must then be on the project root's *current* volume. Equal
+    inodes alone cannot exclude a same-inode replacement on another volume:
+    a whole-volume replacement that keeps the inode passes these checks and is
+    accepted only by the explicit operator confirmation that surrounds the
+    rebinding. A lock recorded on a different volume than the recorded root
+    has no comparable stable evidence and is refused (fail closed).
+    """
+    active = records.get("active")
+    if active is None:
+        return
+    install = records.get("install")
+    recorded_root = install.get("root_identity") if isinstance(install, dict) else None
+    if not _legacy_identity_shape(recorded_root):
+        raise PreflightError("installation_identity_unverified", "Rebinding is not applicable")
+    recorded_locks = active.get("locks")
+    if not isinstance(recorded_locks, dict) or set(recorded_locks) != {"anchor", "legacy"}:
+        raise PreflightError("lock_identity_missing", "Recorded lock identity unavailable")
+    current_root = evidence.record()
+    for role in ("anchor", "legacy"):
+        recorded = recorded_locks.get(role)
+        held = lock_ids.get(role) if isinstance(lock_ids, dict) else None
+        if not _stable_identity_shape(held):
+            raise PreflightError("lock_ownership_unverified", "Held lock identity unavailable")
+        if not _legacy_identity_shape(recorded):
+            # A mixed set may already carry the stable form; it stays exact.
+            if not (_stable_identity_shape(recorded) and recorded == held):
+                raise PreflightError("lock_identity_changed",
+                                     "Recorded lock identity does not match the held lock")
+            continue
+        if recorded["inode"] != held["inode"]:
+            raise PreflightError("lock_identity_changed",
+                                 "Recorded lock identity does not match the held lock")
+        if recorded["device"] != recorded_root["device"]:
+            raise PreflightError("lock_ownership_unverified",
+                                 "Recorded lock was not on the recorded project volume")
+        if held["uuid"] != current_root["uuid"]:
+            raise PreflightError("lock_identity_changed",
+                                 "Held lock is not on the project root's current volume")
+
+
+def rebind_installation(state_dir, records: dict, evidence: RootEvidence, lock_ids: dict, *,
+                        anchor, legacy, source: str, reason: str = "legacy_other_boot") -> dict:
+    """Re-baseline a schema-2 install whose directory is unchanged.
+
+    Only called after explicit interactive confirmation. ``install_id`` and all
+    other generation fields are preserved; a bounded history records the change.
+    Before any write it proves the recorded instance is stale (design §3) and
+    that the held locks are consistent with the recorded inode/volume evidence
+    (design §5). A whole-volume replacement that keeps the inodes cannot be
+    distinguished from that evidence; the operator confirmation accepts it.
+    """
+    if os.name == "nt":
+        raise PreflightError("record_invalid", "POSIX record rebinding is unavailable")
+    install = records.get("install")
+    if not isinstance(install, dict) or install.get("schema") != INSTANCE_SCHEMA \
+            or not _legacy_identity_shape(install.get("root_identity")):
+        raise PreflightError("installation_identity_unverified", "Rebinding is not applicable")
+    if not isinstance(source, str) or not source.strip() or len(source.strip()) > 256:
+        raise PreflightError("initialization_unconfirmed", "Operator confirmation and source required")
+    _rebind_stale_process_evidence(records.get("active"))
+    _rebind_lock_ownership_evidence(records, evidence, lock_ids)
+    state = Path(state_dir)
+    old = install["root_identity"]
+    history = list(install.get("identity_history") or [])
+    history.append({"time": _utc_time(), "reason": reason,
+                    "old": {"device": old["device"], "inode": old["inode"]},
+                    "new": evidence.record(),
+                    "source": source.strip()})
+    history = history[-8:]
+    upgraded = upgraded_installation_records(records, evidence, lock_ids)
+    upgraded["install"] = dict(upgraded["install"], identity_history=history)
+    backup_installation_records(state, records)
+    for name in ("install", "active", "last_good_paths"):
+        if records.get(name) is not None:
+            write_instance_record(state, name + ".json", upgraded[name], anchor=anchor, legacy=legacy)
+    return upgraded
 
 
 def _verify_windows_held_instance_locks(anchor, legacy) -> None:

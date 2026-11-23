@@ -64,6 +64,11 @@ from .config_snapshot import (ConfigSnapshot, ConfigSnapshotError, FileMarker,
                               verify_mac_business_config, mac_config_error_code)
 from .runtime_paths import PATH_KEYS, read_runtime_paths, RuntimePathsError
 from .discovery import (inspect_runtime_identities, PreflightError, INSTANCE_SCHEMA,
+                        POSIX_RECORD_SCHEMA, IDENTITY_SAME, IDENTITY_LEGACY_SAME_BOOT,
+                        IDENTITY_LEGACY_OTHER_BOOT, IDENTITY_INODE_CHANGED, IDENTITY_VOLUME_CHANGED,
+                        IDENTITY_UNAVAILABLE, IDENTITY_INVALID,
+                        installation_identity, stable_lock_record, lock_identity_matches,
+                        migrate_installation,
                         process_start_identity, process_executable, write_instance_record,
                         read_instance_record, read_instance_set, initialize_installation,
                         verify_record_directory, verify_held_instance_locks,
@@ -4623,7 +4628,7 @@ def _windows_startup_recovery_detail(exc):
     return f": cause={cause} records=unverified rollback=not_attempted"
 
 
-def _instance_observation(server, anchor, legacy, install):
+def _instance_observation(server, anchor, legacy, install, evidence=None):
     """Protected record data, not proof of current process or peer ownership."""
     pid = os.getpid()
     nonce = os.environ.get("MODEL_PROXY_START_NONCE")
@@ -4634,14 +4639,15 @@ def _instance_observation(server, anchor, legacy, install):
     identities = legacy.snapshot.as_dict()
     if os.name == "nt":
         locks = _lock_identities(anchor, legacy)
+        schema = INSTANCE_SCHEMA
     else:
-        locks = {}
-        for name, held in (("anchor", anchor), ("legacy", legacy)):
-            info = os.fstat(held.fileno())
-            locks[name] = {"device": info.st_dev, "inode": info.st_ino}
+        if evidence is None:
+            raise PreflightError("volume_identity_unavailable", "Volume identity unavailable")
+        locks = _lock_identities(anchor, legacy)
+        schema = POSIX_RECORD_SCHEMA
     host, port = server.server_address[:2]
     return {
-        "schema": INSTANCE_SCHEMA, "record": "active", "state": "STARTING",
+        "schema": schema, "record": "active", "state": "STARTING",
         "instance_nonce": nonce, "pid": pid,
         "process_start": process_start_identity(pid),
         "executable": process_executable(pid),
@@ -4732,18 +4738,51 @@ def _lock_identities(anchor, legacy):
     result = {}
     for name, held in (("anchor", anchor), ("legacy", legacy)):
         info = os.fstat(held.fileno())
-        result[name] = {"device": info.st_dev, "inode": info.st_ino}
+        identity = held.snapshot.as_dict()[held.role]
+        result[name] = stable_lock_record(identity.canonical, device=info.st_dev, inode=info.st_ino)
     return result
 
 
-def _ensure_stale_instance(records, current_paths, current_listen, lock_ids):
-    """Reject path/lock drift and require the previous PID to have exited or changed."""
+def _upgrade_allows_boot_drift(records) -> bool:
+    """Whether this record set may tolerate a schema-2 lock record's boot drift.
+
+    Only a mixed 2/4 set left by an interrupted migration qualifies: the
+    install record is already schema 4 and was verified as ``SAME`` by the
+    caller, while some instance record is still schema 2 (design §3). A pure
+    schema-2 set has no schema-4-verified evidence and must stay exact.
+    """
+    if not isinstance(records, dict):
+        return False
+    install = records.get("install")
+    if not isinstance(install, dict) or install.get("schema") != POSIX_RECORD_SCHEMA:
+        return False
+    return any(isinstance(records.get(name), dict)
+               and records[name].get("schema") == INSTANCE_SCHEMA
+               for name in ("active", "last_good_paths"))
+
+
+def _ensure_stale_instance(records, current_paths, current_listen, lock_ids, *,
+                           allow_boot_drift=False, lock_devices=None):
+    """Reject path/lock drift and require the previous PID to have exited or changed.
+
+    ``allow_boot_drift`` is only used while both locks are held, the install
+    identity has been verified in its schema-4 form, and the recorded lock is
+    schema 2 with an equal inode (see ``_upgrade_allows_boot_drift``). Process
+    evidence is still required below. ``lock_devices`` supplies this boot's
+    mount numbers; a schema-2 lock record needs them and they cannot be part
+    of the stable ``lock_ids`` form.
+    """
     active = records["active"]
     if active is None:
         return
     if active["runtime_paths"] != current_paths:
         raise PreflightError("runtime_drift", "Runtime paths changed; migration required")
-    if active["locks"] != lock_ids:
+    devices = lock_devices or {}
+    if set(active["locks"]) != {"anchor", "legacy"} or any(
+            not lock_identity_matches(active["locks"][role], lock_ids.get(role),
+                                      require_same_boot=not allow_boot_drift,
+                                      current_device=devices.get(role))
+            for role in ("anchor", "legacy")):
         raise PreflightError("lock_identity_changed", "Previous lock identities changed")
     pid = active["pid"]
     if os.name == "nt":
@@ -4772,6 +4811,20 @@ def _ensure_stale_instance(records, current_paths, current_listen, lock_ids):
         raise PreflightError("process_unverified", "Previous process identity unavailable")
     if current == active["process_start"]:
         raise PreflightError("process_still_active", "Previous process is still active")
+
+
+def _fail_installation_identity(judged):
+    """Map an identity verdict to its fixed startup failure code."""
+    if judged.verdict == IDENTITY_UNAVAILABLE:
+        raise PreflightError(judged.code or "volume_identity_unavailable",
+                             "Volume identity unavailable")
+    if judged.verdict == IDENTITY_LEGACY_OTHER_BOOT:
+        # A direct service start never rebinds; the operator must use the CLI.
+        raise PreflightError("installation_identity_unverified",
+                             "Installation identity unverified; use the CLI")
+    if judged.verdict in (IDENTITY_INODE_CHANGED, IDENTITY_VOLUME_CHANGED):
+        raise PreflightError("installation_changed", "Installation identity changed")
+    raise PreflightError("record_unavailable", "Installation record invalid")
 
 
 def _same_configured_listener(configured, previous):
@@ -5152,11 +5205,38 @@ def _run_server(config_path, listen_cfg, anchor, legacy, *, initial_private=None
     _check_config_targets(_runtime_paths, config_path)
     state_dir = Path(legacy.snapshot.as_dict()["state_dir"].canonical)
     records = read_instance_set(state_dir)
+    evidence = None
+    needs_upgrade = False
+    allow_boot_drift = False
+    if os.name != "nt" and records is not None:
+        judged = installation_identity(state_dir, records["install"])
+        evidence = judged.evidence
+        if judged.verdict not in (IDENTITY_SAME, IDENTITY_LEGACY_SAME_BOOT):
+            _fail_installation_identity(judged)
+        # An interrupted upgrade leaves a mixed 2/4 set that must finish here,
+        # under both locks, before publishing. The migration trigger is any
+        # schema-2 record; boot-drift tolerance is narrower and additionally
+        # requires the install record to be the schema-4 form verified above.
+        needs_upgrade = any(
+            records[name] is not None and records[name]["schema"] == INSTANCE_SCHEMA
+            for name in ("install", "active", "last_good_paths"))
+        allow_boot_drift = _upgrade_allows_boot_drift(records)
     active = None if records is None else records["active"]
     current_paths = {key: legacy.snapshot.as_dict()[key].canonical for key in PATH_KEYS}
     lock_ids = _lock_identities(anchor, legacy)
+    lock_devices = None
+    if os.name != "nt":
+        # Boot-local mount numbers for legacy lock records; they are not part
+        # of the stable identity and a missing entry fails closed downstream.
+        snapshot = legacy.snapshot.as_dict()
+        lock_devices = {role: getattr(snapshot.get(key), "device", None)
+                        for role, key in (("anchor", "anchor.lock"), ("legacy", "lock"))}
     if active is not None:
-        _ensure_stale_instance(records, current_paths, listen_cfg, lock_ids)
+        # Judge the previous instance before reserving its endpoint. A
+        # LEGACY_SAME_BOOT upgrade may tolerate a boot-local device change,
+        # but still requires an equal inode and an exited process.
+        _ensure_stale_instance(records, current_paths, listen_cfg, lock_ids,
+                               allow_boot_drift=allow_boot_drift, lock_devices=lock_devices)
     migration = (active is not None and not _same_configured_listener(listen_cfg, active["listen"]))
     # Every startup must revalidate the stopped/current ledger, even if the
     # listen endpoint did not change or no earlier instance exists.
@@ -5173,14 +5253,18 @@ def _run_server(config_path, listen_cfg, anchor, legacy, *, initial_private=None
         _require_windows_listener_validation()
         if migration:
             old_listener = listeners.enter_context(_reserve_previous_listener(active["listen"]))
-            _ensure_stale_instance(records, current_paths, listen_cfg, lock_ids)
+            _ensure_stale_instance(records, current_paths, listen_cfg, lock_ids,
+                                   allow_boot_drift=allow_boot_drift,
+                                   lock_devices=lock_devices)
             if active["listen"]["port"] == listen_cfg["port"]:
                 old_listener.close()
         server = ProxyHTTPServer((listen_cfg["host"], listen_cfg["port"]), ModelProxyHandler)
         listeners.callback(server.server_close)
         _verify_migration_guard(guard, config_path, config_store, listen_cfg, anchor, legacy, records)
         if migration:
-            _ensure_stale_instance(records, current_paths, listen_cfg, lock_ids)
+            _ensure_stale_instance(records, current_paths, listen_cfg, lock_ids,
+                                   allow_boot_drift=allow_boot_drift,
+                                   lock_devices=lock_devices)
             old_listener.close()
         if (resolve_runtime_paths() != _runtime_paths or
                 inspect_runtime_identities(_PACKAGE_DIR, _runtime_paths) != legacy.snapshot):
@@ -5188,6 +5272,21 @@ def _run_server(config_path, listen_cfg, anchor, legacy, *, initial_private=None
         _check_config_targets(_runtime_paths, config_path)
         if read_instance_set(state_dir) != records:
             raise PreflightError("records_changed", "Instance records changed")
+        if needs_upgrade:
+            # The upgrade rewrites the record inodes, so it must run after the
+            # held-lock snapshot comparison above and before this startup
+            # publishes its own active record. A stale observation is judged
+            # once more before active.json is rewritten, with the same
+            # boot-drift tolerance the earlier judgements used.
+            def judge_stale_before_active():
+                if records["active"] is not None:
+                    _ensure_stale_instance(records, current_paths, listen_cfg, lock_ids,
+                                           allow_boot_drift=allow_boot_drift,
+                                           lock_devices=lock_devices)
+            records = migrate_installation(state_dir, records, evidence, lock_ids,
+                                           anchor=anchor, legacy=legacy,
+                                           before_active=judge_stale_before_active)
+            active = records["active"]
         if records is None or records["active"] is None:
             _check_legacy_observations(legacy.snapshot)
         if records is None:
@@ -5202,7 +5301,12 @@ def _run_server(config_path, listen_cfg, anchor, legacy, *, initial_private=None
             if records is None:
                 raise PreflightError("initialization_unverified", "Initialization did not verify")
         install = records["install"]
-        record = _instance_observation(server, anchor, legacy, install)
+        if os.name != "nt":
+            judged = installation_identity(state_dir, install)
+            if judged.verdict != IDENTITY_SAME:
+                _fail_installation_identity(judged)
+            evidence = judged.evidence
+        record = _instance_observation(server, anchor, legacy, install, evidence)
         if record["process_start"] is None or record["executable"] is None:
             raise PreflightError("process_unverified", "Current process identity unavailable")
         _ensure_stale_instance(records, record["runtime_paths"], record["listen"], record["locks"])

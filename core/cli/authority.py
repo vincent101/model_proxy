@@ -25,14 +25,29 @@ from pathlib import Path
 from typing import Mapping
 
 from core.discovery import (
+    INSTANCE_SCHEMA,
+    IDENTITY_INODE_CHANGED,
+    IDENTITY_LEGACY_OTHER_BOOT,
+    IDENTITY_LEGACY_SAME_BOOT,
+    IDENTITY_SAME,
+    IDENTITY_UNAVAILABLE,
+    IDENTITY_VOLUME_CHANGED,
     PreflightError,
     _verify_directory,
+    collect_root_identity,
     delete_instance_record_if_matches,
     inspect_runtime_identities,
     initialize_installation,
+    installation_identity,
+    lock_identity_matches,
+    lock_identity_matches_observed,
+    lock_identity_requires_same_boot,
     process_executable,
     process_start_identity,
     read_instance_set,
+    rebind_installation,
+    stable_lock_record,
+    verify_fixed_state_directory,
     verify_held_instance_locks,
     verify_local_filesystem_fd,
     verify_no_extended_acl,
@@ -40,7 +55,8 @@ from core.discovery import (
 )
 from core.cli.control import (ControlError, MacControl, StartupPending, _check_mac_new_listener,
                               _endpoint, _valid_record,
-                              INSTALL_INITIALIZED, INSTALL_UNINITIALIZED_OR_RECORD_LOST)
+                              INSTALL_CHANGED, INSTALL_IDENTITY_UNVERIFIED, INSTALL_INITIALIZED,
+                              INSTALL_UNINITIALIZED_OR_RECORD_LOST)
 from core import platform_process
 from core.listen_config import resolve_listen
 from core.platform_lock import LockError, acquire_lock, verify_local_access
@@ -390,11 +406,47 @@ class InstallationObservation:
         return ((None, None) if result is None
                 else (result["active"], result["last_good_paths"]))
 
+    def installation_identity(self) -> str | None:
+        """Return the install identity verdict, or None when uninitialized.
+
+        Used only by startup paths and the credential-bearing reload gate.
+        ``IDENTITY_UNAVAILABLE`` is returned as a verdict so that gate can
+        reject it explicitly. A detectable directory change is an explicit
+        failure here. Plain status/off never call this: they locate the
+        recorded instance structurally and prove it live instead.
+        """
+        records = self.record_set()
+        if records is None:
+            return None
+        judged = installation_identity(self._state, records["install"])
+        if judged.verdict == IDENTITY_UNAVAILABLE:
+            return judged.verdict
+        if judged.verdict not in (IDENTITY_SAME, IDENTITY_LEGACY_SAME_BOOT,
+                                  IDENTITY_LEGACY_OTHER_BOOT):
+            raise PreflightError(judged.code or "installation_changed",
+                                 "Installation identity changed")
+        return judged.verdict
+
     def installation_state(self) -> str:
-        """Classify installation metadata; missing records do not mean stopped."""
+        """Classify installation metadata; missing records do not mean stopped.
+
+        Uses the raw verdict: ``installation_identity`` raises on a changed
+        directory, while this classifier must report it so initialization can
+        offer a full rebind.
+        """
         records = self.record_set()
         if records is not None:
-            return INSTALL_INITIALIZED
+            judged = installation_identity(self._state, records["install"])
+            if judged.verdict in (IDENTITY_SAME, IDENTITY_LEGACY_SAME_BOOT):
+                return INSTALL_INITIALIZED
+            if judged.verdict == IDENTITY_LEGACY_OTHER_BOOT:
+                return INSTALL_IDENTITY_UNVERIFIED
+            if judged.verdict in (IDENTITY_INODE_CHANGED, IDENTITY_VOLUME_CHANGED):
+                return INSTALL_CHANGED
+            if judged.verdict == IDENTITY_UNAVAILABLE:
+                raise PreflightError(judged.code or "volume_identity_unavailable",
+                                     "Volume identity unavailable")
+            raise PreflightError("record_unavailable", "Installation record invalid")
         snapshot = inspect_runtime_identities(self._root, self._paths)
         with acquire_lock(snapshot, "anchor.lock", create=True,
                           access_verifier=verify_local_access):
@@ -541,6 +593,130 @@ class InstallationObservation:
                             raise PreflightError("initialization_cleanup_failed",
                                                  "Initialization cleanup unknown") from None
                         raise
+                    return True
+
+
+    def rebaseline_interactively(self, stdin, stdout) -> bool:
+        """Re-bind a schema-2 install recorded under another boot or volume.
+
+        Only the explicit TTY path may do this. The directory inode must be
+        unchanged (the verdict already proves it), the project root must match,
+        both instance locks must be held and the configured listener bound.
+        ``install_id`` and generation fields are preserved; a bounded history
+        records the rebinding.
+        """
+        _require_same_terminal(stdin, stdout)
+        self._check()
+        before = self._launch_inputs()
+        records = self.record_set()
+        if records is None or records["install"].get("schema") != INSTANCE_SCHEMA:
+            raise PreflightError("installation_identity_unverified", "Rebinding is not applicable")
+        snapshot = before[-1]
+        with acquire_lock(snapshot, "anchor.lock", create=True,
+                          access_verifier=verify_local_access) as anchor:
+            with acquire_lock(anchor.snapshot, "lock", create=True,
+                              access_verifier=verify_local_access, anchor=anchor) as legacy:
+                verify_held_instance_locks(anchor, legacy)
+                stable = self._launch_inputs()
+                old_targets, new_targets = dict(before[-2]), dict(stable[-2])
+                if old_targets["lock"] is None:
+                    old_targets["lock"] = new_targets["lock"]
+                if (before[:4] != stable[:4] or old_targets != new_targets
+                        or stable[-1] != legacy.snapshot):
+                    raise PreflightError("preflight_changed", "Launch inputs changed")
+                current = self.record_set()
+                if current != records:
+                    raise PreflightError("preflight_changed", "Installation record changed")
+                judged = installation_identity(self._state, current["install"])
+                if judged.verdict != IDENTITY_LEGACY_OTHER_BOOT or judged.evidence is None:
+                    raise PreflightError("installation_identity_unverified",
+                                         "Rebinding is not applicable")
+                if current["install"].get("project_root") != str(self._state.parent):
+                    raise PreflightError("installation_identity_unverified",
+                                         "Rebinding is not applicable")
+                lock_ids = {}
+                for name, held in (("anchor", anchor), ("legacy", legacy)):
+                    info = os.fstat(held.fileno())
+                    identity = held.snapshot.as_dict()[held.role]
+                    lock_ids[name] = stable_lock_record(identity.canonical, device=info.st_dev,
+                                                        inode=info.st_ino)
+                # The rebinding writes these held-lock identities into the
+                # active record, so the record's own locks must still describe
+                # the locks actually held. An inode change is refused here
+                # instead of being blessed by the rewrite. This is the one
+                # cross-boot recovery context: verdict LEGACY_OTHER_BOOT has
+                # already proven the install inode equal, and a schema-2 lock
+                # record's device is boot-local, so only the inode is
+                # comparable. A whole-volume replacement that keeps the inode
+                # cannot be excluded by that evidence; it is accepted only
+                # after the explicit operator confirmation below. Schema 4
+                # locks stay uuid+inode exact.
+                require_same_boot = False
+
+                def verify_recorded_locks():
+                    active = current["active"]
+                    if active is None:
+                        return
+                    for name in ("anchor", "legacy"):
+                        if not lock_identity_matches(active["locks"].get(name), lock_ids[name],
+                                                     require_same_boot=require_same_boot):
+                            raise PreflightError(
+                                "lock_identity_changed",
+                                "Recorded lock identity does not match the held lock")
+
+                verify_recorded_locks()
+                with _bound_listener(stable[3]) as listener:
+                    bound_socket = (listener.fileno(), listener.family, listener.getsockname())
+                    stdout.write(
+                        "Recorded installation identity came from another boot or volume; "
+                        "the project directory inode is unchanged.\n"
+                        "Installation/recovery source: "
+                    )
+                    stdout.flush()
+                    source = stdin.readline(512)
+                    stdout.write("Type YES to rebind this directory to the current boot: ")
+                    stdout.flush()
+                    confirmation = stdin.readline(64)
+                    if (not source.endswith("\n") or not confirmation.endswith("\n")
+                            or not source.strip() or len(source.strip()) > 256
+                            or "\x00" in source or confirmation.strip() != "YES"):
+                        return False
+
+                    def recheck_confirmed_inputs():
+                        self._check()
+                        verify_held_instance_locks(anchor, legacy)
+                        after = self._launch_inputs()
+                        before_ids, after_ids = stable[-1].as_dict(), after[-1].as_dict()
+                        if (stable[:-1] != after[:-1]
+                                or any(before_ids[name] != after_ids[name]
+                                       for name in before_ids if name != "install.json")
+                                or self.record_set() != current):
+                            raise PreflightError("preflight_changed", "Rebinding inputs changed")
+                        try:
+                            current_socket = (listener.fileno(), listener.family,
+                                              listener.getsockname())
+                            if (current_socket != bound_socket or listener.fileno() < 0
+                                    or listener.getsockopt(socket.SOL_SOCKET, socket.SO_TYPE)
+                                    != socket.SOCK_STREAM):
+                                raise PreflightError("listen_unverified", "Bound listener changed")
+                        except OSError:
+                            raise PreflightError("listen_unverified",
+                                                 "Bound listener unavailable") from None
+                        verify_recorded_locks()
+
+                    recheck_confirmed_inputs()
+                    rebound = rebind_installation(
+                        self._state, current, judged.evidence, lock_ids,
+                        anchor=anchor, legacy=legacy, source=source.strip(),
+                        reason="legacy_other_boot",
+                    )
+                    after = self.record_set()
+                    if (after is None or after["install"] != rebound["install"]
+                            or after["install"]["install_id"] != current["install"]["install_id"]
+                            or after["active"] != rebound["active"]
+                            or after["last_good_paths"] != rebound["last_good_paths"]):
+                        raise PreflightError("installation_identity_unverified",
+                                             "Rebinding did not verify")
                     return True
 
 
@@ -812,8 +988,14 @@ class _InitializationLease:
     def installation_state(self):
         return self._observation.installation_state()
 
+    def installation_identity(self):
+        return self._observation.installation_identity()
+
     def initialize_interactively(self, stdin, stdout):
         return self._observation.initialize_interactively(stdin, stdout)
+
+    def rebaseline_interactively(self, stdin, stdout):
+        return self._observation.rebaseline_interactively(stdin, stdout)
 
     def records(self):
         return self._observation.records()
@@ -822,14 +1004,17 @@ class _InitializationLease:
     def _active_unverified():
         raise ControlError("installation_identity_unknown", "no signal or credential sent")
 
-    def verify_active(self, instance):
+    def verify_active(self, instance, *, require_identity_evidence=True):
         return self._active_unverified()
 
     def assert_startable(self):
         # Do not spawn a child that this adapter cannot later verify or stop.
         return self._active_unverified()
 
-    def assert_stopped(self, instance):
+    def stop_lock_evidence(self, instance):
+        return self._active_unverified()
+
+    def assert_stopped(self, instance, *, require_identity_evidence=True):
         return self._active_unverified()
 
     def admin_token(self):
@@ -878,16 +1063,26 @@ class MacAuthorityLease(_InitializationLease):
         self._restart_records = None
         self._launch_config_pair = None
         self._token_config_pair = None
+        # Evidence standard of the last verify_active(); admin_token() repeats
+        # that same verification instead of silently re-judging identity.
+        self._verified_identity_evidence = True
+        # Device+inode of the exact fixed lock objects observed before the
+        # stop signal. assert_stopped proves these objects released; a missing
+        # capture is rejected rather than re-observed after the signal.
+        self._stop_lock_evidence = None
 
     @contextlib.contextmanager
     def stopping(self):
         previous = self._stopping
         self._stopping = True
+        self._stop_lock_evidence = None
         try:
             yield
         finally:
             self._stopping = previous
             self._verified = None
+            self._verified_identity_evidence = True
+            self._stop_lock_evidence = None
 
     def watch_start(self, pid, nonce):
         if type(pid) is not int or pid <= 1 or not re.fullmatch(r"[0-9a-f]{32}", nonce):
@@ -990,7 +1185,7 @@ class MacAuthorityLease(_InitializationLease):
         # before reporting success or sending anything. This only sleeps.
         return True
 
-    def _assert_running_anchor(self, instance):
+    def _assert_running_anchor(self, instance, *, require_identity_evidence=True):
         """Require a real flock conflict on the verified anchor, not its owner.
 
         F_GETLKPID is only a read-only early rejection, never positive proof:
@@ -998,16 +1193,26 @@ class MacAuthorityLease(_InitializationLease):
         the same verified inode is additionally required. If the anchor was
         released between probes, a briefly acquired probe is immediately
         unlocked and the result is rejected; it can race a new starter.
+
+        ``require_identity_evidence`` is False only for plain status/off. Those
+        paths still require the fixed protected anchor and a live flock
+        conflict, but must not collect a volume UUID or compare a recorded
+        inode, so an identity anomaly cannot hide a running service.
         """
         obs = self._observation
         root, paths = obs._root, instance.active["runtime_paths"]
         anchor = root / ".runtime" / "anchor.lock"
         try:
             before = inspect_runtime_identities(root, paths).as_dict()["anchor.lock"]
-            expected = instance.active["locks"]["anchor"]
-            if (not before.exists or before.canonical != str(anchor)
-                    or expected != {"device": before.device, "inode": before.inode}
-                    or not verify_local_access(anchor, "file")):
+            if not before.exists or before.canonical != str(anchor):
+                raise ControlError("anchor_unverified")
+            if require_identity_evidence:
+                verify_fixed_state_directory(root / ".runtime")
+                if not lock_identity_matches_observed(
+                        instance.active["locks"]["anchor"], before,
+                        require_same_boot=lock_identity_requires_same_boot(instance.active)):
+                    raise ControlError("anchor_unverified")
+            if not verify_local_access(anchor, "file"):
                 raise ControlError("anchor_unverified")
             verify_record_directory(root / ".runtime")
             flags = os.O_RDWR | os.O_NOFOLLOW | os.O_CLOEXEC | os.O_NONBLOCK
@@ -1041,6 +1246,7 @@ class MacAuthorityLease(_InitializationLease):
                         or not verify_local_access(anchor, "file")):
                     raise ControlError("anchor_unverified")
                 verify_record_directory(root / ".runtime")
+                return (opened.st_dev, opened.st_ino)
             finally:
                 os.close(fd)
         except ControlError:
@@ -1048,23 +1254,30 @@ class MacAuthorityLease(_InitializationLease):
         except (OSError, ValueError, TypeError, AttributeError, KeyError, PreflightError):
             raise ControlError("anchor_unverified") from None
 
-    def _assert_stop_locks(self, instance):
-        """Verify both recorded lock inodes and observe a conflict on each.
+    def _assert_stop_locks(self, instance, *, require_identity_evidence=True):
+        """Observe a conflict on both fixed locks; optionally match the record.
 
         A conflicting flock probe does not identify its owner or prove the
         conflict came from an exclusive flock. All observations are racy.
+
+        ``require_identity_evidence`` is False only for plain off: the fixed
+        lock paths, protection and flock liveness are still verified, but no
+        volume UUID is collected and no recorded inode is compared.
         """
         root = self._observation._root
         paths = instance.active["runtime_paths"]
         try:
             before = inspect_runtime_identities(root, paths)
             identity = before.as_dict()["lock"]
-            expected = instance.active["locks"]["legacy"]
             target = Path(identity.canonical)
-            if (not identity.exists or target != Path(paths["lock"])
-                    or expected != {"device": identity.device, "inode": identity.inode}):
+            if not identity.exists or target != Path(paths["lock"]):
                 raise ControlError("legacy_lock_unverified")
-            self._assert_running_anchor(instance)
+            if require_identity_evidence and not lock_identity_matches_observed(
+                    instance.active["locks"]["legacy"], identity,
+                    require_same_boot=lock_identity_requires_same_boot(instance.active)):
+                raise ControlError("legacy_lock_unverified")
+            anchor_identity = self._assert_running_anchor(
+                instance, require_identity_evidence=require_identity_evidence)
             parent_before = _verify_directory(target.parent, private=False)
             if not verify_local_access(target.parent, "directory") or not verify_local_access(target, "file"):
                 raise ControlError("legacy_lock_unverified")
@@ -1084,6 +1297,7 @@ class MacAuthorityLease(_InitializationLease):
             fd = os.open(target, flags)
             try:
                 opened = os.fstat(fd)
+                legacy_identity = (opened.st_dev, opened.st_ino)
                 if marker(original) != marker(opened):
                     raise ControlError("legacy_lock_unverified")
                 verify_local_filesystem_fd(fd)
@@ -1112,12 +1326,17 @@ class MacAuthorityLease(_InitializationLease):
                 raise ControlError("legacy_lock_unverified")
             if inspect_runtime_identities(root, paths) != before:
                 raise ControlError("legacy_lock_unverified")
+            # Record the exact lock objects verified before any signal. The
+            # release proof must succeed for these objects, not for whatever
+            # occupies the fixed paths after the process exits.
+            self._stop_lock_evidence = {"anchor": anchor_identity,
+                                        "legacy": legacy_identity}
         except ControlError:
             raise
         except (OSError, ValueError, TypeError, AttributeError, KeyError, PreflightError):
             raise ControlError("legacy_lock_unverified") from None
 
-    def verify_active(self, instance):
+    def verify_active(self, instance, *, require_identity_evidence=True):
         obs = self._observation
         self._verified = None
         records = obs.record_set()
@@ -1157,7 +1376,8 @@ class MacAuthorityLease(_InitializationLease):
                 raise ControlError("installation_identity_unknown")
         platform_process.check_identity(instance.pid, instance.start, instance.executable)
         if not self._stopping:
-            self._assert_running_anchor(instance)
+            self._assert_running_anchor(
+                instance, require_identity_evidence=require_identity_evidence)
         if obs.record_set() != records:
             raise ControlError("installation_identity_unknown")
         if self._stopping and self._restart_baseline is not None:
@@ -1174,14 +1394,26 @@ class MacAuthorityLease(_InitializationLease):
                 raise ControlError("installation_identity_unknown")
             _same_business(*launch_pair)
         if self._stopping:
-            # Both file identities and current conflicts are rechecked near
-            # every signal-bound check, without consulting mutable config.
-            self._assert_stop_locks(instance)
+            # Both lock conflicts are rechecked near every signal-bound check,
+            # without consulting mutable config; the recorded lock identity is
+            # compared only when this lease is authorized to judge it.
+            self._assert_stop_locks(
+                instance, require_identity_evidence=require_identity_evidence)
             if obs.record_set() != records:
                 raise ControlError("installation_identity_unknown")
             platform_process.check_identity(instance.pid, instance.start, instance.executable)
         self._verified = instance
+        self._verified_identity_evidence = require_identity_evidence
         return True
+
+    def _install_identity_verified(self):
+        """Whether the install record is this boot's exact schema-4 identity.
+
+        Design §3 allows a schema-2 lock record's boot-local device drift only
+        when the install identity was already verified in the schema-4 form.
+        Every other verdict (legacy, unavailable, absent) keeps the exact check.
+        """
+        return self.installation_identity() == IDENTITY_SAME
 
     def _locks_free(self, expected_records):
         obs = self._observation
@@ -1200,9 +1432,18 @@ class MacAuthorityLease(_InitializationLease):
                 active = expected_records["active"]
                 if active is not None:
                     ids = legacy.snapshot.as_dict()
+                    collect_root_identity(obs._root / ".runtime")
+                    # Both locks are now held. A schema-2 lock record may be
+                    # left from the interrupted migration's previous boot, but
+                    # only a schema-4-verified install makes that drift
+                    # tolerable (design §3); schema 4 stays exact regardless.
+                    allow_boot_drift = self._install_identity_verified()
+                    require_same_boot = (lock_identity_requires_same_boot(active)
+                                         and not allow_boot_drift)
                     for name, role in (("anchor", "anchor.lock"), ("legacy", "lock")):
-                        if active["locks"][name] != {"device": ids[role].device,
-                                                     "inode": ids[role].inode}:
+                        if not lock_identity_matches_observed(
+                                active["locks"][name], ids[role],
+                                require_same_boot=require_same_boot):
                             raise ControlError("lock_identity_changed")
 
     def assert_startable(self):
@@ -1223,7 +1464,12 @@ class MacAuthorityLease(_InitializationLease):
             raise ControlError("start_state_changed")
         active = records["active"]
         if active is not None:
-            instance = _valid_record(obs._root, active, records["last_good_paths"])
+            # The eventual permission to start still requires both locks free
+            # (and the process gone) below; a schema-4-verified install lets a
+            # schema-2 lock record from the interrupted migration's previous
+            # boot survive the read to that point. Schema 4 stays exact.
+            instance = _valid_record(obs._root, active, records["last_good_paths"],
+                                     allow_boot_drift=self._install_identity_verified())
             identities = snapshot.as_dict()
             if {key: identities[key].canonical for key in PATH_KEYS} != active["runtime_paths"]:
                 raise ControlError("configuration_migration_required",
@@ -1263,9 +1509,71 @@ class MacAuthorityLease(_InitializationLease):
             return False
         return self._launch_baseline == baseline
 
-    def assert_stopped(self, instance):
+    def stop_lock_evidence(self, instance):
+        """Record the exact fixed lock objects before any stop signal.
+
+        Only the object identity available without a volume UUID is used, so
+        plain off needs no installation identity evidence. The observed paths
+        must still be the configured fixed lock paths and the opened files must
+        carry the expected protection. A later assert_stopped proves release
+        for these objects only; replacement files at the same paths never
+        count. Any capture failure is refused by the caller before a signal.
+        """
+        obs = self._observation
+        paths = instance.active.get("runtime_paths") if isinstance(instance.active, dict) else None
+        if not isinstance(paths, dict) or set(paths) != set(PATH_KEYS):
+            raise ControlError("lock_identity_changed")
+        try:
+            verify_record_directory(obs._root / ".runtime")
+            snapshot = inspect_runtime_identities(obs._root, paths).as_dict()
+            fixed = {"anchor": obs._root / ".runtime" / "anchor.lock",
+                     "legacy": Path(paths["lock"])}
+            evidence = {}
+            flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC | os.O_NONBLOCK
+            for name, role in (("anchor", "anchor.lock"), ("legacy", "lock")):
+                identity = snapshot[role]
+                if (not identity.exists or Path(identity.canonical) != fixed[name]
+                        or identity.final_was_link):
+                    raise ControlError("lock_identity_changed")
+                fd = os.open(identity.canonical, flags)
+                try:
+                    info = os.fstat(fd)
+                    # Match the existing live lock gates exactly: both locks
+                    # need owner read/write; only the anchor must additionally
+                    # be private. A legacy 0644 lock stays stoppable.
+                    if (not stat.S_ISREG(info.st_mode) or info.st_nlink != 1
+                            or info.st_uid != os.geteuid()
+                            or info.st_mode & 0o600 != 0o600
+                            or (name == "anchor" and info.st_mode & 0o077)
+                            or (info.st_dev, info.st_ino) != (identity.device, identity.inode)):
+                        raise ControlError("lock_identity_changed")
+                    evidence[name] = (info.st_dev, info.st_ino)
+                finally:
+                    os.close(fd)
+            previous = self._stop_lock_evidence
+            if previous is not None and previous != evidence:
+                # The objects verified by the last pre-signal lock check were
+                # replaced before this final capture; refuse to signal.
+                raise ControlError("lock_identity_changed")
+            self._stop_lock_evidence = evidence
+            return evidence
+        except ControlError:
+            raise
+        except (OSError, ValueError, TypeError, KeyError, AttributeError, PreflightError):
+            raise ControlError("lock_identity_changed") from None
+
+    def assert_stopped(self, instance, *, require_identity_evidence=True):
         if not platform_process.process_gone(instance.pid, instance.start, instance.executable):
             return False
+        # Consume the pre-signal capture: an absent or malformed capture is
+        # refused instead of being re-observed after the signal has been sent.
+        evidence = self._stop_lock_evidence
+        self._stop_lock_evidence = None
+        if (not isinstance(evidence, dict) or set(evidence) != {"anchor", "legacy"}
+                or any(not isinstance(value, tuple) or len(value) != 2
+                       or any(type(part) is not int for part in value)
+                       for value in evidence.values())):
+            raise ControlError("release_unverified")
         records = self._observation.record_set()
         if (records is None or records["active"] != instance.active
                 or records["last_good_paths"] != instance.last_good):
@@ -1273,14 +1581,31 @@ class MacAuthorityLease(_InitializationLease):
         obs = self._observation
         snapshot = inspect_runtime_identities(obs._root, instance.active["runtime_paths"])
         ids = snapshot.as_dict()
+        # The fixed paths must still be the original objects observed before
+        # the signal. Otherwise their release is unknowable and refused.
         for name, role in (("anchor", "anchor.lock"), ("legacy", "lock")):
-            if instance.active["locks"][name] != {"device": ids[role].device,
-                                                  "inode": ids[role].inode}:
-                raise ControlError("lock_identity_changed")
+            identity = ids[role]
+            if (not identity.exists
+                    or (identity.device, identity.inode) != evidence[name]):
+                raise ControlError("release_unverified")
+        if require_identity_evidence:
+            # Plain off passes False: release is proven by the process exit,
+            # the unchanged record set, and re-acquiring both original locks.
+            verify_fixed_state_directory(obs._root / ".runtime")
+            require_same_boot = lock_identity_requires_same_boot(instance.active)
+            for name, role in (("anchor", "anchor.lock"), ("legacy", "lock")):
+                if not lock_identity_matches_observed(
+                        instance.active["locks"][name], ids[role],
+                        require_same_boot=require_same_boot):
+                    raise ControlError("lock_identity_changed")
         with acquire_lock(snapshot, "anchor.lock", access_verifier=verify_local_access) as anchor:
             with acquire_lock(anchor.snapshot, "lock", access_verifier=verify_local_access,
                               anchor=anchor) as legacy:
                 verify_held_instance_locks(anchor, legacy)
+                for name, held in (("anchor", anchor), ("legacy", legacy)):
+                    info = os.fstat(held.fileno())
+                    if (info.st_dev, info.st_ino) != evidence[name]:
+                        raise ControlError("release_unverified")
                 if obs.record_set() != records:
                     raise ControlError("release_unverified")
                 if not platform_process.process_gone(instance.pid, instance.start, instance.executable):
@@ -1351,8 +1676,12 @@ class MacAuthorityLease(_InitializationLease):
                 raise ControlError("installation_identity_unknown")
             self._restart_records = records
             return True
+        # Restart stops first (stop-first tolerance) and only then starts under
+        # both locks; the same schema-4-verified condition applies here so the
+        # interrupted migration stays resumable.
         instance = _valid_record(self._observation._root, records["active"],
-                                 records["last_good_paths"])
+                                 records["last_good_paths"],
+                                 allow_boot_drift=self._install_identity_verified())
         config, runtime, listen, snapshot = self._configuration(os.environ.get("MODEL_PROXY_PORT"))
         # This is the new target, not the recorded old endpoint used by off.
         _check_mac_new_listener(listen)
@@ -1396,7 +1725,11 @@ class MacAuthorityLease(_InitializationLease):
         if self._stopping or self._verified is None:
             raise ControlError("installation_identity_unknown")
         instance = self._verified
-        self.verify_active(instance)
+        # Bind the token to the same evidence standard the lease last
+        # authorized: status (relaxed identity) must not re-judge installation
+        # identity here, while reload keeps the strict recheck.
+        self.verify_active(
+            instance, require_identity_evidence=self._verified_identity_evidence)
         pair = self._launch_config_pair
         try:
             if pair is None:
@@ -1446,6 +1779,8 @@ class MacInstallationAuthority(PartialMacInstallationAuthority):
         with locked_observation(project, paths, config_path, recovery=True) as obs:
             if obs.record_set() != records:
                 raise ControlError("instance_changed", "no signal or credential sent")
+            # Plain stop is located structurally and proven live; it never
+            # requires the installation identity or a volume UUID.
             _valid_record(project, records["active"], records["last_good_paths"],
-                          allow_unavailable_host=True)
+                          allow_unavailable_host=True, require_identity_evidence=False)
             yield MacAuthorityLease(obs)

@@ -27,8 +27,10 @@ if (Path(__file__).resolve().parents[1] != _ISOLATION / 'project'
 
 from core.cli.control import (ControlError, Instance, MacControl, StartupPending, _endpoint,
                               INSTALL_INITIALIZED, INSTALL_UNINITIALIZED_OR_RECORD_LOST)
-from core.discovery import process_executable, process_start_identity
-from core import platform_process
+from core import discovery, platform_process
+from core.discovery import (inspect_runtime_identities, process_executable, process_start_identity,
+                            verify_record_directory, write_instance_record)
+from core.platform_lock import acquire_lock, verify_local_access
 
 
 class LocalNumericEndpointTests(unittest.TestCase):
@@ -218,9 +220,18 @@ class FakeAuthority:
         self.initialization_calls = 0
         self.initialization_safe = True
         self.commit_on_confirm = True
+        self.lock_evidence_captures = 0
 
     def installation_state(self):
         return self.state
+
+    def installation_identity(self):
+        """Judge the fixture's real install record with the production rule."""
+        try:
+            install = json.loads((self.root / '.runtime/install.json').read_text())
+        except FileNotFoundError:
+            return None
+        return discovery.installation_identity(self.root / '.runtime', install).verdict
 
     def initialize_interactively(self, stdin, stdout):
         # Testing double only; no real record, lock-ownership or ACL proof.
@@ -252,14 +263,25 @@ class FakeAuthority:
                 return None
         return read('active.json'), read('last_good_paths.json')
 
-    def verify_active(self, instance):
+    def verify_active(self, instance, *, require_identity_evidence=True):
         return self.allow
 
     def assert_startable(self):
         return (self.permit_start and not locked_by_other(self.root/'.runtime/anchor.lock')
                 and not locked_by_other(self.root/'runtime/lock'))
 
-    def assert_stopped(self, instance):
+    def stop_lock_evidence(self, instance):
+        # Real fixed lock objects from this fixture; production additionally
+        # verifies protection and consumes the evidence in assert_stopped.
+        self.lock_evidence_captures += 1
+        evidence = {}
+        for name, path in (('anchor', self.root/'.runtime/anchor.lock'),
+                           ('legacy', self.root/'runtime/lock')):
+            info = os.lstat(path)
+            evidence[name] = (info.st_dev, info.st_ino)
+        return evidence
+
+    def assert_stopped(self, instance, *, require_identity_evidence=True):
         return (self.permit_release and not locked_by_other(self.root/'.runtime/anchor.lock')
                 and not locked_by_other(self.root/'runtime/lock'))
 
@@ -291,6 +313,21 @@ class IsolatedMacControlTests(unittest.TestCase):
         self.paths = {key: str(self.root/'runtime'/key) for key in
                       ('log','totals','lock','pid','ensure_log','start_lock')}
         (self.root/'config/runtime_paths.json').write_text(json.dumps(self.paths))
+        # Reload is a live operation: the fixture provides a real install
+        # record, judged by the production rule, instead of faking a verdict.
+        device, inode = verify_record_directory(self.root/'.runtime')
+        snapshot = inspect_runtime_identities(self.root, self.paths)
+        with acquire_lock(snapshot, 'anchor.lock', create=True,
+                          access_verifier=verify_local_access) as anchor:
+            with acquire_lock(anchor.snapshot, 'lock', create=True,
+                              access_verifier=verify_local_access, anchor=anchor) as legacy:
+                write_instance_record(self.root/'.runtime', 'install.json', {
+                    'schema': discovery.INSTANCE_SCHEMA, 'record': 'install',
+                    'project_root': str(self.root), 'install_id': 'b' * 32,
+                    'root_identity': {'device': device, 'inode': inode},
+                    'initialization_source': 'isolated test fixture',
+                    'ever_started': True, 'last_instance_nonce': 'a' * 32,
+                }, anchor=anchor, legacy=legacy)
         self.port = unused_port()
         self.token = 'FAKE_CONTROL_TOKEN_"_NOT_A_REAL_CREDENTIAL'
         self.config = self.root/'config/model_proxy_config.json'
@@ -601,8 +638,8 @@ class IsolatedMacControlTests(unittest.TestCase):
         child = self.start()
         self.start_reaper(child)
         original = self.auth.assert_stopped
-        def stopped(instance):
-            ok = original(instance)
+        def stopped(instance, **kwargs):
+            ok = original(instance, **kwargs)
             self.auth.state = INSTALL_UNINITIALIZED_OR_RECORD_LOST
             return ok
         with mock.patch.object(self.auth, 'assert_stopped', side_effect=stopped):
@@ -647,12 +684,13 @@ class IsolatedMacControlTests(unittest.TestCase):
         self.assertEqual(len(self.children), 1)
         self.assertFalse((self.root/'received.log').exists())
 
-    def test_last_good_mismatch_and_changed_lock_fail_closed(self):
+    def test_last_good_mismatch_fails_closed_and_off_ignores_a_recorded_lock(self):
         self.start()
         good = self.root/'.runtime/last_good_paths.json'
         saved = json.loads(good.read_text())
         bad = dict(saved, instance_nonce='a'*32)
         good.write_text(json.dumps(bad))
+        # A structurally inconsistent record set still fails closed for status.
         self.assertEqual(self.control.status(), 1)
         good.write_text(json.dumps(saved))
         active = self.root/'.runtime/active.json'
@@ -660,9 +698,64 @@ class IsolatedMacControlTests(unittest.TestCase):
         value['locks']['anchor']['inode'] += 1
         active.write_text(json.dumps(value))
         with mock.patch('core.platform_process.signal_verified') as signal_call:
+            # Stop judges structure plus live process/lock evidence; a changed
+            # recorded lock identity no longer blocks the signal. The mocked
+            # signal leaves the fixture child alive, so the confirmed exit
+            # times out instead of reporting an identity failure.
             self.assertEqual(self.control.off(), 1)
-            signal_call.assert_not_called()
+            signal_call.assert_called_once()
+            self.assertIn('stop_timeout', self.err.getvalue())
+            self.assertNotIn('lock_identity_changed', self.err.getvalue())
         self.assertEqual(self.auth.token_reads, 0)
+
+    def test_restart_rejects_changed_lock_identity_while_off_still_stops(self):
+        child = self.start()
+        self.start_reaper(child)
+        active = self.root/'.runtime/active.json'
+        value = json.loads(active.read_text())
+        value['locks']['anchor']['inode'] += 1
+        active.write_text(json.dumps(value))
+        # Restart keeps the strict identity gate: the drifted recorded lock is
+        # rejected before any signal.
+        with mock.patch('core.platform_process.signal_verified') as signal:
+            self.assertEqual(self.control.restart(), 1)
+            signal.assert_not_called()
+        self.assertIn('lock_identity_changed', self.err.getvalue())
+        self.assertIsNone(child.poll())
+        self.assertEqual(self.auth.lock_evidence_captures, 0)
+        # Plain off uses structure plus live evidence; the same drifted record
+        # does not block stopping the real fixture process, and the original
+        # lock objects are recorded before the signal is sent.
+        real_signal = platform_process.signal_verified
+        captured_at_signal = []
+        def signal_after_capture(pid, start, executable):
+            captured_at_signal.append(self.auth.lock_evidence_captures)
+            real_signal(pid, start, executable)
+        with mock.patch('core.platform_process.signal_verified',
+                        side_effect=signal_after_capture):
+            self.assertEqual(self.control.off(), 0, self.err.getvalue())
+        self.assertEqual(captured_at_signal, [1])
+        self.assertIsNotNone(child.poll())
+
+    def test_restart_pre_signal_rechecks_never_downgrade_identity(self):
+        child = self.start()
+        original = self.auth.records
+        calls = []
+        def drifting_records():
+            calls.append(1)
+            active, good = original()
+            if len(calls) >= 4 and isinstance(active, dict):
+                active = json.loads(json.dumps(active))
+                active['locks']['legacy']['inode'] += 1
+            return active, good
+        # The drift appears only after the initial record read and instance
+        # check; a relaxed pre-signal recheck would signal the process.
+        with mock.patch.object(self.auth, 'records', side_effect=drifting_records), \
+                mock.patch('core.platform_process.signal_verified') as signal:
+            self.assertEqual(self.control.restart(), 1)
+            signal.assert_not_called()
+        self.assertIn('lock_identity_changed', self.err.getvalue())
+        self.assertIsNone(child.poll())
 
     def test_pid_reuse_or_permissions_never_signal(self):
         self.start()

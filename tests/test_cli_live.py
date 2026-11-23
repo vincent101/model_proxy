@@ -32,8 +32,9 @@ from core.cli import dispatch
 from core.cli import authority as authority_module
 from core.cli.control import ControlError, MacControl
 from core.cli.authority import MacAuthorityLease, MacInstallationAuthority
-from core.discovery import PreflightError, process_executable, process_start_identity
-from core import platform_process
+from core.discovery import (POSIX_RECORD_SCHEMA, PreflightError, process_executable,
+                            process_start_identity)
+from core import discovery, platform_process
 
 
 @unittest.skipUnless(sys.platform == "darwin", "requires native Darwin process evidence")
@@ -167,7 +168,7 @@ import os, sys
 from pathlib import Path
 if Path(sys.argv[0]).name == "model_proxy.py":
     import core.server as server
-    def checked_stub(records, current_paths, current_listen, lock_ids):
+    def checked_stub(records, current_paths, current_listen, lock_ids, **kwargs):
         active = records["active"]
         if active is None:
             return
@@ -196,6 +197,19 @@ if Path(sys.argv[0]).name == "model_proxy.py":
             port = probe.getsockname()[1]
         self.assertNotIn(port, (self.port, 18889))
         return port
+
+    def _mutate_record(self, name, mutate):
+        path = self.root / ".runtime" / name
+        record = json.loads(path.read_text())
+        mutate(record)
+        path.write_text(json.dumps(record))
+        path.chmod(0o600)
+
+    def _drift_recorded_listen(self, port):
+        for name in ("active.json", "last_good_paths.json"):
+            self._mutate_record(
+                name, lambda record: record.__setitem__(
+                    "listen", {"host": "127.0.0.1", "port": port}))
 
     @staticmethod
     def _fake_ledger(version, requests=3):
@@ -923,6 +937,135 @@ _verify_migration_guard = _test_verify
                 token.assert_not_called()
             self.assertIsNotNone(self.children[-1].poll())
 
+    def test_status_succeeds_with_an_unverified_install_identity(self):
+        # Real authority, real server, real token/connection/response/output.
+        # The install record is genuinely anomalous (inode changed), so a
+        # strict identity path would reject it; status must still report.
+        with self._managed_environment():
+            self._start_interactively()
+            installed = json.loads((self.root / ".runtime" / "install.json").read_text())
+            self.assertEqual(installed["schema"], POSIX_RECORD_SCHEMA)
+            self._mutate_record("install.json", lambda record: record["root_identity"].__setitem__(
+                "inode", record["root_identity"]["inode"] + 1))
+            forbidden = AssertionError("status must not collect a volume UUID")
+            with mock.patch.object(discovery, "_darwin_volume_uuid", side_effect=forbidden):
+                result, out, err = self._run("status")
+            self.assertEqual(result, 0, err)
+            self.assertIn("service running on port", out)
+            self.assertIn("active sessions (30min):", out)
+            self.assertNotIn("fake-live-admin-token", out + err)
+            # The recorded anomaly is real for credential-bearing operations.
+            result, out, err = self._run("reload")
+            self.assertEqual(result, 1)
+            self.assertIn("installation_changed", err)
+            self.assertNotIn("fake-live-admin-token", out + err)
+
+    def test_status_succeeds_with_a_changed_recorded_lock_identity(self):
+        with self._managed_environment():
+            self._start_interactively()
+            self._mutate_record("active.json", lambda record: record["locks"]["anchor"].__setitem__(
+                "inode", record["locks"]["anchor"]["inode"] + 1))
+            with mock.patch.object(discovery, "_darwin_volume_uuid",
+                                   side_effect=AssertionError(
+                                       "status must not collect a volume UUID")):
+                result, out, err = self._run("status")
+            self.assertEqual(result, 0, err)
+            self.assertIn("service running on port", out)
+            self.assertIn("active sessions (30min):", out)
+            # The drifted recorded lock is real for credential-bearing reload.
+            result, out, err = self._run("reload")
+            self.assertEqual(result, 1)
+            self.assertIn("lock_identity_changed", err)
+
+    def test_off_completes_with_a_port_ownership_warning(self):
+        # The recorded endpoint is drifted to a free port, so the recorded PID
+        # verifiably has no listener there. Plain off must warn and still stop
+        # the real server; the post-stop port check then passes.
+        with self._managed_environment():
+            self._start_interactively()
+            child = self.children[-1]
+            drifted = self._new_loopback_port()
+            self._drift_recorded_listen(drifted)
+            result, out, err = self._run("off")
+            self.assertEqual(result, 0, err)
+            self.assertIn(f"recorded PID {child.pid} has no listener on "
+                          f"127.0.0.1:{drifted}", err)
+            self.assertIn("stopping the recorded process", err)
+            self.assertIn("model_proxy stopped; locks and port verified free.", out)
+            self.assertIsNotNone(child.poll())
+
+    def test_off_reports_another_process_holding_the_recorded_port(self):
+        # A real second process owns the recorded endpoint. The existing
+        # post-stop port boundary still applies while the recorded process is
+        # stopped with the ownership explanation in the output.
+        with self._managed_environment():
+            self._start_interactively()
+            child = self.children[-1]
+            drifted = self._new_loopback_port()
+            self._drift_recorded_listen(drifted)
+            with socket.socket() as other:
+                other.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                other.bind(("127.0.0.1", drifted))
+                other.listen(1)
+                result, out, err = self._run("off")
+                self.assertEqual(result, 1, err)
+                self.assertIn(f"listening port 127.0.0.1:{drifted} is not held by "
+                              f"recorded PID {child.pid} and is occupied by another process",
+                              err)
+                self.assertIn("process exited; locks released; port occupied", err)
+                self.assertIsNotNone(child.poll())
+            # The original double locks are released with the real process.
+            for path in (self.root / ".runtime/anchor.lock", Path(self.paths["lock"])):
+                with open(path, "r+") as held:
+                    fcntl.flock(held.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    fcntl.flock(held.fileno(), fcntl.LOCK_UN)
+
+    def test_off_warns_but_stops_when_port_ownership_is_unverifiable(self):
+        # Inject only the OS ownership primitive: the user-approved decision
+        # is to warn and continue when ownership cannot be verified. The stop
+        # chain (identity, locks, signal, release) stays real.
+        with self._managed_environment():
+            self._start_interactively()
+            child = self.children[-1]
+            with mock.patch.object(
+                    platform_process, "verify_listening_owner",
+                    side_effect=platform_process.ProcessEvidenceError("fd_list_unavailable")):
+                result, out, err = self._run("off")
+            self.assertEqual(result, 0, err)
+            self.assertIn("ownership could not be verified", err)
+            self.assertIn("stopping the recorded process anyway", err)
+            self.assertIsNotNone(child.poll())
+
+    def test_restart_strict_gate_rejects_lock_drift_after_preflight_while_off_stops(self):
+        # The drift is introduced after the restart preflight passed, so only
+        # the strict stop precheck/rechecks can reject it; plain off in the
+        # same state still completes.
+        with self._managed_environment():
+            self._start_interactively()
+            child = self.children[-1]
+            state = self.root / ".runtime"
+            original = MacAuthorityLease.assert_restart_supported
+            def preflight_then_drift(lease):
+                passed = original(lease)
+                active = state / "active.json"
+                record = json.loads(active.read_text())
+                record["locks"]["anchor"]["inode"] += 1
+                active.write_text(json.dumps(record))
+                active.chmod(0o600)
+                return passed
+            with mock.patch.object(MacAuthorityLease, "assert_restart_supported",
+                                   preflight_then_drift), \
+                    mock.patch.object(platform_process, "signal_verified",
+                                      wraps=platform_process.signal_verified) as signal:
+                result, out, err = self._run("restart")
+            self.assertEqual(result, 1, err)
+            self.assertIn("lock_identity_changed", err)
+            signal.assert_not_called()
+            self.assertIsNone(child.poll())
+            result, out, err = self._run("off")
+            self.assertEqual(result, 0, err)
+            self.assertIsNotNone(child.poll())
+
     def test_same_port_wildcard_expansion_refused_before_old_stop(self):
         import signal as signal_module
         with self._managed_environment():
@@ -1182,11 +1325,11 @@ _verify_migration_guard = _test_verify
     def test_transient_startup_change_waits_then_revalidates_without_token(self):
         original = MacAuthorityLease.verify_active
         calls = []
-        def transient(lease, instance):
+        def transient(lease, instance, **kwargs):
             calls.append("verify")
             if len(calls) == 1:
                 raise PreflightError("protection_changed", "synthetic transient")
-            return original(lease, instance)
+            return original(lease, instance, **kwargs)
         with self._managed_environment(), \
                 mock.patch.object(MacAuthorityLease, "verify_active", transient), \
                 mock.patch.object(MacAuthorityLease, "admin_token",

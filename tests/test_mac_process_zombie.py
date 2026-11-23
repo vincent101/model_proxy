@@ -20,6 +20,13 @@ sys.path.insert(0, str(ISO / 'project'))
 from core import platform_process, server
 from core.discovery import PreflightError, process_executable, process_start_identity
 
+# Placeholder stable lock identities: this file tests process-state evidence,
+# so the lock gate must pass with a schema-4 shaped record while all process
+# fields stay real.
+STABLE_LOCKS = {role: {"kind": "macos_volume_uuid",
+                       "uuid": "00000000-0000-0000-0000-000000000000", "inode": index}
+                for role, index in (("anchor", 1), ("legacy", 2))}
+
 
 @unittest.skipUnless(sys.platform == 'darwin', 'native Darwin process state required')
 class RealOwnedZombie(unittest.TestCase):
@@ -129,7 +136,7 @@ int main(void) {
 
     def test_server_stale_check_accepts_only_exact_zombie_not_unknown(self):
         self.start_owned()
-        paths = {'fake': 'paths'}; locks = {'fake': 'locks'}
+        paths = {'fake': 'paths'}; locks = dict(STABLE_LOCKS)
         active = {'pid': self.child.pid, 'process_start': self.start,
                   'runtime_paths': paths, 'locks': locks}
         with self.assertRaises(PreflightError) as running:
@@ -162,7 +169,7 @@ int main(void) {
         # Existing server policy treats a stable different start as a stale
         # *old generation*, not proof that this new process is dead. Locks
         # and ports remain separate startup gates.
-        paths, locks = {'fake': 'paths'}, {'fake': 'locks'}
+        paths, locks = {'fake': 'paths'}, dict(STABLE_LOCKS)
         active = {'pid': self.child.pid, 'process_start': wrong,
                   'runtime_paths': paths, 'locks': locks}
         server._ensure_stale_instance({'active': active}, paths, {}, locks)

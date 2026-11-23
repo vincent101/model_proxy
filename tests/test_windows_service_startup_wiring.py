@@ -343,10 +343,13 @@ class WindowsStartupWiringTests(fixtures.WindowsCoreMockStartupTests):
         self.assertEqual(self.fs.write_calls, before)
 
     def test_unknown_previous_process_is_never_signalled(self):
-        record = {"active": {"runtime_paths": self.paths, "locks": {},
+        # Windows keeps its boot-local {'device','inode'} lock shape; identical
+        # records must pass the lock comparison so the process check is reached.
+        locks = {"anchor": {"device": 1, "inode": 2}, "legacy": {"device": 1, "inode": 3}}
+        record = {"active": {"runtime_paths": self.paths, "locks": dict(locks),
                              "pid": 999, "process_start": {"kind": "windows_filetime", "ticks_100ns": 1}}}
         with self.assertRaises(discovery.PreflightError) as caught:
-            server._ensure_stale_instance(record, self.paths, self.listen, {})
+            server._ensure_stale_instance(record, self.paths, self.listen, dict(locks))
         self.assertEqual(caught.exception.code, "process_unverified")
         server.os.kill.assert_not_called()
 

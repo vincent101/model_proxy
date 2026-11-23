@@ -650,23 +650,32 @@ class RealOwnedRecovery(unittest.TestCase):
             token.assert_not_called(); connection.assert_not_called()
         self.assertIsNone(self.child.poll())
 
-    def test_off_rejects_wrong_installation_root_identity(self):
+    def test_off_ignores_wrong_installation_root_identity_and_still_stops(self):
+        # Stopping is judged by structure plus live process/lock evidence only:
+        # an identity anomaly must never make the service impossible to stop.
         self.start_child_and_records(wrong_root=True)
         self.service.unlink()
         with self.no_unowned_signal_or_token() as (sent, token, connection):
-            self.assertEqual(self.cli.off(), 1)
-            self.assertEqual(sent, [])
+            self.assertEqual(self.cli.off(), 0, self.cli.err.getvalue())
+            self.assertEqual(sent, [self.child.pid])
+            self.signal_mock.assert_called_once()
             token.assert_not_called(); connection.assert_not_called()
-        self.assertIsNone(self.child.poll())
+        self.wait_unreaped_child()
+        os.kill(self.child.pid, 0)
 
-    def test_off_rejects_wrong_recorded_lock(self):
+    def test_off_ignores_wrong_recorded_lock_and_still_stops(self):
+        # A recorded lock identity is not lock liveness: off proves the fixed
+        # lock paths, their protection and a held conflict, and signals only
+        # the recorded process identity.
         self.start_child_and_records(wrong_lock=True)
         self.service.unlink()
         with self.no_unowned_signal_or_token() as (sent, token, connection):
-            self.assertEqual(self.cli.off(), 1)
-            self.assertEqual(sent, [])
+            self.assertEqual(self.cli.off(), 0, self.cli.err.getvalue())
+            self.assertEqual(sent, [self.child.pid])
+            self.signal_mock.assert_called_once()
             token.assert_not_called(); connection.assert_not_called()
-        self.assertIsNone(self.child.poll())
+        self.wait_unreaped_child()
+        os.kill(self.child.pid, 0)
 
     def test_off_rejects_inconsistent_generation_records(self):
         self.start_child_and_records(inconsistent=True)

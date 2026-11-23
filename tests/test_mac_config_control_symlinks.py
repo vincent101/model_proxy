@@ -44,7 +44,10 @@ class MacConfigControlLinks(unittest.TestCase):
         self.service.symlink_to(self.target)
         self.entry = self.root / 'core/cli/model_proxy.py'
         self.entry.write_text('# fake entry, never executed\n')
-        self.obs = SimpleNamespace(_root=self.root, _config_path=self.cli)
+        # observation fixture: installation_identity=None mirrors an
+        # uninitialized record set (no credential path may treat it as verified).
+        self.obs = SimpleNamespace(_root=self.root, _config_path=self.cli,
+                                   installation_identity=lambda: None)
         self.lease = authority.MacAuthorityLease(self.obs)
         self.env = {'MODEL_PROXY_CONFIG': str(self.service)}
         self.paths = {key: str(self.root / 'runtime' / key) for key in PATH_KEYS}
@@ -276,7 +279,7 @@ class MacConfigControlLinks(unittest.TestCase):
                                     '127.0.0.1', 29389, {}, {})
         cli = control.MacControl(self.root, config_path=self.cli)
         calls = []
-        def recheck(*args):
+        def recheck(*args, **kwargs):
             calls.append(1)
             if len(calls) == 2:
                 # Change only service link, retaining its final target and bytes.
@@ -311,7 +314,7 @@ class MacConfigControlLinks(unittest.TestCase):
         sock = mock.MagicMock()
         sock.__enter__.return_value = sock
         checks = []
-        def recheck(*args):
+        def recheck(*args, **kwargs):
             checks.append(1)
             if len(checks) == 2:
                 self.alias.unlink()

@@ -62,7 +62,7 @@ class LifecycleRepairTests(unittest.TestCase):
              mock.patch.object(platform_process, 'check_identity') as identity:
             self.assertTrue(self.lease.verify_active(self.instance))
         self.assertEqual(launch.call_count, 2)
-        locks.assert_called_once_with(self.instance)
+        locks.assert_called_once_with(self.instance, require_identity_evidence=True)
         self.assertEqual(identity.call_count, 2)
 
     def test_stop_does_not_relax_launch_or_process_identity(self):
@@ -166,7 +166,8 @@ class LifecycleRepairTests(unittest.TestCase):
         self.cli.authority = auth
         with mock.patch.object(self.cli, '_stop') as stop:
             self.assertEqual(self.cli.off(), 0)
-            stop.assert_called_once_with(self.lease, allow_stale=True)
+            stop.assert_called_once_with(self.lease, allow_stale=True,
+                                         require_identity_evidence=False)
         auth.locked_for_stop.assert_called_once()
         auth.locked.assert_not_called()
 
