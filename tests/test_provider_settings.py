@@ -108,12 +108,15 @@ class TestOverrideLayers(unittest.TestCase):
             os.rmdir(d)
 
     def test_cache_invalidated_when_file_changes(self):
+        # 缓存键是 (mtime_ns, size)。Windows 上同一时钟刻度内的两次写入可能得到
+        # 相同的 mtime_ns，因此这里故意让内容长度不同，只测「文件变了要重新读」
+        # 这个契约；同长度改写的边界见注释说明，不在这里断言。
         with _SettingsFile({"catpaw-ide": {"bridge_lib": "/tmp/v1.dll"}}):
             self.assertEqual(catpaw_ide.resolve_paths({})[1], "/tmp/v1.dll")
             Path(os.environ["MODEL_PROXY_PROVIDER_SETTINGS"]).write_text(
-                json.dumps({"catpaw-ide": {"bridge_lib": "/tmp/v2.dll"}}),
+                json.dumps({"catpaw-ide": {"bridge_lib": "/tmp/v2-rebuilt.dll"}}),
                 encoding="utf-8")
-            self.assertEqual(catpaw_ide.resolve_paths({})[1], "/tmp/v2.dll")
+            self.assertEqual(catpaw_ide.resolve_paths({})[1], "/tmp/v2-rebuilt.dll")
 
 
 class TestSupplyValidation(unittest.TestCase):

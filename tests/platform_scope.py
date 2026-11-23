@@ -48,6 +48,7 @@ FILE_SCOPE: dict[str, tuple] = {
     'test_discovery_anchor.py': (POSIX, 'POSIX inode 身份 preflight；Windows 身份由 test_windows_discovery 覆盖'),
     'test_install_ops.py': (POSIX, 'POSIX 私有安装目标校验；Windows 安装由 test_windows_secure_hook_install 覆盖'),
     'test_usage_totals.py': (POSIX, '账本读写夹具依赖 POSIX 快照与裸读配置', True),
+    'test_reload_contract.py': (POSIX, '热加载夹具把配置写在 tempdir；Windows 的 _read_business_config 只认项目树内已验证边界', True),
     'test_runtime_unify_paths.py': (POSIX, '夹具注入 POSIX 形态的项目根/路径，且含 POSIX 侧 Windows 模拟', True),
     'test_windows_control_a_followup.py': (POSIX, '在 POSIX 上用假 Win32 后端模拟 Windows 控制；原生 Windows 会先被真实启动前置条件拦下'),
 }
@@ -82,6 +83,26 @@ TEST_SCOPE: dict[tuple, tuple] = {
         POSIX, '依赖 os.O_NOFOLLOW 与 macOS 扩展属性'),
     ('test_runtime_paths_cross_platform.py', 'RuntimePathFileTests.test_valid_file_is_parsed_with_injected_fixture_defaults'): (
         POSIX, '用例注入 POSIX 绝对路径作为项目根'),
+}
+
+
+# --- 已知红灯（隔离清单） ---------------------------------------------------
+# 这些文件在**两个平台**上都已经红了（历史遗留，或与本轮无关的另一项改动撞车）。
+# 与 FILE_SCOPE/TEST_SCOPE 的区别：那两者是「该平台不适用」，这里是「本该通过
+# 但确实坏了」。清单会每次都打印，且一旦某文件开始通过就会报 STALE 并让 CI 红，
+# 逼着把它从清单里删掉——不允许长期沉淀成新的静默掩盖。
+KNOWN_BROKEN: dict[str, tuple[str, str]] = {
+    'test_windows_gate.py': (
+        '2026-11-23',
+        '启动顺序用例在 macOS 上 25 项、Windows 上 14 项失败（此前被 test_windows_ '
+        '前缀误判为「仅 Windows 可测」而长期掩盖）；部分断言仍用旧 lock 身份 '
+        '{device,inode}，与在改的 macos_volume_uuid 方案撞车，需单独修复',
+    ),
+    'test_windows_secure_install_wiring.py': (
+        '2026-11-23',
+        '两平台各 9 项失败（fake 快照缺 os.fspath、write_target 未被调用）；'
+        '此前被 windows-native 标签掩盖，需单独修复',
+    ),
 }
 
 

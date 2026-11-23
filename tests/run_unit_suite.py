@@ -75,6 +75,18 @@ def failed_ids(output: str) -> list[tuple[str, str]]:
     return found
 
 
+def scope_summary(name: str) -> str:
+    """给被跳过的文件生成一行可读原因（文件级声明优先，其次用例级）。"""
+    file_declared, file_reason, _ = platform_scope.file_scope(name)
+    if file_declared != platform_scope.BOTH:
+        return f'scope={file_declared}  {file_reason}'
+    patterns = sorted(pattern for (file_name, pattern) in platform_scope.TEST_SCOPE
+                      if file_name == name and pattern)
+    if not patterns:
+        return 'scope=both'
+    return '用例级 posix-only: ' + ', '.join(patterns)
+
+
 def classify(name: str, output: str) -> str:
     """ok / isolation / out-of-scope / windows-native / macos-native / fail
 
@@ -93,6 +105,10 @@ def classify(name: str, output: str) -> str:
     scope, _, _ = platform_scope.file_scope(name)
     if scope != platform_scope.BOTH and scope != HOST:
         return 'out-of-scope'
+    # 已知红灯先于「原生专测」前缀判定：这些文件在**当前宿主**上本该能跑，
+    # 不能靠 test_windows_ 前缀把它们变成 mac 侧静默跳过。
+    if name in platform_scope.KNOWN_BROKEN:
+        return 'known-broken'
     if HOST == 'posix' and (name.startswith('test_windows_') or name.startswith('test_wine_')):
         return 'windows-native'
     if sys.platform != 'darwin' and (name.startswith('test_mac_')
@@ -184,17 +200,18 @@ def main(argv=None) -> int:
         print()
 
     buckets = {'ok': [], 'isolation': [], 'out-of-scope': [], 'windows-native': [],
-               'macos-native': [], 'fail': []}
+               'macos-native': [], 'known-broken': [], 'fail': []}
     prefixes = {'ok': 'ok  ', 'isolation': 'iso ', 'out-of-scope': 'skip',
-                'windows-native': 'win ', 'macos-native': 'mac ', 'fail': 'FAIL'}
+                'windows-native': 'win ', 'macos-native': 'mac ',
+                'known-broken': 'KNOWN', 'fail': 'FAIL'}
     skipped_by_scope = []
+    stale_known = []
     with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, args.jobs)) as pool:
         for name, kind, summary, detail in pool.map(run_one, runnable):
             buckets[kind].append(name)
             print(f'{prefixes[kind]} {name:<52} {summary}')
             if kind == 'out-of-scope':
-                scope, reason, _ = platform_scope.file_scope(name)
-                skipped_by_scope.append((name, scope, reason))
+                skipped_by_scope.append((name, scope_summary(name)))
             for line in detail:
                 print(f'     | {line}')
 
@@ -205,13 +222,28 @@ def main(argv=None) -> int:
           f'  本平台不适用: {len(buckets["out-of-scope"])}'
           f'  windows-native: {len(buckets["windows-native"])}'
           f'  macos-native: {len(buckets["macos-native"])}'
+          f'  已知红灯: {len(buckets["known-broken"])}'
           f'  意外失败: {len(buckets["fail"])}')
+
+    stale_known = [name for name in buckets['ok'] if name in platform_scope.KNOWN_BROKEN]
 
     if skipped_by_scope:
         print()
         print('按平台范围清单跳过（tests/platform_scope.py 显式声明，非静默）:')
-        for name, scope, reason in skipped_by_scope:
-            print(f'  - {name:<48} scope={scope}  {reason}')
+        for name, reason in skipped_by_scope:
+            print(f'  - {name:<48} {reason}')
+
+    if buckets['known-broken'] or stale_known:
+        print()
+        print('已知红灯（tests/platform_scope.py::KNOWN_BROKEN；需单独修复，不是豁免）:')
+        for name in sorted(buckets['known-broken']):
+            added, reason = platform_scope.KNOWN_BROKEN[name]
+            print(f'  - {name:<48} 记录于 {added}')
+            print(f'      {reason}')
+        for name in stale_known:
+            print(f'  - STALE {name}：已通过，请从 KNOWN_BROKEN 移除')
+        if stale_known:
+            return 1
 
     gaps = platform_scope.gaps()
     if gaps:
