@@ -66,10 +66,19 @@ class TemporaryDirectory:
         while True:
             candidate = Path(base) / f"{prefix}{secrets.token_hex(6)}{suffix}"
             try:
-                candidate.mkdir(mode=0o700)
+                candidate.mkdir()
             except FileExistsError:
                 continue
             break
+        # mkdir(mode=...) 在 Windows 上会得到 OWNER RIGHTS 而非显式用户 ACE
+        # （实测：helper 版 mkdir(mode=0o700) → Administrators + OWNER RIGHTS，
+        # 同一父目录下 mkdir() → Administrators + <machine><user>）。所以先不传
+        # mode，再在 POSIX 上补 chmod（Windows 的 chmod 只切只读位，无副作用）。
+        if os.name != "nt":
+            try:
+                candidate.chmod(0o700)
+            except OSError:
+                pass
         self.name = str(candidate)
 
     def cleanup(self) -> None:
