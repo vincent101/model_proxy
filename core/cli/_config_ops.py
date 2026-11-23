@@ -667,7 +667,6 @@ def _precheck_inherited_marker():
     """Bind the inherited write pipe before any mutating helper work."""
     global _MARKER_BASELINE
     if os.name == "nt":
-        from pathlib import Path
         from core import windows_secure_files as secure
         raw = os.environ.get("CONFIG_OPS_RELOAD_MARKER")
         if (not raw or not os.path.isabs(raw) or os.path.normpath(raw) != raw
@@ -675,7 +674,12 @@ def _precheck_inherited_marker():
             raise MarkerSafetyError("Windows reload marker unavailable")
         marker = os.path.abspath(raw)
         parent = os.path.dirname(marker)
-        temporary = os.path.join(str(Path(__file__).resolve().parents[2]), ".runtime", "tmp")
+        # 用 os.path 而不是 pathlib.Path：Path 的具体类在**调用时**按 os.name
+        # 选择，模拟 Windows 的测试会让它在 macOS 上变成 WindowsPath，进而走到
+        # 宿主不支持的 ntpath 实现。本函数其余部分已经统一用 os.path。
+        project_root = os.path.dirname(os.path.dirname(
+            os.path.dirname(os.path.realpath(__file__))))
+        temporary = os.path.join(project_root, ".runtime", "tmp")
         snap = None
         try:
             if (os.path.basename(marker) != "reload" or
@@ -683,7 +687,7 @@ def _precheck_inherited_marker():
                     os.path.normcase(os.path.dirname(parent)) != os.path.normcase(temporary)):
                 raise MarkerSafetyError("Windows reload marker location unverified")
             snap = secure.capture_target(marker, authorized_root=parent, max_bytes=64,
-                                         trusted_boundary=str(Path(__file__).resolve().parents[2]))
+                                         trusted_boundary=project_root)
             if not snap.exists or snap.contents != b"started":
                 raise MarkerSafetyError("Windows reload marker changed")
             snap.revalidate()
