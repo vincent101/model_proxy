@@ -25,6 +25,7 @@ runner 的 `%TEMP%` 目录（`C:\\Users\\RUNNER~1\\AppData\\Local\\Temp`）ACL �
 from __future__ import annotations
 
 import os
+import secrets
 import shutil
 import tempfile
 from pathlib import Path
@@ -47,12 +48,29 @@ class TemporaryDirectory:
     """`tempfile.TemporaryDirectory` 的跨平台替代（同名 API）。
 
     Windows 上建在 `%LOCALAPPDATA%`（见模块说明），POSIX 上行为不变。
+
+    **为什么不是 `tempfile.mkdtemp`**：实测（windows-latest，2026-11-23）
+    `mkdtemp` 与 `Path.mkdir()` 在同一父目录下产出的 DACL 不同——
+
+        mkdtemp  → BUILTIN\\Administrators:(OI)(CI)(F) + OWNER RIGHTS:(OI)(CI)(F)
+        mkdir    → BUILTIN\\Administrators:(OI)(CI)(F) + <machine>\\<user>:(OI)(CI)(F)
+
+    （上面为反斜杠原样展示，判断 ACL 时看的是显式用户 SID。）
+
+    前者没有显式用户 SID（`OWNER RIGHTS` 是 S-1-3-4，产品不认），后者可以
+    通过产品的 `private` 判定。所以这里用 mkdir 自己拼随机名。
     """
 
     def __init__(self, suffix: str = "", prefix: str = "mp-test-", dir: str | None = None):
-        if dir is None:
-            dir = base_dir()
-        self.name = tempfile.mkdtemp(suffix=suffix, prefix=prefix, dir=dir)
+        base = dir if dir is not None else (base_dir() or tempfile.gettempdir())
+        while True:
+            candidate = Path(base) / f"{prefix}{secrets.token_hex(6)}{suffix}"
+            try:
+                candidate.mkdir(mode=0o700)
+            except FileExistsError:
+                continue
+            break
+        self.name = str(candidate)
 
     def cleanup(self) -> None:
         shutil.rmtree(self.name, ignore_errors=True)
