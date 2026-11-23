@@ -42,10 +42,23 @@ jobs:
         shell: pwsh
         run: |
           # c-shared 需要 gcc；先装，装完找不到则回退到镜像预装的 MSYS2。
+          # 注意：choco 的 mingw 包实际落在 ...\mingw64\mingw64\bin（实测 2026-11-23），
+          # 与直觉的 ...\mingw64\bin 差一层，两个都列上并再加 Get-Command 兜底。
           choco install mingw -y --no-progress
-          $candidates = @('C:\ProgramData\mingw64\bin', 'C:\msys64\mingw64\bin')
+          $candidates = @(
+            'C:\ProgramData\mingw64\mingw64\bin',
+            'C:\ProgramData\mingw64\bin',
+            'C:\msys64\mingw64\bin',
+            'C:\ProgramData\chocolatey\lib\mingw\tools\install\mingw64\bin'
+          )
           $mingw = $candidates | Where-Object { Test-Path (Join-Path $_ 'gcc.exe') } | Select-Object -First 1
-          if (-not $mingw) { throw "no gcc.exe found in $($candidates -join ', ')" }
+          if (-not $mingw) {
+            # 兜底：让 shell 自己去找（PATH 可能已被 choco 刷新到新位置）。
+            $found = Get-ChildItem -Path 'C:\ProgramData','C:\msys64' -Filter 'gcc.exe' -Recurse -ErrorAction SilentlyContinue |
+                     Select-Object -First 1
+            if ($found) { $mingw = $found.DirectoryName }
+            else { throw "no gcc.exe found in $($candidates -join ', ')" }
+          }
           "$mingw" | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
           & (Join-Path $mingw 'gcc.exe') --version
 
