@@ -56,6 +56,7 @@ FILE_SCOPE: dict[str, tuple] = {
     # 本文件验的正是 direct 模式的账本语义；Windows 启动路径的账本校验由
     # test_windows_gate 覆盖。
     'test_usage_totals.py': (POSIX, 'direct 构造的账本读取在 Windows 上按设计严格 fail-closed'),
+'test_identity_stability.py': (POSIX, '安装身份与锁语义依赖 fcntl、pty 及 st_dev+st_ino；Windows 身份由 test_windows_discovery 等覆盖'),
     'test_windows_control_a_followup.py': (POSIX, '在 POSIX 上用假 Win32 后端模拟 Windows 控制；原生 Windows 会先被真实启动前置条件拦下'),
 }
 
