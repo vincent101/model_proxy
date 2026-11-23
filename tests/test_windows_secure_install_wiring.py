@@ -35,7 +35,9 @@ class WindowsInstallWiringTests(unittest.TestCase):
         self.addCleanup(self.temp.cleanup)
         self.target = Path(self.temp.name) / 'fake-client.json'
         self.root = Path(self.temp.name)
-        self.fake_os = types.SimpleNamespace(name='nt', path=os.path)
+        # 产品代码在 nt 分支里用 os.fspath 规范化目标路径；伪造 os 必须带上它，
+        # 否则用例在渲染前就 AttributeError（与平台无关的夹具缺陷）。
+        self.fake_os = types.SimpleNamespace(name='nt', path=os.path, fspath=os.fspath)
         self.snapshot = FakeSnapshot()
         self.snapshot.path = str(self.target)
         self.stdout = io.StringIO()

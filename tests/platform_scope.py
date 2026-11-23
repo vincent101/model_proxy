@@ -100,8 +100,11 @@ KNOWN_BROKEN: dict[str, tuple[str, str]] = {
     ),
     'test_windows_secure_install_wiring.py': (
         '2026-11-23',
-        '两平台各 9 项失败（fake 快照缺 os.fspath、write_target 未被调用）；'
-        '此前被 windows-native 标签掩盖，需单独修复',
+        '两平台各 9 项失败（夹具早于 2026-11-22 安装边界复核：伪造 os 缺 fspath、'
+        '未提供项目内 runtime_paths.json，导致 write_target 未被调用）；此前被 '
+        'windows-native 标签掩盖。真实 Windows 写入链另有原生验收：'
+        'test_windows_config_write_integration（6 项原生通过）与 '
+        'test_windows_secure_hook_install',
     ),
 }
 
