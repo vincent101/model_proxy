@@ -1,9 +1,6 @@
-"""临时探针：定位「tempdir 里的配置在 Windows 上读不到」的真实原因。
+"""临时探针：拆开 read_guarded_file 的 read_unavailable，定位真实失败点。
 
-只在原生 Windows 上跑；结论直接进 CI 日志（失败输出），取证后删除本文件。
-要回答两件事：
-  A. 现状（配置在 %TEMP%）失败在哪个具体错误码；
-  B. 若把项目根 patch 到该临时目录（boundary = 项目根），是否能读通。
+只在原生 Windows 上跑；结论进 CI 日志（失败输出），取证后删除本文件。
 """
 import json
 import ntpath
@@ -11,21 +8,30 @@ import os
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import patch
 
 import core.server as server
-from core import platform_windows as pw
+from core import platform_windows as pww
+from core import windows_paths
 
 
-def _describe(exc):
-    chain = []
-    current = exc
+def describe(exc):
+    chain, current = [], exc
     for _ in range(6):
         if current is None:
             break
-        chain.append(f'{type(current).__name__}(code={getattr(current, "code", None)!r})')
+        chain.append(f'{type(current).__name__}(code={getattr(current, "code", None)!r}: {current})')
         current = current.__cause__ or current.__context__
     return ' <- '.join(chain)
+
+
+def step(record, label, fn):
+    try:
+        value = fn()
+    except BaseException as exc:
+        record(f'{label} raised {describe(exc)}')
+        return None
+    record(f'{label} ok = {value!r}')
+    return value
 
 
 @unittest.skipUnless(os.name == 'nt', 'requires native Windows')
@@ -37,43 +43,27 @@ class ConfigBoundaryProbe(unittest.TestCase):
             lines.append(text)
 
         with tempfile.TemporaryDirectory(prefix='mp-boundary-') as temp:
-            record(f'temp={temp!r}')
-            record(f'package_dir={str(server._PACKAGE_DIR)!r}')
-            record(f'localappdata={os.environ.get("LOCALAPPDATA")!r}')
-
             flat = Path(temp) / 'config.json'
             flat.write_text('{}', encoding='utf-8')
-            try:
-                record(f'A.boundary={server._windows_config_boundary(flat)!r}')
-            except BaseException as exc:
-                record(f'A.boundary raised {_describe(exc)}')
-            try:
-                pw.read_guarded_file(ntpath.abspath(str(flat)), with_data=True)
-                record('A.read ok')
-            except BaseException as exc:
-                record(f'A.read raised {_describe(exc)}')
+            target = ntpath.abspath(str(flat))
+            record(f'target={target!r}')
+            record(f'package_dir={str(server._PACKAGE_DIR)!r}')
 
-            root = Path(temp) / 'proj'
-            (root / 'config').mkdir(parents=True)
-            nested = root / 'config' / 'config.json'
-            nested.write_text(json.dumps({'supplies': []}), encoding='utf-8')
-            try:
-                with patch.object(server, '_PACKAGE_DIR', root):
-                    record(f'B.boundary={server._windows_config_boundary(nested)!r}')
-            except BaseException as exc:
-                record(f'B.boundary raised {_describe(exc)}')
-            try:
-                value = pw.read_guarded_file(ntpath.abspath(str(nested)), with_data=True,
-                                             trusted_boundary=str(root))
-                record(f'B.read ok bytes={len(value.data)}')
-            except BaseException as exc:
-                record(f'B.read raised {_describe(exc)}')
-
-            try:
-                with patch.object(server, '_PACKAGE_DIR', root):
-                    store = server.ConfigStore(nested)
-                record(f'B.ConfigStore ok supplies={len(store._config.get("supplies", []))}')
-            except BaseException as exc:
-                record(f'B.ConfigStore raised {_describe(exc)}')
+            step(record, '1.local_absolute', lambda: pww._local_absolute_target(target))
+            api = step(record, '2.api', pww._api)
+            step(record, '3.volume_info(C:\\)', lambda: api.volume_info('C:\\'))
+            step(record, '3b.volume_info(D:\\)', lambda: api.volume_info('D:\\'))
+            step(record, '4.fixed_drive',
+                 lambda: pww._check_fixed_drive(api, pww._local_absolute_target(target)))
+            from core.discovery import _WindowsPathMonitor, _windows_path_backend
+            monitor = step(record, '5.monitor', lambda: _WindowsPathMonitor(_windows_path_backend()))
+            step(record, '6.inspect',
+                 lambda: windows_paths.inspect(target, backend=monitor, kind='file',
+                                               private=True, single_link=True,
+                                               trusted_boundary=str(Path(temp))))
+            step(record, '7.open_read_file', lambda: pww.open_read_file(target, backend=api))
+            step(record, '8.read_guarded_file',
+                 lambda: pww.read_guarded_file(target, with_data=True,
+                                               trusted_boundary=str(Path(temp))))
 
         self.fail('PROBE RESULTS\n' + '\n'.join(lines))
