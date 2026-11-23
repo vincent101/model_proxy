@@ -232,7 +232,7 @@ class TestLedgerStateMachine(unittest.TestCase):
             path = Path(directory) / 'totals.json'
             content = json.dumps(initial_data())
             path.write_text(content)
-            snap = server.read_stable_config(path, reject_duplicate_keys=True)
+            snap = platform_tmp.read_stable(path, reject_duplicate_keys=True)
             store = server.UsageTotalsStore.from_verified_snapshot(path, snap)
             store.record(ACC, 1)
             self.assertEqual(store.persistence_state, 'PENDING')

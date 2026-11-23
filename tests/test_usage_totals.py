@@ -62,7 +62,7 @@ class _FakeBusinessDiskAdapter:
             self.path.lstat()
         except FileNotFoundError:
             return LedgerObservation(None, (parent.st_dev, parent.st_ino, None, None))
-        snapshot = read_stable_config(self.path, reject_duplicate_keys=True)
+        snapshot = platform_tmp.read_stable(self.path, reject_duplicate_keys=True)
         raw = self.path.read_bytes()
         return LedgerObservation(copy.deepcopy(snapshot.config),
                                  (parent.st_dev, parent.st_ino, snapshot.marker, raw))
@@ -104,7 +104,7 @@ def _business_store(path, *, mode="direct", snapshot=None):
     """Exercise direct load or verified load, then use the explicit fake disk."""
     path = Path(path)
     if snapshot is None and path.exists():
-        snapshot = read_stable_config(path, reject_duplicate_keys=True)
+        snapshot = platform_tmp.read_stable(path, reject_duplicate_keys=True)
     adapter = _FakeBusinessDiskAdapter(path)
     if mode == "direct":
         store = UsageTotalsStore(path)
@@ -1001,7 +1001,7 @@ class TestMigrationLedgerValidation(unittest.TestCase):
                             original = copy.deepcopy(data)
                             self.path.write_text(json.dumps(data), encoding="utf-8")
                             before, inode = self.path.read_bytes(), self.path.stat().st_ino
-                            snapshot = read_stable_config(self.path)
+                            snapshot = platform_tmp.read_stable(self.path)
                             with patch("builtins.open", side_effect=AssertionError("unexpected I/O")):
                                 self.assertIsNone(validate_migration_ledger_snapshot(snapshot))
                             with patch.object(server_module, "KEEP_DAYS", 1), \
@@ -1030,7 +1030,7 @@ class TestMigrationLedgerValidation(unittest.TestCase):
                             )
                             self.assertEqual("months_archive" in actual,
                                              not missing_months or not missing_days)
-                            validate_migration_ledger_snapshot(read_stable_config(self.path))
+                            validate_migration_ledger_snapshot(platform_tmp.read_stable(self.path))
                             self.path.unlink()
 
     def test_v3_omitted_optional_containers_are_not_fabricated_on_load(self):
@@ -1040,7 +1040,7 @@ class TestMigrationLedgerValidation(unittest.TestCase):
                 for field in fields:
                     del data[field]
                 self.path.write_text(json.dumps(data), encoding="utf-8")
-                snapshot = read_stable_config(self.path)
+                snapshot = platform_tmp.read_stable(self.path)
                 validate_migration_ledger_snapshot(snapshot)
                 store = _business_store(self.path, mode="snapshot", snapshot=snapshot)
                 for field in fields:
@@ -1296,7 +1296,7 @@ class TestMigrationLedgerValidation(unittest.TestCase):
         data["FAKE_PRIVATE_VALUE"] = "FAKE_PRIVATE_VALUE"
         self.path.write_text(json.dumps(data))
         before, inode = self.path.read_bytes(), self.path.stat().st_ino
-        snapshot = read_stable_config(self.path)
+        snapshot = platform_tmp.read_stable(self.path)
         self.assert_invalid(snapshot.config)
         self.assertEqual(self.path.read_bytes(), before)
         self.assertEqual(self.path.stat().st_ino, inode)
@@ -1424,7 +1424,7 @@ class TestMigrationLedgerValidation(unittest.TestCase):
                 self.assertEqual(january_after["sum_ms"], 90)
                 self.assertEqual(january_after["combos"][self.combo_key]["usage_in"], 30)
                 validate_migration_ledger_snapshot(
-                    read_stable_config(self.path, reject_duplicate_keys=True))
+                    platform_tmp.read_stable(self.path, reject_duplicate_keys=True))
                 self.path.unlink()
 
     def test_valid_v2_and_v3_continue_recording_after_verified_load(self):
@@ -1433,7 +1433,7 @@ class TestMigrationLedgerValidation(unittest.TestCase):
                 data = self.ledger(version)
                 self.path.write_text(json.dumps(data), encoding="utf-8")
                 before = self.path.read_bytes()
-                snapshot = read_stable_config(self.path, reject_duplicate_keys=True)
+                snapshot = platform_tmp.read_stable(self.path, reject_duplicate_keys=True)
                 store = _business_store(self.path, mode="snapshot", snapshot=snapshot)
                 self.assertEqual(self.path.read_bytes(), before)
                 store.record(_acc(), 7)
@@ -1445,7 +1445,7 @@ class TestMigrationLedgerValidation(unittest.TestCase):
                 self.assertEqual(actual["days"][self.today]["requests"], 3)
                 self.assertEqual(actual["total"]["combos"][self.combo_key]["usage_in"], 20)
                 self.assertEqual(snapshot.config, data)
-                validate_migration_ledger_snapshot(read_stable_config(self.path))
+                validate_migration_ledger_snapshot(platform_tmp.read_stable(self.path))
                 self.path.unlink()
 
     def test_valid_v2_continues_archive_and_records_without_losing_counters(self):
@@ -1454,7 +1454,7 @@ class TestMigrationLedgerValidation(unittest.TestCase):
         data["days"] = {"2026-01-01": self.bucket(2), "2026-01-02": self.bucket(2)}
         self.path.write_text(json.dumps(data), encoding="utf-8")
         before = self.path.read_bytes()
-        snapshot = read_stable_config(self.path, reject_duplicate_keys=True)
+        snapshot = platform_tmp.read_stable(self.path, reject_duplicate_keys=True)
         store = _business_store(self.path, mode="snapshot", snapshot=snapshot)
         self.assertEqual(self.path.read_bytes(), before)
         with patch.object(server_module, "KEEP_DAYS", 1):
@@ -1466,7 +1466,7 @@ class TestMigrationLedgerValidation(unittest.TestCase):
         self.assertEqual(actual["months_archive"]["2026-01"]["requests"], 6)
         self.assertEqual(actual["months_archive"]["2026-01"]["combos"][self.combo_key]["usage_in"], 30)
         self.assertEqual(snapshot.config, data)
-        validate_migration_ledger_snapshot(read_stable_config(self.path))
+        validate_migration_ledger_snapshot(platform_tmp.read_stable(self.path))
 
 
 if __name__ == "__main__":

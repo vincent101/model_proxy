@@ -94,3 +94,17 @@ class TemporaryDirectory:
 def path(prefix: str = "mp-test-") -> Path:
     """建一个私有临时目录并返回 Path（调用方负责清理）。"""
     return Path(TemporaryDirectory(prefix=prefix).name)
+
+
+def read_stable(path, **kwargs):
+    """按生产口径读配置/账本快照。
+
+    Windows 上 `read_guarded_file` 必须以项目内的已验证边界为 trusted_boundary，
+    否则会一路检查到盘根（含 BUILTIN\\Users），必然 fail-closed。生产侧由
+    `server._read_business_config` 补这一步；测试直接调底层 API 时用它保持一致。
+    """
+    from core import config_snapshot, server
+
+    if os.name == "nt" and "trusted_boundary" not in kwargs:
+        kwargs["trusted_boundary"] = server._windows_config_boundary(path)
+    return config_snapshot.read_stable_config(path, **kwargs)
