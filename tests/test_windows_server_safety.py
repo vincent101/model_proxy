@@ -11,13 +11,15 @@ from core.discovery import PreflightError
 
 class WindowsPreviousProcessSafetyTests(unittest.TestCase):
     def test_existing_record_never_probes_or_signals_windows_pid(self):
-        record = {"active": {"runtime_paths": {"fake": "fake"}, "locks": {"fake": "fake"},
-                              "pid": 4321, "process_start": {"fake": "fake"}}}
+        # Windows keeps its boot-local {'device','inode'} lock shape.
+        locks = {"anchor": {"device": 1, "inode": 2}, "legacy": {"device": 1, "inode": 3}}
+        record = {"active": {"runtime_paths": {"fake": "fake"}, "locks": dict(locks),
+                             "pid": 4321, "process_start": {"fake": "fake"}}}
         with patch.object(server.os, "name", "nt"), \
              patch.object(server.os, "kill", side_effect=AssertionError("signal forbidden")) as signal, \
              patch.object(server, "process_start_identity") as identity:
             with self.assertRaises(PreflightError) as caught:
-                server._ensure_stale_instance(record, {"fake": "fake"}, {}, {"fake": "fake"})
+                server._ensure_stale_instance(record, {"fake": "fake"}, {}, dict(locks))
         self.assertEqual(caught.exception.code, "process_unverified")
         signal.assert_not_called()
         identity.assert_not_called()
@@ -28,8 +30,11 @@ class WindowsPreviousProcessSafetyTests(unittest.TestCase):
                                           recovery=WindowsRecordRecovery("missing", "replacement_changed", "unknown"),
                                           temporary_created=True, temporary_may_contain_data=True)
         output = io.StringIO()
+        # 原生 Windows 上 main() 会先做服务启动形态校验（POSIX 宿主模拟时不会），
+        # 这里一并放行，用例只针对「提交失败时的错误汇报」。
         with patch.object(server.os, "name", "nt"), \
              patch.object(server, "resolve_listen", return_value={}), \
+             patch.object(server, "_require_windows_service_launch"), \
              patch.object(server, "resolve_runtime_paths", side_effect=failure), redirect_stderr(output):
             with self.assertRaises(SystemExit):
                 server.main()

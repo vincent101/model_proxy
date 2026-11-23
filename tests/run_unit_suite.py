@@ -20,8 +20,12 @@ from __future__ import annotations
 import argparse
 import concurrent.futures
 import pathlib
+import re
 import subprocess
 import sys
+
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
+import platform_scope  # noqa: E402  (同目录清单，唯一真相源)
 
 # Windows 控制台默认 cp1252，中文输出会直接 UnicodeEncodeError 打断整套测试
 # （实测 GitHub Actions windows-latest）。这里强制 UTF-8，并在不支持时降级为
@@ -52,26 +56,56 @@ WINDOWS_NATIVE_HINT = (
 )
 
 
+FAILED_ID = re.compile(r"tests/([A-Za-z0-9_]+\.py)::([A-Za-z0-9_]+::)?([A-Za-z0-9_\[\]=,\.\-']+)")
+
+
+def failed_ids(output: str) -> list[tuple[str, str]]:
+    """从 pytest 输出里取出失败的 (文件名, 'Class.test' / 'test')。"""
+    found, seen = [], set()
+    for line in output.splitlines():
+        if 'FAILED' not in line:
+            continue
+        for match in FAILED_ID.finditer(line):
+            cls, test = match.group(2), match.group(3)
+            test_id = (cls[:-2] + '.' + test) if cls else test
+            key = (match.group(1), test_id)
+            if key not in seen:
+                seen.add(key)
+                found.append(key)
+    return found
+
+
 def classify(name: str, output: str) -> str:
-    """ok / isolation / windows-native / macos-native / fail
+    """ok / isolation / out-of-scope / windows-native / macos-native / fail
 
-    判据顺序：隔离环境变量 → 文件名（平台专测）→ 错误信息特征。
+    判据顺序：隔离环境变量 → 平台范围清单 → 文件名前缀（原生专测）→ 错误特征。
 
-    `test_windows_*` / `test_wine_*` 专测 Win32 句柄/ACL/记录目录，
-    `test_mac_*` / `test_darwin_*` 专测 macOS 原生保护——各自只能在对应宿主上
-    验收。跨平台 CI 必须两边都跑才能覆盖全部；缺哪边，哪边就是「未原生验收」。
+    平台范围清单（`tests/platform_scope.py`）优先：显式声明了 `posix`/`windows`
+    的文件或用例，在另一宿主上的失败是「不适用」，不是缺陷。未声明的文件默认
+    两边都必须通过（fail-closed），所以新用例想逃过 Windows 验收必须显式登记。
     """
     if any(var in output for var in NEEDS_ISOLATION_ENV):
         return 'isolation'
-    if sys.platform != 'win32' and (name.startswith('test_windows_')
-                                    or name.startswith('test_wine_')):
+    ids = failed_ids(output)
+    if ids and all(platform_scope.covers(file_name, test_id, HOST) for file_name, test_id in ids):
+        return 'out-of-scope'
+    # 文件级声明覆盖「整份都只属于另一平台」但输出里没解析出具体用例 id 的情况
+    scope, _, _ = platform_scope.file_scope(name)
+    if scope != platform_scope.BOTH and scope != HOST:
+        return 'out-of-scope'
+    if HOST == 'posix' and (name.startswith('test_windows_') or name.startswith('test_wine_')):
         return 'windows-native'
     if sys.platform != 'darwin' and (name.startswith('test_mac_')
                                      or name.startswith('test_darwin_')):
         return 'macos-native'
-    if any(hint in output for hint in WINDOWS_NATIVE_HINT):
+    # 特征串只在「非 Windows 宿主」上作为 Windows 专测的兜底；在 Windows 上出现
+    # 这些特征就是真失败（之前会把它错标成 windows-native 从而永久掩盖）。
+    if HOST != 'windows' and any(hint in output for hint in WINDOWS_NATIVE_HINT):
         return 'windows-native'
     return 'fail'
+
+
+HOST = platform_scope.host_scope()
 
 
 DETAIL_LINES = 60     # 失败时要保留的输出行数（够看到首个断言的完整回溯）
@@ -115,8 +149,23 @@ def run_one(path: pathlib.Path) -> tuple[str, str, str, list[str]]:
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument('-j', '--jobs', type=int, default=4)
+    parser.add_argument('--list-scope', action='store_true',
+                        help='打印平台范围清单后退出')
     parser.add_argument('files', nargs='*')
     args = parser.parse_args(argv)
+
+    if args.list_scope:
+        print(f'host: {HOST}')
+        print('按文件声明：')
+        for name in sorted(platform_scope.FILE_SCOPE):
+            scope, reason, gap = platform_scope.file_scope(name)
+            print(f'  {name:<52} {scope:<8}{" [gap]" if gap else ""}  {reason}')
+        print('按用例声明：')
+        for (name, pattern), entry in sorted(platform_scope.TEST_SCOPE.items()):
+            scope, reason, gap = platform_scope._split(entry)
+            print(f'  {name}::{pattern or "*"}')
+            print(f'      {scope:<8}{" [gap]" if gap else ""}  {reason}')
+        return 0
 
     root = pathlib.Path(__file__).resolve().parent
     if args.files:
@@ -134,29 +183,51 @@ def main(argv=None) -> int:
             print('  -', path.name)
         print()
 
-    buckets = {'ok': [], 'isolation': [], 'windows-native': [], 'macos-native': [],
-               'fail': []}
+    buckets = {'ok': [], 'isolation': [], 'out-of-scope': [], 'windows-native': [],
+               'macos-native': [], 'fail': []}
+    prefixes = {'ok': 'ok  ', 'isolation': 'iso ', 'out-of-scope': 'skip',
+                'windows-native': 'win ', 'macos-native': 'mac ', 'fail': 'FAIL'}
+    skipped_by_scope = []
     with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, args.jobs)) as pool:
         for name, kind, summary, detail in pool.map(run_one, runnable):
             buckets[kind].append(name)
-            prefix = {'ok': 'ok  ', 'isolation': 'iso ',
-                      'windows-native': 'win ', 'macos-native': 'mac ',
-                      'fail': 'FAIL'}[kind]
-            print(f'{prefix} {name:<52} {summary}')
+            print(f'{prefixes[kind]} {name:<52} {summary}')
+            if kind == 'out-of-scope':
+                scope, reason, _ = platform_scope.file_scope(name)
+                skipped_by_scope.append((name, scope, reason))
             for line in detail:
                 print(f'     | {line}')
 
     print()
+    print(f'host: {HOST}')
     print(f'files run: {len(runnable)}  ok: {len(buckets["ok"])}'
           f'  needs-isolation: {len(skipped) + len(buckets["isolation"])}'
+          f'  本平台不适用: {len(buckets["out-of-scope"])}'
           f'  windows-native: {len(buckets["windows-native"])}'
           f'  macos-native: {len(buckets["macos-native"])}'
           f'  意外失败: {len(buckets["fail"])}')
+
+    if skipped_by_scope:
+        print()
+        print('按平台范围清单跳过（tests/platform_scope.py 显式声明，非静默）:')
+        for name, scope, reason in skipped_by_scope:
+            print(f'  - {name:<48} scope={scope}  {reason}')
+
+    gaps = platform_scope.gaps()
+    if gaps:
+        print()
+        print(f'Windows 覆盖缺口 {len(gaps)} 项（跨平台逻辑、夹具仍绑定 POSIX；待补而非豁免）:')
+        for name, reason in gaps:
+            print(f'  - {name:<60} {reason}')
+
     if buckets['fail']:
         print()
-        print('意外失败（既不是隔离环境缺失，也不是 Windows 原生限制）:')
+        print('意外失败（不在平台范围清单里，也不是隔离环境缺失）:')
         for name in buckets['fail']:
             print('  -', name)
+        print()
+        print('若确认该文件/用例只属于另一平台，请在 tests/platform_scope.py 登记并写原因；'
+              '若属共享逻辑，请修夹具而不是登记。')
         return 1
     return 0
 

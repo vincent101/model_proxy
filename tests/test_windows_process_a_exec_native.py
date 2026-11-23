@@ -54,10 +54,15 @@ class WindowsExecSmoke(unittest.TestCase):
             data = json.loads(receipt.read_text(encoding="utf-8"))
             self.assertEqual(data["config"], str(config))
             self.assertEqual(data["port"], "12345")
-            # 产品在 re-exec 前把入口/配置规范化成长路径（8.3 短名会被展开）。
-            # tempfile 在 runner 上给的是 RUNNER~1 短名，因此期望值同样取规范化结果。
-            self.assertEqual(data["argv"][-5:], [str(entry.resolve()), "--config",
-                                                 str(config.resolve()), "--port", "12345"])
+            # tempfile 在 runner 上给出的是 8.3 短名（RUNNER~1），产品对入口与
+            # 配置的规范化路径并不一致：入口取脚本自身 __file__（已是长名），
+            # 配置走 ntpath.abspath（保留短名）。两者都指向同一文件，所以按
+            # 「规范化后相等」比较，而不是钉死某一种拼写。
+            tail = data["argv"][-5:]
+            self.assertEqual(tail[1:2], ["--config"])
+            self.assertEqual(tail[3:5], ["--port", "12345"])
+            self.assertEqual(Path(tail[0]).resolve(), entry.resolve())
+            self.assertEqual(Path(tail[2]).resolve(), config.resolve())
 
     def test_direct_parent_returns_the_owned_service_child_failure(self):
         source = Path(__file__).resolve().parents[1]

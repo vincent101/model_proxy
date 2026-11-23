@@ -148,7 +148,9 @@ class WindowsHookTests(unittest.TestCase):
             hook = hook_dir / WINDOWS_HOOK.name
             shutil.copyfile(WINDOWS_HOOK, hook)
             cli = root / 'model_proxy_cli.bat'
-            cli.write_text('@echo off\n> "%HOOK_CALLS%" echo %*\n'
+            # 不能写成 `echo %*`：参数正好是 `on` 时 `echo on` 是 cmd 的开关
+            # 命令，什么都不打印（实测 calls.txt 为空）。用括号包一层强制按文本输出。
+            cli.write_text('@echo off\n> "%HOOK_CALLS%" echo [%*]\n'
                            'echo fake cli stdout\n'
                            'echo initialization_interactive_required 1>&2\n'
                            'exit /b %FAKE_CODE%\n')
@@ -167,7 +169,7 @@ class WindowsHookTests(unittest.TestCase):
                                             env=env, stdin=subprocess.DEVNULL, text=True,
                                             stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=5)
                     self.assertEqual(result.returncode, code)
-                    self.assertEqual((root / 'calls.txt').read_text().strip(), 'on')
+                    self.assertEqual((root / 'calls.txt').read_text().strip(), '[on]')
                     self.assertIn('initialization_interactive_required', result.stderr)
 
 

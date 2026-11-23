@@ -391,8 +391,9 @@ class TestResolveAppkey(unittest.TestCase):
 
     def test_tilde_expansion(self):
         """appkey_file 支持 ~ 展开（os.path.expanduser，HOME 指向临时目录）。"""
+        # Windows 的 expanduser 读 USERPROFILE，POSIX 读 HOME；两边都指向临时目录。
         with tempfile.TemporaryDirectory() as d, \
-                patch.dict(os.environ, {"HOME": d}):
+                patch.dict(os.environ, {"HOME": d, "USERPROFILE": d}):
             _write_keyfile(Path(d) / "kf.yaml", ["AUTHORIZATION: tk_home"])
             s = {"id": "s1", "appkey_file": "~/kf.yaml"}
             self.assertEqual(resolve_appkey(s), "tk_home")
