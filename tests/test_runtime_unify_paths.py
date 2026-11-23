@@ -127,9 +127,10 @@ class FirstConfigMarkerTests(unittest.TestCase):
         snap = Mock(exists=True, contents=b"started")
         fake_os = SimpleNamespace(name="nt", path=ntpath,
                                   environ={"CONFIG_OPS_RELOAD_MARKER": marker})
-        fake_file = Mock()
-        fake_file.resolve.return_value.parents = [None, None, root]
-        with patch.object(ops, "os", fake_os), patch("pathlib.Path", return_value=fake_file), \
+        # 实现用 os.path.realpath(__file__) 求项目根（不再依赖按 os.name 选择
+        # 的 Path 类），因此这里直接给 Windows 形状的 __file__。
+        with patch.object(ops, "os", fake_os), \
+             patch.object(ops, "__file__", root + r"\core\cli\_config_ops.py"), \
              patch.object(ops, "_MARKER_BASELINE", None), \
              patch.object(windows_secure_files, "capture_target", return_value=snap) as capture:
             ops._precheck_inherited_marker()
