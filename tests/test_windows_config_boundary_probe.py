@@ -1,4 +1,4 @@
-"""临时探针：确认「用 icacls 收紧 ACL 的项目根」能否让真实 Windows 读到配置。
+"""临时探针：找出 Windows 上「ACL 被判 private」的可写目录位置。
 
 只在原生 Windows 上跑；结论进 CI 日志（失败输出），取证后删除本文件。
 """
@@ -25,48 +25,46 @@ def describe(exc):
     return ' <- '.join(chain)
 
 
-def harden(path):
-    """把目录 ACL 收成仅当前用户：移除继承 + 只授当前用户完全控制。"""
-    user = os.environ.get('USERNAME', '')
-    done = subprocess.run(['icacls', str(path), '/inheritance:r',
-                           '/grant:r', f'{user}:(OI)(CI)F'],
-                          capture_output=True, text=True)
-    return done.returncode, (done.stdout or '') + (done.stderr or '')
+def acl_lines(path):
+    done = subprocess.run(['icacls', str(path)], capture_output=True, text=True)
+    keep = [line.strip() for line in (done.stdout or '').splitlines()[1:] if ':' in line]
+    return keep[:8]
+
+
+def try_read(record, label, base):
+    root = Path(base) / 'proj'
+    (root / 'config').mkdir(parents=True, exist_ok=True)
+    flat = root / 'config' / 'config.json'
+    flat.write_text(json.dumps({'supplies': []}), encoding='utf-8')
+    record(f'{label}.root={str(root)!r}')
+    record(f'{label}.acl={acl_lines(root)!r}')
+    try:
+        with patch.object(server, '_PACKAGE_DIR', root):
+            store = server.ConfigStore(flat)
+        record(f'{label}.ConfigStore ok supplies={len(store._config.get("supplies", []))}')
+    except BaseException as exc:
+        record(f'{label}.ConfigStore raised {describe(exc)}')
 
 
 @unittest.skipUnless(os.name == 'nt', 'requires native Windows')
-class PrivateRootProbe(unittest.TestCase):
+class AclLocationProbe(unittest.TestCase):
     def test_probe(self):
         lines = []
 
         def record(text):
             lines.append(text)
 
-        temp = tempfile.mkdtemp(prefix='mp-probe-')
-        root = Path(temp) / 'proj'
-        (root / 'config').mkdir(parents=True)
-        flat = root / 'config' / 'config.json'
-        flat.write_text(json.dumps({'supplies': []}), encoding='utf-8')
-        record(f'root={str(root)!r}')
+        record(f'username={os.environ.get("USERNAME")!r}')
+        record(f'temp={tempfile.gettempdir()!r}')
+        record(f'localappdata={os.environ.get("LOCALAPPDATA")!r}')
+        record(f'userprofile={os.environ.get("USERPROFILE")!r}')
 
-        record(f'icacls(proj)={harden(root)[0]}')
-        record(f'icacls(config)={harden(root / "config")[0]}')
-        record(f'icacls(file)={harden(flat)[0]}')
-        code, text = harden(root)
-        record(f'icacls output sample={text.strip().splitlines()[:2]!r}')
-
-        target = ntpath.abspath(str(flat))
-        try:
-            value = pww.read_guarded_file(target, with_data=True)
-            record(f'A.read ok bytes={len(value.data)}')
-        except BaseException as exc:
-            record(f'A.read raised {describe(exc)}')
-
-        try:
-            with patch.object(server, '_PACKAGE_DIR', root):
-                store = server.ConfigStore(flat)
-                record(f'B.ConfigStore ok supplies={len(store._config.get("supplies", []))}')
-        except BaseException as exc:
-            record(f'B.ConfigStore raised {describe(exc)}')
+        try_read(record, 'A.temp', tempfile.mkdtemp(prefix='mp-probe-'))
+        local = Path(os.environ['LOCALAPPDATA']) / 'mp-probe-local'
+        try_read(record, 'B.localappdata', local)
+        profile = Path(os.environ['USERPROFILE']) / 'mp-probe-profile'
+        try_read(record, 'C.userprofile', profile)
+        workspace = Path(os.environ.get('GITHUB_WORKSPACE') or os.getcwd())
+        try_read(record, 'D.workspace', workspace)
 
         self.fail('PROBE RESULTS\n' + '\n'.join(lines))
