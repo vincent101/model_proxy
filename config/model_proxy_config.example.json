@@ -1,31 +1,189 @@
 {
-  "admin_token": "xaxaxaaxaxaxaxax",
-  "listen": {"host": "0.0.0.0", "port": 18889},
+  "admin_token": "REPLACE_WITH_ADMIN_TOKEN",
+  "listen": {
+    "host": "0.0.0.0",
+    "port": 18889
+  },
   "allow_hosts": [],
   "cooldown_rules": [
-    {"errorcode": [429,500,502,503,504],"cooldown_seconds": 60},
-    {"errorcode": [],"cooldown_seconds": 3600},
-    {"errorcode": [400],"cooldown_seconds": 5},
-    {"errorcode": [401,402,403],"cooldown_seconds": 21600},
-    {"errorcode": ["URLError"],"cooldown_seconds": 60}
+    {
+      "errorcode": [
+        429,
+        500,
+        502,
+        503,
+        504
+      ],
+      "cooldown_seconds": 60
+    },
+    {
+      "errorcode": [
+        400
+      ],
+      "cooldown_seconds": 5
+    },
+    {
+      "errorcode": [
+        401,
+        402,
+        403
+      ],
+      "cooldown_seconds": 21600
+    },
+    {
+      "errorcode": [
+        "URLError"
+      ],
+      "cooldown_seconds": 60
+    }
   ],
   "upstream_timeout_seconds": 3600,
-  "budget_retry": {"enabled": true,"max_retries": 5},
-  "log_upstream_error_body": {"enabled": false, "max_bytes": 4096, "redact_patterns": []},
+  "budget_retry": {
+    "enabled": true,
+    "max_retries": 5
+  },
+  "log_upstream_error_body": {
+    "enabled": false,
+    "max_bytes": 4096,
+    "redact_patterns": []
+  },
   "body_error_rules": [
-    {"pattern": "当前小时请求过于频繁", "match": "contains", "errorcode": "body_rate_limited"},
-    {"pattern": "未命中任何路由策略", "match": "contains", "errorcode": "body_route_miss"}
+    {
+      "pattern": "当前小时请求过于频繁",
+      "match": "contains",
+      "errorcode": "body_rate_limited"
+    },
+    {
+      "pattern": "未命中任何路由策略",
+      "match": "contains",
+      "errorcode": "body_route_miss"
+    }
   ],
   "supplies": [
-    {"id": "glm-53-sankuai-xxxx","url": "https://aigc.sankuai.com/v1/anthropic/v1/messages","protocol": "anthropic","appkey": "xxx","target_model": "glm-5.3","reasoning_capability": {"effort_enum": ["high","max"]}},
-    {"id": "ds-pro-sankuai-xxxx","url": "https://aigc.sankuai.com/v1/anthropic/v1/messages","protocol": "anthropic","appkey": "xxx","target_model": "deepseek-v4-pro","reasoning_capability": {"effort_enum": ["low","high","max"]}},
-    {"id": "ds-flash-sankuai-xxxx","url": "https://aigc.sankuai.com/v1/anthropic/v1/messages","protocol": "anthropic","appkey": "xxx","target_model": "deepseek-v4-flash","reasoning_capability": {"effort_enum": ["high"]}},
-    {"id": "glm-53-mcli-example","url": "https://mcli.sankuai.com/v1/messages","protocol": "anthropic","appkey_file": "~/.config/mcopilot-cli/.config.yaml","target_model": "glm-5.3","reasoning_capability": {"effort_enum": ["off","low","medium","high"]},"extra_headers": {"X-Working-Dir": "/"},"system_inject": "x-anthropic-billing-header: cc_version=2.1.196; cc_entrypoint=sdk-cli; cch=00000;"}
+    {
+      "id": "anthropic-example",
+      "protocol": "anthropic",
+      "url": "https://your-upstream.example.com/v1/anthropic/v1/messages",
+      "appkey": "REPLACE_WITH_UPSTREAM_APPKEY",
+      "target_model": "REPLACE_WITH_UPSTREAM_MODEL",
+      "reasoning_capability": {
+        "effort_enum": [
+          "low",
+          "medium",
+          "high",
+          "max"
+        ]
+      }
+    },
+    {
+      "id": "responses-example",
+      "protocol": "responses",
+      "url": "https://your-upstream.example.com/v1/responses",
+      "appkey": "REPLACE_WITH_UPSTREAM_APPKEY",
+      "target_model": "REPLACE_WITH_UPSTREAM_MODEL"
+    },
+    {
+      "id": "catpaw-cli-example",
+      "protocol": "catpaw-cli",
+      "target_model": "REPLACE_WITH_MCLI_MODEL",
+      "reasoning_capability": {
+        "effort_enum": [
+          "low",
+          "medium",
+          "high",
+          "xhigh",
+          "max"
+        ]
+      }
+    },
+    {
+      "id": "catpaw-ide-example",
+      "protocol": "catpaw-ide",
+      "target_model": "REPLACE_WITH_IDE_MODEL",
+      "reasoning_capability": {
+        "effort_enum": [
+          "low",
+          "medium",
+          "high",
+          "xhigh",
+          "max"
+        ]
+      }
+    },
+    {
+      "id": "glm-53-mcli-example",
+      "protocol": "anthropic",
+      "url": "https://mcli.sankuai.com/v1/messages",
+      "appkey_file": "~/.config/mcopilot-cli/.config.yaml",
+      "target_model": "glm-5.3",
+      "reasoning_capability": {
+        "effort_enum": [
+          "off",
+          "low",
+          "medium",
+          "high"
+        ]
+      },
+      "extra_headers": {
+        "X-Working-Dir": "/"
+      },
+      "system_inject": "x-anthropic-billing-header: cc_version=2.1.196; cc_entrypoint=sdk-cli; cch=00000;"
+    }
   ],
   "routes": [
-    {"id": "nation1","tiers": {"fable": ["glm-53-sankuai-xxxx"],"opus": ["glm-53-sankuai-xxxx"],"sonnet": ["ds-pro-sankuai-xxxx","glm-53-mcli-example"],"haiku": ["ds-flash-sankuai-xxxx"]},"failover": "on"}
+    {
+      "id": "mixed",
+      "tiers": {
+        "fable": [
+          "catpaw-ide-example"
+        ],
+        "opus": [
+          "catpaw-ide-example"
+        ],
+        "sonnet": [
+          "anthropic-example",
+          "catpaw-cli-example"
+        ],
+        "haiku": [
+          "glm-53-mcli-example"
+        ]
+      },
+      "failover": "on"
+    },
+    {
+      "id": "responses-only",
+      "tiers": {
+        "fable": [
+          "responses-example"
+        ],
+        "opus": [
+          "responses-example"
+        ],
+        "sonnet": [
+          "responses-example"
+        ],
+        "haiku": [
+          "responses-example"
+        ]
+      },
+      "failover": "on"
+    }
   ],
   "strategies": [
-    {"client_token": "cc","route_pool": [{"route_id": "nation1","weight": 1}],"note": "Claude Code SDK"}
+    {
+      "client_token": "REPLACE_WITH_CC_CLIENT_TOKEN",
+      "route_pool": [
+        {
+          "route_id": "mixed",
+          "weight": 1
+        }
+      ],
+      "note": "Claude Code"
+    },
+    {
+      "client_token": "REPLACE_WITH_CODEX_CLIENT_TOKEN",
+      "route_id": "responses-only",
+      "note": "Codex"
+    }
   ]
 }

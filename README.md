@@ -22,7 +22,7 @@ version: 0.16
 | **正文错误识别** | 上游 200 但正文是"限流/额度/模型不存在"等语义错误 → 按虚拟错误码冷却，不当作成功 |
 | **effort 映射** | 客户端档位按**相对排名**映射到上游档位，不同供应商档位数量不一致也不会错位 |
 | **用量观测** | 每请求一条 ACCESS 日志 + 独立 token 账本，可按天/月统计；`status` 汇总**每条在用供给的近 30min 成功率、首 token 中位数、输出 tps、失败码**（标题行的 cooldown/degraded 计数与表内行数同口径），以及活跃会话 |
-| **三类上游接入** | 标准 HTTP（自带 url/appkey）、`catpaw-cli`（mcli 网关）、`catpaw-ide`（CatPaw IDE，凭据由 mtsso_keeper 管） |
+| **四类上游接入** | ① 标准 HTTP-Anthropic（自带 url/appkey）② 标准 HTTP-Responses ③ `catpaw-cli`（mcli 网关）④ `catpaw-ide`（CatPaw IDE，凭据由 mtsso_keeper 管）；标准 HTTP-Chat 仅作出站路径 |
 
 上游协议组合矩阵（行是客户端入站，列是上游；每条通路都有流式和非流式实现）：
 
@@ -39,7 +39,9 @@ version: 0.16
 - **只做模型路由，不做鉴权中心**：`client_token` 是路由查表键，不是密钥校验；
   上游 `appkey`/`appkey_file` 只供出站，绝不能发给客户端。
 - **流一旦提交就不能换供给**：切换发生在响应开始之前；流内失败只影响后续请求。
-- **Mac 有真实使用证据；Windows 尚未原生验收**，当前只供测试，不用于生产。
+- **平台成熟度**：Mac 有长期真实使用证据。Windows 的核心链路（CLI 生命周期、启动 preflight、
+  私有目录/ACL、配置读写、监听绑定、进程与套接字观测）已由原生 windows-latest CI 逐项验证，
+  但**尚无真实 Windows 生产流量**；`catpaw-ide` 另需本机的桥动态库（见下）。首次上线按试运行对待。
 - 支持范围以本文档与 [CONFIG](docs/CONFIG.md) 为准，未列出的功能组合不保证可用。
 
 [首次跑通](#首次跑通一次请求) · [接入客户端](#接入其他客户端或手动配置) · [选路与会话](#换上游模型档位或当前会话) · [运维排错](#查看状态更新配置处理失败) · [远程使用](#从另一台电脑使用) · [深入文档](#深入文档)
@@ -84,9 +86,21 @@ if exist config\model_proxy_config.json (echo 配置已存在，未覆盖) else 
 编辑新配置：
 
 1. 示例是 `listen.host: "0.0.0.0"` 加空 `allow_hosts`，**原样会拒绝启动**。本机使用改成 `127.0.0.1`；远程使用见[下文](#从另一台电脑使用)。
-2. 为要使用的 supply 填入真实上游完整端点、`target_model` 和 `appkey` 或 `appkey_file`；示例不是可用凭据。示例 `nation1` 的 `sonnet` 还引用 mcli：不用 mcli 时先从该 route 的 tier 列表移除引用，再删除其 supply。使用 mcli 时需有效登录态；`appkey_file`、`extra_headers`、`system_inject` 示例在配置样例中，不应假设本机已有登录态。
+2. 配置样例把**四种上游接入方式**各放了一条，按要用的那条改，用不到的删掉：
 
-   **内网两条免配置通道**（端点、鉴权、header、计费块都在模块里，supply 只写 4 个字段）：
+   | 样例 supply id | `protocol` | 需要填什么 | 说明 |
+   |---|---|---|---|
+   | `anthropic-example` | `anthropic` | `url` + `appkey`（或 `appkey_file`）+ `target_model` | 标准 Anthropic 端点，最常见 |
+   | `responses-example` | `responses` | 同上 | 标准 OpenAI Responses 端点；路由给它时 Codex 可直接接线 |
+   | `catpaw-cli-example` | `catpaw-cli` | 只填 `target_model` | mcli 网关：端点/凭据/计费块内置 |
+   | `catpaw-ide-example` | `catpaw-ide` | 只填 `target_model` | CatPaw IDE：另需桥动态库（见下） |
+   | `glm-53-mcli-example` | `anthropic` | `appkey_file` 指向登录态 | 同一份 mcli 令牌走标准 HTTP 的写法，含 `extra_headers`/`system_inject` |
+
+   样例里 `mixed` 路由按档位混用这几种，`responses-only` 路由把四档都指向
+   `responses-example`（Codex 直接可用）。**示例 URL 与 token 全是占位符，不是可用凭据**；
+   删掉某条 supply 时，要同时清掉 routes 里对它的引用。
+
+   **两条免配置通道**（端点、鉴权、header、计费块都在模块里，supply 只写 4 个字段）：
 
    | protocol | 用途 | 凭据来源 |
    |---|---|---|
@@ -95,10 +109,12 @@ if exist config\model_proxy_config.json (echo 配置已存在，未覆盖) else 
 
    两者凭据都由 `mtsso_keeper` 维护，本代理只读不刷新；路径默认内置，换机器改
    `config/provider_settings.json`（样例 `provider_settings.example.json`）。桥库由
-   `build-catpaw-bridge` workflow 按平台产出，见 [CONFIG](docs/CONFIG.md#桥库从哪来)；
-   字段与内置值见 [两个 CatPaw provider](docs/CONFIG.md#两个-catpaw-provider)。
+   `build-catpaw-bridge` workflow 按平台产出（产物名：macOS `.dylib` / Windows `.dll`），
+   取回后把路径写进 `provider_settings.json` 的 `bridge_lib`，见
+   [CONFIG](docs/CONFIG.md#桥库从哪来)；字段与内置值见
+   [两个 CatPaw provider](docs/CONFIG.md#两个-catpaw-provider)。
 3. 设置相互独立的随机强 `admin_token` 和 strategy `client_token`，核对 routes、tiers 和 supplies 的引用。示例 strategy 使用 `route_pool`，不是单值 `route_id`。
-4. 密钥和配置不得提交或分享。Mac 保持私有文件权限；Windows 私有 ACL 检查失败时不要绕过或反复重试：记录并脱敏错误，参考 [Windows 路径与 ACL 限制](docs/designs/2026-11-16-model-proxy-Windows路径ACL默认目录兼容方案.md)（草稿，非已验收修复步骤），必要时请管理员协助核对路径和权限。Windows 尚未原生验收。
+4. 密钥和配置不得提交或分享。Mac 保持私有文件权限（示例命令已 `umask 077` + `chmod 600`）；Windows 上配置与日志落在项目内 `.runtime/`，私有 ACL 检查失败时不要绕过或反复重试：记录并脱敏错误，参考 [Windows 路径与 ACL 限制](docs/designs/2026-11-16-model-proxy-Windows路径ACL默认目录兼容方案.md)，必要时请管理员协助核对路径和权限。
 
 ### 2. 启动、接线并验证
 

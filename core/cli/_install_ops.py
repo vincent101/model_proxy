@@ -110,6 +110,23 @@ def detect_installed(name: str) -> bool:
 # strategy → 协议过滤候选 token
 # ---------------------------------------------------------------------------
 
+def _wire_protocol_of(supply: dict) -> str:
+    """supply → 上游线协议（用于按协议筛客户端 token）。
+
+    provider supply（catpaw-cli / catpaw-ide）的 protocol 字段表示「交由哪个模块
+    处理」，线协议恒为 anthropic——直接拿它去问 reasoning 注册表会被判「非法
+    protocol」，于是 catpaw-only 的配置会筛不出任何候选，`install` 直接跳过
+    Claude。这里按 provider 分流：provider 取模块内置线协议，legacy 走唯一权威
+    推断（与转发主链路的 server._upstream_protocol 同口径）。
+    """
+    from core.providers import is_provider, resolve_handler, wire_protocol
+
+    handler = resolve_handler(supply)
+    if is_provider(handler):
+        return wire_protocol(handler)
+    return resolve_protocol(supply)
+
+
 def candidate_tokens(cfg: dict, protocol: str | None) -> list[dict]:
     """按协议过滤候选 client_token。protocol=None 时不过滤（hermes/openclaw 双协议可选）。
 
@@ -149,7 +166,7 @@ def candidate_tokens(cfg: dict, protocol: str | None) -> list[dict]:
                 supply = supply_map.get(sid)
                 if supply:
                     try:
-                        tier_protocol = resolve_protocol(supply)
+                        tier_protocol = _wire_protocol_of(supply)
                     except ValueError:
                         print("  Warning: supply 协议解析失败，跳过该候选。")
                         continue

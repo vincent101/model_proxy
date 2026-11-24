@@ -45,6 +45,19 @@ Error: reload: reload_failed; loaded=no, cooldown_cleared=yes, error=config_reje
 
 一个供给单元 = 一个上游端点。
 
+四种形态，按 `protocol` 区分（配置样例里各有一条）：
+
+| 形态 | `protocol` | 必填 | 走向 |
+|---|---|---|---|
+| 标准 HTTP-Anthropic | `anthropic` | `url` + `appkey`/`appkey_file` + `target_model` | legacy HTTP 路径，线协议 anthropic |
+| 标准 HTTP-Responses | `responses` | 同上 | legacy HTTP 路径，线协议 responses |
+| 标准 HTTP-Chat | `chat` | 同上 | 仅作出站（入站 Chat 返 501） |
+| `catpaw-cli` | `catpaw-cli` | 只填 `target_model`（+ 可选 `reasoning_capability`） | 模块内置端点/凭据/header/计费块，线协议 anthropic |
+| `catpaw-ide` | `catpaw-ide` | 只填 `target_model`（+ 可选 `reasoning_capability`） | 模块内置，另需桥动态库，线协议 anthropic |
+
+`protocol` 同时承担「选处理模块」与「声明线协议」两个职责，因此不存在
+`protocol: catpaw-cli` + 其它线协议的矛盾写法；细节见 §6。
+
 ```json
 {
   "id": "claude-sonnet-k0",
@@ -61,8 +74,8 @@ Error: reload: reload_failed; loaded=no, cooldown_cleared=yes, error=config_reje
 - `id`：唯一标识，routes 里按 id 引用。
 - `url`：完整终态请求端点，代理不做任何拼接，直接原样作为出站请求 URL（只会在其后拼接
   经净化的原始 query，剔除 `beta` 参数）。
-- `protocol`（可选）：`anthropic` / `chat` / `responses`。缺省时从 `url` 尾缀自动推断（详见
-  下方「protocol 推断规则」）。
+- `protocol`（可选）：`anthropic` / `chat` / `responses` / `catpaw-cli` / `catpaw-ide`。
+  缺省时从 `url` 尾缀自动推断（详见下方「protocol 推断规则」）。
 - `appkey`：鉴权用 Bearer token，注入到转发请求。
 - `target_model`：实际下发给上游的模型名（客户端请求里的 model 字段会被替换成这个）。
 - `reasoning_capability`（可选）：该 supply（target 侧，真实上游）支持的 effort 档位能力
