@@ -322,7 +322,10 @@ model_proxy_cli.bat stats month
 
 日志默认 `.runtime/model_proxy.log`，启动时保留末 5000 行；账本独立存于 `.runtime/model_proxy_totals.json`，其他路径见 [runtime_paths.json](config/runtime_paths.json)。日志、账本、sidecar、备份可能含敏感信息，分享前脱敏并限制访问。旧项目根 `.model_proxy_totals.json` **不会自动迁移**；v2→v3 是已选账本的 schema 升级，不是路径迁移。需承接时必须先停稳旧进程并备份旧账本，再迁移；新路径已有账本不要覆盖，迁移后核对统计；顺序见 [CONFIG 账本说明](docs/CONFIG.md)。
 
-安装身份记录（`.runtime/install.json`、`active.json`、`last_good_paths.json`）在 macOS 上升为 schema 4：卷 UUID + 目录 inode，取代重启后可能重排的 `st_dev`，因此重启不再被误判为安装变更。**只有 `on`/服务启动链路判安装身份**；`status`/`off` 不判身份（不采集卷 UUID，也不比对记录中的 inode），只凭记录结构、真实进程、端口归属与锁活体定位/停止，身份异常不会让服务无法查询或停止（停止前会尽力核实端口由记录进程持有，核实不了时告警但不阻断）。卷 UUID 取不到时启动链 fail-closed（拒绝启动、不写新记录），凭据路径 `reload` 同样拒绝。升级在服务启动且双锁持有时自动进行，升级前的记录备份在 `.runtime/backups/identity-v2-<UTC>/`（0600，只增不改、不覆盖既有备份）。**旧版本读不了 schema 4 记录**（会按记录不可用拒绝）。**降级必须先 `off`，再按备份恢复这三份记录，然后才切回旧版本**：备份可能是迁移中断留下的 2/4 混合；全新安装没有迁移备份，只能重新初始化；跨启动或跨卷恢复的 schema 2 记录在旧版本仍可能报 `installation_changed`，属预期；恢复的文件须保持 0600，不要手工改 `schema` 字段。
+安装/运行身份记录（`.runtime/install.json`、`active.json`、`last_good_paths.json`）：macOS 上是
+schema 4（卷 UUID + inode），重启不再被误判为安装变更；`status`/`off` 不判身份，身份异常也不会
+让服务查不到或停不掉。**降级旧版本必须先 `off` 并按备份恢复这三份记录**，细节（备份位置、2/4 混合
+记录、Windows 为何不需要）见 [CONFIG §12 安装与运行身份记录](docs/CONFIG.md#12-安装与运行身份记录)。
 
 ## 从另一台电脑使用
 

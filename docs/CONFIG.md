@@ -474,6 +474,59 @@ bucket 补 `max_ms=0`（断档但保真，不虚高），既有值保留，记 `
 账本供 `stats` 命令查询（见 README「CLI 命令速查」），与 ACCESS 日志完全独立。账本结构细节见设计记录
 `docs/designs/2026-07-23-usage-totals-ledger.md` + `docs/designs/2026-08-08-log-optimization-plan.md`。
 
+## 12. 安装与运行身份记录
+
+`.runtime/` 下的 `install.json` / `active.json` / `last_good_paths.json` 是「这个安装、这个实例」的身份凭据：服务启动链路靠它们判断
+「还是不是同一份安装、上次那个进程是否已经退出」。
+
+### 12.1 macOS：schema 4（卷 UUID + inode）
+
+早期记录用 `{device, inode}` 描述安装根。`st_dev` 是内核的**挂载编号**，重启后会重排，
+于是每次重启都被判成「安装已变」而拒绝启动。schema 4 改为
+`{kind: "macos_volume_uuid", uuid, inode}`：
+
+- `uuid` 取卷的持久 UUID，跨重启不变；
+- `inode` 仍指向目录本身，防止「同卷内换了目录」；
+- 旧记录能就地升级（`LEGACY_SAME_BOOT`），跨启动的旧记录需一次交互重绑定
+  （`LEGACY_OTHER_BOOT`）。
+
+### 12.2 谁判身份、谁不判
+
+| 链路 | 是否判安装身份 | 依据 |
+|---|---|---|
+| `on` / 服务启动 | **判** | 记录结构 + 卷 UUID + inode + 双锁活体 |
+| `status` / `off` | **不判** | 记录结构 + 真实进程 + 端口归属 + 锁活体 |
+
+`status`/`off` 不采集卷 UUID、也不比对记录里的 inode，因此身份异常不会让服务
+查不到或停不掉（停止前仍会尽力核实端口由记录进程持有，核实不了时告警但不阻断）。
+
+卷 UUID 取不到时**启动链 fail-closed**（拒绝启动、不写新记录）；凭据路径的 `reload`
+同样拒绝。
+
+### 12.3 升级与备份
+
+升级在服务启动且双锁持有时自动进行。升级前的记录备份到
+`.runtime/backups/identity-v2-<UTC>/`：0600、只增不改、不覆盖既有备份。
+
+### 12.4 降级（必须按顺序）
+
+1. `off` 停服务（不要只是 `kill`）。
+2. 用上一步的备份**原样恢复**这三份记录，保持 0600。
+3. 再切回旧版本。
+
+注意事项：
+
+- 备份可能是迁移中断留下的 **2/4 混合**（旧版本读不了其中的 schema 4 记录）；
+- **全新安装没有迁移备份**，只能重新初始化；
+- 跨启动或跨卷恢复的 schema 2 记录在旧版本仍可能报 `installation_changed`，属预期；
+- **不要手工改 `schema` 字段**——旧版本会按记录不可用拒绝。
+
+### 12.5 Windows
+
+Windows 不使用这套卷身份：启动路径只校验 schema 3 的 `active.json`（PID、
+`process_start`、可执行文件路径拼写），不持久化卷身份，因此「跨重启 device 漂移」
+在 Windows 上不成立。
+
 ## 用户环境可选 MCP 服务
 
 仅适用于用户自己的 vault 环境：open-websearch 和 friday-websearch 是独立部署的可选服务，不由 model_proxy CLI 管理，也不是独立 clone 的依赖。其示例地址分别为 `http://server.local:3000/mcp`、`http://server.local:3001/mcp`；`server.local` 只是占位符，按实际部署替换。vault 根下 `.claude/skills/websearch-router/runtime/ensure_websearch.sh` 是用户环境中的恢复入口，存在与可用性须自行确认。
