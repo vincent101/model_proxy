@@ -58,6 +58,11 @@ FILE_SCOPE: dict[str, tuple] = {
     'test_usage_totals.py': (POSIX, 'direct 构造的账本读取在 Windows 上按设计严格 fail-closed'),
 'test_identity_stability.py': (POSIX, '安装身份与锁语义依赖 fcntl、pty 及 st_dev+st_ino；Windows 身份由 test_windows_discovery 等覆盖'),
     'test_windows_control_a_followup.py': (POSIX, '在 POSIX 上用假 Win32 后端模拟 Windows 控制；原生 Windows 会先被真实启动前置条件拦下'),
+    # 文件名有 windows_ 前缀，但内容验的是 **POSIX/macOS 启动链**：flock 锁、
+    # POSIX ACL 校验器、os.kill 探活、tempdir 里的项目根。在原生 Windows 上
+    # main() 走的是另一条 _windows_main 分支，这些断言不适用；Windows 启动链
+    # 由 test_windows_service_startup* / test_windows_control* 覆盖。
+    'test_windows_gate.py': (POSIX, '验 POSIX/macOS 启动顺序（flock/ACL/os.kill）；Windows 启动链另有原生用例'),
 }
 
 # --- 文件的某几个用例只属于某个平台 -----------------------------------------
