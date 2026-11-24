@@ -50,6 +50,16 @@ class WindowsInstallWiringTests(unittest.TestCase):
         self.stack.enter_context(patch.object(install.urllib.request, 'urlopen',
                                              side_effect=OSError('fake offline')))
         self.capture = self.stack.enter_context(patch.object(win_secure, 'capture_target', return_value=self.snapshot))
+        # 2026-11-22 起 Windows 写入前会先做一次「运行目录/角色证据」原生预检
+        # （_windows_runtime_locations → dispatch.runtime_paths → 真实 Win32 句柄）。
+        # 本文件验的是「快照生命周期与 writer 接线」，不是原生预检本身，所以把它
+        # 收成三个假实现；原生预检由 test_windows_config_write_integration 等覆盖。
+        self.stack.enter_context(patch.object(install, '_windows_runtime_locations',
+                                              return_value=object()))
+        self.stack.enter_context(patch('core.cli._config_ops._windows_cross_volume',
+                                       return_value=False))
+        self.stack.enter_context(patch.object(install, '_windows_write_options',
+                                              return_value={'preflight': lambda: True}))
         self.stack.enter_context(contextlib.redirect_stdout(self.stdout))
         self.stack.enter_context(contextlib.redirect_stderr(self.stderr))
 
@@ -110,9 +120,14 @@ class WindowsInstallWiringTests(unittest.TestCase):
             events.append(Path(snap.path).name)
             Path(snap.path).write_bytes(payload)
             return WriteOutcome('VERIFIED', None, False, 'NONE')
-        def make_dir(path, *, required_access):
+        def make_dir(path, *, required_access, trusted_boundary):
             self.assertEqual(path, str(catalog.parent))
             self.assertEqual(required_access, 0x200A3)
+            # 边界只限制遍历/ACL 策略，不授予写权限。夹具用 POSIX 临时目录模拟
+            # Windows，边界会被改写成 PureWindowsPath 形态（/var/... → \var\...），
+            # 所以只校验它指向项目根这个名字，而不是拼写。
+            self.assertIsInstance(trusted_boundary, str)
+            self.assertTrue(trusted_boundary.endswith(self.root.name), trusted_boundary)
             events.append('mkdir')
             if creation_failure:
                 if creation_failure.created is True:
@@ -136,7 +151,7 @@ class WindowsInstallWiringTests(unittest.TestCase):
 
     def test_windows_first_codex_install_creates_private_catalog_and_links_it(self):
         result, config, catalog, events = self._run_first_codex_catalog_install()
-        self.assertEqual(result, 0, self.stderr.getvalue())
+        self.assertEqual(result, 0, self.stderr.getvalue() + '\n--STDOUT--\n' + self.stdout.getvalue())
         self.assertEqual(events, ['config.toml', 'mkdir', 'model_proxy_catalog.json', 'config.toml'])
         self.assertTrue(catalog.is_file())
         self.assertIn('model_catalog_json', config.read_text())

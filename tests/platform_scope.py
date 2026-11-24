@@ -82,23 +82,7 @@ TEST_SCOPE: dict[tuple, tuple] = {
 # 与 FILE_SCOPE/TEST_SCOPE 的区别：那两者是「该平台不适用」，这里是「本该通过
 # 但确实坏了」。清单会每次都打印，且一旦某文件开始通过就会报 STALE 并让 CI 红，
 # 逼着把它从清单里删掉——不允许长期沉淀成新的静默掩盖。
-KNOWN_BROKEN: dict[str, tuple[str, str]] = {
-    'test_windows_gate.py': (
-        '2026-11-23',
-        '启动顺序用例在 macOS 上 25 项、Windows 上 14 项失败（此前被 test_windows_ '
-        '前缀误判为「仅 Windows 可测」而长期掩盖）；部分断言仍用旧 lock 身份 '
-        '{device,inode}，与在改的 macos_volume_uuid 方案撞车，需单独修复',
-    ),
-    'test_windows_secure_install_wiring.py': (
-        '2026-11-23',
-        '两平台各 9 项失败（夹具早于 2026-11-22 安装边界复核：伪造 os 缺 fspath、'
-        '未提供项目内 runtime_paths.json，导致 write_target 未被调用）；此前被 '
-        'windows-native 标签掩盖。真实 Windows 写入链另有原生验收：'
-        'test_windows_config_write_integration（6 项原生通过）与 '
-        'test_windows_secure_hook_install',
-    ),
-}
-
+KNOWN_BROKEN: dict[str, tuple[str, str]] = {}
 
 def host_scope() -> str:
     import sys

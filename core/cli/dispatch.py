@@ -32,6 +32,9 @@ def config_path(root=ROOT):
 
 
 def runtime_paths(root=ROOT):
+    # 调用方可能已把 root 归一化成 str（Windows 分支用 ntpath 拼路径后就是这样），
+    # 而这里要用 `/` 运算符拼子路径。统一在本函数内换成 Path，两种入参都接受。
+    root = Path(os.fspath(root))
     paths = read_runtime_paths(root / 'config' / 'runtime_paths.json', project_root=root,
                                local_appdata=os.environ.get('LOCALAPPDATA'))
     # Read-only preflight is not a service ownership proof. It is nevertheless

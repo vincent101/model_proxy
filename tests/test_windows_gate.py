@@ -42,8 +42,10 @@ class StartupIsolationTests(unittest.TestCase):
         self.mock_root = patch.object(server, "_PACKAGE_DIR", self.root)
         self.mock_root.start()
         self.addCleanup(self.mock_root.stop)
+        # `_LedgerRuntimeGuard.__call__` 会用显式路径参数调用它，因此夹具必须
+        # 接受（并忽略）位置参数——固定成一个无参 lambda 会让账本守卫恒失败。
         self.resolve = patch.object(server, "resolve_runtime_paths",
-                                    side_effect=lambda: self.original_resolve(self.path_file))
+                                    side_effect=lambda *a, **k: self.original_resolve(self.path_file))
         self.original_resolve = server.resolve_runtime_paths
         self.resolve.start()
         self.addCleanup(self.resolve.stop)
@@ -81,9 +83,14 @@ class StartupIsolationTests(unittest.TestCase):
             (target / "marker").write_text("legacy sentinel")
         else:
             target.write_text("legacy sentinel")
+        # 2026-11-16 起状态目录固定为 <项目根>/.runtime。它是「已有部署」必然存在的
+        # 一部分，先建好；这里要证明的是「发现遗留运行文件后不写任何新东西」，
+        # 而不是「连状态目录都不建」。之前 patch 掉 Path.mkdir 会让
+        # verify_record_directory 直接失败（protection_unavailable），掩盖真正断言。
+        state = self.root / ".runtime"
+        state.mkdir(mode=0o700)
         stderr = io.StringIO()
-        with patch.object(Path, "mkdir") as mkdir, \
-             patch.object(server, "ProxyHTTPServer") as bind, \
+        with patch.object(server, "ProxyHTTPServer") as bind, \
              patch.object(server, "_confirm_initialization") as confirm, \
              patch.object(server, "init_logging") as logging, \
              patch.object(server, "UsageTotalsStore") as totals, \
@@ -91,13 +98,13 @@ class StartupIsolationTests(unittest.TestCase):
             with self.assertRaises(SystemExit):
                 server.main()
         self.assertIn("legacy_state_unknown", stderr.getvalue())
-        mkdir.assert_not_called()
         bind.assert_not_called()
         confirm.assert_not_called()
         logging.assert_not_called()
         totals.assert_not_called()
         record.assert_not_called()
-        self.assertFalse((self.root / ".runtime").exists())
+        # 状态目录里不得留下任何记录文件或暂存/备份子目录。
+        self.assertEqual(list(state.iterdir()), [])
         self.assertFalse(self.paths["log"].exists())
         self.assertFalse(self.paths["totals"].exists())
         self.assertEqual((target / "marker" if directory else target).read_text(), "legacy sentinel")
@@ -128,14 +135,12 @@ class StartupIsolationTests(unittest.TestCase):
         self.paths["pid"].write_text("legacy sentinel")
         before = {item.name: item.read_bytes() for item in state.iterdir()}
         stderr = io.StringIO()
-        with patch.object(Path, "mkdir") as mkdir, \
-             patch.object(server, "ProxyHTTPServer") as bind, \
+        with patch.object(server, "ProxyHTTPServer") as bind, \
              patch.object(server, "init_logging") as logging, \
              patch.object(server, "write_instance_record") as record, redirect_stderr(stderr):
             with self.assertRaises(SystemExit):
                 server.main()
         self.assertIn("legacy_state_unknown", stderr.getvalue())
-        mkdir.assert_not_called()
         bind.assert_not_called()
         logging.assert_not_called()
         record.assert_not_called()
@@ -148,35 +153,35 @@ class StartupIsolationTests(unittest.TestCase):
         ledger = self.paths["totals"]
         ledger.write_text("legacy ledger sentinel")
         ledger.chmod(0o666)
+        state = self.root / ".runtime"
+        state.mkdir(mode=0o700)
         stderr = io.StringIO()
-        with patch.object(Path, "mkdir") as mkdir, \
-             patch.object(server, "init_logging") as logging, \
+        with patch.object(server, "init_logging") as logging, \
              patch.object(server, "ProxyHTTPServer") as bind, redirect_stderr(stderr):
             with self.assertRaises(SystemExit):
                 server.main()
         self.assertIn("legacy_state_unknown", stderr.getvalue())
-        mkdir.assert_not_called()
         logging.assert_not_called()
         bind.assert_not_called()
         self.assertEqual(ledger.read_text(), "legacy ledger sentinel")
-        self.assertFalse((self.root / ".runtime").exists())
+        self.assertEqual(list(state.iterdir()), [])
 
     def test_hardlinked_legacy_runtime_file_fails_before_any_new_write(self):
         ledger = self.paths["totals"]
         ledger.write_text("legacy ledger sentinel")
         alias = self.root / "runtime" / "other-ledger-name"
         os.link(ledger, alias)
+        state = self.root / ".runtime"
+        state.mkdir(mode=0o700)
         stderr = io.StringIO()
-        with patch.object(Path, "mkdir") as mkdir, \
-             patch.object(server, "init_logging") as logging, redirect_stderr(stderr):
+        with patch.object(server, "init_logging") as logging, redirect_stderr(stderr):
             with self.assertRaises(SystemExit):
                 server.main()
         self.assertIn("legacy_state_unknown", stderr.getvalue())
-        mkdir.assert_not_called()
         logging.assert_not_called()
         self.assertEqual(ledger.read_text(), "legacy ledger sentinel")
         self.assertEqual(alias.read_text(), "legacy ledger sentinel")
-        self.assertFalse((self.root / ".runtime").exists())
+        self.assertEqual(list(state.iterdir()), [])
 
     def test_unknown_legacy_identity_stops_before_any_write(self):
         original_lstat = os.lstat
@@ -184,27 +189,35 @@ class StartupIsolationTests(unittest.TestCase):
             if os.fspath(path) == str(self.paths["pid"]):
                 raise PermissionError("fake denied")
             return original_lstat(path, *args, **kwargs)
+        state = self.root / ".runtime"
+        state.mkdir(mode=0o700)
         with patch("os.lstat", side_effect=deny_pid), \
-             patch.object(Path, "mkdir") as mkdir, \
              patch.object(server, "ProxyHTTPServer") as bind, redirect_stderr(io.StringIO()):
             with self.assertRaises(SystemExit):
                 server.main()
-        mkdir.assert_not_called()
         bind.assert_not_called()
-        self.assertFalse((self.root / ".runtime").exists())
+        self.assertEqual(list(state.iterdir()), [])
 
     def test_legacy_pid_created_after_readonly_preflight_is_rechecked_under_locks(self):
-        real_verify = server.verify_record_directory
+        """只读预检通过后、双锁持有期间出现遗留 pid：必须被上锁后的复核拒绝。
+
+        注入点选在 `verify_held_instance_locks` 之后：那里已经过了「持锁快照
+        一致性比较」，再写入 pid 才能证明是**遗留观测复核**拦下的，而不是被更早
+        的 snapshot 比较顺手拦掉（两种都 fail-closed，但只有后者证明不变量）。
+        """
         real_check = server._check_legacy_observations
+        real_verify = server.verify_held_instance_locks
         injected = False
-        def insert_after_state_creation(state):
+
+        def verify_then_insert(anchor, legacy):
             nonlocal injected
+            real_verify(anchor, legacy)
             if not injected:
                 injected = True
                 self.paths["pid"].write_text("legacy appeared")
-            return real_verify(state)
+
         stderr = io.StringIO()
-        with patch.object(server, "verify_record_directory", side_effect=insert_after_state_creation), \
+        with patch.object(server, "verify_held_instance_locks", side_effect=verify_then_insert), \
              patch.object(server, "_check_legacy_observations", wraps=real_check) as checked, \
              patch.object(server, "_run_server") as run, \
              patch.object(server, "init_logging") as logging, redirect_stderr(stderr):
@@ -765,11 +778,18 @@ class StartupIsolationTests(unittest.TestCase):
                 install = initialize_installation(anchor, legacy, old_sock,
                     listen={"host": "127.0.0.1", "port": old_port}, source="fake old installation", confirmed=True)
                 ids = legacy.snapshot.as_dict()
+                # 种子记录写成当前 schema（4：卷 UUID + inode），与生产首次初始化
+                # 产出的形态一致。schema-2 旧记录的启动期升级由
+                # tests/test_identity_stability.py 专门覆盖；这里需要的是「重启不改
+                # 写记录字节」这一类断言，所以不制造一次升级。
+                from core.discovery import POSIX_RECORD_SCHEMA, stable_lock_record
                 locks = {}
-                for name, held in (("anchor", anchor), ("legacy", legacy)):
+                for name, held, role in (("anchor", anchor, "anchor.lock"),
+                                         ("legacy", legacy, "lock")):
                     info = os.fstat(held.fileno())
-                    locks[name] = {"device": info.st_dev, "inode": info.st_ino}
-                common = {"schema": 2, "install_id": install["install_id"],
+                    locks[name] = stable_lock_record(ids[role].canonical,
+                                                     device=info.st_dev, inode=info.st_ino)
+                common = {"schema": POSIX_RECORD_SCHEMA, "install_id": install["install_id"],
                           "project_root": str(self.root), "instance_nonce": "b" * 32,
                           "listen": {"host": "127.0.0.1", "port": old_port},
                           "runtime_paths": {key: ids[key].canonical for key in PATH_KEYS}}
@@ -786,11 +806,16 @@ class StartupIsolationTests(unittest.TestCase):
         self.config_file.write_text(json.dumps({"supplies": [], "routes": [], "strategies": [],
                                                 "listen": {"host": "127.0.0.1", "port": port}}))
 
+    def _write_ledger(self, ledger, text):
+        """写账本夹具；账本属私有文件，macOS 侧读取会校验 0600 保护。"""
+        ledger.write_text(text if isinstance(text, str) else json.dumps(text))
+        ledger.chmod(0o600)
+
     def _ledger_fixture(self):
         ledger = self.paths["totals"]
         total = dict(server._zero_bucket(), sentinel="keep")
-        ledger.write_text(json.dumps({"version": 3, "since": "2026-01-01", "keep_days": 400,
-                                      "total": total, "days": {}, "months_archive": {}}))
+        self._write_ledger(ledger, {"version": 3, "since": "2026-01-01", "keep_days": 400,
+                                    "total": total, "days": {}, "months_archive": {}})
         return ledger
 
     def _unused_fixture_port(self):
@@ -847,7 +872,12 @@ class StartupIsolationTests(unittest.TestCase):
         self.assertEqual(new_records["active"]["listen"]["port"], new_port)
         self.assertEqual(new_records["install"]["install_id"], old_records["install"]["install_id"])
         self.assertEqual(new_records["active"]["runtime_paths"], old_records["active"]["runtime_paths"])
-        self.assertEqual(new_records["active"]["locks"], old_records["active"]["locks"])
+        # 锁身份在 schema 4 里是 {kind, uuid, inode}（卷 UUID + inode），schema 2 的
+        # {device, inode} 会在启动时就地升级。这里比较的是「是不是同一把锁」，
+        # 所以比 inode，而不是钉死某种记录的字节形态。
+        for role in ("anchor", "legacy"):
+            self.assertEqual(new_records["active"]["locks"][role]["inode"],
+                             old_records["active"]["locks"][role]["inode"], role)
         self.assertNotEqual(new_records["active"]["instance_nonce"], old_records["active"]["instance_nonce"])
         self.assertEqual(ledger.read_bytes(), before)
 
@@ -859,7 +889,7 @@ class StartupIsolationTests(unittest.TestCase):
                          "combos": {"supply=s1|route=r1|strategy=cc":
                                     {"requests": 1, "ok": 1, "fail": 0, "usage_in": 10, "usage_out": 20}}},
                "days": {}, "months_archive": {}}
-        ledger.write_text(json.dumps(old))
+        self._write_ledger(ledger, old)
         before = ledger.read_bytes()
         snapshot = read_stable_config(ledger)
         store = server.UsageTotalsStore.from_verified_snapshot(ledger, snapshot)
@@ -870,7 +900,7 @@ class StartupIsolationTests(unittest.TestCase):
 
     def test_server_bound_entry_without_verified_guard_never_resets_ledger(self):
         ledger = self.paths["totals"]
-        ledger.write_text("{bad fake ledger")
+        self._write_ledger(ledger, "{bad fake ledger")
         before, inode = ledger.read_bytes(), ledger.stat().st_ino
         with patch.object(server, "init_logging") as logging, \
              patch.object(server, "UsageTotalsStore") as totals, \
@@ -892,7 +922,7 @@ class StartupIsolationTests(unittest.TestCase):
         log_path.write_text("2000-01-01 00:00:00,000 old\n"
                             "2099-01-01 00:00:00,000 retained\n")
         ledger = self.paths["totals"]
-        ledger.write_text("fake ledger untouched")
+        self._write_ledger(ledger, "fake ledger untouched")
         proxy = Mock()
         version = Mock()
         version.read_text.return_value = "fake"
@@ -1395,28 +1425,26 @@ class StartupIsolationTests(unittest.TestCase):
         bad = copy.deepcopy(good); bad["version"] = 99; cases.append(("unknown version", bad))
         for label, value in cases:
             with self.subTest(case=label):
-                ledger.write_text(json.dumps(value))
+                self._write_ledger(ledger, value)
                 before, inode = ledger.read_bytes(), ledger.stat().st_ino
-                stderr = io.StringIO()
+                # 2026-11-22 契约：语义非法的账本降级为 `LedgerUnavailable`
+                # （记录停写），启动继续；不变量是「旧账本与记录一个字节都不改，
+                # 私有值不出现在任何输出里」。
                 with patch.object(server, "resolve_listen", side_effect=real_resolve), \
                      patch.object(server.os, "kill", side_effect=ProcessLookupError()), \
-                     patch.object(server, "ProxyHTTPServer") as bind, \
-                     patch.object(server, "_reserve_previous_listener") as reserve, \
-                     patch.object(server, "init_logging") as logging, \
-                     patch("os.replace", side_effect=AssertionError("unexpected write")) as replace, \
-                     redirect_stderr(stderr):
-                    with self.assertRaises(SystemExit):
-                        server.main()
-                self.assertIn("ledger_unverified", stderr.getvalue())
-                self.assertNotIn("FAKE_PRIVATE_VALUE", stderr.getvalue())
-                bind.assert_not_called()
-                reserve.assert_not_called()
-                logging.assert_not_called()
-                replace.assert_not_called()
+                     patch.object(server.ProxyHTTPServer, "serve_forever", lambda http: None), \
+                     patch.object(server.ProxyHTTPServer, "shutdown", lambda http: None), \
+                     patch.object(server, "init_logging") as logging:
+                    server.main()
                 self.assertEqual(ledger.read_bytes(), before)
                 self.assertEqual(ledger.stat().st_ino, inode)
                 self.assertEqual(list(ledger.parent.glob("totals.corrupt.*")), [])
-                self.assertEqual(self._record_bytes(), records_before)
+                self.assertEqual(server.usage_totals.persistence_state, "UNAVAILABLE")
+                # 记录会正常更新（新的 instance_nonce），但安装身份不能变——
+                # 账本损坏绝不能被当成「重装」。
+                records_after = self._record_bytes()
+                self.assertEqual(json.loads(records_after["install.json"])["install_id"],
+                                 json.loads(records_before["install.json"])["install_id"])
 
     def _assert_migrated_ledger_records_new_usage(self, version, *, same_listen=False, omit_version=False):
         from core.discovery import read_instance_set
@@ -1436,7 +1464,7 @@ class StartupIsolationTests(unittest.TestCase):
         if omit_version:
             self.assertEqual(version, 2)
             del data["version"]
-        ledger.write_text(json.dumps(data))
+        self._write_ledger(ledger, data)
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as old:
             old.bind(("127.0.0.1", 0))
             old.listen()
@@ -1493,6 +1521,12 @@ class StartupIsolationTests(unittest.TestCase):
         self._assert_migrated_ledger_records_new_usage(3)
 
     def test_same_listen_restart_revalidates_after_preflight(self):
+        """CLI 预检通过后账本被改成语义非法：重启必须重新复核并降级，不动旧账本。
+
+        2026-11-22 起语义非法账本降级为 `LedgerUnavailable`（记录停写），而不是
+        拒绝启动；但「重新复核」这一步不能省，否则被 CLI 判为合法的旧快照会被
+        直接沿用。
+        """
         from core.config_snapshot import read_stable_config
         from core.listen_config import resolve_listen as real_resolve
         ledger = self._ledger_fixture()
@@ -1505,51 +1539,46 @@ class StartupIsolationTests(unittest.TestCase):
         server.validate_migration_ledger_snapshot(read_stable_config(ledger))
         data = json.loads(ledger.read_text())
         del data["total"]["ok"]
-        ledger.write_text(json.dumps(data))
+        self._write_ledger(ledger, data)
         self._write_listen_config(old_port)
-        before, inode, records_before = ledger.read_bytes(), ledger.stat().st_ino, self._record_bytes()
-        stderr = io.StringIO()
+        before, inode = ledger.read_bytes(), ledger.stat().st_ino
         with patch.object(server, "resolve_listen", side_effect=real_resolve), \
              patch.object(server.os, "kill", side_effect=ProcessLookupError()), \
-             patch.object(server, "ProxyHTTPServer") as bind, \
-             patch.object(server, "init_logging") as logging, redirect_stderr(stderr):
-            with self.assertRaises(SystemExit):
-                server.main()
-        self.assertIn("ledger_unverified", stderr.getvalue())
-        bind.assert_not_called()
-        logging.assert_not_called()
+             patch.object(server.ProxyHTTPServer, "serve_forever", lambda http: None), \
+             patch.object(server.ProxyHTTPServer, "shutdown", lambda http: None), \
+             patch.object(server, "init_logging"):
+            server.main()
         self.assertEqual(ledger.read_bytes(), before)
         self.assertEqual(ledger.stat().st_ino, inode)
-        self.assertEqual(self._record_bytes(), records_before)
         self.assertEqual(list(ledger.parent.glob("totals.corrupt.*")), [])
+        self.assertEqual(server.usage_totals.persistence_state, "UNAVAILABLE")
 
     def test_same_listen_restart_valid_ledger_continues_recording(self):
         self._assert_migrated_ledger_records_new_usage(3, same_listen=True)
 
     def _assert_first_start_invalid_ledger_untouched(self, contents):
+        """损坏账本：启动可继续，但绝不重命名/重置/覆盖，统计保持不可用。
+
+        2026-11-22 契约变更：能稳定读出的 JSON/schema 损坏降级为
+        `LedgerUnavailable`（记录停写），而不是让整个启动失败。此前本用例断言
+        「启动失败」，与新契约相反；真正该守的不变量是「旧账本一个字节都不动」。
+        """
+        from core.listen_config import resolve_listen as real_resolve
         ledger = self.paths["totals"]
-        ledger.write_text(contents)
+        self._write_ledger(ledger, contents)
+        # 首次启动要真正绑定并校验监听端口（0 会被判 listen_unverified）。
+        self._write_listen_config(self._unused_fixture_port())
         before, inode = ledger.read_bytes(), ledger.stat().st_ino
-        stderr = io.StringIO()
-        with patch.object(server, "ProxyHTTPServer") as bind, \
-             patch.object(server, "_confirm_initialization") as confirm, \
-             patch.object(server, "init_logging") as logging, \
-             patch.object(server, "write_instance_record") as record, \
-             patch("os.replace", side_effect=AssertionError("unexpected write")) as replace, redirect_stderr(stderr):
-            with self.assertRaises(SystemExit):
-                server.main()
-        self.assertIn("ledger_unverified", stderr.getvalue())
-        bind.assert_not_called()
-        confirm.assert_not_called()
-        logging.assert_not_called()
-        record.assert_not_called()
-        replace.assert_not_called()
+        with patch.object(server, "_confirm_initialization", return_value="fake source"), \
+             patch.object(server, "resolve_listen", side_effect=real_resolve), \
+             patch.object(server.ProxyHTTPServer, "serve_forever", lambda http: None), \
+             patch.object(server.ProxyHTTPServer, "shutdown", lambda http: None), \
+             patch.object(server, "init_logging"):
+            server.main()
         self.assertEqual(ledger.read_bytes(), before)
         self.assertEqual(ledger.stat().st_ino, inode)
         self.assertEqual(list(ledger.parent.glob("totals.corrupt.*")), [])
-        state = self.root / ".runtime"
-        for name in ("install.json", "active.json", "last_good_paths.json"):
-            self.assertFalse((state / name).exists())
+        self.assertEqual(server.usage_totals.persistence_state, "UNAVAILABLE")
 
     def test_first_start_invalid_semantics_does_not_reset_ledger(self):
         data = {"version": 3, "total": {"requests": 1, "fail": 0, "sum_ms": 2, "combos": {}},
@@ -1560,31 +1589,39 @@ class StartupIsolationTests(unittest.TestCase):
         self._assert_first_start_invalid_ledger_untouched("{bad fake ledger")
 
     def test_corrupt_ledger_blocks_migration_without_rename_or_reset(self):
+        """重启遇到损坏账本：迁移继续，但账本不改名、不重置、不覆盖。"""
         from core.listen_config import resolve_listen as real_resolve
         ledger = self.paths["totals"]
-        ledger.write_text("{invalid fake ledger")
+        self._write_ledger(ledger, "{invalid fake ledger")
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as old:
             old.bind(("127.0.0.1", 0))
             old.listen()
             self._seed_stopped_instance(old)
         self._write_listen_config(self._unused_fixture_port())
-        before = self._record_bytes()
-        stderr = io.StringIO()
+        before, inode = ledger.read_bytes(), ledger.stat().st_ino
         with patch.object(server, "resolve_listen", side_effect=real_resolve), \
              patch.object(server.os, "kill", side_effect=ProcessLookupError()), \
-             patch.object(server, "ProxyHTTPServer") as bind, redirect_stderr(stderr):
-            with self.assertRaises(SystemExit):
-                server.main()
-        self.assertIn("ledger_unverified", stderr.getvalue())
-        bind.assert_not_called()
-        self.assertEqual(ledger.read_text(), "{invalid fake ledger")
+             patch.object(server.ProxyHTTPServer, "serve_forever", lambda http: None), \
+             patch.object(server.ProxyHTTPServer, "shutdown", lambda http: None), \
+             patch.object(server, "init_logging"):
+            server.main()
+        self.assertEqual(ledger.read_bytes(), before)
+        self.assertEqual(ledger.stat().st_ino, inode)
         self.assertEqual(list(ledger.parent.glob("totals.corrupt.*")), [])
-        self.assertEqual(self._record_bytes(), before)
+        self.assertEqual(server.usage_totals.persistence_state, "UNAVAILABLE")
 
     def test_previous_live_or_unknown_pid_is_never_treated_as_stale(self):
+        # 锁身份是 schema-4 的 {kind, uuid, inode}；本用例只关心「进程还活着/
+        # 证据不可用就不能当陈旧」，所以让记录与本次观测完全一致（虚构卷 UUID），
+        # 把失败点严格限定在进程判定上。
+        def lock(inode):
+            return {"kind": "macos_volume_uuid",
+                    "uuid": "11111111-2222-3333-4444-555555555555", "inode": inode}
         record = {"runtime_paths": {"lock": "fake"}, "listen": {"host": "127.0.0.1", "port": 1},
-                  "locks": {"anchor": "fake"}, "pid": 999999, "process_start": {"kind": "fake"}}
-        args = ({"active": record}, record["runtime_paths"], record["listen"], record["locks"])
+                  "locks": {"anchor": lock(41), "legacy": lock(42)},
+                  "pid": 999999, "process_start": {"kind": "fake"}}
+        args = ({"active": record}, record["runtime_paths"], record["listen"],
+                {"anchor": lock(41), "legacy": lock(42)})
         for identity in (None, {"kind": "fake"}):
             with patch.object(server.os, "kill"), patch.object(server, "process_start_identity", return_value=identity):
                 with self.assertRaises(server.PreflightError):
