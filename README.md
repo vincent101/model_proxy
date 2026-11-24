@@ -21,7 +21,7 @@ version: 0.16
 | **故障切换** | 供给按顺序尝试；命中冷却规则即标记坏供给并换下一个，坏供给在 `status` 里可见 |
 | **正文错误识别** | 上游 200 但正文是"限流/额度/模型不存在"等语义错误 → 按虚拟错误码冷却，不当作成功 |
 | **effort 映射** | 客户端档位按**相对排名**映射到上游档位，不同供应商档位数量不一致也不会错位 |
-| **用量观测** | 每请求一条 ACCESS 日志 + 独立 token 账本，可按天/月统计；`status` 汇总**每条在用供给的近 30min 成功率、首 token 中位数、输出 tps、失败码**（标题行的 cooldown/degraded 计数与表内行数同口径），以及活跃会话 |
+| **用量观测** | 每请求一条 ACCESS 日志 + 独立 token 账本，可按天/月统计；`status` 汇总**每条在用供给的近 30min 成功率、首 token 中位数、输出 tps、失败码**，以及活跃会话 |
 | **四类上游接入** | ① 标准 HTTP-Anthropic（自带 url/appkey）② 标准 HTTP-Responses ③ `catpaw-cli`（mcli 网关）④ `catpaw-ide`（CatPaw IDE，凭据由 mtsso_keeper 管）；标准 HTTP-Chat 仅作出站路径 |
 
 上游协议组合矩阵（行是客户端入站，列是上游；每条通路都有流式和非流式实现）：
@@ -39,9 +39,9 @@ version: 0.16
 - **只做模型路由，不做鉴权中心**：`client_token` 是路由查表键，不是密钥校验；
   上游 `appkey`/`appkey_file` 只供出站，绝不能发给客户端。
 - **流一旦提交就不能换供给**：切换发生在响应开始之前；流内失败只影响后续请求。
-- **平台成熟度**：Mac 有长期真实使用证据。Windows 的核心链路（CLI 生命周期、启动 preflight、
-  私有目录/ACL、配置读写、监听绑定、进程与套接字观测）已由原生 windows-latest CI 逐项验证，
-  但**尚无真实 Windows 生产流量**；`catpaw-ide` 另需本机的桥动态库（见下）。首次上线按试运行对待。
+- **平台支持**：macOS 有长期真实使用证据；Windows 可用（CLI 生命周期、启动 preflight、
+  私有目录/ACL、配置读写、监听绑定、进程与套接字观测均已覆盖），但**尚无真实生产流量**，
+  建议先按试运行对待。`catpaw-ide` 另需本机的桥动态库（见下）。
 - 支持范围以本文档与 [CONFIG](docs/CONFIG.md) 为准，未列出的功能组合不保证可用。
 
 [首次跑通](#首次跑通一次请求) · [接入客户端](#接入其他客户端或手动配置) · [选路与会话](#换上游模型档位或当前会话) · [运维排错](#查看状态更新配置处理失败) · [远程使用](#从另一台电脑使用) · [深入文档](#深入文档)
@@ -161,7 +161,7 @@ model_proxy_cli.bat logs
 | Hermes | `~/.hermes/config.yaml` 和 `.env`；`http://localhost:18889/` | 始终打印片段，手工合并；用 `anthropic_messages`，不要采用打印文案中 `chat_completions` 的建议，本代理不支持 Chat 入站。 |
 | OpenClaw | `~/.openclaw/openclaw.json`；`http://localhost:18889/` | 已有标准 JSON 才写/替换 `models.providers.model_proxy`；该节点自定义字段不保证保留。缺文件或 JSON5 解析失败时手配。 |
 
-**候选筛选不是协议能力判断**：安装器取 strategy 的首个有效 route、其中首个可解析 tier/supply 的**上游协议**；Claude 筛 Anthropic，Codex 筛 Responses，Hermes/OpenClaw 不过滤。它不核验全部档位、pool 或后备供给，可能隐藏实际可转换的线路。无候选时未必有完整手配片段：若已有可用跨协议绑定，用其 token 手配；若确无有效绑定，使用 `strategy` 一级菜单或手工补绑定。不要使用程序旧提示中的 `strategy add`。
+**候选筛选不是协议能力判断**：安装器取 strategy 的首个有效 route、其中首个可解析 tier/supply 的**上游协议**；Claude 筛 Anthropic，Codex 筛 Responses，Hermes/OpenClaw 不过滤。它不核验全部档位、pool 或后备供给，可能隐藏实际可转换的线路。无候选时未必有完整手配片段：若已有可用跨协议绑定，用其 token 手配；若确无有效绑定，使用 `strategy` 一级菜单或手工补绑定。
 
 ### Claude / Codex 手动接线
 
@@ -320,12 +320,11 @@ model_proxy_cli.bat stats month
 4. **检查 pool 与正文错误**：pool 可在缺 tier、供给耗尽时尝试其他 route，但并非所有错误都遍历。非流式正文错误须被识别且匹配冷却规则才可能重试；结合 [正文错误机制](docs/designs/2026-10-10-正文错误识别与failover衔接方案.md) 和日志定位。
 5. **检查流是否已提交**：一旦提交，本次请求不能换供给；部分正文错误收口后冷却，仅影响后续请求。预算放大只在特定非流式截断条件下发生；[仅思考内容兜底](docs/impl-reports/2026-08-07-chat-reasoning-mirror-batch3.md)不等于正式回答。
 
-日志默认 `.runtime/model_proxy.log`，启动时保留末 5000 行；账本独立存于 `.runtime/model_proxy_totals.json`，其他路径见 [runtime_paths.json](config/runtime_paths.json)。日志、账本、sidecar、备份可能含敏感信息，分享前脱敏并限制访问。旧项目根 `.model_proxy_totals.json` **不会自动迁移**；v2→v3 是已选账本的 schema 升级，不是路径迁移。需承接时必须先停稳旧进程并备份旧账本，再迁移；新路径已有账本不要覆盖，迁移后核对统计；顺序见 [CONFIG 账本说明](docs/CONFIG.md)。
+日志默认 `.runtime/model_proxy.log`，启动时保留末 5000 行；账本独立存于 `.runtime/model_proxy_totals.json`，其他路径见 [runtime_paths.json](config/runtime_paths.json)。日志、账本、sidecar、备份可能含敏感信息，分享前脱敏并限制访问。账本只认配置里的当前路径，不会自动承接其他位置的账本；需要合并历史时先停稳服务、备份后再手工迁移，见 [CONFIG 账本说明](docs/CONFIG.md)。
 
-安装/运行身份记录（`.runtime/install.json`、`active.json`、`last_good_paths.json`）：macOS 上是
-schema 4（卷 UUID + inode），重启不再被误判为安装变更；`status`/`off` 不判身份，身份异常也不会
-让服务查不到或停不掉。**降级旧版本必须先 `off` 并按备份恢复这三份记录**，细节（备份位置、2/4 混合
-记录、Windows 为何不需要）见 [CONFIG §12 安装与运行身份记录](docs/CONFIG.md#12-安装与运行身份记录)。
+`.runtime/` 下另有安装身份记录（`install.json`、`active.json`、`last_good_paths.json`）：
+`on` 与服务启动会核验它们是否属于当前安装，`status`/`off` 只凭记录结构、真实进程、端口归属与锁活体定位，
+身份异常也不会让服务查不到或停不掉。字段与跨重启、跨卷场景见 [CONFIG §12](docs/CONFIG.md#12-安装与运行身份记录)。
 
 ## 从另一台电脑使用
 
