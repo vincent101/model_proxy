@@ -28,8 +28,8 @@ PROVIDER = "catpaw-ide"
 # 凭据默认路径：mtsso_keeper 的 CatPaw IDE 段固定写这里。
 DEFAULT_CREDENTIAL_FILE = "~/.mtsso_keeper/catpaw_ide_session.json"
 
-# 剩余寿命低于该阈值即拒绝出站：给 keeper 一次 tick 的窗口，避免边界抖动。
-_EXPIRE_MARGIN_SECONDS = 300
+# 有效期内放行；精确到期点本地快速失败。
+_EXPIRE_MARGIN_SECONDS = 0
 
 # 桥输出缓冲：单次 Next 的上限，也是流式读取的粒度。
 _READ_SIZE = 65536
@@ -91,7 +91,7 @@ def read_credential(path: str) -> dict:
     remaining = int(expire) - int(time.time())
     if remaining <= _EXPIRE_MARGIN_SECONDS:
         raise CredentialError(
-            f"CatPaw IDE 凭据已过期或即将过期（剩余 {remaining}s）；"
+            f"CatPaw IDE 凭据已过期（剩余 {remaining}s）；"
             "请运行 mtsso_keeper 刷新后重试")
     return data
 

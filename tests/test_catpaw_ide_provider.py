@@ -11,6 +11,7 @@ import tempfile
 import time
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 HERE = Path(__file__).resolve().parent
 ROOT = HERE.parent
@@ -102,10 +103,14 @@ class TestCredential(unittest.TestCase):
             ide.read_credential(self._write(_cred(expire_delta=-10)))
         self.assertIn("过期", str(cm.exception))
 
-    def test_expiring_soon(self):
-        # 剩余不足 5 分钟即拒绝，避免边界抖动
-        with self.assertRaises(ide.CredentialError):
-            ide.read_credential(self._write(_cred(expire_delta=60)))
+    def test_expiration_boundaries(self):
+        with patch.object(ide.time, "time", return_value=1_800_000_000):
+            for delta in (299, 60, 1):
+                with self.subTest(delta=delta):
+                    self.assertEqual(ide.read_credential(self._write(_cred(delta)))["mis"], "wangfan24")
+            for delta in (0, -1):
+                with self.subTest(delta=delta), self.assertRaises(ide.CredentialError):
+                    ide.read_credential(self._write(_cred(delta)))
 
     def test_build_auth_shape(self):
         a = ide.build_auth(_cred())

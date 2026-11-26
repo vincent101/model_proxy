@@ -15,6 +15,7 @@ import time
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
@@ -214,6 +215,76 @@ class TestIdeForward(unittest.TestCase):
         self.assertEqual(status, 500)
         self.assertIn("过期", body.decode())
         self.assertEqual(cd.hits, [])
+
+    def test_expired_then_new_file_recovers_without_cooldown(self):
+        from core.providers import catpaw_ide
+        now = 1_800_000_000
+        supply = self._ide_supply()
+        path = Path(supply["credential_file"])
+        cred = json.loads(path.read_text())
+        cred["expire"] = now
+        path.write_text(json.dumps(cred))
+        cd = _Cooldown()
+        body = {"model": "claude-opus", "max_tokens": 8, "stream": False,
+                "messages": [{"role": "user", "content": "hi"}]}
+        with patch.object(catpaw_ide.time, "time", return_value=now):
+            h1 = _handler([supply], ["ide1"], body, cd)
+            h1._forward("POST")
+            self.assertEqual(h1._responses[-1][0], 500)
+            cred["expire"] = now + 3600
+            cred["accessToken"] = "new-fake-at"
+            path.write_text(json.dumps(cred))
+            h2 = _handler([supply], ["ide1"], body, cd)
+            h2._forward("POST")
+            self.assertEqual(h2._responses[-1][0], 200)
+        self.assertEqual(cd.hits, [])
+        self.assertEqual(h2._acc["failover"], 0)
+
+    def test_upstream_401_follows_cooldown_and_failover(self):
+        from core.providers import catpaw_ide
+        cd = _Cooldown()
+        bad = self._ide_supply()
+        good = self._ide_supply()
+        good["id"] = "ide2"
+        h = _handler([bad, good], ["ide1", "ide2"], {
+            "model": "claude-opus", "max_tokens": 8, "stream": False,
+            "messages": [{"role": "user", "content": "hi"}]}, cd,
+            cooldown_rules=[{"errorcode": [401], "cooldown_seconds": 10}])
+        real = catpaw_ide.start_request
+        calls = [0]
+        def upstream(*args, **kwargs):
+            calls[0] += 1
+            if calls[0] == 1:
+                raise catpaw_ide.UpstreamError(401, "fake unauthorized")
+            return real(*args, **kwargs)
+        with patch.object(catpaw_ide, "start_request", side_effect=upstream):
+            h._forward("POST")
+        self.assertEqual(h._responses[-1][0], 200)
+        self.assertEqual(h._acc["failover"], 1)
+        self.assertEqual(cd.hits, [("ide1", 10, "http_401")])
+        self.assertEqual(calls[0], 2)
+
+    def test_exact_expiry_fast_fails_and_299_forwards(self):
+        from core.providers import catpaw_ide
+        now = 1_800_000_000
+        body = {"model": "claude-opus", "max_tokens": 8, "stream": False,
+                "messages": [{"role": "user", "content": "hi"}]}
+        for delta in (0, 299):
+            cd = _Cooldown()
+            sup = self._ide_supply()
+            p = Path(sup["credential_file"])
+            c = json.loads(p.read_text())
+            c["expire"] = now + delta
+            p.write_text(json.dumps(c))
+            h = _handler([sup], ["ide1"], body, cd,
+                         cooldown_rules=[{"errorcode": [500, 401], "cooldown_seconds": 60}])
+            with patch.object(catpaw_ide.time, "time", return_value=now), \
+                 patch.object(catpaw_ide, "start_request", wraps=catpaw_ide.start_request) as bridge:
+                h._forward("POST")
+            self.assertEqual(h._responses[-1][0], 500 if delta == 0 else 200)
+            self.assertEqual(bridge.call_count, 0 if delta == 0 else 1)
+            self.assertEqual(cd.hits, [])
+            self.assertEqual(h._acc["failover"], 0)
 
     def test_upstream_model_missing_cooldowns_with_configured_code(self):
         """IDE 目录无此模型（本地 invalid 400）→ body_error_rules 映射成
