@@ -5,7 +5,7 @@
 定位：与 CIBA 段、mcli 段平级的**第三类凭据**，由 keeper 独占管理；
 model_proxy 只读本模块产出的 credential_file，不刷新、不登录。
 
-与 mint_mcli_token.py 的根本差异（不可复用其代码路径）：
+与 mcli_token.py 的根本差异（不可复用其代码路径）：
   - mcli：客户端自造 uuid，服务端只"激活"，无签发秘密
   - IDE ：真 OAuth。access/refresh/attestation 三要素，刷新需三头
 
@@ -100,6 +100,35 @@ class CheckResult:
     new_issued_at: float | None = None
     remaining: float | None = None
     generation: str = ""
+
+
+@dataclass(frozen=True)
+class RecoveryProgress:
+    generation: str = ""
+    expire: float | None = None
+    pending: bool = False
+    pending_valid: bool = False
+    pending_related: bool = False
+    first_unavailable_at: float | None = None
+    next_deadline: float | None = None
+    budget_deadline: float | None = None
+    early_invalid: bool = False
+    event_id: str = ""
+    stop_reason: str = ""
+    verdict: str = ""
+    post_in_flight: bool = False
+    early_post_allowed_at: float | None = None
+
+
+@dataclass(frozen=True)
+class ObserveResult:
+    verdict: str
+    code: int
+    reason: str = ""
+    expire: float | None = None
+    remaining: float | None = None
+    generation: str = ""
+    progress: RecoveryProgress | None = None
 
 
 @dataclass(frozen=True)
@@ -560,6 +589,15 @@ def _fail(st: dict, verdict: str, code: int, reason: str, now: float,
     return _finish(st, verdict, code, reason)
 
 
+def _stop_for_budget(st: dict, now: float) -> EnsureResult:
+    """预算到期不取代既有不可恢复停止原因。"""
+    if st.get("stop_reason") and st["stop_reason"] != "auto_budget_exhausted":
+        verdict = st.get("verdict", "need_human")
+        return _finish(st, verdict, EXIT_FAIL if verdict in ("refresh_indeterminate", "commit_failed")
+                       else EXIT_HUMAN, st["stop_reason"])
+    return _fail(st, "need_human", EXIT_HUMAN, "auto_budget_exhausted", now, "need_human", True)
+
+
 def check(path: str = CRED_FILE, verbose: bool = False) -> CheckResult:
     """纯只读检查；401/403 单独区分，其他拒绝不猜测为过期。"""
     del verbose
@@ -664,6 +702,13 @@ def _valid_pending(p) -> bool:
     return (_valid_cred(p.get("candidate")) and _time_value(p.get("old_expire"))
             and _time_value(p.get("old_issued_at")) and isinstance(p.get("old_generation"), str)
             and bool(p["old_generation"]) and isinstance(p.get("baseline"), str) and bool(p["baseline"]))
+
+
+def _record_earlier_unavailable(st: dict, expire: float, now: float) -> None:
+    """可信到期时间只能收紧已开始的不可用预算。"""
+    if expire <= now:
+        first = st.get("first_unavailable_at")
+        st["first_unavailable_at"] = min(first, expire) if _time_value(first) else expire
 
 
 def _apply_verified_lifetime(st: dict, path: str, cred: dict, checked: CheckResult,
@@ -791,7 +836,7 @@ def _recover_pending(st: dict, path: str, now: float, handle) -> EnsureResult:
         result = _finish(st, "renewed", EXIT_OK, "renewed")
     elif (st.get("first_unavailable_at") is not None and
             now - st["first_unavailable_at"] >= BUDGET_SECONDS):
-        return _fail(st, "need_human", EXIT_HUMAN, "auto_budget_exhausted", now, "need_human", True)
+        return _stop_for_budget(st, now)
     elif new["expire"] <= p["old_expire"]:
         _retry(st, now)
         _alert(st, "rotation_only", now, st["generation"])
@@ -867,7 +912,195 @@ def _discard_stale_pending(st: dict, path: str, p: dict, now: float, handle) -> 
         return _fail(st, "commit_failed", EXIT_FAIL, "pending_supersede", now, "commit_failed", True)
 
 
-def _ensure_locked(path: str, verbose: bool, local_gate: bool, handle) -> EnsureResult:
+def acquire_lock():
+    os.makedirs(os.path.dirname(os.path.expanduser(LOCK_FILE)), mode=0o700, exist_ok=True)
+    handle = file_lock.try_acquire(os.path.expanduser(LOCK_FILE))
+    if handle is not None:
+        _HELD_IDE_LOCK.handle = handle
+    return handle
+
+
+def release_lock(handle) -> None:
+    if handle is getattr(_HELD_IDE_LOCK, "handle", None):
+        _HELD_IDE_LOCK.handle = None
+    file_lock.release(handle)
+
+
+def recovery_progress(handle, path: str = CRED_FILE, owner_revision: str = "",
+                      now: float | None = None) -> RecoveryProgress:
+    """锁内返回非秘密恢复事实；不执行网络、通知或凭据写入。"""
+    _assert_ide_lock(handle)
+    now = time.time() if now is None else now
+    st = load_status()
+    cred = read_cred(path)
+    generation = _generation(cred) if _valid_cred(cred) else ""
+    pending_exists = os.path.exists(os.path.expanduser(PENDING_FILE))
+    pending = _read_json(PENDING_FILE) if pending_exists else None
+    valid = (_valid_pending(pending) and pending.get("path") == os.path.abspath(os.path.expanduser(path)))
+    related = False
+    if valid and owner_revision and pending.get("old_generation") == owner_revision:
+        candidate_generation = _generation(pending["candidate"])
+        related = generation in (owner_revision, candidate_generation)
+        if pending.get("operation") == "login" and not generation and not owner_revision:
+            related = True
+    if valid and pending.get("operation") == "login" and not owner_revision:
+        related = (not pending.get("old_generation") and not generation)
+    first = st.get("first_unavailable_at")
+    if not _time_value(first):
+        first = cred["expire"] if _valid_cred(cred) and cred["expire"] <= now else None
+    budget = first + BUDGET_SECONDS if first is not None else None
+    deadlines = []
+    retry = st.get("next_retry_at")
+    if _time_value(retry):
+        if (st.get("early_invalid") and not st.get("early_recovered")
+                and _time_value(st.get("last_early_post_at")) and not pending_exists):
+            retry = max(retry, st["last_early_post_at"] + EARLY_POST_INTERVAL)
+        if retry > now:
+            deadlines.append(retry)
+    if first is not None:
+        event_id = st.get("active_events", {}).get("unavailable_too_long")
+        notified = st.get("events", {}).get(event_id, {}).get("last_notified_at") if event_id else None
+        if not notified and first + ALERT_AFTER > now:
+            deadlines.append(first + ALERT_AFTER)
+        if budget > now:
+            deadlines.append(budget)
+    early = bool(st.get("early_invalid") and not st.get("early_recovered"))
+    event_id = st.get("active_events", {}).get("early_invalid", "") if early else ""
+    early_allowed = (st["last_early_post_at"] + EARLY_POST_INTERVAL
+                     if early and _time_value(st.get("last_early_post_at")) else None)
+    if early_allowed is not None and early_allowed > now and not pending_exists:
+        deadlines.append(early_allowed)
+    return RecoveryProgress(generation, cred["expire"] if _valid_cred(cred) else None,
+                            pending_exists, bool(valid), related, first,
+                            min(deadlines) if deadlines else None, budget, early,
+                            event_id, str(st.get("stop_reason") or ""),
+                            str(st.get("verdict") or ""), bool(st.get("post_in_flight")), early_allowed)
+
+
+def _observe_locked(path: str, handle) -> ObserveResult:
+    """观察先于恢复分支；不触发通知、POST 或 pending 提交。"""
+    _assert_ide_lock(handle)
+    now = time.time()
+    st = load_status()
+    cred = read_cred(path)
+    checked = check(path)
+    generation = checked.generation
+    st["last_observation"] = now
+    st["observation_verdict"] = checked.verdict
+    st["observation_reason"] = checked.reason
+    trusted = (checked.verdict in ("healthy", "expired") and checked.reason == "whoami"
+               and _valid_cred(cred) and generation == _generation(cred))
+    if trusted:
+        try:
+            _apply_verified_lifetime(st, path, cred, checked, now, handle)
+        except (OSError, ValueError, GenerationConflict):
+            st["observation_verdict"] = "commit_failed"
+            st["observation_reason"] = "metadata_commit"
+            st["check_fail_count"] = int(st.get("check_fail_count", 0)) + 1
+            _save_status(st)
+            return ObserveResult("commit_failed", EXIT_FAIL, "metadata_commit", generation=generation,
+                                 progress=recovery_progress(handle, path, generation, now))
+        st["last_observation_error"] = ""
+        st["check_fail_count"] = 0
+        st["last_probe"] = now
+        st.setdefault("generation", generation)
+        st.setdefault("old_expire", cred["expire"])
+        st.setdefault("old_issued_at", cred["issuedAt"])
+        if checked.new_expire <= now:
+            _record_earlier_unavailable(st, checked.new_expire, now)
+            _event(st, "unavailable", st["first_unavailable_at"], generation).setdefault("verdict", "expired")
+        if (st.get("first_unavailable_at") is not None
+                and now - st["first_unavailable_at"] >= BUDGET_SECONDS
+                and not st.get("stop_reason")
+                and not os.path.exists(os.path.expanduser(PENDING_FILE))):
+            st.update(verdict="need_human", reason="auto_budget_exhausted", stop_reason="auto_budget_exhausted")
+            _event(st, "need_human", now, generation).update(verdict="need_human", reason="auto_budget_exhausted")
+    elif checked.verdict == "expired" and checked.reason == "upstream_unauthorized" and _valid_cred(cred):
+        st["last_observation_error"] = ""
+        st["check_fail_count"] = 0
+        st.setdefault("generation", generation)
+        st.setdefault("old_expire", cred["expire"])
+        st.setdefault("old_issued_at", cred["issuedAt"])
+        if cred["expire"] > now:
+            if not st.get("early_invalid") or st.get("early_recovered"):
+                st.update(early_invalid=True, early_recovered=False, first_unavailable_at=now)
+                st.pop("last_early_post_at", None)
+            _event(st, "early_invalid", st["first_unavailable_at"], generation).setdefault("verdict", "expired")
+        else:
+            st.setdefault("first_unavailable_at", cred["expire"])
+        _event(st, "unavailable", st["first_unavailable_at"], generation).setdefault("verdict", "expired")
+        if (now - st["first_unavailable_at"] >= BUDGET_SECONDS
+                and not st.get("stop_reason")
+                and not os.path.exists(os.path.expanduser(PENDING_FILE))):
+            st.update(verdict="need_human", reason="auto_budget_exhausted", stop_reason="auto_budget_exhausted")
+            _event(st, "need_human", now, generation).update(verdict="need_human", reason="auto_budget_exhausted")
+    else:
+        st["last_observation_error"] = checked.reason or checked.verdict
+        st["check_fail_count"] = int(st.get("check_fail_count", 0)) + 1
+    _save_status(st)
+    progress = recovery_progress(handle, path, generation, now)
+    expire = checked.new_expire if trusted else (cred["expire"] if checked.reason == "upstream_unauthorized" and _valid_cred(cred) else None)
+    code = EXIT_OK if checked.verdict in ("healthy", "expired") else EXIT_FAIL
+    return ObserveResult(checked.verdict, code, checked.reason, expire,
+                         expire - now if expire is not None else None, generation, progress)
+
+
+def record_observation_error_locked(handle, reason: str) -> None:
+    _assert_ide_lock(handle)
+    st = load_status()
+    st.update(last_observation=time.time(), last_observation_error=reason,
+              check_fail_count=int(st.get("check_fail_count", 0)) + 1)
+    _save_status(st)
+
+
+def observe_locked(handle, path: str = CRED_FILE) -> ObserveResult:
+    return _observe_locked(path, handle)
+
+
+def advance_deadlines_locked(handle, path: str = CRED_FILE) -> EnsureResult:
+    """只推进本地告警/预算截止，不发 GET 或 POST。"""
+    _assert_ide_lock(handle)
+    now = time.time()
+    st = load_status()
+    progress = recovery_progress(handle, path, now=now)
+    if progress.first_unavailable_at is not None:
+        st.setdefault("first_unavailable_at", progress.first_unavailable_at)
+        _event(st, "unavailable", progress.first_unavailable_at, progress.generation).setdefault("verdict", "expired")
+        if now - progress.first_unavailable_at >= ALERT_AFTER:
+            _alert(st, "unavailable_too_long", now, progress.generation)
+        if now - progress.first_unavailable_at >= BUDGET_SECONDS and not progress.pending:
+            return _stop_for_budget(st, now)
+    return _finish(st, "retry_wait", EXIT_FAIL, "deadline_wait")
+
+
+def expire_budget_locked(handle, path: str = CRED_FILE) -> EnsureResult:
+    """无 pending 且墙钟预算已尽时仅推进既有本地事件，不联网。"""
+    _assert_ide_lock(handle)
+    now = time.time()
+    st = load_status()
+    progress = recovery_progress(handle, path, now=now)
+    if (progress.pending or progress.budget_deadline is None or now < progress.budget_deadline):
+        raise ValueError("budget_not_exhausted")
+    st.setdefault("generation", progress.generation)
+    st.setdefault("first_unavailable_at", progress.first_unavailable_at)
+    _event(st, "unavailable", st["first_unavailable_at"], progress.generation).setdefault("verdict", "expired")
+    _alert(st, "unavailable_too_long", now, progress.generation)
+    return _stop_for_budget(st, now)
+
+
+def observe(path: str = CRED_FILE, verbose: bool = False) -> ObserveResult:
+    del verbose
+    handle = acquire_lock()
+    if handle is None:
+        return ObserveResult("retry_wait", EXIT_FAIL, "lock_busy")
+    try:
+        return _observe_locked(path, handle)
+    finally:
+        release_lock(handle)
+
+
+def _ensure_locked(path: str, verbose: bool, local_gate: bool, handle,
+                   verification_only: bool = False) -> EnsureResult:
     del verbose
     now = time.time()
     st = load_status()
@@ -875,13 +1108,21 @@ def _ensure_locked(path: str, verbose: bool, local_gate: bool, handle) -> Ensure
         event = _event(st, "rotation_only", st.get("last_run", now), st.get("generation", ""))
         event.update(verdict="rotation_only", reason="expire_not_advanced")
     cred = read_cred(path)
+    if (not st.get("first_unavailable_at") and not os.path.exists(os.path.expanduser(PENDING_FILE))
+            and _valid_cred(cred) and cred["expire"] <= now):
+        st["first_unavailable_at"] = cred["expire"]
     if now < st.get("next_retry_at", 0):
         if st.get("first_unavailable_at") is not None:
             if now - st["first_unavailable_at"] >= ALERT_AFTER:
                 _alert(st, "unavailable_too_long", now, st.get("generation", ""))
             if now - st["first_unavailable_at"] >= BUDGET_SECONDS:
-                return _fail(st, "need_human", EXIT_HUMAN, "auto_budget_exhausted", now, "need_human", True)
-        return _finish(st, "retry_wait", EXIT_FAIL, "probe_backoff")
+                if os.path.exists(os.path.expanduser(PENDING_FILE)):
+                    # 到截止仅允许验证已签发候选，不再等待验证退避。
+                    st["next_retry_at"] = 0
+                else:
+                    return _stop_for_budget(st, now)
+        if now < st.get("next_retry_at", 0):
+            return _finish(st, "retry_wait", EXIT_FAIL, "probe_backoff")
     if (_valid_cred(cred) and st.get("generation")
             and st["generation"] != _generation(cred)
             and not os.path.exists(os.path.expanduser(PENDING_FILE))):
@@ -921,7 +1162,7 @@ def _ensure_locked(path: str, verbose: bool, local_gate: bool, handle) -> Ensure
             st["first_unavailable_at"] = pending["old_expire"]
             if now - pending["old_expire"] >= ALERT_AFTER:
                 _alert(st, "unavailable_too_long", now, st.get("generation", ""))
-            if now - pending["old_expire"] >= BUDGET_SECONDS:
+            if now - pending["old_expire"] >= BUDGET_SECONDS and not st.get("stop_reason"):
                 st["stop_reason"] = "auto_budget_exhausted"
                 _alert(st, "need_human", now, st.get("generation", ""))
         if st.get("stop_reason") == "auto_budget_exhausted":
@@ -945,6 +1186,15 @@ def _ensure_locked(path: str, verbose: bool, local_gate: bool, handle) -> Ensure
             and st.get("stop_reason")):
         # 停止 POST 不妨碍只读核验与可信寿命写回；下方统一先写回再返回停止状态。
         _alert(st, st["verdict"], now, st.get("generation", ""))
+    if verification_only and not os.path.exists(os.path.expanduser(PENDING_FILE)):
+        if st.get("stop_reason"):
+            verdict = st.get("verdict", "need_human")
+            return _finish(st, verdict, EXIT_FAIL if verdict in ("refresh_indeterminate", "commit_failed")
+                           else EXIT_HUMAN, st["stop_reason"])
+        if st.get("active_events", {}).get("rotation_only"):
+            _retry(st, now)
+            return _finish(st, "rotation_only", EXIT_FAIL, "expire_not_advanced")
+        return _finish(st, "need_human", EXIT_HUMAN, "verification_only")
     if cred is None:
         verdict = "missing" if not os.path.exists(os.path.expanduser(path)) else "invalid_schema"
         return _finish(st, verdict, EXIT_HUMAN, verdict)
@@ -988,7 +1238,7 @@ def _ensure_locked(path: str, verbose: bool, local_gate: bool, handle) -> Ensure
                 if now - st["first_unavailable_at"] >= ALERT_AFTER:
                     _alert(st, "unavailable_too_long", now, generation)
                 if now - st["first_unavailable_at"] >= BUDGET_SECONDS:
-                    return _fail(st, "need_human", EXIT_HUMAN, "auto_budget_exhausted", now, "need_human", True)
+                    return _stop_for_budget(st, now)
             _alert(st, "rotation_only", now, generation)
             return _finish(st, "rotation_only", EXIT_FAIL, "expire_not_advanced")
         if st.get("stop_reason"):
@@ -1016,7 +1266,7 @@ def _ensure_locked(path: str, verbose: bool, local_gate: bool, handle) -> Ensure
             if now - st["first_unavailable_at"] >= ALERT_AFTER:
                 _alert(st, "unavailable_too_long", now, generation)
             if now - st["first_unavailable_at"] >= BUDGET_SECONDS:
-                return _fail(st, "need_human", EXIT_HUMAN, "auto_budget_exhausted", now, "need_human", True)
+                return _stop_for_budget(st, now)
         if st.get("stop_reason"):
             verdict = st.get("verdict", "need_human")
             return _finish(st, verdict, EXIT_FAIL if verdict in ("refresh_indeterminate", "commit_failed")
@@ -1034,6 +1284,8 @@ def _ensure_locked(path: str, verbose: bool, local_gate: bool, handle) -> Ensure
             return _fail(st, "commit_failed", EXIT_FAIL, "metadata_commit", now, "commit_failed", True)
         cred = updated
         st["old_expire"], st["old_issued_at"] = cred["expire"], cred["issuedAt"]
+    if c.verdict == "expired" and c.reason == "whoami":
+        _record_earlier_unavailable(st, c.new_expire, time.time())
     if changed:
         return _fail(st, "need_human", EXIT_HUMAN, "unverified_generation", now, "need_human", True)
     early = cred["expire"] > now and c.reason == "upstream_unauthorized"
@@ -1052,7 +1304,7 @@ def _ensure_locked(path: str, verbose: bool, local_gate: bool, handle) -> Ensure
     if now - st["first_unavailable_at"] >= ALERT_AFTER:
         _alert(st, "unavailable_too_long", now, generation)
     if now - st["first_unavailable_at"] >= BUDGET_SECONDS:
-        return _fail(st, "need_human", EXIT_HUMAN, "auto_budget_exhausted", now, "need_human", True)
+        return _stop_for_budget(st, now)
     if st.get("stop_reason"):
         verdict = st.get("verdict", "need_human")
         return _finish(st, verdict, EXIT_FAIL if verdict in ("refresh_indeterminate", "commit_failed")
@@ -1092,6 +1344,18 @@ def _ensure_locked(path: str, verbose: bool, local_gate: bool, handle) -> Ensure
         if confirm.verdict == "transient_error":
             return _fail(st, "transient_error", EXIT_FAIL, "prepost_probe", now, retry=True)
         return _fail(st, "need_human", EXIT_HUMAN, "prepost_rejected", now, "need_human", True)
+    if confirm.reason == "whoami":
+        try:
+            _apply_verified_lifetime(st, path, cred, confirm, time.time(), handle)
+        except GenerationConflict:
+            return _fail(st, "need_human", EXIT_HUMAN, "generation_conflict", time.time(), "need_human", True)
+        except (OSError, ValueError):
+            return _fail(st, "commit_failed", EXIT_FAIL, "metadata_commit", time.time(), "commit_failed", True)
+        cred = dict(cred, expire=confirm.new_expire, issuedAt=confirm.new_issued_at)
+        _record_earlier_unavailable(st, confirm.new_expire, time.time())
+    now = time.time()
+    if now - st["first_unavailable_at"] >= BUDGET_SECONDS:
+        return _stop_for_budget(st, now)
     try:
         baseline = _backup(path)
         # 先持久化 POST 意图；中断时不能假设 RT 未轮换。
@@ -1101,6 +1365,10 @@ def _ensure_locked(path: str, verbose: bool, local_gate: bool, handle) -> Ensure
         _save_status(st)
     except (OSError, ValueError):
         return _fail(st, "commit_failed", EXIT_FAIL, "prepost_backup", now, "commit_failed", True)
+    now = time.time()
+    if now - st["first_unavailable_at"] >= BUDGET_SECONDS:
+        st["post_in_flight"] = False
+        return _stop_for_budget(st, now)
     try:
         response = refresh(cred["accessToken"], cred["refreshToken"], cred["attestation"])
     except PermissionError:
@@ -1129,20 +1397,23 @@ def _ensure_locked(path: str, verbose: bool, local_gate: bool, handle) -> Ensure
     return _recover_pending(st, path, time.time(), handle)
 
 
+def maintain_locked(handle, path: str = CRED_FILE, verbose: bool = False,
+                    verification_only: bool = False) -> EnsureResult:
+    _assert_ide_lock(handle)
+    return _ensure_locked(path, verbose, False, handle, verification_only=verification_only)
+
+
 def ensure(force: bool = False, path: str = CRED_FILE, verbose: bool = False,
            local_gate: bool = False) -> EnsureResult:
     if force:
         _v(True, "--force 已废弃，仍遵守刷新门控")
-    os.makedirs(os.path.dirname(os.path.expanduser(LOCK_FILE)), mode=0o700, exist_ok=True)
-    handle = file_lock.try_acquire(os.path.expanduser(LOCK_FILE))
+    handle = acquire_lock()
     if handle is None:
         return EnsureResult("retry_wait", EXIT_FAIL, "lock_busy")
-    _HELD_IDE_LOCK.handle = handle
     try:
         return _ensure_locked(path, verbose, local_gate, handle)
     finally:
-        _HELD_IDE_LOCK.handle = None
-        file_lock.release(handle)
+        release_lock(handle)
 
 
 def attestation_warning(cred: dict | None) -> str | None:

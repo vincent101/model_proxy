@@ -26,7 +26,7 @@ DEFAULT_SOURCE = Path("/Users/vincentwang/Documents/NoteVault/tools/mtsso_keeper
 # catpaw-ide：凭据产出/刷新；catpaw-cli-refresh：mcli 令牌保鲜（可选）。
 COMPONENTS = {
     "catpaw-ide": ["catpaw_ide_session.py", "file_lock.py", "mtsso_core.py"],
-    "catpaw-cli-refresh": ["mint_mcli_token.py", "mtsso_core.py"],
+    "catpaw-cli-refresh": ["mcli_token.py", "mtsso_core.py", "keeper_common.py"],
 }
 
 # 绝不允许出现在快照里的名字（运行态/凭据/守护体系/缓存）。

@@ -3,10 +3,10 @@
   "component": "mtsso_keeper",
   "source_repo": "NoteVault",
   "source_path": "tools/mtsso_keeper",
-  "source_commit": "8180f920068987cbfbe7e421bcc288a2aa4024eb",
-  "source_commit_date": "2026-11-26T11:15:10+08:00",
-  "source_dirty": false,
-  "snapshot_at": "2026-11-26T15:46:09+0800",
+  "source_commit": "9c761cec48777fdaffe1213c4c1a4c3d7e578939",
+  "source_commit_date": "2026-11-26T19:53:06+08:00",
+  "source_dirty": true,
+  "snapshot_at": "2026-11-26T20:09:35+0800",
   "vendored_by": "tools/model_proxy/scripts/vendor_mtsso_keeper.py --sync",
   "components": {
     "catpaw-ide": [
@@ -15,25 +15,31 @@
       "mtsso_core.py"
     ],
     "catpaw-cli-refresh": [
-      "mint_mcli_token.py",
-      "mtsso_core.py"
+      "mcli_token.py",
+      "mtsso_core.py",
+      "keeper_common.py"
     ]
   },
   "files": {
     "catpaw_ide_session.py": {
-      "sha256": "b7e0a4680e01c7a268e4c90072779cbde4ac5454f46e16efb4d76a491bc6389d",
-      "bytes": 58397,
-      "source_mtime": "2026-11-26T11:45:54+0800"
+      "sha256": "152bd406ba1e53d4d855e9e780729bff56f9ef88b6a4f20b26806345211886cb",
+      "bytes": 71718,
+      "source_mtime": "2026-11-26T19:59:30+0800"
     },
     "file_lock.py": {
-      "sha256": "375dc10bc460f72ba62e448afd8ec4210b1d1110edf4d0f2a49e59a29df0ccca",
-      "bytes": 3083,
-      "source_mtime": "2026-11-21T23:56:53+0800"
+      "sha256": "68bd76569c8cb9958a7f4c6e421448810ae88271ce39a0d03b1225a4fb370c10",
+      "bytes": 3582,
+      "source_mtime": "2026-11-26T16:41:04+0800"
     },
-    "mint_mcli_token.py": {
-      "sha256": "8d62d8b9772e14d034370af95991be23c018cded1043993edce89339d6b44235",
-      "bytes": 28531,
-      "source_mtime": "2026-09-21T10:15:16+0800"
+    "keeper_common.py": {
+      "sha256": "6f0829e47c3a60d3853766f0fd20e947263a6011bf9b9704c3839693bd712ec7",
+      "bytes": 5416,
+      "source_mtime": "2026-11-26T20:08:45+0800"
+    },
+    "mcli_token.py": {
+      "sha256": "0cd9debdaac9a1d7df1df7de2f2a6d1da799a04ca7d5b03a114162332786d733",
+      "bytes": 27398,
+      "source_mtime": "2026-11-26T20:09:18+0800"
     },
     "mtsso_core.py": {
       "sha256": "901822c79138beaed3aa85023141164d6197333fadd8988059eb44db24d6b473",
@@ -41,5 +47,7 @@
       "source_mtime": "2026-08-20T18:22:57+0800"
     }
   },
-  "notes": []
+  "notes": [
+    "快照取自 keeper 工作区（含未提交改动）；keeper 冻结后应重跑 --sync 重新冻结。"
+  ]
 }

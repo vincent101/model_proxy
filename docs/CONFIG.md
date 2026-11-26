@@ -188,19 +188,28 @@ go build -buildmode=c-shared -o ~/.local/lib/libcatpaw_bridge.dylib ./cmd/native
 `catpaw-ide` 用独立 OIDC 凭据（认证脚本必需，守护可选）。IDE 凭据缺失或过期返回 500 且不进
 cooldown（凭据问题不是上游故障，写冷却会误伤 failover）；CLI 令牌是否被上游接受只能实际请求核验。
 
-#### 无守护进程的 catpaw-ide
+#### 不装 keeper 也能用（两条链路各自的最小集）
 
-「不用 keeper」指**不装守护进程**，不是不需要认证脚本：IDE 凭据由 `mtsso_keeper` 的
-`catpaw_ide_session.py` 产出，本代理只读。以下以 macOS 为例。
+「不用 keeper」指**不装守护进程**，不是不需要认证脚本。`vendor/mtsso_keeper/` 内置了
+两条链路各自完整的依赖闭包（有测试守着：只拷该组件的文件就能跑起来）：
+
+| 链路 | 组件 | 文件 | 是否必需 |
+|---|---|---|---|
+| `catpaw-ide` | `catpaw-ide` | `catpaw_ide_session.py` `file_lock.py` `mtsso_core.py` | **必需**（凭据只能由它产出） |
+| `catpaw-cli` | `catpaw-cli-refresh` | `mcli_token.py` `keeper_common.py` `mtsso_core.py` | 可选（mc CLI 自己登录时不需要） |
+
+快照是只读的，来源 commit 与逐文件 hash 见 `vendor/mtsso_keeper/SOURCE.json`，可用
+`python3 scripts/vendor_mtsso_keeper.py --check` 校验；**不要就地修改**，改动回源目录后重跑
+`--sync`。详细说明见 `vendor/mtsso_keeper/README.md`。
+
+以下两节分别对应两条链路。
+
+#### 无守护进程的 catpaw-ide
 
 **准备**
 
 - Python 3.10+（纯标准库）、可完成内网 SSO 的帐号与网络、本机浏览器。
-- 认证脚本用仓库内置的 `vendor/mtsso_keeper/`（快照：`catpaw_ide_session.py`、
-  `file_lock.py`、`mtsso_core.py` + `mint_mcli_token.py`）。它是只读快照，来源 commit 与
-  逐文件 hash 见 `vendor/mtsso_keeper/SOURCE.json`，可用
-  `python3 scripts/vendor_mtsso_keeper.py --check` 校验；**不要就地修改**，改动回源目录后重跑
-  `--sync`。目录内的 `mint_mcli_token.py` 是 `catpaw-cli` 的可选保鲜脚本，IDE 不需要它。
+- 上面的 `catpaw-ide` 组件（3 个文件）。
 - 本平台桥库，见[桥库从哪来](#桥库从哪来)。
 
 **首次登录（一次）**
@@ -248,6 +257,47 @@ python3 "$K/catpaw_ide_session.py" --check  # 只读探测，不刷新
 
 **Windows**：登录是人工打开打印的 URL；`osascript` 只用于桌面通知，缺它不影响结果。但脚本仍含
 POSIX 写盘与权限处理，这条链路尚未在 Windows 验收——DLL 能加载不代表登录可用。
+
+#### 无守护进程的 catpaw-cli
+
+`catpaw-cli` 通道读的是 mc CLI 自己写的 `~/.config/mcopilot-cli/.config.yaml` 里的
+`AUTHORIZATION` 行。**本机 mc CLI 已登录就不需要任何脚本**，本节可跳过。
+
+只有要自己保鲜（没有 mc CLI、或要长期无人值守）时才用 `catpaw-cli-refresh` 组件：
+
+```bash
+K="<model_proxy 根>/vendor/mtsso_keeper"
+python3 "$K/mcli_token.py" --check    # 只读：探测现网 token 是否还有效
+python3 "$K/mcli_token.py"            # ensure：有效则秒退，失效才铸
+python3 "$K/mcli_token.py" --force    # 无条件铸票
+```
+
+**铸票需要 SSO 会话，二选一**：
+
+| 方式 | 命令 | 前置 |
+|---|---|---|
+| cookie 重放（默认） | `mcli_token.py --force` | `~/.mtsso_keeper/sso_session.json` 存在且 cookie 有效 |
+| 浏览器激活 | `mcli_token.py --force --activator browser` | 无（脚本打印 URL，你打开完成 SSO，它轮询最长 60s） |
+
+`sso_session.json` 格式（cookie 取 `ssosv.sankuai.com` 域）：
+
+```json
+{"cookies": "k1=v1; k2=v2", "source": "ego|chrome", "updated_at": 1764000000}
+```
+
+**首次铸票要求 `~/.config/mcopilot-cli/.config.yaml` 已存在**——脚本的四道回写护栏
+（行级重写 / schema 断言 / 备份 / 回读验证）拒绝写不存在的文件，避免凭空造出一份配置。
+没有 mc CLI 时先建空文件即可（空文件是合法输入，只追加 `AUTHORIZATION` 行）：
+
+```bash
+mkdir -p ~/.config/mcopilot-cli && : > ~/.config/mcopilot-cli/.config.yaml
+```
+
+回写只动 `AUTHORIZATION` 行；备份落 `~/.mtsso_keeper/backups/mcli/`，不留在消费目录。
+退出码与上节相同（0/1/3/4），`3` 表示 SSO 会话失效需人工重建。
+
+**与 mc CLI 不要同时写**：铸票会整文件重写配置，与 mc CLI 自己的写入窗口重叠时可能互相
+覆盖（后果有界：重铸一次即可）。保鲜机制上线后，不要在开着 mc CLI 的同时跑 `--force`。
 
 ## 3. routes 字段
 

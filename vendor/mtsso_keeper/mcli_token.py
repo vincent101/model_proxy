@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""mint_mcli_token.py — 铸 mcli (CatPaw/mcli.sankuai.com) 的 uuid token（动作 C）
+"""mcli_token.py — mcli token 生命周期：探测 / 铸票 / Authorization 行回写（动作 C）
 
 协议逆向快照：mcopilot-cli v0.2.3（方案 §2，pclntab + 反汇编逐段还原）：
   - token = uuid.NewString() 去横线（32 hex，uuid v4）——服务端不签发秘密，
@@ -16,10 +16,10 @@
 不适用；行式 KV 等新原语留本文件内（方案 §4.5：mtsso_core.py 不改）。
 
 用法：
-  python3 mint_mcli_token.py                      # ensure：探活，有效秒退；失效才铸
-  python3 mint_mcli_token.py --check              # 只读健康检查（不铸票）
-  python3 mint_mcli_token.py --force              # 无条件铸票（SSO 重建后人工在场用）
-  python3 mint_mcli_token.py --activator browser  # c 路径：打印激活 URL 等待 ego/人工浏览器
+  python3 mcli_token.py                      # ensure：探活，有效秒退；失效才铸
+  python3 mcli_token.py --check              # 只读健康检查（不铸票）
+  python3 mcli_token.py --force              # 无条件铸票（SSO 重建后人工在场用）
+  python3 mcli_token.py --activator browser  # c 路径：打印激活 URL 等待 ego/人工浏览器
 
 回写四护栏（§4.3）：行级重写只动 AUTHORIZATION 行 / schema 断言拒写 /
 备份落 ~/.mtsso_keeper/backups/mcli/（绝不落消费目录）+ 原子替换 /
@@ -36,6 +36,8 @@ c（浏览器激活）轮询超时 → 直接 exit 3 不换 uuid（避免浏览�
 
 凭证纪律：token 不进 argv、不进日志（只 core.fingerprint 指纹）、不进 vault；
 SSO session cookie 只存 ~/.mtsso_keeper/sso_session.json（vault 外 0600）。
+keeper state 的 mcli 段只经 state_hook 由 keeper_common.apply_mcli_minted 写，
+本模块不直接读写 keeper state。
 
 设计记录：docs/designs/2026-09-20-mtsso_keeper铸mcli票方案-动作C.md
 """
@@ -58,6 +60,7 @@ _HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, _HERE)
 
 import mtsso_core as core  # noqa: E402
+import keeper_common  # noqa: E402
 
 # ── 常量（协议逆向快照，勿凭猜改）─────────────────────────────────────
 MCLI_CONFIG = "~/.config/mcopilot-cli/.config.yaml"   # 消费端配置（model_proxy appkey_file 亦读此）
@@ -95,7 +98,7 @@ _SSO_DEAD_HINT = (
     "  1. 用 ego-browser（或 Chrome）打开任一 sankuai SSO 登录页完成登录\n"
     "  2. 提取 ssosv.sankuai.com 域 cookie，写入 ~/.mtsso_keeper/sso_session.json：\n"
     '     {"cookies": "k1=v1; k2=v2", "source": "ego|chrome", "updated_at": <unix秒>}\n'
-    "  3. 重跑: python3 mint_mcli_token.py --force"
+    "  3. 重跑: python3 mcli_token.py --force"
 )
 
 
@@ -418,44 +421,14 @@ def poll_info(mcli_uuid: str, interval: float = None, timeout: float = None,
         time.sleep(interval)
 
 
-# ── state 反哺（供 keeper tick 消费；人工跑时与 tick 并发窗口 ≈ 0）────
-def _update_state_ok(new_token: str, old_token_code=None) -> None:
-    """铸票成功后更新 keeper state 的 mcli 段（token 指纹/last_ok/清 stop_retry）。
-
-    只记指纹不记明文（方案 §4.5）。写失败不阻断成功结论（warn；下 tick
-    探测自愈 token_fp）。并发说明：人工 --force 与 launchd tick 撞在毫秒级
-    写窗口的概率 ≈ 0，且后果可恢复（bootstrap/refresh-once 重建），不加锁。
-    """
-    try:
-        st = {}
-        try:
-            with open(os.path.expanduser(core.STATE_FILE), encoding="utf-8") as f:
-                st = json.load(f)
-        except (OSError, ValueError):
-            st = {}
-        if not isinstance(st, dict):
-            st = {}
-        m = st.get("mcli") if isinstance(st.get("mcli"), dict) else {}
-        now = int(time.time() * 1000)
-        m["token_fp"] = core.fingerprint(new_token)
-        m["last_ok"] = now
-        m["last_probe"] = now
-        m["minted_at"] = now
-        m["fail_count"] = 0
-        m.pop("stop_retry", None)
-        if old_token_code is not None:
-            m.setdefault("observed", {})["old_token_code_after_mint"] = old_token_code
-        st["mcli"] = m
-        core.atomic_write_json(core.STATE_FILE, st)
-    except Exception as e:  # noqa: BLE001 —— state 记录失败不阻断铸票成功
-        print(f"[warn] keeper state 更新失败（不阻断结果，下 tick 自愈）: {e}",
-              file=sys.stderr)
-
-
 # ── 主流程 ───────────────────────────────────────────────────────────
 def run_ensure(force: bool = False, verbose: bool = False, activator: str = "cookie",
-               config_path: str = None, backup_dir: str = None) -> int:
-    """ensure 主流程（§4.1 状态机），返回退出码。"""
+               config_path: str = None, backup_dir: str = None,
+               state_hook=None) -> int:
+    """ensure 主流程（§4.1 状态机），返回退出码。
+
+    state_hook：铸票成功回写配置后调用 `state_hook(new_token, old_code)`；
+    keeper state 的写入由调用方注入（本模块不写 keeper state）。"""
     config_path = os.path.expanduser(config_path or MCLI_CONFIG)
     backup_dir = backup_dir or BACKUP_DIR
 
@@ -548,7 +521,8 @@ def run_ensure(force: bool = False, verbose: bool = False, activator: str = "coo
         print(f"[ERROR] 回写 IO 失败: {e}", file=sys.stderr)
         return 1
 
-    _update_state_ok(minted_uuid, old_code)
+    if state_hook:
+        state_hook(minted_uuid, old_code)
     print(f"[完成] 已铸 mcli token 并回写 {config_path}")
     print(f"  新 token: {core.fingerprint(minted_uuid)}  misId={minted_data.get('misId', '?')}")
     if old_code is not None:
@@ -594,7 +568,8 @@ def main() -> int:
     args = ap.parse_args()
     if args.check:
         return run_check()
-    return run_ensure(force=args.force, verbose=args.verbose, activator=args.activator)
+    return run_ensure(force=args.force, verbose=args.verbose, activator=args.activator,
+                      state_hook=keeper_common.apply_mcli_minted)
 
 
 if __name__ == "__main__":

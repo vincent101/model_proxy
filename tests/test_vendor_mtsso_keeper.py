@@ -72,6 +72,41 @@ class VendorSnapshotTests(unittest.TestCase):
                     self.assertIn(name, self.source["files"], "组件声明了未登记文件")
                     self.assertTrue((VENDOR / name).is_file())
 
+    def test_each_component_runs_from_its_own_closure(self):
+        """每个组件声明的文件集合必须自洽：只拷这些文件就能跑起来。
+
+        只拿到 model_proxy 的人不会有 keeper 源码，也不会知道还差哪个模块。
+        组件清单漏一个文件（例如 mcli_token 依赖 keeper_common）在这里直接暴露，
+        而不是等到用户机器上 ModuleNotFoundError。
+        """
+        import os
+        import shutil
+        import subprocess
+        import sys
+        import tempfile
+
+        entry = {"catpaw-ide": "catpaw_ide_session.py",
+                 "catpaw-cli-refresh": "mcli_token.py"}
+        for component, names in self.source["components"].items():
+            with self.subTest(component=component):
+                self.assertIn(component, entry, "新增组件需在此登记入口脚本")
+                with tempfile.TemporaryDirectory() as td:
+                    for name in names:
+                        shutil.copy2(VENDOR / name, Path(td) / name)
+                    env = dict(os.environ, HOME=td, PYTHONDONTWRITEBYTECODE="1")
+                    proc = subprocess.run(
+                        [sys.executable, str(Path(td) / entry[component]), "--check"],
+                        capture_output=True, text=True, env=env, timeout=120)
+                    # 隔离 HOME 下无凭据 → 1；纯 import 失败是 1 + traceback，
+                    # 用 stderr 有无 ModuleNotFoundError 区分两种情况
+                    self.assertNotIn("ModuleNotFoundError", proc.stderr,
+                                     f"{component} 闭包缺文件: {proc.stderr[-300:]}")
+                    self.assertNotIn("ImportError", proc.stderr,
+                                     f"{component} 闭包缺文件: {proc.stderr[-300:]}")
+                    self.assertEqual(proc.returncode, 1,
+                                     f"{component} 期望无凭据退出 1，"
+                                     f"实际 {proc.returncode}: {proc.stderr[-300:]}")
+
     def test_snapshot_carries_provenance(self):
         self.assertTrue(self.source.get("source_commit"), "缺少来源 commit")
         self.assertIn("source_dirty", self.source, "缺少脏工作区标记")

@@ -36,6 +36,22 @@ class LockUnavailableError(RuntimeError):
     """当前平台没有任何可用的文件锁机制（fail-closed，不静默放行）。"""
 
 
+def _open_private(path: str):
+    flags = (os.O_RDWR | os.O_CREAT | os.O_APPEND | getattr(os, "O_BINARY", 0)
+             | getattr(os, "O_NOFOLLOW", 0))
+    handle = open(path, "a+b", buffering=0,
+                  opener=lambda name, _flags: os.open(name, flags, 0o600))
+    try:
+        if hasattr(os, "fchmod"):
+            os.fchmod(handle.fileno(), 0o600)
+        else:
+            os.chmod(path, 0o600)
+        return handle
+    except BaseException:
+        handle.close()
+        raise
+
+
 def try_acquire(path: str):
     """尝试独占锁；成功返回文件句柄（调用方持有期间不得关闭），失败返回 None。
 
@@ -45,7 +61,7 @@ def try_acquire(path: str):
     显式 close；被别处持有时返回 None。
     """
     # 不缓冲：锁的持有者是 fd，不是 Python 缓冲区。
-    handle = open(path, "a+b")
+    handle = _open_private(path)
     try:
         if fcntl is not None:
             try:
