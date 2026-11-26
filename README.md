@@ -32,6 +32,10 @@ version: 0.16
 | OpenAI `/v1/responses` | 转换 | 501 | 同协议 |
 | Chat（不支持入站） | 501 | 501 | 501 |
 
+转换到 Anthropic 时，Responses 的命名空间工具（Codex 的 `multi_agent_v1.spawn_agent` 等）
+会摊平为 `<namespace>__<tool>` 发给上游，回程再还原成 `name` + `namespace`，子 agent 派单
+不会因为跨协议而丢失。
+
 ## 边界与限制
 
 - **转换有损**：跨协议会改写模型名、推理字段、部分签名和 item ID，
@@ -106,12 +110,13 @@ if exist config\model_proxy_config.json (echo 配置已存在，未覆盖) else 
    | protocol | 用途 | 凭据来源 | 前置条件 |
    |---|---|---|---|
    | `catpaw-cli` | mcli 网关（Claude / GLM / Kimi / DeepSeek…） | `~/.config/mcopilot-cli/.config.yaml` | 本机 mc CLI 已登录；**不需要 mtsso_keeper**（keeper 只是可选保鲜） |
-   | `catpaw-ide` | CatPaw IDE（GPT / Gemini / LongCat…） | `~/.mtsso_keeper/catpaw_ide_session.json` | ① 取得 `mtsso_keeper` 的认证脚本并交互登录一次 ② 本平台桥动态库；**不装守护进程也能用** |
+   | `catpaw-ide` | CatPaw IDE（GPT / Gemini / LongCat…） | `~/.mtsso_keeper/catpaw_ide_session.json` | ① 用内置快照 `vendor/mtsso_keeper/` 交互登录一次 ② 本平台桥动态库；**不装守护进程也能用** |
 
    本代理只读凭据，不登录、不刷新。mc CLI 的登录态不能当 IDE 凭据用。凭据缺失或过期
    时本地返回 500；缺桥库同样调不通，重启代理不会补齐这些前置条件。
 
-   - 不装守护进程的手动维护方式见
+   - 认证脚本已随仓库内置在 `vendor/mtsso_keeper/`（只读快照，不含凭据），
+     不装守护进程的手动维护方式见
      [无守护进程的 catpaw-ide](docs/CONFIG.md#无守护进程的-catpaw-ide)。
    - macOS 自动维护：先手动登录一次，再按 `mtsso_keeper` 的 README 安装 launchd 作业；
      守护不能代替首次登录。

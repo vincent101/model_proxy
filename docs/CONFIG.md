@@ -196,14 +196,17 @@ cooldown（凭据问题不是上游故障，写冷却会误伤 failover）；CLI
 **准备**
 
 - Python 3.10+（纯标准库）、可完成内网 SSO 的帐号与网络、本机浏览器。
-- `catpaw_ide_session.py`、`mtsso_core.py`、`file_lock.py` 三个文件同目录、同版本；本仓库不含
-  这些文件，须从 `mtsso_keeper` 取得，不可混用不同版本。
+- 认证脚本用仓库内置的 `vendor/mtsso_keeper/`（快照：`catpaw_ide_session.py`、
+  `file_lock.py`、`mtsso_core.py` + `mint_mcli_token.py`）。它是只读快照，来源 commit 与
+  逐文件 hash 见 `vendor/mtsso_keeper/SOURCE.json`，可用
+  `python3 scripts/vendor_mtsso_keeper.py --check` 校验；**不要就地修改**，改动回源目录后重跑
+  `--sync`。目录内的 `mint_mcli_token.py` 是 `catpaw-cli` 的可选保鲜脚本，IDE 不需要它。
 - 本平台桥库，见[桥库从哪来](#桥库从哪来)。
 
 **首次登录（一次）**
 
 ```bash
-K="/绝对路径/mtsso_keeper"
+K="<model_proxy 根>/vendor/mtsso_keeper"
 python3 "$K/catpaw_ide_session.py" --login
 ```
 

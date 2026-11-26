@@ -654,6 +654,102 @@ def truncate_tool_name(name: str) -> str:
 
 
 # ============================================================
+# 辅助：命名空间工具摊平（Codex multi_agent_v1 等）
+# ============================================================
+
+# Responses 协议允许 `{"type": "namespace", "name": "multi_agent_v1", "tools": [...]}`
+# 把一组 function 工具打包。Anthropic 没有命名空间概念，只能摊平成扁平工具名；
+# 回程必须还原成 `name=<子工具> + namespace=<分组>`，否则 Codex 侧 dispatch 会
+# 报 `unsupported call`（2026-11-26 实测）。
+NAMESPACE_TOOL_SEP = "__"
+
+
+def namespace_tool_alias(namespace: str, name: str) -> str:
+    """命名空间 + 工具名 → Anthropic 合法扁平名（确定性，请求/历史/响应三处共用）。"""
+    return truncate_tool_name(f"{namespace}{NAMESPACE_TOOL_SEP}{name}")
+
+
+def build_namespace_maps(responses_tools):
+    """扫一遍 Responses tools，产出命名空间双向映射。
+
+    返回 ``(alias_by_pair, pair_by_alias)``：
+      - ``alias_by_pair[(namespace, name)] = alias``
+      - ``pair_by_alias[alias] = (namespace, name)``
+
+    扁平工具名与别名的冲突按确定性规则消解（重名时退化为「子工具名 + 哈希」），
+    保证同一份 tools 列表在请求、历史回放、响应三处算出同一结果。
+    """
+    reserved = set()
+    for tool in responses_tools or []:
+        if isinstance(tool, dict) and tool.get("type") == "function" and tool.get("name"):
+            reserved.add(truncate_tool_name(tool["name"]))
+
+    alias_by_pair = {}
+    pair_by_alias = {}
+    for tool in responses_tools or []:
+        if not isinstance(tool, dict) or tool.get("type") != "namespace":
+            continue
+        ns = tool.get("name") or ""
+        if not ns:
+            continue
+        for sub in tool.get("tools") or []:
+            if not isinstance(sub, dict) or sub.get("type") != "function":
+                continue
+            sub_name = sub.get("name") or ""
+            if not sub_name:
+                continue
+            alias = namespace_tool_alias(ns, sub_name)
+            if alias in reserved or alias in pair_by_alias:
+                digest = hashlib.sha256(f"{ns}/{sub_name}".encode("utf-8")).hexdigest()[:8]
+                alias = truncate_tool_name(f"{sub_name}_{digest}")
+                while alias in reserved or alias in pair_by_alias:   # 极端兜底
+                    alias = truncate_tool_name(f"{alias}_{digest}")
+            alias_by_pair[(ns, sub_name)] = alias
+            pair_by_alias[alias] = (ns, sub_name)
+    return alias_by_pair, pair_by_alias
+
+
+def _flatten_one_tool(tool: dict):
+    """单个 Responses 工具 → Anthropic tool dict；不支持的类型返回 None。"""
+    if tool.get("type") == "function":
+        return {
+            "name": tool.get("name", ""),
+            "description": tool.get("description", ""),
+            "input_schema": tool.get("parameters") or {"type": "object", "properties": {}},
+        }
+    if tool.get("type") == "namespace":
+        return None   # 由调用方展开
+    return None
+
+
+def _flatten_namespaced_tools(responses_tools, alias_by_pair) -> list:
+    """把 namespace 分组摊平成扁平 Anthropic 工具；其余托管工具跳过。"""
+    out = []
+    for tool in responses_tools or []:
+        if not isinstance(tool, dict):
+            continue
+        ttype = tool.get("type")
+        if ttype == "function":
+            out.append(_flatten_one_tool(tool))
+            continue
+        if ttype != "namespace":
+            continue                                  # 托管工具（web_search 等）跳过
+        ns = tool.get("name") or ""
+        for sub in tool.get("tools") or []:
+            if not isinstance(sub, dict) or sub.get("type") != "function":
+                continue
+            alias = alias_by_pair.get((ns, sub.get("name") or ""))
+            if not alias:
+                continue
+            out.append({
+                "name": alias,
+                "description": sub.get("description", ""),
+                "input_schema": sub.get("parameters") or {"type": "object", "properties": {}},
+            })
+    return out
+
+
+# ============================================================
 # reasoning 强度处理已迁移到 core.reasoning.*（ladder/capability/codecs/registry）。
 # 本模块的 *_request 函数不再自己算强度/选语法，改为接收调用方（server.py）已算好的
 # reasoning_fields dict，只负责 merge 进 body（详见各 *_request 函数签名变更）。
@@ -1668,8 +1764,11 @@ def responses_content_to_anthropic_blocks(content) -> list:
     return blocks
 
 
-def map_tool_choice(tc):
-    """Responses tool_choice -> Anthropic tool_choice（反向规格 §1.6）。"""
+def map_tool_choice(tc, alias_by_pair=None):
+    """Responses tool_choice -> Anthropic tool_choice（反向规格 §1.6）。
+
+    带 `namespace` 的指定工具须换成摊平别名，否则指向的工具在 Anthropic 侧不存在。
+    """
     if tc == "auto":
         return {"type": "auto"}
     if tc == "none":
@@ -1677,22 +1776,23 @@ def map_tool_choice(tc):
     if tc == "required":
         return {"type": "any"}
     if isinstance(tc, dict) and tc.get("type") == "function":
-        return {"type": "tool", "name": tc.get("name", "")}
+        name = tc.get("name", "")
+        ns = tc.get("namespace")
+        if ns:
+            mapped = (alias_by_pair or {}).get((ns, name))
+            name = mapped or namespace_tool_alias(ns, name)
+        return {"type": "tool", "name": name}
     return None                                  # 缺失/未知 -> 不设
 
 
 def translate_tools(responses_tools) -> list:
-    """Responses 扁平 function tools -> Anthropic tools（反向规格 §1.5）。"""
-    out = []
-    for tool in responses_tools or []:
-        if not isinstance(tool, dict) or tool.get("type") != "function":
-            continue                             # 非 function（托管工具）跳过
-        out.append({
-            "name": tool.get("name", ""),
-            "description": tool.get("description", ""),
-            "input_schema": tool.get("parameters") or {"type": "object", "properties": {}},
-        })
-    return out
+    """Responses tools -> Anthropic tools（反向规格 §1.5）。
+
+    `type: namespace` 分组会摊平成扁平工具（名字见 `namespace_tool_alias`），
+    因为 Anthropic 无命名空间概念；回程由 `build_namespace_maps` 的逆向映射还原。
+    """
+    alias_by_pair, _ = build_namespace_maps(responses_tools)
+    return _flatten_namespaced_tools(responses_tools, alias_by_pair)
 
 
 # ============================================================================
@@ -1719,8 +1819,11 @@ def responses_to_anthropic_request(body: dict, max_tokens_default: int = 4096,
     if sys:
         ab["system"] = sys
 
+    # 命名空间工具的双向映射：请求摊平、历史回放、响应还原三处共用同一份结果
+    alias_by_pair, _ = build_namespace_maps(body.get("tools"))
+
     # input -> messages（§1.3）
-    ab["messages"] = _input_to_messages(body.get("input"))
+    ab["messages"] = _input_to_messages(body.get("input"), alias_by_pair)
 
     # max_completion_tokens / max_output_tokens -> max_tokens（§1.7，必填兜底）
     ab["max_tokens"] = (
@@ -1732,15 +1835,15 @@ def responses_to_anthropic_request(body: dict, max_tokens_default: int = 4096,
     # reasoning 字段（已由调用方算好，本函数只 merge）
     _merge_reasoning_fields(ab, reasoning_fields)
 
-    # tools -> input_schema（§1.5）
+    # tools -> input_schema（§1.5）；namespace 分组在这里摊平
     if body.get("tools"):
-        tools = translate_tools(body.get("tools"))
+        tools = _flatten_namespaced_tools(body.get("tools"), alias_by_pair)
         if tools:
             ab["tools"] = tools
 
     # tool_choice（§1.6）
     if "tool_choice" in body:
-        tc = map_tool_choice(body.get("tool_choice"))
+        tc = map_tool_choice(body.get("tool_choice"), alias_by_pair)
         if tc is not None:
             ab["tool_choice"] = tc
 
@@ -1763,8 +1866,13 @@ def _append_tool_use(messages: list, tool_use: dict) -> None:
         messages.append({"role": "assistant", "content": [tool_use]})
 
 
-def _input_to_messages(input_items) -> list:
-    """Responses input（字符串 或 items 数组）-> Anthropic messages（反向规格 §1.3）。"""
+def _input_to_messages(input_items, alias_by_pair=None) -> list:
+    """Responses input（字符串 或 items 数组）-> Anthropic messages（反向规格 §1.3）。
+
+    ``alias_by_pair`` 供命名空间工具历史回放：Codex 会把上一轮的工具调用作为
+    ``{"type": "function_call", "name": "spawn_agent", "namespace": "multi_agent_v1"}``
+    回传，必须映射回摊平后的工具名，否则与本次 tools 定义对不上。
+    """
     # 形态1：字符串
     if isinstance(input_items, str):
         return [{"role": "user", "content": input_items}]
@@ -1803,10 +1911,14 @@ def _input_to_messages(input_items) -> list:
 
         elif t == "function_call":
             flush_user()
+            name = item.get("name", "")
+            ns = item.get("namespace")
+            if ns and alias_by_pair:
+                name = alias_by_pair.get((ns, name), name)
             tool_use = {
                 "type": "tool_use",
                 "id": item.get("call_id") or gen_toolu_id(),
-                "name": item.get("name", ""),
+                "name": name,
                 "input": _safe_json_loads(item.get("arguments", "{}")),
             }
             _append_tool_use(messages, tool_use)
@@ -1902,6 +2014,8 @@ def anthropic_to_responses_response(resp: dict, model: str,
                                source_type="anthropic", reason=state.reason)
         return _responses_terminal_response(model, TerminalStatus.FAILED, err,
                                             reasoning_effort, tools_echo)
+    # 命名空间工具：由摊平别名反查（namespace, name），回程必须带 namespace 字段
+    _, pair_by_alias = build_namespace_maps(tools_echo)
     output = []
     for block in resp.get("content", []) or []:
         if not isinstance(block, dict):
@@ -1922,7 +2036,7 @@ def anthropic_to_responses_response(resp: dict, model: str,
                 }],
             })
         elif bt == "tool_use":
-            output.append({
+            item = {
                 "type": "function_call",
                 "id": gen_item_id(),
                 "status": "completed",
@@ -1930,7 +2044,11 @@ def anthropic_to_responses_response(resp: dict, model: str,
                 "name": block.get("name", ""),
                 # Anthropic tool_use.input 是 dict -> Responses arguments 要 JSON 字符串
                 "arguments": json.dumps(block.get("input", {}), ensure_ascii=False),
-            })
+            }
+            pair = pair_by_alias.get(block.get("name", ""))
+            if pair:
+                item["name"], item["namespace"] = pair[1], pair[0]
+            output.append(item)
         elif bt == "thinking":
             thinking_text = block.get("thinking", "") or ""
             output.append({
@@ -2016,6 +2134,8 @@ class AnthropicToResponsesStreamAdapter:
         self.model = model
         self.tools_echo = ctx.get("tools") or []
         self.reasoning_effort = ctx.get("reasoning_effort")
+        # 命名空间工具：摊平别名 → (namespace, name)，用于流式回程还原
+        _, self._pair_by_alias = build_namespace_maps(self.tools_echo)
 
         self.seq = 0
         self.response_id = gen_response_id()
@@ -2178,6 +2298,7 @@ class AnthropicToResponsesStreamAdapter:
                 self._stop_message_item(events)
             elif self.cur_item_kind == "function_call":
                 self._stop_tool_item(events)
+                self.cur_tool_namespace = None
             elif self.cur_item_kind == "reasoning":
                 self._stop_reasoning_item(events)
             self.cur_item_kind = None
@@ -2365,19 +2486,27 @@ class AnthropicToResponsesStreamAdapter:
         self.cur_item_kind = "function_call"
         self.cur_item_id = gen_item_id()
         self.cur_call_id = cb.get("id") or gen_call_id()
-        self.cur_tool_name = cb.get("name", "")
+        alias = cb.get("name", "")
+        pair = self._pair_by_alias.get(alias)
+        # 命名空间工具在 Responses 侧要拆成 name=<子工具> + namespace=<分组>；
+        # 只写裸名或只写 "ns.name" 都会被 Codex 判成 unsupported call（2026-11-26 实测）。
+        self.cur_tool_name = pair[1] if pair else alias
+        self.cur_tool_namespace = pair[0] if pair else None
         self.cur_args_buf = ""
+        item = {
+            "id": self.cur_item_id,
+            "type": "function_call",
+            "status": "in_progress",
+            "call_id": self.cur_call_id,
+            "name": self.cur_tool_name,
+            "arguments": "",
+        }
+        if self.cur_tool_namespace:
+            item["namespace"] = self.cur_tool_namespace
         events.append(self._emit({
             "type": "response.output_item.added",
             "output_index": self.output_index,
-            "item": {
-                "id": self.cur_item_id,
-                "type": "function_call",
-                "status": "in_progress",
-                "call_id": self.cur_call_id,
-                "name": self.cur_tool_name,
-                "arguments": "",
-            },
+            "item": item,
         }))
 
     def _stop_tool_item(self, events: list) -> None:
@@ -2397,6 +2526,8 @@ class AnthropicToResponsesStreamAdapter:
             "name": self.cur_tool_name,
             "arguments": args,
         }
+        if getattr(self, "cur_tool_namespace", None):
+            item["namespace"] = self.cur_tool_namespace
         events.append(self._emit({
             "type": "response.output_item.done",
             "output_index": self.output_index,

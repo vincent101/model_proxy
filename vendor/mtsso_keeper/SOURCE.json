@@ -1,0 +1,45 @@
+{
+  "schema": 1,
+  "component": "mtsso_keeper",
+  "source_repo": "NoteVault",
+  "source_path": "tools/mtsso_keeper",
+  "source_commit": "8180f920068987cbfbe7e421bcc288a2aa4024eb",
+  "source_commit_date": "2026-11-26T11:15:10+08:00",
+  "source_dirty": false,
+  "snapshot_at": "2026-11-26T15:46:09+0800",
+  "vendored_by": "tools/model_proxy/scripts/vendor_mtsso_keeper.py --sync",
+  "components": {
+    "catpaw-ide": [
+      "catpaw_ide_session.py",
+      "file_lock.py",
+      "mtsso_core.py"
+    ],
+    "catpaw-cli-refresh": [
+      "mint_mcli_token.py",
+      "mtsso_core.py"
+    ]
+  },
+  "files": {
+    "catpaw_ide_session.py": {
+      "sha256": "b7e0a4680e01c7a268e4c90072779cbde4ac5454f46e16efb4d76a491bc6389d",
+      "bytes": 58397,
+      "source_mtime": "2026-11-26T11:45:54+0800"
+    },
+    "file_lock.py": {
+      "sha256": "375dc10bc460f72ba62e448afd8ec4210b1d1110edf4d0f2a49e59a29df0ccca",
+      "bytes": 3083,
+      "source_mtime": "2026-11-21T23:56:53+0800"
+    },
+    "mint_mcli_token.py": {
+      "sha256": "8d62d8b9772e14d034370af95991be23c018cded1043993edce89339d6b44235",
+      "bytes": 28531,
+      "source_mtime": "2026-09-21T10:15:16+0800"
+    },
+    "mtsso_core.py": {
+      "sha256": "901822c79138beaed3aa85023141164d6197333fadd8988059eb44db24d6b473",
+      "bytes": 18324,
+      "source_mtime": "2026-08-20T18:22:57+0800"
+    }
+  },
+  "notes": []
+}
