@@ -78,7 +78,7 @@ class StatusStructureTests(unittest.TestCase):
             control = wc.WindowsControl(ROOT, config_path=CONFIG, out=io.StringIO())
             control.config_path = str(config)
             empty = {'sessions': {}, 'truncated': False, 'log_missing': True}
-            with patch.object(_format_ops, 'load_session_names', return_value={}), \
+            with patch.object(_format_ops, 'load_merged_session_names', return_value={}), \
                  patch.object(_format_ops, 'load_active_sessions', return_value=sessions or empty):
                 return control._display_status(RECORD, {'totals': str(root/'totals'),
                                                         'log': str(root/'log')}, (data, token))
@@ -137,7 +137,7 @@ class StatusDynamicConfigReferenceTests(unittest.TestCase):
                  patch.object(windows_process, 'recorded_process_state', return_value='running'), \
                  patch.object(control, '_request', return_value=(data, actual_token)), \
                  patch.object(_format_ops, 'load_supply_health', return_value=health), \
-                 patch.object(_format_ops, 'load_session_names', return_value={}), \
+                 patch.object(_format_ops, 'load_merged_session_names', return_value={}), \
                  patch.object(_format_ops, 'load_active_sessions', return_value=sessions):
                 rc = control.status()
             # Default formatter has no Windows-only guard; Mac/menu behavior
@@ -221,7 +221,7 @@ class StatusDynamicConfigReferenceTests(unittest.TestCase):
                     'routes': [{'id': 'route1', 'tiers': {'sonnet': ['s1']}}],
                     'strategies': [{'client_token': token, 'route_id': 'route1'}]}), encoding='utf-8')
                 control.config_path = str(config)
-                with patch.object(_format_ops, 'load_session_names', return_value={}), \
+                with patch.object(_format_ops, 'load_merged_session_names', return_value={}), \
                      patch.object(_format_ops, 'load_active_sessions',
                                   return_value={'sessions': {}, 'truncated': False, 'log_missing': True}):
                     with self.assertRaises(wc.WindowsControlError) as caught:

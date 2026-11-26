@@ -677,9 +677,31 @@ NAMESPACE_TOOL_PARAM_HINT = (
 )
 
 
-def with_namespace_param_hint(description: str) -> str:
-    """给摊平后的命名空间工具描述追加参数填写约定（幂等）。"""
-    desc = (description or "").rstrip()
+def wants_namespace_param_hint(schema) -> bool:
+    """该工具 schema 是否存在 `message`/`items` 互斥对，决定是否追加提示。
+
+    只给真有这对参数的工具加（实测 `multi_agent_v1` 里只有 `spawn_agent`/`send_input`
+    具备）；给 `close_agent` 这类只有 `target` 的工具加提示反而可能诱导模型补空值，
+    正好制造本提示要消除的那类校验拒绝。
+    """
+    if not isinstance(schema, dict):
+        return False
+    props = schema.get("properties")
+    if not isinstance(props, dict):
+        return False
+    return "message" in props and "items" in props
+
+
+def with_namespace_param_hint(description, schema=None) -> str:
+    """给摊平后的命名空间工具描述追加参数填写约定（幂等）。
+
+    schema 给出时按 `wants_namespace_param_hint` 判定适用范围；不给则无条件追加
+    （仅供直接调用/测试）。
+    """
+    text = description if isinstance(description, str) else ""
+    desc = text.rstrip()
+    if schema is not None and not wants_namespace_param_hint(schema):
+        return desc
     if not desc:
         return NAMESPACE_TOOL_PARAM_HINT
     if NAMESPACE_TOOL_PARAM_HINT in desc:
@@ -764,10 +786,11 @@ def _flatten_namespaced_tools(responses_tools, alias_by_pair) -> list:
             alias = alias_by_pair.get((ns, sub.get("name") or ""))
             if not alias:
                 continue
+            schema = sub.get("parameters") or {"type": "object", "properties": {}}
             out.append({
                 "name": alias,
-                "description": with_namespace_param_hint(sub.get("description", "")),
-                "input_schema": sub.get("parameters") or {"type": "object", "properties": {}},
+                "description": with_namespace_param_hint(sub.get("description", ""), schema),
+                "input_schema": schema,
             })
     return out
 

@@ -49,9 +49,10 @@ class VendorSnapshotTests(unittest.TestCase):
     def test_no_unregistered_or_forbidden_files(self):
         allowed = set(self.source["files"]) | {"SOURCE.json", "SHA256SUMS", "README.md", "NOTICE.md"}
         for path in VENDOR.iterdir():
-            if path.name == "__pycache__":
+            if path.name == "__pycache__" and path.is_dir():
                 # 运行快照脚本会生成字节码目录（Python 副产物，非快照内容）；
                 # 想保持目录干净可设 PYTHONDONTWRITEBYTECODE=1。
+                # 仅在确为目录时豁免：同名普通文件仍须接受校验。
                 continue
             if not path.is_file():
                 self.fail(f"快照目录不应有子目录: {path.name}")

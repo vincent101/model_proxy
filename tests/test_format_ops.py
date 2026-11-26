@@ -180,6 +180,22 @@ class TestS7ColumnWidth(unittest.TestCase):
 
 class TestStatusFormatFromJson(unittest.TestCase):
 
+    def setUp(self):
+        # 隔离真实 HOME：会话身份源默认指向不存在路径，输出确定且不依赖本机会话
+        # （CC 注册表 + Codex rollout 两个源都要隔离，只隔离前者仍会读 ~/.codex）。
+        tmpdir = tempfile.TemporaryDirectory()
+        self.addCleanup(tmpdir.cleanup)
+        self._patcher = patch(
+            "core.session_identity.DEFAULT_SESSIONS_DIR",
+            Path(tmpdir.name) / "missing-sessions-registry")
+        self._patcher.start()
+        self.addCleanup(self._patcher.stop)
+        self._codex_patcher = patch(
+            "core.session_identity.DEFAULT_CODEX_SESSIONS_DIR",
+            Path(tmpdir.name) / "missing-codex-sessions")
+        self._codex_patcher.start()
+        self.addCleanup(self._codex_patcher.stop)
+
     def _make_config(self, td, cfg_dict=None):
         """写 config 文件，返回路径。"""
         path = os.path.join(td, "config.json")
@@ -1163,12 +1179,12 @@ class TestStatusFormatWithSessions(unittest.TestCase):
                           route="nation1", tier="opus",
                           supply="kimi-k3-sankuai-3339",
                           failover="0", route_failover="0", builtin="",
-                          final_error="", source="anthropic"):
+                          final_error="", source="anthropic", token="cc"):
         ts_str = ts.strftime("%Y-%m-%d %H:%M:%S,") + ts.strftime("%f")[:3]
         return (f"{ts_str} req_id={req_id} ACCESS ms=1000 status={status}"
                 f" source={source} route={route} tier={tier} supply={supply}"
                 f" failover={failover} attempts=1 usage_in=10 usage_out=5"
-                f" token=cc session={session}"
+                f" token={token} session={session}"
                 f" route_failover={route_failover} builtin={builtin}"
                 f" budget_retried= budget_truncated=0 stop_reason=end_turn"
                 f" final_error={final_error}")
@@ -1337,6 +1353,86 @@ class TestStatusFormatWithSessions(unittest.TestCase):
         for line in lines:
             if "ccccdddd" in line:
                 self.assertTrue(line.lstrip().startswith("ccccdddd"))
+
+    # -----------------------------------------------------------------
+    # codex session name（~/.codex/sessions rollout 首行派生，注入测试路径）
+    # -----------------------------------------------------------------
+
+    def _make_codex_rollouts(self, td, entries):
+        """写临时 codex sessions 目录（<Y>/<M>/<D>/rollout-*.jsonl），返回根路径。"""
+        root = Path(td) / "codex-sessions"
+        day = root / "2026" / "11" / "26"
+        day.mkdir(parents=True, exist_ok=True)
+        for i, (sid, cwd) in enumerate(entries):
+            meta = {"type": "session_meta",
+                    "payload": {"session_id": sid, "cwd": cwd, "originator": "claudian"}}
+            (day / f"rollout-2026-11-26T18-0{i}-00-{sid}.jsonl").write_text(
+                json.dumps(meta, ensure_ascii=False) + "\n", encoding="utf-8")
+        return str(root)
+
+    def test_codex_session_annotated(self):
+        """日志里的 codex session 命中 rollout 首行 → 行首显示派生名。"""
+        now = datetime.now()
+        sid = "01a1a4ab-6ed5-7a42-9512-3d90353b9b4a"
+        with tempfile.TemporaryDirectory() as td:
+            cfg_path = self._make_config(td)
+            totals_path = self._make_totals(td)
+            log_path = self._make_log(td, [
+                self._make_access_line(ts=now - timedelta(minutes=5),
+                                       session=sid, token="codex"),
+            ])
+            codex_dir = self._make_codex_rollouts(
+                td, [(sid, "/Users/vincentwang/Documents/NoteVault")])
+            lines = _format_status_from_json(
+                self._status_data(), cfg_path, totals_path, log_path,
+                sessions_dir=self._make_registry(td, []),
+                codex_sessions_dir=codex_dir)
+        joined = "\n".join(lines)
+        # uuid 后两位对齐 status 行首的 uuid8，便于核对
+        self.assertIn("notevault-ab · 01a1a4ab", joined)
+        self.assertIn("[codex]", joined)
+
+    def test_cc_name_wins_over_codex_for_same_uuid(self):
+        """同一 UUID 两源都有名时，CC 注册表是权威名。"""
+        now = datetime.now()
+        sid = "01a1a4ab-6ed5-7a42-9512-3d90353b9b4a"
+        with tempfile.TemporaryDirectory() as td:
+            cfg_path = self._make_config(td)
+            totals_path = self._make_totals(td)
+            log_path = self._make_log(td, [
+                self._make_access_line(ts=now - timedelta(minutes=5), session=sid),
+            ])
+            codex_dir = self._make_codex_rollouts(
+                td, [(sid, "/Users/vincentwang/Documents/NoteVault")])
+            sessions_dir = self._make_registry(td, [{
+                "pid": 1, "sessionId": sid, "name": "cc-authoritative",
+                "procStart": "Mon Aug 24 03:42:10 2026",
+            }])
+            lines = _format_status_from_json(
+                self._status_data(), cfg_path, totals_path, log_path,
+                sessions_dir=sessions_dir, codex_sessions_dir=codex_dir)
+        joined = "\n".join(lines)
+        self.assertIn("cc-authoritative · 01a1a4ab", joined)
+        self.assertNotIn("notevault-ab", joined)
+
+    def test_codex_dir_absent_degrades_to_uuid8(self):
+        """codex 目录不存在 → 不报错，退回纯 uuid8。"""
+        now = datetime.now()
+        sid = "01a1a4ab-6ed5-7a42-9512-3d90353b9b4a"
+        with tempfile.TemporaryDirectory() as td:
+            cfg_path = self._make_config(td)
+            totals_path = self._make_totals(td)
+            log_path = self._make_log(td, [
+                self._make_access_line(ts=now - timedelta(minutes=5),
+                                       session=sid, token="codex"),
+            ])
+            lines = _format_status_from_json(
+                self._status_data(), cfg_path, totals_path, log_path,
+                sessions_dir=self._make_registry(td, []),
+                codex_sessions_dir=os.path.join(td, "no-such-codex-dir"))
+        joined = "\n".join(lines)
+        self.assertIn("01a1a4ab", joined)
+        self.assertNotIn("notevault-ab", joined)
 
 
 if __name__ == "__main__":

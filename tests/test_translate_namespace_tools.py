@@ -19,12 +19,19 @@ from core.translate import (
     namespace_tool_alias,
     responses_to_anthropic_request,
     NAMESPACE_TOOL_PARAM_HINT,
+    wants_namespace_param_hint,
     with_namespace_param_hint,
 )
 
+# 按真实 Codex 0.166 schema 裁剪：spawn_agent 有 message/items 互斥对，close_agent 没有。
 SUB_TOOLS = [
     {"type": "function", "name": "spawn_agent", "description": "spawn",
-     "parameters": {"type": "object", "properties": {"agent_type": {"type": "string"}}}},
+     "parameters": {"type": "object", "properties": {
+         "agent_type": {"type": "string"},
+         "message": {"type": "string"},
+         "items": {"type": "array", "items": {"type": "object"}},
+         "model": {"type": "string"},
+     }}},
     {"type": "function", "name": "close_agent", "description": "close",
      "parameters": {"type": "object", "properties": {"target": {"type": "string"}}}},
 ]
@@ -72,6 +79,37 @@ class NamespaceFlattenRequestTests(unittest.TestCase):
         once = with_namespace_param_hint("spawn")
         self.assertEqual(with_namespace_param_hint(once), once)
         self.assertEqual(with_namespace_param_hint(""), NAMESPACE_TOOL_PARAM_HINT)
+
+    def test_param_hint_skipped_for_tools_without_message_items_pair(self):
+        """只有 close_agent(target) 缺 message/items 对，不该被塞入互斥提示。"""
+        ab = responses_to_anthropic_request({"model": "m", "input": [], "tools": TOOLS})
+        by_name = {t["name"]: t for t in ab["tools"]}
+        close = by_name[namespace_tool_alias("multi_agent_v1", "close_agent")]
+        self.assertEqual(close["description"], "close")
+        self.assertNotIn(NAMESPACE_TOOL_PARAM_HINT, close["description"])
+
+    def test_param_hint_requires_both_message_and_items(self):
+        only_message = {"type": "object", "properties": {"message": {"type": "string"}}}
+        both = {"type": "object", "properties": {"message": {}, "items": {}}}
+        self.assertFalse(wants_namespace_param_hint(only_message))
+        self.assertTrue(wants_namespace_param_hint(both))
+        self.assertFalse(wants_namespace_param_hint(None))
+        self.assertFalse(wants_namespace_param_hint({"type": "object", "properties": []}))
+
+    def test_param_hint_tolerates_non_str_description(self):
+        """上游给非字符串 description 时不能抛错（否则整请求 500）。"""
+        schema = {"type": "object", "properties": {"message": {}, "items": {}}}
+        self.assertEqual(with_namespace_param_hint({"weird": 1}, schema),
+                         NAMESPACE_TOOL_PARAM_HINT)
+        self.assertEqual(with_namespace_param_hint(None, schema), NAMESPACE_TOOL_PARAM_HINT)
+
+    def test_namespaced_tool_with_non_str_description_does_not_crash(self):
+        tools = [{"type": "namespace", "name": "multi_agent_v1", "tools": [{
+            "type": "function", "name": "spawn_agent", "description": {"bad": True},
+            "parameters": {"type": "object", "properties": {"message": {}, "items": {}}},
+        }]}]
+        ab = responses_to_anthropic_request({"model": "m", "input": [], "tools": tools})
+        self.assertEqual(ab["tools"][0]["description"], NAMESPACE_TOOL_PARAM_HINT)
 
     def test_hosted_tool_types_are_still_skipped(self):
         tools = TOOLS + [{"type": "web_search", "name": "web_search"}]

@@ -1,13 +1,24 @@
-"""Claude Code session 身份注册表只读解析（~/.claude/sessions/*.json）。
+"""Session 身份只读解析（CC 注册表 + Codex rollout），把 UUID 翻成可读 name。
 
-status CLI（_format_ops.py）与代理 server 层（$route 回执）共用：把 session
-UUID 翻译成人类可读的 name（展示形态 `notevault-44 · b6ceb46d`）。
+status CLI（_format_ops.py）与代理 server 层（$route 回执）共用，展示形态
+`notevault-44 · b6ceb46d`。两个来源：
+- Claude Code：`~/.claude/sessions/*.json`（pid 注册表，含 name，权威）
+- Codex：`~/.codex/sessions/<Y>/<M>/<D>/rollout-*.jsonl` 首行的 session_meta.payload
+  （只带 session_id + cwd，名字由本模块派生）
 
-设计约束（2026-08-24 方案）：
-- 只读：绝不写注册表，不做任何持久化
-- 按次扫描不缓存：目录规模是活跃进程数级别（个位/十位数），缓存反而引入失效问题
-- 不进 runtime_paths.json：其职责是代理自产运行文件的路径，本注册表是外部状态
+设计约束：
+- 只读：绝不写这些目录，不做任何持久化
+- 按次扫描不缓存：CC 侧规模是活跃进程数（个位/十位数）；Codex 侧是历史累积
+  （本机数百个 rollout），故按 mtime 只解析最近 _CODEX_MAX_SCAN 个文件，保持
+  单次扫描在毫秒级。缓存反而引入失效问题
+- 不进 runtime_paths.json：其职责是代理自产运行文件的路径，这些是外部状态
 - 容错：坏 JSON/缺目录/缺字段一律跳过；未命中由调用方回退仅显示 UUID8
+
+已知边界（可接受，不影响正确性）：
+- Codex 派生名可能碰撞：同 cwd + uuid8 后两位相同（约 1/256）时两个会话显示同名，
+  但 status 行首仍带完整 uuid8，可区分
+- _CODEX_MAX_SCAN 计的是 rollout 文件数而非会话数；子 agent 与父会话共享
+  session_id，会额外消耗窗口。极端并发下活跃会话可能落到窗口外 → 退回纯 uuid8
 """
 
 import json

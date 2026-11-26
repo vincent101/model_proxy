@@ -58,7 +58,7 @@ class DiskConfigReferenceTests(unittest.TestCase):
                  patch.object(windows_process, 'recorded_process_state', return_value='running'), \
                  patch.object(control, '_request', return_value=(data, token)), \
                  patch.object(_format_ops, 'load_supply_health', return_value=health), \
-                 patch.object(_format_ops, 'load_session_names', return_value={}), \
+                 patch.object(_format_ops, 'load_merged_session_names', return_value={}), \
                  patch.object(_format_ops, 'load_active_sessions', return_value=sessions):
                 rc = control.status()
             # The default formatter is the unchanged Mac behavior and should

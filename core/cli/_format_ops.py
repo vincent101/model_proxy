@@ -677,7 +677,7 @@ def _format_active_sessions(result: dict, cfg: dict | None = None,
     """渲染活跃 session 段（header + 每 session 一行 + FAIL err 续行）。
 
     行格式：`[name · ]sid8  state n=N fail=F [fo=K] [client]  HH:MM status  route tier/supply(pct%) ...`
-    session_names 为 ~/.claude/sessions 注册快照（{sessionId: name}），命中时
+    session_names 为本机会话记录派生的 {sessionId: name}（CC 注册表 + Codex rollout），命中时
     行首附 name；id 列宽随内容动态放宽（≥8），命名行与未命名行各自对齐。
     链路为窗口内 (tier, supply) 分布按次数降序；route 取窗口内主 route。
     排序：FAIL → warn → ok，同档按最近请求时间倒序。
@@ -735,7 +735,7 @@ def _format_active_sessions(result: dict, cfg: dict | None = None,
     max_rows = 20
     shown = entries[:max_rows]
 
-    # 行首 id：注册快照命中时附 name（name · uuid8）；id 列宽随内容动态放宽（≥8）。
+    # 行首 id：名字命中时附 name（name · uuid8）；id 列宽随内容动态放宽（≥8）。
     names = session_names or {}
     id_strs = [session_display_id(names, sid) for sid, _, _ in shown]
     id_w = max([8] + [display_width(s) for s in id_strs])
@@ -967,6 +967,7 @@ def _format_status_header(port: int, pid: int, started: int | None = None) -> st
 def _format_status_from_json(data: dict, config_path: str, totals_path: str,
                              log_path: str | None = None,
                              cooldown_unknown: bool = False,
+                             *,
                              sessions_dir=None,
                              codex_sessions_dir=None,
                              forbidden_reference_token: str | None = None) -> list[str]:
@@ -1059,7 +1060,7 @@ def _format_status_from_json(data: dict, config_path: str, totals_path: str,
     if not cfg:
         lines.append("  （配置不可读，供给清单未知）")
 
-    # active sessions 段（在线时恒展示；行首 name 标注取自 session 注册快照）
+    # active sessions 段（在线时恒展示；行首 name 取自本机会话记录）
     if log_path:
         lines.append("")
         session_names = load_merged_session_names(sessions_dir, codex_sessions_dir)
