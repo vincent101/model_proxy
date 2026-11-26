@@ -1121,6 +1121,12 @@ class TestStatusFormatWithSessions(unittest.TestCase):
             Path(tmpdir.name) / "missing-sessions-registry")
         self._patcher.start()
         self.addCleanup(self._patcher.stop)
+        # Codex rollout 同理：默认指向不存在路径，避免读到真实 ~/.codex/sessions。
+        self._codex_patcher = patch(
+            "core.session_identity.DEFAULT_CODEX_SESSIONS_DIR",
+            Path(tmpdir.name) / "missing-codex-sessions")
+        self._codex_patcher.start()
+        self.addCleanup(self._codex_patcher.stop)
 
     def _make_config(self, td, cfg_dict=None):
         path = os.path.join(td, "config.json")
@@ -1261,7 +1267,7 @@ class TestStatusFormatWithSessions(unittest.TestCase):
         }
 
     def test_named_session_annotated(self):
-        """注册表命中 → 行首 `name · uuid8`，段标题注明 name 为当前注册快照。"""
+        """注册表命中 → 行首 `name · uuid8`，段标题注明 name 取自本机会话记录。"""
         now = datetime.now()
         sid = "b6ceb46d-1a05-4604-b6a5-ce6fb1a99e8a"
         with tempfile.TemporaryDirectory() as td:
@@ -1281,7 +1287,7 @@ class TestStatusFormatWithSessions(unittest.TestCase):
         joined = "\n".join(lines)
         self.assertIn("notevault-42 · b6ceb46d", joined)
         header = next(ln for ln in lines if ln.startswith("active sessions"))
-        self.assertIn("name 为当前注册快照", header)  # 段标题一次性注明
+        self.assertIn("name 取自本机会话记录", header)  # 段标题一次性注明
 
     def test_unnamed_session_plain_uuid8_no_note(self):
         """注册表未命中 → 仅 uuid8、无 name 标注，段标题不加注册快照说明。"""
@@ -1301,7 +1307,7 @@ class TestStatusFormatWithSessions(unittest.TestCase):
         joined = "\n".join(lines)
         self.assertIn("\n  b6ceb46d ", joined)  # 行首 id 仍为纯 uuid8
         self.assertNotIn("notevault-42", joined)
-        self.assertNotIn("name 为当前注册快照", joined)
+        self.assertNotIn("name 取自本机会话记录", joined)
 
     def test_mixed_named_and_unnamed_rows(self):
         """命中与未命中混排：命中行带 name 标注，未命中行保持纯 uuid8。"""

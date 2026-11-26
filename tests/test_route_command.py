@@ -616,6 +616,11 @@ class TestForwardInterceptEndToEnd(unittest.TestCase):
         self._identity_patcher = patch(
             "core.session_identity.DEFAULT_SESSIONS_DIR", sessions_dir)
         self._identity_patcher.start()
+        self._codex_identity_patcher = patch(
+            "core.session_identity.DEFAULT_CODEX_SESSIONS_DIR",
+            Path(self._sessions_td.name) / "codex-sessions")
+        self._codex_identity_patcher.start()
+        self.addCleanup(self._codex_identity_patcher.stop)
         self._claudian_patcher = patch(
             "core.claudian_titles.DEFAULT_CLAUDIAN_SESSIONS_DIR", sessions_dir)
         self._claudian_patcher.start()
@@ -743,6 +748,11 @@ class TestRouteReceiptSessionIdentity(unittest.TestCase):
         self._identity_patcher = patch(
             "core.session_identity.DEFAULT_SESSIONS_DIR", sessions_dir)
         self._identity_patcher.start()
+        self._codex_identity_patcher = patch(
+            "core.session_identity.DEFAULT_CODEX_SESSIONS_DIR",
+            Path(self._sessions_td.name) / "codex-sessions")
+        self._codex_identity_patcher.start()
+        self.addCleanup(self._codex_identity_patcher.stop)
         self._claudian_patcher = patch(
             "core.claudian_titles.DEFAULT_CLAUDIAN_SESSIONS_DIR", sessions_dir)
         self._claudian_patcher.start()
@@ -848,6 +858,11 @@ class TestRouteReceiptClaudianTitle(unittest.TestCase):
         self._identity_patcher = patch(
             "core.session_identity.DEFAULT_SESSIONS_DIR", sessions_dir)
         self._identity_patcher.start()
+        self._codex_identity_patcher = patch(
+            "core.session_identity.DEFAULT_CODEX_SESSIONS_DIR",
+            Path(self._sessions_td.name) / "codex-sessions")
+        self._codex_identity_patcher.start()
+        self.addCleanup(self._codex_identity_patcher.stop)
         self._claudian_patcher = patch(
             "core.claudian_titles.DEFAULT_CLAUDIAN_SESSIONS_DIR", sessions_dir)
         self._claudian_patcher.start()

@@ -19,7 +19,7 @@ from pathlib import Path
 
 from core.protocol_hints import PROTOCOL_HINT_WINDOW_DAYS
 from core.session_identity import (
-    load_session_names,
+    load_merged_session_names,
     match_session_name,
     session_display_id,
 )
@@ -739,10 +739,10 @@ def _format_active_sessions(result: dict, cfg: dict | None = None,
     names = session_names or {}
     id_strs = [session_display_id(names, sid) for sid, _, _ in shown]
     id_w = max([8] + [display_width(s) for s in id_strs])
-    # name 标注存在的语义提示只在段标题说一次（name 取自当前注册快照，可能滞后
-    # 于 30min 窗口内的历史请求），不逐行重复。
+    # name 标注存在的语义提示只在段标题说一次（name 取自本机会话记录——CC 注册表
+    # 与 Codex rollout 派生名——可能滞后于 30min 窗口内的历史请求），不逐行重复。
     if any(match_session_name(names, sid) for sid, _, _ in shown):
-        header += "  （name 为当前注册快照）"
+        header += "  （name 取自本机会话记录）"
 
     lines = [header]
 
@@ -968,6 +968,7 @@ def _format_status_from_json(data: dict, config_path: str, totals_path: str,
                              log_path: str | None = None,
                              cooldown_unknown: bool = False,
                              sessions_dir=None,
+                             codex_sessions_dir=None,
                              forbidden_reference_token: str | None = None) -> list[str]:
     """从 server status JSON + config + 日志 格式化 status 输出。
 
@@ -981,8 +982,10 @@ def _format_status_from_json(data: dict, config_path: str, totals_path: str,
     表内不会有 `cool` 行，明细段跳过；supply health 与 active sessions 都基于日志，
     离线照常展示。
 
-    sessions_dir：session 身份注册表目录（默认 ~/.claude/sessions）。显式参数
-    供测试注入临时目录（不读真实 HOME）；仅在有 log_path 时扫描一次。
+    sessions_dir / codex_sessions_dir：会话身份来源目录，分别是 CC 注册表
+    （默认 ~/.claude/sessions）与 Codex rollout（默认 ~/.codex/sessions）。CC 注册表
+    是权威名，Codex 侧按 rollout 首行派生 `<目录名>-<uuid8 后两位>` 补位。两者都
+    只在有 log_path 时扫描一次；显式参数供测试注入临时目录（不读真实 HOME）。
 
     forbidden_reference_token：可选的本次管理 token。若实际显示的身份或
     读取失败时展示的路径组件与其相同，抛 StatusReferenceConflict；缺省不改变原展示。
@@ -1059,7 +1062,7 @@ def _format_status_from_json(data: dict, config_path: str, totals_path: str,
     # active sessions 段（在线时恒展示；行首 name 标注取自 session 注册快照）
     if log_path:
         lines.append("")
-        session_names = load_session_names(sessions_dir)
+        session_names = load_merged_session_names(sessions_dir, codex_sessions_dir)
         # 已读到的行直接复用；日志缺失时把 None 交给 load_active_sessions
         # 自行判定（它同样处理缺失，且保留可替换性供测试注入）。
         sessions = load_active_sessions(
