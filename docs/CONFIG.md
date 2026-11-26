@@ -102,7 +102,7 @@ Error: reload: reload_failed; loaded=no, cooldown_cleared=yes, error=config_reje
 | `system_inject` | string | 可选 | 注入计费标识等 system 块（前置合并进客户端 system，幂等）；仅 `protocol: anthropic` 的 supply 可配 | — |
 | `reasoning_capability.effort_enum` | string[] | 可选 | target 侧真实支持的 effort 档位有序列表 | 默认 5 档 `off/low/medium/high/xhigh` |
 | `reasoning_capability.off_alias` | string | 可选 | 关闭动作具体落到哪个档位 | 含 off 则落 off，否则不设（走 STRIP） |
-| `credential_file` | string | 可选覆盖 | 凭据文件路径（`~` 展开），由 `mtsso_keeper` 产出与刷新。每请求读取；缺失或 `expire` 已过则 500 且不冷却 | 模块默认 + `provider_settings.json` 段 |
+| `credential_file` | string | 可选覆盖 | 凭据文件路径（`~` 展开），每请求读取；`catpaw-cli` 由 mc CLI 登录生成（keeper 可选），`catpaw-ide` 由 `catpaw_ide_session.py` 生成与维护；缺失或 `expire` 已过 → 500 且不冷却 | 模块默认 + `provider_settings.json` 段 |
 | `bridge_lib` | string | 可选覆盖 | 桥动态库路径（`~` 展开）；惰性加载并校验 ABI 版本，仅配置 IDE supply 时才加载 | 按平台默认 + `provider_settings.json` 段 |
 
 mcli（CatPaw）的 `appkey_file`、`extra_headers`、`system_inject` 组合见项目内
@@ -125,7 +125,7 @@ supply **只声明差异**：
 
 两类 provider 的 supply 都只留 4 个字段：**路径不进 supply**（见下节）。
 
-内置内容（`core/providers/catpaw_cli.py`）：
+内置内容（`core/providers/catpaw_cli.py` / `core/providers/catpaw_ide.py`）：
 
 | 项 | catpaw-cli | catpaw-ide |
 |---|---|---|
@@ -134,7 +134,7 @@ supply **只声明差异**：
 | 桥库默认路径 | — | `~/.local/lib/libcatpaw_bridge.{dylib,dll,so}`（按平台） |
 | `extra_headers` | `{"X-Working-Dir": "/"}` | — |
 | `system_inject` | 计费 header（跟随 Claude Code 版本） | — |
-| 鉴权 | Bearer + `x-api-key` | OIDC 四要素，桥内部处理 |
+| 鉴权 | Bearer + `x-api-key` | IDE OIDC 凭据（accessToken / refreshToken / attestation / mis / expire），桥内部处理 |
 
 ### 2.1 provider 本机设置（`config/provider_settings.json`）
 
@@ -157,13 +157,13 @@ supply **只声明差异**：
   多账号/多桥库并存时才在单条 supply 上写覆盖。
 - 按 `(mtime, size)` 缓存，改文件后下一次请求即生效，**不需要重启**（路径变更与主配置
   reload 解耦）。
-- Windows：`bridge_lib` 默认解析成 `libcatpaw_bridge.dll`；换机时一般只需改这一行。
+- Windows：`bridge_lib` 默认解析成 `libcatpaw_bridge.dll`；换机时一般只需改这一行。这只是桥库路径，
+  不代表 IDE 登录与凭据写盘已在 Windows 验收。
 
 #### 桥库从哪来
 
-`libcatpaw_bridge` 是 Go 编出的 **c-shared 动态库**（代码产物，与鉴权无关：
-凭据运行时由 keeper 提供）。c-shared **不能交叉编译**，必须由目标平台的 C
-工具链产出，因此走 CI：
+`libcatpaw_bridge` 是 Go 编出的 **c-shared 动态库**（代码产物，与登录/刷新无关：运行时只读取
+认证脚本写好的凭据）。c-shared **不能交叉编译**，必须由目标平台的 C 工具链产出，因此走 CI：
 
 ```
 Actions → build-catpaw-bridge → Run workflow
@@ -184,8 +184,67 @@ go build -buildmode=c-shared -o ~/.local/lib/libcatpaw_bridge.dylib ./cmd/native
 **provider supply 若携带 `url`/`appkey`/`appkey_file`/`extra_headers`/`system_inject`
 一律报错**——写了说明配置有误，不静默忽略。
 
-两个 provider 的凭据都由 `mtsso_keeper` 维护，本代理**只读、不刷新**；凭据缺失或过期返回
-500 且不进 cooldown（凭据问题不是上游故障，写冷却会误伤 failover）。
+两个 provider 都是**只读、不登录、不刷新**：`catpaw-cli` 用 mc CLI 登录态（keeper 可选保鲜），
+`catpaw-ide` 用独立 OIDC 凭据（认证脚本必需，守护可选）。IDE 凭据缺失或过期返回 500 且不进
+cooldown（凭据问题不是上游故障，写冷却会误伤 failover）；CLI 令牌是否被上游接受只能实际请求核验。
+
+#### 无守护进程的 catpaw-ide
+
+「不用 keeper」指**不装守护进程**，不是不需要认证脚本：IDE 凭据由 `mtsso_keeper` 的
+`catpaw_ide_session.py` 产出，本代理只读。以下以 macOS 为例。
+
+**准备**
+
+- Python 3.10+（纯标准库）、可完成内网 SSO 的帐号与网络、本机浏览器。
+- `catpaw_ide_session.py`、`mtsso_core.py`、`file_lock.py` 三个文件同目录、同版本；本仓库不含
+  这些文件，须从 `mtsso_keeper` 取得，不可混用不同版本。
+- 本平台桥库，见[桥库从哪来](#桥库从哪来)。
+
+**首次登录（一次）**
+
+```bash
+K="/绝对路径/mtsso_keeper"
+python3 "$K/catpaw_ide_session.py" --login
+```
+
+保持进程运行，在浏览器打开它打印的 URL 完成 SSO。回调端口 8576 / 9576 与 IDE、Catboss
+共用：两个都被占用时直接失败，先正常退出那边正在进行的登录，不要抢占端口。
+
+成功后凭据写入 `~/.mtsso_keeper/catpaw_ide_session.json`（状态、候选、锁、备份也在用户私有
+目录，不要复制进项目或分享）。代理保持默认 `credential_file`、配好 `bridge_lib` 即可用，
+无需 `keeper.py bootstrap`、无需安装 launchd。
+
+**日常维护（无守护）**
+
+```bash
+python3 "$K/catpaw_ide_session.py"          # ensure：检查，失效才恢复
+python3 "$K/catpaw_ide_session.py" --check  # 只读探测，不刷新
+```
+
+- 每次开始使用前跑一次 ensure。健康期只检查不刷新，真的到期才重建；`--force` 也不绕过门控。
+- access token 实测寿命 72h，但以 `expire` 与上游 whoami 为准。手动模式没有自动续期：
+  连续使用时每 20 分钟左右重跑，或按到期时间设提醒、到期后立即执行。
+- 不可用累计到 30 分钟脚本转人工（`need_human`），不再自动重试；所以隔天跑一次覆盖不了
+  72h 周期内的失效。
+- 上游提前 401/403：先跑 ensure；仍报 `healthy` 说明是模型或账号授权问题，不是过期。
+  过早刷新有限速（同一张票 15 分钟内不重复 POST），按输出退避重试，不要手工清状态。
+
+**退出码**
+
+| 码 | 含义 | 处置 |
+|---|---|---|
+| 0 | 成功或当前有效 | 无 |
+| 1 | 本次未达成（刷新失败、候选未验证等） | 读 `verdict`/`reason`，稍后重跑 |
+| 3 | 需人工（SSO 失效、被拒、身份冲突） | `--login` 重新登录；`identity_mismatch` 时核对浏览器帐号 |
+| 4 | 上游契约变化 | 升级 `mtsso_keeper`，不要改本代理绕过 |
+
+`--check` 只分 0（healthy）与 1（其他），原因看 `verdict`/`reason`。
+
+**与 keeper 共存**：同一份凭据与状态只能有一个维护模式。装了 keeper 的机器不要另设定时手动刷新；
+切手动前先停掉写该状态的 launchd 作业并等在途动作结束。锁只保证不并发，不能让两处交替刷新。
+
+**Windows**：登录是人工打开打印的 URL；`osascript` 只用于桌面通知，缺它不影响结果。但脚本仍含
+POSIX 写盘与权限处理，这条链路尚未在 Windows 验收——DLL 能加载不代表登录可用。
 
 ## 3. routes 字段
 

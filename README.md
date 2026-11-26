@@ -22,7 +22,7 @@ version: 0.16
 | **正文错误识别** | 上游 200 但正文是"限流/额度/模型不存在"等语义错误 → 按虚拟错误码冷却，不当作成功 |
 | **effort 映射** | 客户端档位按**相对排名**映射到上游档位，不同供应商档位数量不一致也不会错位 |
 | **用量观测** | 每请求一条 ACCESS 日志 + 独立 token 账本，可按天/月统计；`status` 汇总**每条在用供给的近 30min 成功率、首 token 中位数、输出 tps、失败码**，以及活跃会话 |
-| **四类上游接入** | ① 标准 HTTP-Anthropic（自带 url/appkey）② 标准 HTTP-Responses ③ `catpaw-cli`（mcli 网关）④ `catpaw-ide`（CatPaw IDE，凭据由 mtsso_keeper 管）；标准 HTTP-Chat 仅作出站路径 |
+| **四类上游接入** | ① 标准 HTTP-Anthropic（自带 url/appkey）② 标准 HTTP-Responses ③ `catpaw-cli`（mcli 网关）④ `catpaw-ide`（CatPaw IDE，凭据由 mtsso_keeper 的认证脚本产出）；标准 HTTP-Chat 仅作出站路径 |
 
 上游协议组合矩阵（行是客户端入站，列是上游；每条通路都有流式和非流式实现）：
 
@@ -93,25 +93,32 @@ if exist config\model_proxy_config.json (echo 配置已存在，未覆盖) else 
    | `anthropic-example` | `anthropic` | `url` + `appkey`（或 `appkey_file`）+ `target_model` | 标准 Anthropic 端点，最常见 |
    | `responses-example` | `responses` | 同上 | 标准 OpenAI Responses 端点；路由给它时 Codex 可直接接线 |
    | `catpaw-cli-example` | `catpaw-cli` | 只填 `target_model` | mcli 网关：端点/凭据/计费块内置 |
-   | `catpaw-ide-example` | `catpaw-ide` | 只填 `target_model` | CatPaw IDE：另需桥动态库（见下） |
+   | `catpaw-ide-example` | `catpaw-ide` | 只填 `target_model` | CatPaw IDE：另需凭据与桥动态库（见下） |
    | `glm-53-mcli-example` | `anthropic` | `appkey_file` 指向登录态 | 同一份 mcli 令牌走标准 HTTP 的写法，含 `extra_headers`/`system_inject` |
 
    样例里 `mixed` 路由按档位混用这几种，`responses-only` 路由把四档都指向
    `responses-example`（Codex 直接可用）。**示例 URL 与 token 全是占位符，不是可用凭据**；
    删掉某条 supply 时，要同时清掉 routes 里对它的引用。
 
-   **两条免配置通道**（端点、鉴权、header、计费块都在模块里，supply 只写 4 个字段）：
+   **两条内置通道**（端点、鉴权、header、计费块都在模块里，supply 只写 4 个字段；
+   免填鉴权字段不等于无需登录）：
 
-   | protocol | 用途 | 凭据来源 |
-   |---|---|---|
-   | `catpaw-cli` | mcli 网关（Claude / GLM / Kimi / DeepSeek…） | `~/.config/mcopilot-cli/.config.yaml` |
-   | `catpaw-ide` | CatPaw IDE（GPT / Gemini / LongCat…） | `~/.mtsso_keeper/catpaw_ide_session.json` + 桥库 |
+   | protocol | 用途 | 凭据来源 | 前置条件 |
+   |---|---|---|---|
+   | `catpaw-cli` | mcli 网关（Claude / GLM / Kimi / DeepSeek…） | `~/.config/mcopilot-cli/.config.yaml` | 本机 mc CLI 已登录；**不需要 mtsso_keeper**（keeper 只是可选保鲜） |
+   | `catpaw-ide` | CatPaw IDE（GPT / Gemini / LongCat…） | `~/.mtsso_keeper/catpaw_ide_session.json` | ① 取得 `mtsso_keeper` 的认证脚本并交互登录一次 ② 本平台桥动态库；**不装守护进程也能用** |
 
-   两者凭据都由 `mtsso_keeper` 维护，本代理只读不刷新；路径默认内置，换机器改
-   `config/provider_settings.json`（样例 `provider_settings.example.json`）。桥库由
-   `build-catpaw-bridge` workflow 按平台产出（产物名：macOS `.dylib` / Windows `.dll`），
-   取回后把路径写进 `provider_settings.json` 的 `bridge_lib`，见
-   [CONFIG](docs/CONFIG.md#桥库从哪来)；字段与内置值见
+   本代理只读凭据，不登录、不刷新。mc CLI 的登录态不能当 IDE 凭据用。凭据缺失或过期
+   时本地返回 500；缺桥库同样调不通，重启代理不会补齐这些前置条件。
+
+   - 不装守护进程的手动维护方式见
+     [无守护进程的 catpaw-ide](docs/CONFIG.md#无守护进程的-catpaw-ide)。
+   - macOS 自动维护：先手动登录一次，再按 `mtsso_keeper` 的 README 安装 launchd 作业；
+     守护不能代替首次登录。
+
+   路径默认内置，换机器改 `config/provider_settings.json`（样例 `provider_settings.example.json`）。
+   桥库由 `build-catpaw-bridge` workflow 按平台产出（macOS `.dylib` / Windows `.dll`），取回后把
+   路径写进 `bridge_lib`，见 [桥库从哪来](docs/CONFIG.md#桥库从哪来)；字段见
    [两个 CatPaw provider](docs/CONFIG.md#两个-catpaw-provider)。
 3. 设置相互独立的随机强 `admin_token` 和 strategy `client_token`，核对 routes、tiers 和 supplies 的引用。示例 strategy 使用 `route_pool`，不是单值 `route_id`。
 4. 密钥和配置不得提交或分享。Mac 保持私有文件权限（示例命令已 `umask 077` + `chmod 600`）；Windows 上配置与日志落在项目内 `.runtime/`，私有 ACL 检查失败时不要绕过或反复重试：记录并脱敏错误，参考 [Windows 路径与 ACL 限制](docs/designs/2026-11-16-model-proxy-Windows路径ACL默认目录兼容方案.md)，必要时请管理员协助核对路径和权限。
