@@ -663,6 +663,29 @@ def truncate_tool_name(name: str) -> str:
 # 报 `unsupported call`（2026-11-26 实测）。
 NAMESPACE_TOOL_SEP = "__"
 
+# 命名空间工具（Codex 的 multi_agent_v1.*）参数填写约定，追加到摊平后的工具描述尾部。
+# 背景（2026-11-26 实测）：上游模型会给可选参数补空值占位，例如
+#   {"agent_type":"runner","fork_context":false,"items":[],"message":"...","model":"","reasoning_effort":""}
+# Codex 侧校验 `Provide either message or items, but not both` 直接拒绝；模型拿不到明确
+# 原因就重试，实测单次派单重试 28~68 次、烧数十万 token。
+# 机理解同 11-06 的 strict 事故（schema 可选字段被填满），但 r2a 出站是 Anthropic 协议，
+# 没有 `strict` 字段可设（对照 Responses 出口的 supply 级 strict 策略），只能在工具描述上约束。
+NAMESPACE_TOOL_PARAM_HINT = (
+    "参数填写约定：只填本工具实际需要的字段。"
+    "`message` 与 `items` 二选一，绝不能同时出现（空数组也算出现）。"
+    "不要给用不到的可选参数补空值，例如 `items: []`、`model: \"\"`、`reasoning_effort: \"\"`。"
+)
+
+
+def with_namespace_param_hint(description: str) -> str:
+    """给摊平后的命名空间工具描述追加参数填写约定（幂等）。"""
+    desc = (description or "").rstrip()
+    if not desc:
+        return NAMESPACE_TOOL_PARAM_HINT
+    if NAMESPACE_TOOL_PARAM_HINT in desc:
+        return desc
+    return f"{desc}\n\n{NAMESPACE_TOOL_PARAM_HINT}"
+
 
 def namespace_tool_alias(namespace: str, name: str) -> str:
     """命名空间 + 工具名 → Anthropic 合法扁平名（确定性，请求/历史/响应三处共用）。"""
@@ -743,7 +766,7 @@ def _flatten_namespaced_tools(responses_tools, alias_by_pair) -> list:
                 continue
             out.append({
                 "name": alias,
-                "description": sub.get("description", ""),
+                "description": with_namespace_param_hint(sub.get("description", "")),
                 "input_schema": sub.get("parameters") or {"type": "object", "properties": {}},
             })
     return out

@@ -18,6 +18,8 @@ from core.translate import (
     build_namespace_maps,
     namespace_tool_alias,
     responses_to_anthropic_request,
+    NAMESPACE_TOOL_PARAM_HINT,
+    with_namespace_param_hint,
 )
 
 SUB_TOOLS = [
@@ -55,8 +57,21 @@ class NamespaceFlattenRequestTests(unittest.TestCase):
         ab = responses_to_anthropic_request({"model": "m", "input": [], "tools": TOOLS})
         by_name = {t["name"]: t for t in ab["tools"]}
         spawn = by_name[namespace_tool_alias("multi_agent_v1", "spawn_agent")]
-        self.assertEqual(spawn["description"], "spawn")
+        # 原描述保留在前，参数填写约定追加在后（2026-11-26 空值重试风暴回归）
+        self.assertTrue(spawn["description"].startswith("spawn"))
+        self.assertIn(NAMESPACE_TOOL_PARAM_HINT, spawn["description"])
         self.assertIn("agent_type", spawn["input_schema"]["properties"])
+
+    def test_flat_function_tool_gets_no_param_hint(self):
+        """提示只加在命名空间工具上，普通 function 工具描述保持原样。"""
+        ab = responses_to_anthropic_request({"model": "m", "input": [], "tools": TOOLS})
+        flat = {t["name"]: t for t in ab["tools"]}["exec_command"]
+        self.assertEqual(flat["description"], "run")
+
+    def test_param_hint_is_idempotent_and_handles_empty_description(self):
+        once = with_namespace_param_hint("spawn")
+        self.assertEqual(with_namespace_param_hint(once), once)
+        self.assertEqual(with_namespace_param_hint(""), NAMESPACE_TOOL_PARAM_HINT)
 
     def test_hosted_tool_types_are_still_skipped(self):
         tools = TOOLS + [{"type": "web_search", "name": "web_search"}]
