@@ -201,6 +201,12 @@ cooldown（凭据问题不是上游故障，写冷却会误伤 failover）；CLI
 `catpaw-cli`：装好 mc CLI、浏览器登录一次即可，model_proxy 直接读配置里的 `AUTHORIZATION`
 行。**不要再自己写刷新脚本**——令牌由 mc CLI 维护，第三方工具插手只会和它的写入打架。
 
+注意这条通道的隐性前提：**没有 mc CLI 就用不了**。mcli 的令牌不是服务端签发的秘密，
+而是客户端自造一个 UUID 后被服务端"激活"（`/user/login?uuid=` → SSO → callback），没有
+"取回凭证"或 refresh 环节——所以除了 mc CLI，没有第二个东西能凭空产出一张新票。令牌
+寿命以服务端为准（观察可达数月）；到期而没有 mc CLI 时，唯一出路是装 mc CLI 重新登录，
+或装 `mtsso_keeper`（它内置铸票实现，见其源仓库）。
+
 快照是只读的，来源 commit 与逐文件 hash 见 `vendor/mtsso_keeper/SOURCE.json`，可用
 `python3 scripts/vendor_mtsso_keeper.py --check` 校验；**不要就地修改**，改动回源目录后重跑
 `--sync`。详细说明见 `vendor/mtsso_keeper/README.md`。

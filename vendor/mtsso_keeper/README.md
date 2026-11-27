@@ -19,8 +19,12 @@ python3 scripts/vendor_mtsso_keeper.py --check
 | `catpaw-cli`（mcli 网关） | mc CLI 自己登录时写 `~/.config/mcopilot-cli/.config.yaml` | **什么都不需要** |
 | `catpaw-ide`（CatPaw IDE） | OIDC，没有第二条产出途径 | `catpaw_ide_session.py` + `file_lock.py` + `mtsso_core.py` |
 
-`catpaw-cli`：**本机 mc CLI 登录过就能用，零脚本**。装好 mc CLI、浏览器登录一次，
-model_proxy 直接读那份配置的 `AUTHORIZATION` 行。
+`catpaw-cli`：**本机 mc CLI 登录过就能用，零脚本**。
+
+前提是这台机器上确实装过 mc CLI 并登录过——**没有 mc CLI 时这条通道直接不可用**。mcli
+的令牌不是服务端签发的秘密，而是客户端自造 UUID 后被"激活"，没有 refresh 环节，所以除了
+mc CLI 没有别的东西能产新票。令牌到期又没有 mc CLI 时，要么装 mc CLI 重新登录，要么装
+`mtsso_keeper`。
 
 `catpaw-ide`：凭据只能由 `catpaw_ide_session.py` 产出，所以脚本是必需的。除此之外
 不需要任何东西。
