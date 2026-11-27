@@ -27,6 +27,7 @@ import hmac
 import json
 import os
 import re
+import secrets
 import shutil
 import subprocess
 import sys
@@ -312,14 +313,41 @@ def write_ciba_entry(mis: str, entry: dict) -> tuple:
 
 # ── 通用 ─────────────────────────────────────────────────────────────
 def atomic_write_json(path: str, obj, mode: int = 0o600) -> None:
-    """原子写 JSON：tmp → chmod → os.replace；父目录 0700。"""
+    """原子写 JSON：tmp → chmod → os.replace；父目录 0700。
+
+    tmp 文件名按 pid + 纳秒时间戳 + 随机后缀唯一：固定名会让并发写者
+    互相截断对方的 tmp，写出半份 JSON。写完（或失败）清理自己的 tmp。
+    """
     path = os.path.expanduser(path)
     os.makedirs(os.path.dirname(path), mode=0o700, exist_ok=True)
-    tmp = path + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(obj, f, ensure_ascii=False, indent=2)
-    os.chmod(tmp, mode)
-    os.replace(tmp, path)
+    tmp = f"{path}.tmp.{os.getpid()}.{time.time_ns()}.{secrets.token_hex(4)}"
+    created = False
+    try:
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        created = True
+        try:
+            f = os.fdopen(fd, "w", encoding="utf-8")
+        except BaseException:
+            os.close(fd)
+            raise
+        with f:
+            json.dump(obj, f, ensure_ascii=False, indent=2)
+        os.chmod(tmp, mode)
+        os.replace(tmp, path)
+    finally:
+        try:
+            if created and os.path.exists(tmp):
+                os.unlink(tmp)
+        except OSError:
+            pass
+
+
+def token_id(tok: str) -> str:
+    """身份判据（等值比较），不可与仅供日志展示的 fingerprint 混用。
+
+    fingerprint 只含前 6 字符与长度，JWT header 相同必然撞车。
+    """
+    return hashlib.sha256(tok.encode("utf-8")).hexdigest()[:16]
 
 
 def fingerprint(tok: str) -> str:

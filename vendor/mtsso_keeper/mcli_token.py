@@ -38,6 +38,8 @@ c（浏览器激活）轮询超时 → 直接 exit 3 不换 uuid（避免浏览�
 SSO session cookie 只存 ~/.mtsso_keeper/sso_session.json（vault 外 0600）。
 keeper state 的 mcli 段只经 state_hook 由 keeper_common.apply_mcli_minted 写，
 本模块不直接读写 keeper state。
+配置写入锁序：mcli_config.lock → state_mcli.lock（state_hook 在配置锁内取状态锁）；
+禁止反向取锁。
 
 设计记录：docs/designs/2026-09-20-mtsso_keeper铸mcli票方案-动作C.md
 """
@@ -45,6 +47,7 @@ keeper state 的 mcli 段只经 state_hook 由 keeper_common.apply_mcli_minted �
 from __future__ import annotations
 
 import argparse
+import contextlib
 import http.cookiejar
 import json
 import os
@@ -59,6 +62,7 @@ import uuid as uuid_mod
 _HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, _HERE)
 
+import file_lock  # noqa: E402
 import mtsso_core as core  # noqa: E402
 import keeper_common  # noqa: E402
 
@@ -66,6 +70,9 @@ import keeper_common  # noqa: E402
 MCLI_CONFIG = "~/.config/mcopilot-cli/.config.yaml"   # 消费端配置（model_proxy appkey_file 亦读此）
 BACKUP_DIR = "~/.mtsso_keeper/backups/mcli"           # 备份绝不落 ~/.config/mcopilot-cli/ 内
 SSO_SESSION_FILE = "~/.mtsso_keeper/sso_session.json" # SSO web session cookie（人工建立）
+CONFIG_LOCK = os.path.expanduser("~/.mtsso_keeper/mcli_config.lock")
+CONFIG_LOCK_TIMEOUT_S = 5.0
+CONFIG_LOCK_POLL_S = 0.02
 
 API_BASE = "https://mcli.sankuai.com/api/v1.0"
 CLI_VERSION = "0.2.3"        # 对齐逆向样本 v0.2.3 的 post body
@@ -105,6 +112,28 @@ _SSO_DEAD_HINT = (
 def _v(verbose: bool, msg: str) -> None:
     if verbose:
         print(f"[mint] {msg}", file=sys.stderr)
+
+
+@contextlib.contextmanager
+def _config_locked():
+    """配置写入互斥：20ms 轮询，最多等待 5s。"""
+    lock_dir = os.path.dirname(CONFIG_LOCK)
+    os.makedirs(lock_dir, mode=0o700, exist_ok=True)
+    os.chmod(lock_dir, 0o700)
+    deadline = time.monotonic() + CONFIG_LOCK_TIMEOUT_S
+    try:
+        handle = file_lock.try_acquire(CONFIG_LOCK)
+        while handle is None:
+            if time.monotonic() >= deadline:
+                raise IOError("配置写锁被占用超过 5s")
+            time.sleep(CONFIG_LOCK_POLL_S)
+            handle = file_lock.try_acquire(CONFIG_LOCK)
+    except file_lock.LockUnavailableError as e:
+        raise IOError(str(e)) from e
+    try:
+        yield
+    finally:
+        file_lock.release(handle)
 
 
 # ── 网络层（模块唯一出口，单测 patch 点）──────────────────────────────
@@ -213,12 +242,15 @@ def read_auth_line(path: str = None):
 
 
 def _verify_writeback(path: str, expected: bytes, backup) -> None:
-    """护栏 4：重读断言（写后内容 == 期望字节）；不一致 → 回滚（备份还原 /
-    首铸无备份删除坏文件，core.rollback 同语义）后抛 IOError。"""
+    """护栏 4：重读断言；失败时仅在当前内容仍为本次写入时回滚。"""
     with open(path, "rb") as f:
         after = f.read()
     if after == expected:
         return
+    with open(path, "rb") as f:
+        current = f.read()
+    if current != expected:
+        raise IOError(f"回写验证失败：检测到并发写入，已放弃回滚，备份: {backup or '无(首铸)'}")
     core.rollback(path, backup)
     raise IOError(f"回写验证失败（内容与期望不一致），已回滚；备份: {backup or '无(首铸)'}")
 
@@ -230,9 +262,9 @@ def rewrite_authorization_line(path: str, new_token: str, backup_dir: str = None
             行尾换行风格）原样字节级保留；
     护栏 2：schema 断言——可读、≤64 行、每行 ^[A-Z_]+: .*$ 或空行、
             AUTHORIZATION 行恰 0/1 个；不满足抛 core.UpstreamChangedError 拒写；
-    护栏 3：copy2 备份落 backup_dir（0600，绝不留在消费目录）→ 写 .mint-tmp
+    护栏 3：copy2 备份落 backup_dir（0600，绝不留在消费目录）→ 写唯一 tmp
             → os.replace 原子替换 → chmod 0600；
-    护栏 4：_verify_writeback 重读断言，失败回滚。
+    护栏 4：_verify_writeback 重读断言，确认当前仍为本次写入才回滚。
     返回备份路径（首铸无旧文件 → None）。
 
     并发注意：避免 keeper 铸票窗口并行手跑 mc（writeYaml 全文件重写可能回滚
@@ -274,19 +306,18 @@ def rewrite_authorization_line(path: str, new_token: str, backup_dir: str = None
     expected = "\n".join(lines).encode("utf-8")
     # 护栏 3：备份 → 原子写
     backup = core.backup_file(path, backup_dir)
-    tmp = path + ".mint-tmp"
+    tmp = f"{path}.mint-tmp.{os.getpid()}.{time.time_ns()}"
     try:
         with open(tmp, "wb") as f:
             f.write(expected)
         os.chmod(tmp, 0o600)
         os.replace(tmp, path)
-    except OSError:
-        if os.path.exists(tmp):
-            try:
+    finally:
+        try:
+            if os.path.exists(tmp):
                 os.remove(tmp)
-            except OSError:
-                pass
-        raise
+        except OSError:
+            pass
     # 护栏 4：回读验证 + 失败回滚
     _verify_writeback(path, expected, backup)
     return backup
@@ -502,27 +533,31 @@ def run_ensure(force: bool = False, verbose: bool = False, activator: str = "coo
         print(f"[ERROR] 新 token 验证失败（code={code} err={err}），不回写", file=sys.stderr)
         return 1
 
-    # verify-old：互斥性观测（§4.1/§7，只记录不阻断）
+    # verify-old → 回写 → state_hook：配置锁覆盖整个写事务。
     old_code = None
-    old = read_auth_line(config_path)
-    if old and old != minted_uuid:
-        try:
-            old_code, _, _ = probe_token(old)
-        except (core.UpstreamChangedError, McliNetError):
-            old_code = None
-
-    # 回写（四护栏）
     try:
-        backup = rewrite_authorization_line(config_path, minted_uuid, backup_dir)
-    except core.UpstreamChangedError as e:
-        print(f"[ERROR] 上游契约变更，拒写: {e}", file=sys.stderr)
-        return 4
-    except OSError as e:
-        print(f"[ERROR] 回写 IO 失败: {e}", file=sys.stderr)
-        return 1
+        with _config_locked():
+            old = read_auth_line(config_path)
+            if old and old != minted_uuid:
+                try:
+                    old_code, _, _ = probe_token(old)
+                except (core.UpstreamChangedError, McliNetError):
+                    old_code = None
 
-    if state_hook:
-        state_hook(minted_uuid, old_code)
+            try:
+                backup = rewrite_authorization_line(config_path, minted_uuid, backup_dir)
+            except core.UpstreamChangedError as e:
+                print(f"[ERROR] 上游契约变更，拒写: {e}", file=sys.stderr)
+                return 4
+            except OSError as e:
+                print(f"[ERROR] 回写 IO 失败: {e}", file=sys.stderr)
+                return 1
+
+            if state_hook:
+                state_hook(minted_uuid, old_code)
+    except OSError as e:
+        print(f"[ERROR] {e}", file=sys.stderr)
+        return 1
     print(f"[完成] 已铸 mcli token 并回写 {config_path}")
     print(f"  新 token: {core.fingerprint(minted_uuid)}  misId={minted_data.get('misId', '?')}")
     if old_code is not None:

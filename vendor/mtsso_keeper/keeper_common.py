@@ -1,28 +1,33 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""keeper_common.py — CIBA/mcli 两条链路实施模块与 keeper 编排层共享的底座。
+"""keeper_common.py — CIBA/mcli 两条链路与 keeper 编排层共享的底座。
 
-内容为原 keeper.py 的日志 / state 原语与阈值常量，逐字搬移；物理位置
-从编排层下沉到此模块，避免 keeper ↔ 链路模块循环 import。
-`apply_mcli_minted` 是 state.json 的 mcli 段唯一写者（tick 与人工 CLI 共用）。
-
-日志只存指纹；state 明文只在 state.json（0600）。
+state.json 只由持有 keeper.lock 的 keeper 进程写入；state_mcli.json 由
+keeper tick 和人工铸票 hook 写入，使用 state_mcli.lock 串行读改写。
+迁移旧状态时先持有 keeper.lock，再持有 state_mcli.lock，先写 mcli 文件，
+再移除旧文件中的 mcli 子对象。日志只存指纹，状态文件均为 0600。
 """
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import sys
 import time
 from datetime import datetime
 
+import file_lock
 import mtsso_core as core
 
 STATE_DIR = os.path.expanduser(core.STATE_DIR)
 STATE_FILE = os.path.expanduser(core.STATE_FILE)
 LOG_FILE = os.path.expanduser(core.LOG_FILE)
 LOCK_FILE = os.path.expanduser(core.LOCK_FILE)
+MCLI_STATE_FILE = os.path.join(STATE_DIR, "state_mcli.json")
+MCLI_LOCK = os.path.join(STATE_DIR, "state_mcli.lock")
+MCLI_LOCK_TIMEOUT_S = 2.0
+MCLI_LOCK_POLL_S = 0.02
 
 REFRESH_THRESHOLD_MS = 48 * 3600 * 1000   # 剩余 < 48h 才续（唯一续期判据）
 ALERT_THRESHOLD_MS = 12 * 3600 * 1000     # 失败且剩余 < 12h → ALERT
@@ -92,50 +97,136 @@ def _fmt_h(ms: float) -> str:
 
 
 # ── state ────────────────────────────────────────────────────────────
-def load_state() -> dict:
+def _read_json_dict(path: str) -> dict:
     try:
-        with open(STATE_FILE, encoding="utf-8") as f:
-            return json.load(f)
-    except (OSError, ValueError):
-        return {}
+        with open(path, encoding="utf-8") as f:
+            st = json.load(f)
+    except (OSError, ValueError, UnicodeError):
+        st = {}
+    return st if isinstance(st, dict) else {}
 
 
-def save_state(st: dict) -> None:
+class McliBusyError(RuntimeError):
+    """mcli 状态锁等待超时，不得无锁写入。"""
+
+
+@contextlib.contextmanager
+def _mcli_locked():
+    os.makedirs(STATE_DIR, mode=0o700, exist_ok=True)
+    deadline = time.monotonic() + MCLI_LOCK_TIMEOUT_S
+    handle = file_lock.try_acquire(MCLI_LOCK)
+    while handle is None:
+        if time.monotonic() >= deadline:
+            raise McliBusyError(f"state_mcli.lock 被占用超过 {MCLI_LOCK_TIMEOUT_S:.1f}s")
+        time.sleep(MCLI_LOCK_POLL_S)
+        handle = file_lock.try_acquire(MCLI_LOCK)
+    try:
+        yield
+    finally:
+        file_lock.release(handle)
+
+
+def migrate_split(*, keeper_locked: bool = False) -> None:
+    """先迁移 mcli，再移除旧键；调用者未持主锁时先取得主锁。"""
+    if not keeper_locked:
+        os.makedirs(STATE_DIR, mode=0o700, exist_ok=True)
+        handle = file_lock.try_acquire(LOCK_FILE)
+        if handle is None:
+            raise McliBusyError("keeper.lock 被占用，无法迁移状态")
+        try:
+            migrate_split(keeper_locked=True)
+        finally:
+            file_lock.release(handle)
+        return
+    with _mcli_locked():
+        st = _read_json_dict(STATE_FILE)
+        if "mcli" not in st:
+            return
+        if not os.path.exists(MCLI_STATE_FILE):
+            _write_mcli_locked(_load_mcli_for_write())
+        st.pop("mcli")
+        core.atomic_write_json(STATE_FILE, st)
+
+
+def load_state(*, keeper_locked: bool = False) -> dict:
+    """读 CIBA 状态；纯读，不做迁移（迁移由入口显式调 `migrate_split`）。"""
+    st = _read_json_dict(STATE_FILE)
+    st.pop("mcli", None)  # 旧布局遗留键：CIBA 视图永远看不到 mcli
+    return st
+
+
+def load_mcli_state() -> dict:
+    """读 mcli 状态；仅当独立文件**不存在**时回退读旧布局的 `mcli` 子对象（只读）。
+
+    文件存在但内容为空/不可解析时以它为准（空即无 mcli 事实），不回退——否则
+    迁移刚写成 `{}` 的窗口里会读出已被接管、即将被删除的旧子对象。
+    """
+    if os.path.exists(MCLI_STATE_FILE):
+        return _read_json_dict(MCLI_STATE_FILE)
+    legacy = _read_json_dict(STATE_FILE).get("mcli")
+    return legacy if isinstance(legacy, dict) else {}
+
+
+def _load_mcli_for_write() -> dict:
+    """锁内读取写盘基线：等同 `load_mcli_state`（旧布局时以遗留子对象为初值）。"""
+    return load_mcli_state()
+
+
+def save_ciba(st: dict) -> None:
+    """由 keeper 单写者原子写入 CIBA 状态。
+
+    迁移未完成（独立文件还不存在）时把磁盘上的遗留 `mcli` 子对象原样带回：
+    `load_state` 已把它从视图里摘掉，若此处直接丢弃，一次"迁移因锁忙跳过"
+    就会永久删掉尚未搬家的 mcli 事实。
+    """
+    st.pop("mcli", None)
+    if not os.path.exists(MCLI_STATE_FILE):
+        legacy = _read_json_dict(STATE_FILE).get("mcli")
+        if isinstance(legacy, dict) and legacy:
+            st["mcli"] = legacy
     st["schema"] = 1
     st["history"] = st.get("history", [])[-HISTORY_LIMIT:]
-    core.atomic_write_json(STATE_FILE, st)  # 0600 / 目录 0700 / 原子写
+    core.atomic_write_json(STATE_FILE, st)
+
+
+def _write_mcli_locked(m: dict) -> None:
+    """mcli 状态落盘的唯一写点；调用者必须已持 `state_mcli.lock`。"""
+    core.atomic_write_json(MCLI_STATE_FILE, m)
+
+
+def update_mcli(mutator, *, guard=None) -> bool:
+    """持锁读取 mcli 状态、检查 guard、增量修改并原子写入。"""
+    with _mcli_locked():
+        m = _load_mcli_for_write()
+        if guard is not None and not guard(m):
+            return False
+        mutator(m)
+        _write_mcli_locked(m)
+    return True
 
 
 def apply_mcli_minted(new_token: str, old_token_code=None) -> bool:
-    """铸票成功后更新 keeper state 的 mcli 段（mcli state 的唯一写者）。
+    """铸票成功后更新 keeper state 的 mcli 段（mcli 归属写者，走 update_mcli）。
 
-    只记指纹不记明文（方案 §4.5）。写失败不阻断成功结论（warn 到 stderr，
-    返回 False；下 tick 探测自愈 token_fp）。并发说明：人工 --force 与
-    launchd tick 撞在毫秒级写窗口的概率 ≈ 0，且后果可恢复
-    （bootstrap/refresh-once 重建），不加锁。
+    只记指纹与身份哈希，均不可逆；不记明文。写失败不阻断成功结论（warn 到
+    stderr，返回 False；下 tick 探测自愈身份）；锁争用同样只降级为 stderr。
     """
-    try:
-        st = {}
-        try:
-            with open(os.path.expanduser(core.STATE_FILE), encoding="utf-8") as f:
-                st = json.load(f)
-        except (OSError, ValueError):
-            st = {}
-        if not isinstance(st, dict):
-            st = {}
-        m = st.get("mcli") if isinstance(st.get("mcli"), dict) else {}
-        now = int(time.time() * 1000)
+    now = int(time.time() * 1000)
+
+    def _apply(m: dict) -> None:
         m["token_fp"] = core.fingerprint(new_token)
+        m["token_id"] = core.token_id(new_token)
         m["last_ok"] = now
         m["last_probe"] = now
         m["minted_at"] = now
         m["fail_count"] = 0
+        m["alert"] = False        # 铸票成功即解除告警：挡住 tick 陈旧结论残留的 ALERT
         m.pop("stop_retry", None)
         if old_token_code is not None:
             m.setdefault("observed", {})["old_token_code_after_mint"] = old_token_code
-        st["mcli"] = m
-        core.atomic_write_json(core.STATE_FILE, st)
-        return True
+
+    try:
+        return update_mcli(_apply)
     except Exception as e:  # noqa: BLE001 —— state 记录失败不阻断铸票成功
         print(f"[warn] keeper state 更新失败（不阻断结果，下 tick 自愈）: {e}",
               file=sys.stderr)

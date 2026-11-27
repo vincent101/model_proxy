@@ -196,7 +196,7 @@ cooldown（凭据问题不是上游故障，写冷却会误伤 failover）；CLI
 | 链路 | 组件 | 文件 | 是否必需 |
 |---|---|---|---|
 | `catpaw-ide` | `catpaw-ide` | `catpaw_ide_session.py` `file_lock.py` `mtsso_core.py` | **必需**（凭据只能由它产出） |
-| `catpaw-cli` | `catpaw-cli-refresh` | `mcli_token.py` `keeper_common.py` `mtsso_core.py` | 可选（mc CLI 自己登录时不需要） |
+| `catpaw-cli` | `catpaw-cli-refresh` | `mcli_token.py` `keeper_common.py` `mtsso_core.py` `file_lock.py` | 可选（mc CLI 自己登录时不需要） |
 
 快照是只读的，来源 commit 与逐文件 hash 见 `vendor/mtsso_keeper/SOURCE.json`，可用
 `python3 scripts/vendor_mtsso_keeper.py --check` 校验；**不要就地修改**，改动回源目录后重跑
@@ -296,8 +296,15 @@ mkdir -p ~/.config/mcopilot-cli && : > ~/.config/mcopilot-cli/.config.yaml
 回写只动 `AUTHORIZATION` 行；备份落 `~/.mtsso_keeper/backups/mcli/`，不留在消费目录。
 退出码与上节相同（0/1/3/4），`3` 表示 SSO 会话失效需人工重建。
 
-**与 mc CLI 不要同时写**：铸票会整文件重写配置，与 mc CLI 自己的写入窗口重叠时可能互相
-覆盖（后果有界：重铸一次即可）。保鲜机制上线后，不要在开着 mc CLI 的同时跑 `--force`。
+**并发边界**（两层，别混淆）：
+
+- **本工具内部（仅 mcli 链路）**：配置写（`mcli_config.lock`）与 mcli 状态写
+  （`state_mcli.lock`）都有锁，keeper 的 6h tick 与人工 `--force` 被设计成两个合法写者，
+  撞车时互斥等待、不会互相覆盖。所以装了 keeper 的机器也可以随时手动跑一次。
+  **IDE 不是这样**——它靠状态机门控而非锁，交替刷新会破坏判定，装 keeper 时别另设定时手动刷新，
+  见上文[与 keeper 共存](#无守护进程的-catpaw-ide)。
+- **mc CLI 本身**：它是独立二进制，不认识这两把锁。铸票会整文件重写配置，与 mc CLI 自己的
+  写入窗口重叠时可能互相覆盖（后果有界：重铸一次即可）。所以**开着 mc CLI 时别跑 `--force`**。
 
 ## 3. routes 字段
 

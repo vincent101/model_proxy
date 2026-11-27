@@ -16,7 +16,7 @@ python3 scripts/vendor_mtsso_keeper.py --check
 | 组件 | 文件 | 什么时候需要 |
 |---|---|---|
 | `catpaw-ide` | `catpaw_ide_session.py` `file_lock.py` `mtsso_core.py` | 用 `protocol: catpaw-ide` 的 supply 时**必需** |
-| `catpaw-cli-refresh` | `mcli_token.py` `keeper_common.py` `mtsso_core.py` | 用 `protocol: catpaw-cli` 时**可选**（只在要无人值守保鲜时） |
+| `catpaw-cli-refresh` | `mcli_token.py` `keeper_common.py` `mtsso_core.py` `file_lock.py` | 用 `protocol: catpaw-cli` 时**可选**（只在要无人值守保鲜时） |
 
 两组声明的文件是各自完整的依赖闭包：只把这几个文件拷到任意目录就能跑，不依赖本目录
 其它文件，也不依赖 keeper 源码（有测试守着）。
