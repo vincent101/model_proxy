@@ -188,21 +188,24 @@ go build -buildmode=c-shared -o ~/.local/lib/libcatpaw_bridge.dylib ./cmd/native
 `catpaw-ide` 用独立 OIDC 凭据（认证脚本必需，守护可选）。IDE 凭据缺失或过期返回 500 且不进
 cooldown（凭据问题不是上游故障，写冷却会误伤 failover）；CLI 令牌是否被上游接受只能实际请求核验。
 
-#### 不装 keeper 也能用（两条链路各自的最小集）
+#### 不装 keeper 也能用
 
-「不用 keeper」指**不装守护进程**，不是不需要认证脚本。`vendor/mtsso_keeper/` 内置了
-两条链路各自完整的依赖闭包（有测试守着：只拷该组件的文件就能跑起来）：
+`vendor/mtsso_keeper/` 的定位只有一条：**让没有 keeper 的人把 model_proxy 跑起来**，
+不承担凭据管理或保鲜。据此两条通道的结论完全不同：
 
-| 链路 | 组件 | 文件 | 是否必需 |
-|---|---|---|---|
-| `catpaw-ide` | `catpaw-ide` | `catpaw_ide_session.py` `file_lock.py` `mtsso_core.py` | **必需**（凭据只能由它产出） |
-| `catpaw-cli` | `catpaw-cli-refresh` | `mcli_token.py` `keeper_common.py` `mtsso_core.py` `file_lock.py` | 可选（mc CLI 自己登录时不需要） |
+| 通道 | 凭据从哪来 | 本目录需要什么 |
+|---|---|---|
+| `catpaw-cli` | mc CLI 登录时自己写 `~/.config/mcopilot-cli/.config.yaml` | **零脚本** |
+| `catpaw-ide` | OIDC，无第二条产出途径 | `catpaw_ide_session.py` + `file_lock.py` + `mtsso_core.py` |
+
+`catpaw-cli`：装好 mc CLI、浏览器登录一次即可，model_proxy 直接读配置里的 `AUTHORIZATION`
+行。**不要再自己写刷新脚本**——令牌由 mc CLI 维护，第三方工具插手只会和它的写入打架。
 
 快照是只读的，来源 commit 与逐文件 hash 见 `vendor/mtsso_keeper/SOURCE.json`，可用
 `python3 scripts/vendor_mtsso_keeper.py --check` 校验；**不要就地修改**，改动回源目录后重跑
 `--sync`。详细说明见 `vendor/mtsso_keeper/README.md`。
 
-以下两节分别对应两条链路。
+下一节只讲 `catpaw-ide`（唯一需要脚本的那条）。
 
 #### 无守护进程的 catpaw-ide
 
@@ -233,11 +236,12 @@ python3 "$K/catpaw_ide_session.py"          # ensure：检查，失效才恢复
 python3 "$K/catpaw_ide_session.py" --check  # 只读探测，不刷新
 ```
 
-- 每次开始使用前跑一次 ensure。健康期只检查不刷新，真的到期才重建；`--force` 也不绕过门控。
-- access token 实测寿命 72h，但以 `expire` 与上游 whoami 为准。手动模式没有自动续期：
-  连续使用时每 20 分钟左右重跑，或按到期时间设提醒、到期后立即执行。
-- 不可用累计到 30 分钟脚本转人工（`need_human`），不再自动重试；所以隔天跑一次覆盖不了
-  72h 周期内的失效。
+- 状态健康时脚本只做本地判定就返回（探测间隔 6h，`PROBE_INTERVAL`），不会因为频繁跑就
+  重复刷新——**跑多跑少都不花钱，跑不跑决定的是到期后有没有人续上**。
+- access token 实测寿命 72h，以 `expire` 与上游 whoami 为准。**无守护 = 没有自动续期**：
+  到期后必须先跑一次无参命令，否则该通道直接 401。所以要么按到期时间设提醒，
+  要么装上 keeper。
+- 不可用累计到 30 分钟脚本转人工（`need_human`），不再自动重试。
 - 上游提前 401/403：先跑 ensure；仍报 `healthy` 说明是模型或账号授权问题，不是过期。
   过早刷新有限速（同一张票 15 分钟内不重复 POST），按输出退避重试，不要手工清状态。
 
@@ -258,53 +262,19 @@ python3 "$K/catpaw_ide_session.py" --check  # 只读探测，不刷新
 **Windows**：登录是人工打开打印的 URL；`osascript` 只用于桌面通知，缺它不影响结果。但脚本仍含
 POSIX 写盘与权限处理，这条链路尚未在 Windows 验收——DLL 能加载不代表登录可用。
 
-#### 无守护进程的 catpaw-cli
+#### 不装 keeper 时的 catpaw-cli
 
-`catpaw-cli` 通道读的是 mc CLI 自己写的 `~/.config/mcopilot-cli/.config.yaml` 里的
-`AUTHORIZATION` 行。**本机 mc CLI 已登录就不需要任何脚本**，本节可跳过。
-
-只有要自己保鲜（没有 mc CLI、或要长期无人值守）时才用 `catpaw-cli-refresh` 组件：
+什么都不用装：mc CLI 登录过，model_proxy 就能用 `protocol: catpaw-cli` 的 supply。
 
 ```bash
-K="<model_proxy 根>/vendor/mtsso_keeper"
-python3 "$K/mcli_token.py" --check    # 只读：探测现网 token 是否还有效
-python3 "$K/mcli_token.py"            # ensure：有效则秒退，失效才铸
-python3 "$K/mcli_token.py" --force    # 无条件铸票
+# 前提：本机 mc CLI 已登录，且 ~/.config/mcopilot-cli/.config.yaml 里有 AUTHORIZATION 行
+ls ~/.config/mcopilot-cli/.config.yaml
 ```
 
-**铸票需要 SSO 会话，二选一**：
+令牌过期时用 mc CLI 自己重新登录——**不要用第三方脚本改写这个文件**。它由 mc CLI 全量
+重写，外部工具的回写窗口与它重叠时会互相覆盖。
 
-| 方式 | 命令 | 前置 |
-|---|---|---|
-| cookie 重放（默认） | `mcli_token.py --force` | `~/.mtsso_keeper/sso_session.json` 存在且 cookie 有效 |
-| 浏览器激活 | `mcli_token.py --force --activator browser` | 无（脚本打印 URL，你打开完成 SSO，它轮询最长 60s） |
-
-`sso_session.json` 格式（cookie 取 `ssosv.sankuai.com` 域）：
-
-```json
-{"cookies": "k1=v1; k2=v2", "source": "ego|chrome", "updated_at": 1764000000}
-```
-
-**首次铸票要求 `~/.config/mcopilot-cli/.config.yaml` 已存在**——脚本的四道回写护栏
-（行级重写 / schema 断言 / 备份 / 回读验证）拒绝写不存在的文件，避免凭空造出一份配置。
-没有 mc CLI 时先建空文件即可（空文件是合法输入，只追加 `AUTHORIZATION` 行）：
-
-```bash
-mkdir -p ~/.config/mcopilot-cli && : > ~/.config/mcopilot-cli/.config.yaml
-```
-
-回写只动 `AUTHORIZATION` 行；备份落 `~/.mtsso_keeper/backups/mcli/`，不留在消费目录。
-退出码与上节相同（0/1/3/4），`3` 表示 SSO 会话失效需人工重建。
-
-**并发边界**（两层，别混淆）：
-
-- **本工具内部（仅 mcli 链路）**：配置写（`mcli_config.lock`）与 mcli 状态写
-  （`state_mcli.lock`）都有锁，keeper 的 6h tick 与人工 `--force` 被设计成两个合法写者，
-  撞车时互斥等待、不会互相覆盖。所以装了 keeper 的机器也可以随时手动跑一次。
-  **IDE 不是这样**——它靠状态机门控而非锁，交替刷新会破坏判定，装 keeper 时别另设定时手动刷新，
-  见上文[与 keeper 共存](#无守护进程的-catpaw-ide)。
-- **mc CLI 本身**：它是独立二进制，不认识这两把锁。铸票会整文件重写配置，与 mc CLI 自己的
-  写入窗口重叠时可能互相覆盖（后果有界：重铸一次即可）。所以**开着 mc CLI 时别跑 `--force`**。
+要无人值守自动续期（不再手动登录），装 `mtsso_keeper`，不要在 model_proxy 里拼装。
 
 ## 3. routes 字段
 

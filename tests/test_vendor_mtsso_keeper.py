@@ -12,8 +12,16 @@ VENDOR = ROOT / "vendor" / "mtsso_keeper"
 
 FORBIDDEN_NAMES = {
     "keeper.py", "install.sh", "uninstall.sh",
+    "mcli_token.py", "keeper_common.py",   # 凭据管理/保鲜，不在最小运行集内
+    "ciba_chain.py", "mcli_chain.py", "event_scheduler.py", "deploy_txn.py",
     "sso_session.json", "catpaw_ide_session.json", "catpaw_ide_pending.json",
     ".config.yaml", "state.json", "auth.json",
+}
+
+# 快照只解决「把 model_proxy 跑起来」，不承担凭据管理/保鲜。
+CREDENTIAL_MANAGEMENT_MODULES = {
+    "mcli_token.py", "keeper_common.py", "ciba_chain.py", "mcli_chain.py",
+    "event_scheduler.py", "deploy_txn.py", "keeper.py",
 }
 FORBIDDEN_SUFFIXES = (".plist", ".tmpl", ".lock", ".log", ".bak", ".pyc")
 
@@ -65,7 +73,6 @@ class VendorSnapshotTests(unittest.TestCase):
     def test_components_declare_existing_files(self):
         declared = self.source.get("components", {})
         self.assertIn("catpaw-ide", declared)
-        self.assertIn("catpaw-cli-refresh", declared)
         for component, names in declared.items():
             for name in names:
                 with self.subTest(component=component, name=name):
@@ -85,8 +92,7 @@ class VendorSnapshotTests(unittest.TestCase):
         import sys
         import tempfile
 
-        entry = {"catpaw-ide": "catpaw_ide_session.py",
-                 "catpaw-cli-refresh": "mcli_token.py"}
+        entry = {"catpaw-ide": "catpaw_ide_session.py"}
         for component, names in self.source["components"].items():
             with self.subTest(component=component):
                 self.assertIn(component, entry, "新增组件需在此登记入口脚本")
@@ -106,6 +112,26 @@ class VendorSnapshotTests(unittest.TestCase):
                     self.assertEqual(proc.returncode, 1,
                                      f"{component} 期望无凭据退出 1，"
                                      f"实际 {proc.returncode}: {proc.stderr[-300:]}")
+
+    def test_snapshot_excludes_credential_management(self):
+        """快照只解决「model_proxy 能跑」，凭据管理/保鲜一律不收。
+
+        catpaw-cli 的凭据由 mc CLI 自己写，零脚本即可；mcli_token.py 这类
+        探测/铸票/回写属于 keeper 的职责（与 6h tick、state 记账耦合），
+        混进快照会让「没有 keeper」的使用者以为要自己跑刷新，反而制造
+        两处交替写配置的风险。
+        """
+        present = {p.name for p in VENDOR.iterdir() if p.is_file()}
+        leaked = present & CREDENTIAL_MANAGEMENT_MODULES
+        self.assertEqual(leaked, set(), f"快照混入了凭据管理脚本: {sorted(leaked)}")
+        for component, names in self.source["components"].items():
+            with self.subTest(component=component):
+                self.assertEqual(set(names) & CREDENTIAL_MANAGEMENT_MODULES, set())
+
+    def test_catpaw_cli_needs_no_script(self):
+        """catpaw-cli 通道不得出现在组件清单里：它零脚本可用。"""
+        self.assertNotIn("catpaw-cli-refresh", self.source["components"],
+                         "catpaw-cli 只需 mc CLI 的登录态，不应有凭证管理组件")
 
     def test_snapshot_carries_provenance(self):
         self.assertTrue(self.source.get("source_commit"), "缺少来源 commit")

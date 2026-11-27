@@ -6,19 +6,13 @@
   "source_commit": "b2d7f72ea0f2825514e87002bb8e8977431c4cd3",
   "source_commit_date": "2026-11-26T21:24:21+08:00",
   "source_dirty": false,
-  "snapshot_at": "2026-11-27T10:14:49+0800",
+  "snapshot_at": "2026-11-27T10:38:35+0800",
   "vendored_by": "tools/model_proxy/scripts/vendor_mtsso_keeper.py --sync",
   "components": {
     "catpaw-ide": [
       "catpaw_ide_session.py",
       "file_lock.py",
       "mtsso_core.py"
-    ],
-    "catpaw-cli-refresh": [
-      "mcli_token.py",
-      "keeper_common.py",
-      "mtsso_core.py",
-      "file_lock.py"
     ]
   },
   "files": {
@@ -31,16 +25,6 @@
       "sha256": "68bd76569c8cb9958a7f4c6e421448810ae88271ce39a0d03b1225a4fb370c10",
       "bytes": 3582,
       "source_mtime": "2026-11-26T16:41:04+0800"
-    },
-    "keeper_common.py": {
-      "sha256": "118e3a435fec43af6dc6ef33a5dda77fdb366f59665af5e591803df0e3154c3e",
-      "bytes": 8820,
-      "source_mtime": "2026-11-26T21:23:18+0800"
-    },
-    "mcli_token.py": {
-      "sha256": "5c7d86a76682623b682e93b0cab7e548888b3eb325564bbbbdd1c1ef4e086584",
-      "bytes": 28830,
-      "source_mtime": "2026-11-26T21:08:30+0800"
     },
     "mtsso_core.py": {
       "sha256": "2f3bbd214af60aeff742e2fa50d8345a9d5746a32e9f4186ddef4edf03024c15",

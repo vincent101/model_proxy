@@ -23,16 +23,22 @@ VENDOR = ROOT / "vendor" / "mtsso_keeper"
 DEFAULT_SOURCE = Path("/Users/vincentwang/Documents/NoteVault/tools/mtsso_keeper")
 
 # 组件 → 该组件运行所需的最小源码闭包。
-# catpaw-ide：凭据产出/刷新；catpaw-cli-refresh：mcli 令牌保鲜（可选）。
+#
+# 定位（2026-11-27 明确）：本快照只解决「没有 mtsso_keeper 的人怎么把 model_proxy 跑起来」，
+# 不承担凭据管理/保鲜职责。据此只有一条边界：
+#   - catpaw-ide：凭据（OIDC）没有第二条产出途径，脚本**必需**，否则该通道完全不可用
+#   - catpaw-cli：凭据就是 mc CLI 自己写的 ~/.config/mcopilot-cli/.config.yaml，
+#     mc CLI 登录即得，**零脚本**。mcli_token.py（探测/铸票/回写）属于凭据管理，
+#     与 keeper 的 6h tick、state 记账强耦合，不进本快照
 COMPONENTS = {
     "catpaw-ide": ["catpaw_ide_session.py", "file_lock.py", "mtsso_core.py"],
-    "catpaw-cli-refresh": ["mcli_token.py", "keeper_common.py", "mtsso_core.py",
-                           "file_lock.py"],
 }
 
 # 绝不允许出现在快照里的名字（运行态/凭据/守护体系/缓存）。
 FORBIDDEN_NAMES = {
     "keeper.py", "install.sh", "uninstall.sh",
+    "mcli_token.py", "keeper_common.py",   # 凭据管理/保鲜，不在最小运行集内
+    "ciba_chain.py", "mcli_chain.py", "event_scheduler.py", "deploy_txn.py",
     "sso_session.json", "catpaw_ide_session.json", "catpaw_ide_pending.json",
     ".config.yaml", "state.json", "auth.json",
 }

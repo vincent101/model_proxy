@@ -109,16 +109,15 @@ if exist config\model_proxy_config.json (echo 配置已存在，未覆盖) else 
 
    | protocol | 用途 | 凭据来源 | 前置条件 |
    |---|---|---|---|
-   | `catpaw-cli` | mcli 网关（Claude / GLM / Kimi / DeepSeek…） | `~/.config/mcopilot-cli/.config.yaml` | 本机 mc CLI 已登录；**不需要 mtsso_keeper**（内置 `mcli_token.py` 只在要自己保鲜时才用） |
+   | `catpaw-cli` | mcli 网关（Claude / GLM / Kimi / DeepSeek…） | `~/.config/mcopilot-cli/.config.yaml` | 本机 mc CLI 已登录即可，**零脚本、不需要 keeper** |
    | `catpaw-ide` | CatPaw IDE（GPT / Gemini / LongCat…） | `~/.mtsso_keeper/catpaw_ide_session.json` | ① 用内置快照 `vendor/mtsso_keeper/` 交互登录一次 ② 本平台桥动态库；**不装守护进程也能用** |
 
    本代理只读凭据，不登录、不刷新。mc CLI 的登录态不能当 IDE 凭据用。凭据缺失或过期
    时本地返回 500；缺桥库同样调不通，重启代理不会补齐这些前置条件。
 
-   - 认证脚本已随仓库内置在 `vendor/mtsso_keeper/`（只读快照，不含凭据，也不含守护进程）。
-     两条链路各自是完整闭包，只有本仓库、没有 keeper 源码也能用：
-     IDE 见 [无守护进程的 catpaw-ide](docs/CONFIG.md#无守护进程的-catpaw-ide)，
-     CLI 保鲜见 [无守护进程的 catpaw-cli](docs/CONFIG.md#无守护进程的-catpaw-cli)。
+   - 只有 `catpaw-ide` 需要脚本，已随仓库内置在 `vendor/mtsso_keeper/`（只读快照，不含凭据、
+     不含守护进程、不含保鲜工具）；`catpaw-cli` 什么都不缺。只有本仓库、没有 keeper 源码也能用，
+     见 [不装 keeper 也能用](docs/CONFIG.md#不装-keeper-也能用)。
    - macOS 自动维护：先手动登录一次，再按 `mtsso_keeper` 的 README 安装 launchd 作业；
      守护不能代替首次登录。
 
@@ -374,7 +373,7 @@ TCP 可达不等于模型可用：重启远端客户端、发送最小消息，�
 ## 深入文档
 
 - [CONFIG](docs/CONFIG.md)：字段、顶层冷却规则、pool、sidecar 和账本；route 支持四档，CLI 菜单仅处理三档。
-  两条内置通道只靠本仓库怎么跑通，见 [不装 keeper 也能用](docs/CONFIG.md#不装-keeper-也能用两条链路各自的最小集)。
+  两条内置通道只靠本仓库怎么跑通，见 [不装 keeper 也能用](docs/CONFIG.md#不装-keeper-也能用)。
 - [ARCHITECTURE](docs/ARCHITECTURE.md)：协议识别、选路与请求处理链路。
 - [REASONING](docs/REASONING.md)：effort 相对排名和调试。
 - [协议转换规格](docs/designs/model_proxy_translate_spec.md)：字段映射；[CHANGELOG](CHANGELOG.md) 和 [设计记录](docs/designs/)：历史背景。
